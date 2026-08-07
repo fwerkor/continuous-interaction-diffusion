@@ -64,7 +64,27 @@ combines the proposal with binding and revision state before committing a transi
 This keeps differentiable lifecycle prediction in the model while making external-event and memory
 safety invariants non-negotiable at runtime.
 
-### 2.2 Typed grounding layer
+### 2.2 Retired-cell archive and reclamation
+
+`RETIRED` cells are not immediately erased. The runtime tracks their retirement step and keeps the
+full cell in TCT until it is safe and useful to reclaim the physical slot. Reclamation is triggered
+when the fraction of empty physical slots falls below a configurable low watermark, and a final
+safe sweep also runs when a trajectory ends. Eligible cells are reclaimed oldest first until the
+target watermark is reached.
+
+A retired cell is reclaimable only after a configurable grace period, when no non-retired binding
+targets it, and when no live cognitive cell has a strong relation requiring its neural state.
+`DEPENDS_ON`, `REQUESTS`, `OBSERVES`, and `CONSTRAINS` are strong relations. Historical relations
+such as `DERIVED_FROM`, `SUPPORTS`, `CONFLICTS`, and `REFERS_TO` may continue to point to an archived
+cell.
+
+Before physical reclamation, runtime writes a `CognitiveTombstone` containing stable identity,
+roles, anchors, typed links, creation/retirement/archive steps, former physical slot, and binding
+provenance. The full semantic vector is deliberately omitted. Weak links can therefore remain
+resolvable through the archive without keeping an expensive neural slot alive. After one or more
+reclaims, the field is compacted; stable `cell_id` references make this position-independent.
+
+### 2.3 Typed grounding layer
 
 TCT grounding is an explicit ABI rather than an untyped string convention. `ObjectRef` identifies
 the runtime object being referenced and distinguishes `CELL`, `FACT`, `BINDING`, `SOURCE`,

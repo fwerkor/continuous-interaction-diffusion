@@ -40,6 +40,16 @@ class LinkRelation(StrEnum):
     REFERS_TO = "refers_to"
 
 
+STRONG_LINK_RELATIONS = frozenset(
+    {
+        LinkRelation.DEPENDS_ON,
+        LinkRelation.REQUESTS,
+        LinkRelation.OBSERVES,
+        LinkRelation.CONSTRAINS,
+    }
+)
+
+
 @dataclass(frozen=True, slots=True)
 class ObjectRef:
     kind: ObjectKind

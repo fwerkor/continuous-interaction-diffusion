@@ -1,18 +1,20 @@
 from __future__ import annotations
 
 import asyncio
+import math
 import time
 from collections.abc import Iterable
 from copy import deepcopy
 from dataclasses import dataclass
 
 from cid.contracts import CIDPolicy, FreshnessDemand, ModelContext, Observation, Percept
-from cid.grounding import ClosedWorldGrounder, ObjectRef
+from cid.grounding import STRONG_LINK_RELATIONS, ClosedWorldGrounder, ObjectKind, ObjectRef
 from cid.lifecycle import LifecycleTransitionController, LifecycleTransitionSignals
+from cid.runtime.archive import CognitiveArchive, CognitiveTombstone
 from cid.runtime.bindings import Binding, BindingStatus, BindingTable
 from cid.runtime.sources import SourceRegistry
 from cid.runtime.trace import RuntimeTrace
-from cid.state import CognitiveField, DisplayCanvas, FactItem, FactStore
+from cid.state import CellLifecycle, CognitiveField, DisplayCanvas, FactItem, FactStore
 
 
 @dataclass(frozen=True, slots=True)
@@ -20,6 +22,9 @@ class RuntimeConfig:
     max_steps: int = 64
     binding_threshold: float = 0.55
     idle_yield_s: float = 0.001
+    reclamation_grace_steps: int = 2
+    reclamation_low_watermark: float = 0.125
+    reclamation_target_watermark: float = 0.25
 
     def __post_init__(self) -> None:
         if self.max_steps <= 0:
@@ -28,6 +33,14 @@ class RuntimeConfig:
             raise ValueError("binding_threshold must be in [0, 1]")
         if self.idle_yield_s < 0:
             raise ValueError("idle_yield_s must be non-negative")
+        if self.reclamation_grace_steps < 0:
+            raise ValueError("reclamation_grace_steps must be non-negative")
+        if not 0.0 <= self.reclamation_low_watermark <= 1.0:
+            raise ValueError("reclamation_low_watermark must be in [0, 1]")
+        if not 0.0 <= self.reclamation_target_watermark <= 1.0:
+            raise ValueError("reclamation_target_watermark must be in [0, 1]")
+        if self.reclamation_target_watermark < self.reclamation_low_watermark:
+            raise ValueError("reclamation_target_watermark cannot be below low watermark")
 
 
 @dataclass(frozen=True, slots=True)
@@ -36,6 +49,7 @@ class RuntimeResult:
     display: DisplayCanvas
     facts: tuple[FactItem, ...]
     bindings: tuple[Binding, ...]
+    archive: tuple[CognitiveTombstone, ...]
     trace: RuntimeTrace
     steps: int
     converged: bool
@@ -61,8 +75,11 @@ class CIDRuntime:
         self.bindings = BindingTable()
         self.trace = RuntimeTrace()
         self.lifecycle = LifecycleTransitionController()
+        self.archive = CognitiveArchive()
         self._jobs: dict[str, _ExternalJob] = {}
         self._cache: dict[str, Observation] = {}
+        self._created_at: dict[str, int] = {}
+        self._retired_at: dict[str, int] = {}
 
     async def run(
         self,
@@ -77,7 +94,14 @@ class CIDRuntime:
         self.facts = FactStore()
         self.bindings = BindingTable()
         self.trace = RuntimeTrace()
+        self.archive = CognitiveArchive()
         self._cache = {}
+        self._created_at = {cell_id: 0 for cell_id in thought.occupied_cell_ids}
+        self._retired_at = {
+            cell.cell_id: 0
+            for cell in thought.cells
+            if cell.cell_id is not None and cell.lifecycle is CellLifecycle.RETIRED
+        }
         for item in facts:
             self.facts.publish(item)
 
@@ -88,6 +112,7 @@ class CIDRuntime:
 
         try:
             for step in range(self.config.max_steps):
+                thought = self._maybe_reclaim(thought, step)
                 previous_thought = thought
                 self._drain_completed_jobs(step)
                 percepts = self._project_available(step, thought)
@@ -169,6 +194,7 @@ class CIDRuntime:
                             f"lifecycle state: {missing}"
                         )
                 self._trace_lifecycle_changes(previous_thought, thought, step)
+                self._record_lifecycle_steps(previous_thought, thought, step)
                 unresolved = self._has_unresolved_active_binding()
                 if update.converged and not unresolved:
                     converged = True
@@ -188,12 +214,15 @@ class CIDRuntime:
                 )
             self._jobs.clear()
 
+        thought = self._maybe_reclaim(thought, completed_steps, force=True)
+
         snapshot = self.facts.snapshot()
         return RuntimeResult(
             thought=thought,
             display=display,
             facts=tuple(snapshot.items.values()),
             bindings=self.bindings.all(),
+            archive=self.archive.all(),
             trace=self.trace,
             steps=completed_steps,
             converged=converged,
@@ -341,6 +370,92 @@ class CIDRuntime:
             for binding in self.bindings.active()
             if binding.status is not BindingStatus.RETIRED
         )
+
+    def _maybe_reclaim(
+        self,
+        thought: CognitiveField,
+        step: int,
+        *,
+        force: bool = False,
+    ) -> CognitiveField:
+        low = math.ceil(thought.capacity * self.config.reclamation_low_watermark)
+        target = math.ceil(thought.capacity * self.config.reclamation_target_watermark)
+        if not force and thought.empty_count >= low:
+            return thought
+
+        binding_pins = self.bindings.pinned_target_cells()
+        strong_link_pins = self._strong_link_pins(thought)
+        candidates = []
+        for slot, cell in enumerate(thought.cells):
+            if cell.cell_id is None or cell.lifecycle is not CellLifecycle.RETIRED:
+                continue
+            retired_step = self._retired_at.setdefault(cell.cell_id, step)
+            if step - retired_step < self.config.reclamation_grace_steps:
+                continue
+            if cell.cell_id in binding_pins or cell.cell_id in strong_link_pins:
+                continue
+            candidates.append((retired_step, slot, cell.cell_id))
+
+        field = thought
+        reclaimed = 0
+        for _, _, cell_id in sorted(candidates):
+            if not force and field.empty_count >= target:
+                break
+            slot = field.slot_of(cell_id)
+            cell = field.get(cell_id)
+            tombstone = self.archive.record(
+                cell,
+                created_step=self._created_at.get(cell_id, 0),
+                retired_step=self._retired_at[cell_id],
+                archived_step=step,
+                physical_slot=slot,
+                binding_ids=self.bindings.binding_ids_targeting(cell_id),
+            )
+            field = field.reclaim(cell_id)
+            reclaimed += 1
+            self.trace.emit(
+                "cell_reclaimed",
+                step,
+                cell_id=tombstone.cell_id,
+                retired_step=tombstone.retired_step,
+                archived_step=tombstone.archived_step,
+            )
+
+        if reclaimed:
+            field = field.compact()
+            self.trace.emit(
+                "cognitive_compaction",
+                step,
+                reclaimed=reclaimed,
+                empty_slots=field.empty_count,
+            )
+        return field
+
+    @staticmethod
+    def _strong_link_pins(thought: CognitiveField) -> frozenset[str]:
+        return frozenset(
+            link.target.identifier
+            for cell in thought.cells
+            if cell.live
+            for link in cell.links
+            if link.target.kind is ObjectKind.CELL and link.relation in STRONG_LINK_RELATIONS
+        )
+
+    def _record_lifecycle_steps(
+        self, previous: CognitiveField, current: CognitiveField, step: int
+    ) -> None:
+        previous_ids = set(previous.occupied_cell_ids)
+        for cell_id in current.occupied_cell_ids:
+            if cell_id not in previous_ids:
+                self._created_at.setdefault(cell_id, step)
+            current_cell = current.get(cell_id)
+            if current_cell.lifecycle is not CellLifecycle.RETIRED:
+                continue
+            if (
+                cell_id not in previous_ids
+                or previous.get(cell_id).lifecycle is not CellLifecycle.RETIRED
+            ):
+                self._retired_at.setdefault(cell_id, step)
 
     def _trace_lifecycle_changes(
         self, previous: CognitiveField, current: CognitiveField, step: int

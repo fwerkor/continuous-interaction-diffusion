@@ -22,6 +22,11 @@ while existing cells transition among `ACTIVE / WAITING / STABLE / RETIRED` unde
 Unresolved bindings hold `WAITING`, explicit revision signals reopen `STABLE`, and only runtime
 reclamation can turn `RETIRED` storage back into `EMPTY`.
 
+Retired cells are reclaimed under slot pressure only after a grace period and safety checks.
+Bindings and strong live cognitive dependencies pin neural state. Before reclamation, lightweight
+tombstones preserve identity, typed anchors/links, lifecycle timing, and provenance without keeping
+the full semantic vector; weak historical links remain resolvable through this archive.
+
 Grounding is typed rather than encoded as ad-hoc strings. Anchors attach canonical symbolic
 objects to cognitive cells, `ObjectRef` distinguishes cells/facts/bindings/sources/display spans,
 and `CognitiveLink` records typed relations between them. The reference neural core predicts
@@ -48,6 +53,7 @@ deterministic training and runtime path before open-world entity resolution is i
 src/cid/state.py            Three-channel state and immutable fact snapshots
 src/cid/grounding.py        Typed anchors, object references, links, oracle grounding
 src/cid/lifecycle.py        Event-aware cognitive lifecycle transition controller
+src/cid/runtime/archive.py  Lightweight tombstones for reclaimed cognitive cells
 src/cid/contracts.py        Model/runtime information-need and percept contracts
 src/cid/runtime/            Async scheduler, bindings, source registry, traces
 src/cid/model/torch_core.py Trainable PyTorch reference core (optional dependency)

@@ -27,6 +27,10 @@ physical slot placement are randomized so a model cannot assign permanent semant
 Allocation loss is masked to slots that are `EMPTY` at the current step. Lifecycle cross-entropy is
 masked to existing cells and has four classes: `ACTIVE`, `WAITING`, `STABLE`, and `RETIRED`.
 Runtime-gated transitions remain hard constraints during both training rollouts and inference.
+Training rollouts should also randomize slot pressure. Retired cells are archived and reclaimed by
+runtime policy rather than model logits; supervision should not teach the model to encode garbage
+collection decisions in TCT. Reclamation traces can be used to measure whether a trained model
+creates excessive short-lived cognition or retains cells unnecessarily.
 
 Grounding supervision is multi-valued per cell. Anchor slots learn presence, anchor kind, and a
 retrieval embedding for the canonical object. Link slots learn presence, relation type, target

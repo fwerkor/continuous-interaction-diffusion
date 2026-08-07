@@ -91,6 +91,20 @@ class BindingTable:
             for target in binding.target_cells
         )
 
+    def pinned_target_cells(self) -> frozenset[str]:
+        return frozenset(
+            target.identifier
+            for binding in self.active()
+            for target in binding.target_cells
+        )
+
+    def binding_ids_targeting(self, cell_id: str) -> tuple[str, ...]:
+        return tuple(
+            binding.binding_id
+            for binding in self.all()
+            if any(target.identifier == cell_id for target in binding.target_cells)
+        )
+
     def reconcile(
         self,
         needs: tuple[InformationNeed, ...],

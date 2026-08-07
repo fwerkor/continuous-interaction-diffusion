@@ -10,6 +10,7 @@ from cid.contracts import (
     SourceDescriptor,
 )
 from cid.grounding import (
+    STRONG_LINK_RELATIONS,
     Anchor,
     AnchorKind,
     ClosedWorldGrounder,
@@ -24,7 +25,13 @@ from cid.lifecycle import (
     LifecycleTransitionController,
     LifecycleTransitionSignals,
 )
-from cid.runtime import CIDRuntime, RuntimeConfig, SourceRegistry
+from cid.runtime import (
+    CIDRuntime,
+    CognitiveArchive,
+    CognitiveTombstone,
+    RuntimeConfig,
+    SourceRegistry,
+)
 from cid.state import (
     CellLifecycle,
     CognitiveCell,
@@ -44,6 +51,8 @@ __all__ = [
     "ArgumentDescriptor",
     "CIDPolicy",
     "CIDRuntime",
+    "CognitiveArchive",
+    "CognitiveTombstone",
     "CellLifecycle",
     "ClosedWorldGrounder",
     "CognitiveCell",
@@ -70,4 +79,5 @@ __all__ = [
     "RuntimeConfig",
     "SourceDescriptor",
     "SourceRegistry",
+    "STRONG_LINK_RELATIONS",
 ]

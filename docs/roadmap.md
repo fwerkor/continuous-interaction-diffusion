@@ -10,6 +10,7 @@ Status: implemented in the initial repository scaffold.
 - protected fact snapshots;
 - fixed-capacity, dynamically occupied TCT with stable cell identity;
 - separate empty-slot allocation and event-gated cell lifecycle semantics;
+- pressure-aware retired-cell archival, reclamation, and physical compaction;
 - typed anchors, object references, cognitive links, and closed-world oracle grounding;
 - typed latent information needs;
 - persistent bindings with external-I/O deduplication;

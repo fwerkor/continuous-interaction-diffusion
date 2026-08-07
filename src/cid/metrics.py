@@ -15,6 +15,8 @@ class InteractionMetrics:
     mean_intent_lead_steps: float
     model_steps_during_io: int
     tool_wait_overlap_s: float
+    reclaimed_cells: int
+    cognitive_compactions: int
 
 
 def summarize_runtime(result: RuntimeResult) -> InteractionMetrics:
@@ -27,6 +29,8 @@ def summarize_runtime(result: RuntimeResult) -> InteractionMetrics:
         mean_intent_lead_steps=_mean_intent_lead_steps(events),
         model_steps_during_io=_model_steps_during_io(events),
         tool_wait_overlap_s=_tool_wait_overlap(events),
+        reclaimed_cells=_count(events, "cell_reclaimed"),
+        cognitive_compactions=_count(events, "cognitive_compaction"),
     )
 
 
