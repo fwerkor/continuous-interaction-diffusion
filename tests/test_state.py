@@ -2,7 +2,7 @@ import time
 
 import pytest
 
-from cid.state import FactItem, FactStore
+from cid.state import CellLifecycle, CognitiveField, CognitiveRole, FactItem, FactStore
 
 
 def test_fact_snapshot_is_read_only() -> None:
@@ -38,3 +38,70 @@ def test_fact_snapshot_cannot_mutate_nested_runtime_value() -> None:
     snapshot.items["structured"].value["numbers"].append(99)
 
     assert store.snapshot().items["structured"].value == {"numbers": [37]}
+
+
+def test_cognitive_field_has_fixed_capacity_but_dynamic_occupancy() -> None:
+    field = CognitiveField.empty(capacity=4, width=3)
+    assert field.capacity == 4
+    assert field.occupied_count == 0
+    assert field.occupied_mask == (False, False, False, False)
+
+    field, plan_id = field.allocate(roles={CognitiveRole.PLAN: 1.0})
+    field, need_id = field.allocate(roles={CognitiveRole.INFORMATION_NEED: 1.0})
+
+    assert field.capacity == 4
+    assert field.live_cell_ids == (plan_id, need_id)
+    assert field.occupied_mask == (True, True, False, False)
+    assert field.get(plan_id).lifecycle is CellLifecycle.ACTIVE
+
+
+def test_allocation_can_materialize_a_model_selected_physical_slot() -> None:
+    field = CognitiveField.empty(capacity=4, width=2)
+    field, cell_id = field.allocate(slot=3, semantic=(0.25, 0.75))
+
+    assert field.slot_of(cell_id) == 3
+    assert field.occupied_mask == (False, False, False, True)
+
+
+def test_stable_cell_id_survives_physical_compaction() -> None:
+    field = CognitiveField.empty(capacity=5, width=2)
+    field, first = field.allocate(semantic=(1.0, 0.0))
+    field, second = field.allocate(semantic=(0.0, 1.0))
+    field, third = field.allocate(semantic=(1.0, 1.0))
+    field = field.retire(second).reclaim(second)
+
+    assert field.slot_of(third) == 2
+    compacted = field.compact()
+
+    assert compacted.slot_of(first) == 0
+    assert compacted.slot_of(third) == 1
+    assert compacted.get(third).semantic == (1.0, 1.0)
+
+
+def test_retired_cell_is_distinct_from_empty_until_reclaimed() -> None:
+    field = CognitiveField.empty(capacity=2, width=2)
+    field, cell_id = field.allocate()
+    retired = field.retire(cell_id)
+
+    assert retired.get(cell_id).lifecycle is CellLifecycle.RETIRED
+    assert retired.occupied_count == 1
+    assert retired.live_count == 0
+    assert retired.empty_count == 1
+
+    reclaimed = retired.reclaim(cell_id)
+    assert reclaimed.occupied_count == 0
+    with pytest.raises(KeyError):
+        reclaimed.get(cell_id)
+
+
+def test_split_and_merge_preserve_logical_lineage() -> None:
+    field = CognitiveField.empty(capacity=6, width=2)
+    field, parent = field.allocate(semantic=(1.0, 0.0))
+    field, children = field.split(parent, ((0.7, 0.3), (0.2, 0.8)))
+
+    assert field.get(parent).lifecycle is CellLifecycle.RETIRED
+    assert all(field.get(child).links == (parent,) for child in children)
+
+    field, merged = field.merge(children, semantic=(0.5, 0.5))
+    assert field.get(merged).links == children
+    assert all(field.get(child).lifecycle is CellLifecycle.RETIRED for child in children)

@@ -14,13 +14,16 @@ Start from an existing masked-diffusion language model. Freeze most of the backb
 train:
 
 - TCT slot projection and role heads;
+- occupancy/allocation and lifecycle heads;
 - source/need confidence heads;
 - argument/anchor alignment heads;
 - percept encoder/cross-attention adapters;
 - local support/conflict and lifecycle heads.
 
 Teacher trajectories should contain pre-arrival and post-arrival states, not only final answers.
-Arrival time, source freshness, and cache availability are randomized.
+They should also supervise cell creation, retirement, optional split/merge lineage, and stable cell
+identity across physical compaction. Arrival time, source freshness, cache availability, and
+physical slot placement are randomized so a model cannot assign permanent semantics to slot index.
 
 ## Stage 2 — joint T/Y refinement
 
@@ -46,6 +49,8 @@ with the same state/data contract rather than changing the system architecture d
 - optional structured TCT supervision;
 - external events with arrival step/time and source version;
 - binding targets and affected regions.
+
+Binding targets refer to stable cognitive `cell_id` values rather than physical slot indices.
 
 The schema deliberately records *when* evidence becomes available. Flattening events into the
 initial prompt destroys the central CID training signal.

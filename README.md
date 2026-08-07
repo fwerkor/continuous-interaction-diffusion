@@ -14,6 +14,10 @@ The runtime can keep denoising while read-only I/O is in flight, reuse static ob
 without repeating I/O, refresh dynamic sources, and re-project the same observation as
 cognition changes.
 
+TCT uses a fixed physical capacity for efficient tensor execution but dynamic logical occupancy.
+Cognitive objects receive stable `cell_id` values, so they can be allocated, retired, reclaimed,
+split, merged, or physically compacted without binding tool/fact links to tensor position.
+
 > This repository is the implementation workspace. The current code establishes the model
 > contract, asynchronous runtime, reference neural core, training data schema, and evaluation
 > instrumentation. It does **not** yet claim the empirical performance proposed by the paper.

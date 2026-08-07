@@ -31,7 +31,7 @@ class Binding:
     arguments: dict[str, Any]
     freshness: FreshnessDemand
     max_age_s: float | None
-    target_cells: tuple[int, ...]
+    target_cells: tuple[str, ...]
     target_display: tuple[int, ...]
     promote_to_fact: bool
     status: BindingStatus = BindingStatus.CANDIDATE

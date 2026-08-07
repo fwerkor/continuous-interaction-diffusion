@@ -8,7 +8,7 @@ the system.
 Status: implemented in the initial repository scaffold.
 
 - protected fact snapshots;
-- fixed-slot TCT and revisable display state;
+- fixed-capacity, dynamically occupied TCT with stable cell identity;
 - typed latent information needs;
 - persistent bindings with external-I/O deduplication;
 - asynchronous model/source overlap;
@@ -23,12 +23,15 @@ quality.
 
 Implement the first real model bridge around an existing masked-diffusion LM. The adapter should:
 
-1. reserve or derive TCT slots from backbone hidden states;
+1. reserve a fixed TCT capacity and learn dynamic occupancy over those physical slots;
 2. preserve the backbone's masked-token denoising path for Y;
 3. encode protected facts separately from transient percepts;
 4. materialize need/source/anchor/refresh predictions into the runtime contract;
 5. map runtime percepts back into context-conditioned percept embeddings;
 6. expose local revision signals without serializing cognition into text.
+
+The adapter must randomize or compact physical slot placement during training so learned cognitive
+roles attach to cell content and type rather than hard-coded positions.
 
 Exit criterion: an untrained or lightly trained adapter can run complete CID trajectories with the
 same runtime used by the oracle policies.

@@ -29,7 +29,7 @@ class BindingTarget:
     source: str
     first_need_step: int
     executable_step: int | None
-    target_cells: tuple[int, ...] = ()
+    target_cells: tuple[str, ...] = ()
     target_display: tuple[int, ...] = ()
 
     def __post_init__(self) -> None:
@@ -37,6 +37,8 @@ class BindingTarget:
             raise ValueError("first_need_step must be non-negative")
         if self.executable_step is not None and self.executable_step < self.first_need_step:
             raise ValueError("executable_step cannot precede first_need_step")
+        if any(not cell_id for cell_id in self.target_cells):
+            raise ValueError("target cell IDs must be non-empty")
 
 
 @dataclass(frozen=True, slots=True)
@@ -70,7 +72,7 @@ class TrajectoryExample:
                     if target.get("executable_step") is None
                     else int(target["executable_step"])
                 ),
-                target_cells=tuple(int(index) for index in target.get("target_cells", ())),
+                target_cells=tuple(str(cell_id) for cell_id in target.get("target_cells", ())),
                 target_display=tuple(int(index) for index in target.get("target_display", ())),
             )
             for target in raw.get("binding_targets", ())

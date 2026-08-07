@@ -14,10 +14,13 @@ This is the most important boundary in the repository. It lets us replace the ne
 without changing asynchronous semantics, and it prevents a model adapter from silently mutating
 protected external facts.
 
-## 2. TCT v0: fixed slots, typed side channels
+## 2. TCT v0: fixed capacity, dynamic occupancy
 
-The first neural model uses a fixed number `N` of cognitive slots. Each slot contains:
+The neural interface uses a fixed physical capacity `N_max`, but the number of cognitive objects
+is dynamic. At diffusion step `s`, only a subset of the physical slots is occupied. Each occupied
+slot contains:
 
+- a stable logical `cell_id` independent of physical position;
 - semantic vector `h`;
 - soft role distribution;
 - uncertainty scalar;
@@ -25,8 +28,25 @@ The first neural model uses a fixed number `N` of cognitive slots. Each slot con
 - lifecycle logits;
 - sparse anchors and links carried by the runtime/data layer.
 
-Fixed slots are chosen for v0 because dynamic allocation would entangle the core hypothesis with
-memory-management policy. Slot creation/retirement can be tested later as a separate extension.
+The lifecycle is `EMPTY -> ACTIVE/WAITING/STABLE -> RETIRED -> EMPTY`. `EMPTY` means no cognitive
+object exists in that physical slot. `RETIRED` preserves the identity and lineage of a cognitive
+object that has stopped participating in current reasoning until the runtime reclaims its storage.
+
+This gives the model a fixed tensor shape
+
+```text
+[batch, N_max, d_model]
+```
+
+for efficient batching and distributed training while allowing actual cognitive occupancy to
+grow and shrink with task complexity. The PyTorch reference core receives an occupancy feature for
+every physical slot and predicts next-step occupancy in addition to lifecycle. Empty slots remain
+available as allocation candidates.
+
+Bindings, fact links, and cognitive edges never store physical slot indices. They reference stable
+`cell_id` values, so compaction can move a cell from one physical slot to another without changing
+its external identity. The state layer supports allocation, retirement, reclamation, compaction,
+split, and merge while keeping `N_max` constant.
 
 ## 3. Shared refinement backbone
 
@@ -37,7 +57,8 @@ semantics.
 
 The reference `TorchCIDCore` is intentionally small and generic. It is not the final 4B model. Its
 API is the target for an adapter around an existing masked-diffusion LM: map model hidden states to
-T slots, retain the model's masked-token denoising for Y, and attach CID role/intent/revision heads.
+the fixed-capacity TCT, retain the model's masked-token denoising for Y, and attach CID
+occupancy/role/intent/revision heads.
 
 ## 4. Information need before executable call
 

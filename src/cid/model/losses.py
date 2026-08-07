@@ -11,6 +11,7 @@ from cid.model.torch_core import CIDTensorOutput
 @dataclass(frozen=True, slots=True)
 class CIDLossWeights:
     thought: float = 1.0
+    occupancy: float = 0.3
     display: float = 1.0
     roles: float = 0.2
     uncertainty: float = 0.1
@@ -25,6 +26,7 @@ class CIDLossWeights:
 @dataclass(slots=True)
 class CIDTargets:
     thought_semantic: Tensor
+    slot_occupancy: Tensor
     display_ids: Tensor
     role_targets: Tensor
     uncertainty: Tensor
@@ -41,6 +43,7 @@ class CIDTargets:
 class CIDLoss:
     total: Tensor
     thought: Tensor
+    occupancy: Tensor
     display: Tensor
     roles: Tensor
     uncertainty: Tensor
@@ -59,6 +62,9 @@ def cid_loss(
 ) -> CIDLoss:
     w = weights or CIDLossWeights()
     thought = F.mse_loss(output.thought_semantic, targets.thought_semantic)
+    occupancy = F.binary_cross_entropy_with_logits(
+        output.occupancy_logits, targets.slot_occupancy
+    )
     display = F.cross_entropy(
         output.display_logits.transpose(1, 2), targets.display_ids, ignore_index=-100
     )
@@ -84,6 +90,7 @@ def cid_loss(
     )
     total = (
         w.thought * thought
+        + w.occupancy * occupancy
         + w.display * display
         + w.roles * roles
         + w.uncertainty * uncertainty
@@ -97,6 +104,7 @@ def cid_loss(
     return CIDLoss(
         total=total,
         thought=thought,
+        occupancy=occupancy,
         display=display,
         roles=roles,
         uncertainty=uncertainty,

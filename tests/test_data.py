@@ -14,7 +14,7 @@ def test_trajectory_jsonl_round_trip(tmp_path) -> None:
                 source="docs",
                 first_need_step=1,
                 executable_step=2,
-                target_cells=(0,),
+                target_cells=("c0",),
                 target_display=(2, 3),
             ),
         ),

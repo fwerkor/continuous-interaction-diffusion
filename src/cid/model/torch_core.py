@@ -12,7 +12,7 @@ class TorchCIDConfig:
     vocab_size: int
     d_model: int = 512
     num_roles: int = 6
-    num_lifecycles: int = 4
+    num_lifecycles: int = 5
     num_refresh_actions: int = 3
     num_layers: int = 6
     num_heads: int = 8
@@ -34,6 +34,7 @@ class CIDTensorBatch:
     role_features: Tensor
     uncertainty: Tensor
     local_noise: Tensor
+    slot_occupancy: Tensor
     display_ids: Tensor
     display_noise: Tensor
     fact_memory: Tensor
@@ -47,6 +48,7 @@ class CIDTensorBatch:
 @dataclass(slots=True)
 class CIDTensorOutput:
     thought_semantic: Tensor
+    occupancy_logits: Tensor
     role_logits: Tensor
     uncertainty: Tensor
     noise_delta: Tensor
@@ -74,6 +76,7 @@ class TorchCIDCore(nn.Module):
         self.external_type_embedding = nn.Embedding(2, d)
         self.role_projection = nn.Linear(config.num_roles, d, bias=False)
         self.scalar_projection = nn.Linear(2, d, bias=False)
+        self.occupancy_projection = nn.Linear(1, d, bias=False)
         self.display_noise_projection = nn.Linear(1, d, bias=False)
         self.percept_projection = nn.Sequential(
             nn.Linear(d * 2, d),
@@ -106,6 +109,7 @@ class TorchCIDCore(nn.Module):
         self.final_norm = nn.LayerNorm(d)
 
         self.thought_delta = nn.Linear(d, d)
+        self.occupancy_head = nn.Linear(d, 1)
         self.role_head = nn.Linear(d, config.num_roles)
         self.uncertainty_head = nn.Linear(d, 1)
         self.noise_head = nn.Linear(d, 1)
@@ -127,6 +131,8 @@ class TorchCIDCore(nn.Module):
         display_length = batch.display_ids.shape[1]
         if thought_slots > self.config.max_thought_slots:
             raise ValueError("thought slot count exceeds configured maximum")
+        if batch.slot_occupancy.shape != (batch_size, thought_slots, 1):
+            raise ValueError("slot_occupancy must have shape [batch, thought_slots, 1]")
         if display_length > self.config.max_display_tokens:
             raise ValueError("display length exceeds configured maximum")
 
@@ -141,6 +147,7 @@ class TorchCIDCore(nn.Module):
             thought
             + self.role_projection(batch.role_features)
             + self.scalar_projection(t_scalars)
+            + self.occupancy_projection(batch.slot_occupancy)
             + t_pos
             + t_channel
         )
@@ -151,7 +158,15 @@ class TorchCIDCore(nn.Module):
             + y_channel
         )
         seed_hidden = torch.cat((thought_hidden, display_hidden), dim=1)
-        context_summary = seed_hidden.mean(dim=1, keepdim=True)
+        thought_weight = batch.slot_occupancy.clamp(0.0, 1.0)
+        display_weight = torch.ones(
+            (batch_size, display_length, 1),
+            dtype=thought_weight.dtype,
+            device=device,
+        )
+        context_weight = torch.cat((thought_weight, display_weight), dim=1)
+        context_summary = (seed_hidden * context_weight).sum(dim=1, keepdim=True)
+        context_summary = context_summary / context_weight.sum(dim=1, keepdim=True).clamp_min(1.0)
         percept_context = context_summary.expand(-1, batch.percept_memory.shape[1], -1)
         projected_percepts = self.percept_projection(
             torch.cat((batch.percept_memory, percept_context), dim=-1)
@@ -188,6 +203,7 @@ class TorchCIDCore(nn.Module):
 
         return CIDTensorOutput(
             thought_semantic=thought + self.thought_delta(t_hidden),
+            occupancy_logits=self.occupancy_head(t_hidden).squeeze(-1),
             role_logits=self.role_head(t_hidden),
             uncertainty=torch.sigmoid(self.uncertainty_head(t_hidden)),
             noise_delta=torch.tanh(self.noise_head(t_hidden)),

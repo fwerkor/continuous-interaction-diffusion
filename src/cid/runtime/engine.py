@@ -96,8 +96,15 @@ class CIDRuntime:
                 completed_steps = step + 1
                 thought = update.thought
                 display = update.display
+                live_cell_ids = set(thought.live_cell_ids)
 
                 for need in update.needs:
+                    missing_targets = set(need.target_cells) - live_cell_ids
+                    if missing_targets:
+                        missing = ", ".join(sorted(missing_targets))
+                        raise ValueError(
+                            f"information need {need.need_id!r} targets non-live cells: {missing}"
+                        )
                     source = need.selected_source()
                     required = required_args.get(source or "", ())
                     executable = source in required_args and all(

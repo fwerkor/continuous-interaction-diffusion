@@ -20,6 +20,13 @@ from cid.runtime import CIDRuntime, RuntimeConfig, SourceRegistry
 from cid.state import CognitiveField, DisplayCanvas
 
 
+def seeded_thought(live_cells: int, capacity: int | None = None) -> CognitiveField:
+    field = CognitiveField.empty(capacity=capacity or live_cells, width=4)
+    for _ in range(live_cells):
+        field, _ = field.allocate()
+    return field
+
+
 @dataclass
 class CountingSource:
     delay_s: float = 0.0
@@ -48,6 +55,7 @@ class CountingSource:
 class DuplicateNeedPolicy:
     def step(self, context: ModelContext) -> ModelUpdate:
         time.sleep(0.01)
+        cell_a, cell_b = context.thought.live_cell_ids[:2]
         common = dict(
             source_scores={"source": 1.0},
             arguments={"key": "same"},
@@ -55,8 +63,8 @@ class DuplicateNeedPolicy:
             freshness=FreshnessDemand.ONCE,
         )
         needs = (
-            InformationNeed(need_id="need-a", target_cells=(0,), **common),
-            InformationNeed(need_id="need-b", target_cells=(1,), **common),
+            InformationNeed(need_id="need-a", target_cells=(cell_a,), **common),
+            InformationNeed(need_id="need-b", target_cells=(cell_b,), **common),
         )
         converged = len(context.percepts) == 2
         return ModelUpdate(
@@ -70,13 +78,14 @@ class DuplicateNeedPolicy:
 class PersistentNeedPolicy:
     def step(self, context: ModelContext) -> ModelUpdate:
         time.sleep(0.005)
+        target_cell = context.thought.live_cell_ids[0]
         need = InformationNeed(
             need_id="persistent",
             source_scores={"source": 1.0},
             arguments={"key": "value"},
             confidence=1.0,
             freshness=FreshnessDemand.ONCE,
-            target_cells=(0,),
+            target_cells=(target_cell,),
         )
         projection_index = context.percepts[0].projection_index if context.percepts else 0
         return ModelUpdate(
@@ -111,12 +120,13 @@ class IncrementingDynamicSource:
 class AlwaysRefreshPolicy:
     def step(self, context: ModelContext) -> ModelUpdate:
         time.sleep(0.003)
+        target_cell = context.thought.live_cell_ids[0]
         need = InformationNeed(
             need_id="dynamic-state",
             source_scores={"dynamic": 1.0},
             confidence=1.0,
             freshness=FreshnessDemand.ALWAYS,
-            target_cells=(0,),
+            target_cells=(target_cell,),
         )
         latest = int(context.percepts[0].observation.value) if context.percepts else 0
         return ModelUpdate(
@@ -149,6 +159,28 @@ class RebindingPolicy:
         )
 
 
+class StableIdCompactionPolicy:
+    def __init__(self, target_cell_id: str) -> None:
+        self.target_cell_id = target_cell_id
+
+    def step(self, context: ModelContext) -> ModelUpdate:
+        time.sleep(0.003)
+        compacted = context.thought.compact()
+        need = InformationNeed(
+            need_id="stable-target",
+            source_scores={"source": 1.0},
+            arguments={"key": "value"},
+            confidence=1.0,
+            target_cells=(self.target_cell_id,),
+        )
+        return ModelUpdate(
+            thought=compacted.advance(compacted.cells),
+            display=context.display.advance(context.display.token_ids),
+            needs=(need,),
+            converged=bool(context.percepts),
+        )
+
+
 async def test_duplicate_needs_share_one_external_read() -> None:
     source = CountingSource(delay_s=0.015)
     registry = SourceRegistry()
@@ -157,7 +189,7 @@ async def test_duplicate_needs_share_one_external_read() -> None:
 
     result = await runtime.run(
         DuplicateNeedPolicy(),
-        thought=CognitiveField.empty(2, 4),
+        thought=seeded_thought(2),
         display=DisplayCanvas.masked(2, -1),
     )
 
@@ -175,7 +207,7 @@ async def test_static_observation_is_reprojected_without_refetch() -> None:
 
     result = await runtime.run(
         PersistentNeedPolicy(),
-        thought=CognitiveField.empty(1, 4),
+        thought=seeded_thought(1),
         display=DisplayCanvas.masked(1, -1),
     )
 
@@ -193,7 +225,7 @@ async def test_model_compute_overlaps_source_wait() -> None:
 
     result = await runtime.run(
         DuplicateNeedPolicy(),
-        thought=CognitiveField.empty(2, 4),
+        thought=seeded_thought(2),
         display=DisplayCanvas.masked(2, -1),
     )
     metrics = summarize_runtime(result)
@@ -211,7 +243,7 @@ async def test_dynamic_source_refreshes_without_cache_reuse() -> None:
 
     result = await runtime.run(
         AlwaysRefreshPolicy(),
-        thought=CognitiveField.empty(1, 4),
+        thought=seeded_thought(1),
         display=DisplayCanvas.masked(1, -1),
     )
 
@@ -228,7 +260,7 @@ async def test_changed_arguments_invalidate_old_observation() -> None:
 
     result = await runtime.run(
         RebindingPolicy(),
-        thought=CognitiveField.empty(1, 4),
+        thought=seeded_thought(1),
         display=DisplayCanvas.masked(1, -1),
     )
 
@@ -236,3 +268,25 @@ async def test_changed_arguments_invalidate_old_observation() -> None:
     assert source.reads == 2
     assert result.bindings[-1].observation is not None
     assert result.bindings[-1].observation.value == "b"
+
+
+async def test_binding_target_survives_physical_slot_compaction() -> None:
+    source = CountingSource()
+    registry = SourceRegistry()
+    registry.register(source)
+    runtime = CIDRuntime(registry, RuntimeConfig(max_steps=20))
+    thought = CognitiveField.empty(capacity=3, width=4)
+    thought, first = thought.allocate()
+    thought, target = thought.allocate()
+    thought = thought.retire(first).reclaim(first)
+    assert thought.slot_of(target) == 1
+
+    result = await runtime.run(
+        StableIdCompactionPolicy(target),
+        thought=thought,
+        display=DisplayCanvas.masked(1, -1),
+    )
+
+    assert result.converged
+    assert result.thought.slot_of(target) == 0
+    assert result.bindings[-1].target_cells == (target,)

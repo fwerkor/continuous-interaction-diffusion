@@ -31,6 +31,9 @@ def test_torch_core_shapes_and_backward() -> None:
         role_features=torch.rand(batch_size, thought_slots, config.num_roles),
         uncertainty=torch.rand(batch_size, thought_slots, 1),
         local_noise=torch.rand(batch_size, thought_slots, 1),
+        slot_occupancy=torch.tensor(
+            [[[1.0], [1.0], [0.0], [0.0]], [[1.0], [0.0], [0.0], [0.0]]]
+        ),
         display_ids=torch.randint(0, config.vocab_size, (batch_size, display_length)),
         display_noise=torch.rand(batch_size, display_length, 1),
         fact_memory=torch.randn(batch_size, 2, config.d_model),
@@ -40,12 +43,14 @@ def test_torch_core_shapes_and_backward() -> None:
     output = model(batch)
 
     assert output.thought_semantic.shape == (batch_size, thought_slots, config.d_model)
+    assert output.occupancy_logits.shape == (batch_size, thought_slots)
     assert output.display_logits.shape == (batch_size, display_length, config.vocab_size)
     assert output.source_logits.shape == (batch_size, thought_slots, source_count)
     assert output.refresh_logits.shape == (batch_size, thought_slots, config.num_refresh_actions)
 
     targets = CIDTargets(
         thought_semantic=torch.randn_like(output.thought_semantic),
+        slot_occupancy=torch.randint(0, 2, (batch_size, thought_slots)).float(),
         display_ids=torch.randint(0, config.vocab_size, (batch_size, display_length)),
         role_targets=torch.rand_like(output.role_logits),
         uncertainty=torch.rand_like(output.uncertainty),
@@ -78,6 +83,7 @@ def test_torch_core_accepts_empty_external_memory_and_no_sources() -> None:
         role_features=torch.rand(1, 2, config.num_roles),
         uncertainty=torch.rand(1, 2, 1),
         local_noise=torch.rand(1, 2, 1),
+        slot_occupancy=torch.zeros(1, 2, 1),
         display_ids=torch.randint(0, config.vocab_size, (1, 3)),
         display_noise=torch.rand(1, 3, 1),
         fact_memory=torch.empty(1, 0, config.d_model),

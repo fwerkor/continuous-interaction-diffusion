@@ -7,10 +7,13 @@ import time
 from cid.contracts import FreshnessDemand, InformationNeed, ModelContext, ModelUpdate
 from cid.metrics import summarize_runtime
 from cid.runtime import CIDRuntime, RuntimeConfig, SourceRegistry, StaticMappingSource
-from cid.state import CognitiveField, DisplayCanvas
+from cid.state import CognitiveField, CognitiveRole, DisplayCanvas
 
 
 class DemoPolicy:
+    def __init__(self, target_cell_id: str) -> None:
+        self.target_cell_id = target_cell_id
+
     def step(self, context: ModelContext) -> ModelUpdate:
         time.sleep(0.02)
         need = InformationNeed(
@@ -19,7 +22,7 @@ class DemoPolicy:
             arguments={"key": "latency_ms"},
             confidence=1.0,
             freshness=FreshnessDemand.ONCE,
-            target_cells=(0,),
+            target_cells=(self.target_cell_id,),
             target_display=(0,),
             promote_to_fact=True,
         )
@@ -43,9 +46,12 @@ async def _run_demo() -> None:
     sources = SourceRegistry()
     sources.register(StaticMappingSource("docs", {"latency_ms": 37}, delay_s=0.03))
     runtime = CIDRuntime(sources, RuntimeConfig(max_steps=12, idle_yield_s=0.001))
+    thought, need_cell_id = CognitiveField.empty(capacity=4, width=8).allocate(
+        roles={CognitiveRole.INFORMATION_NEED: 1.0}
+    )
     result = await runtime.run(
-        DemoPolicy(),
-        thought=CognitiveField.empty(count=4, width=8),
+        DemoPolicy(need_cell_id),
+        thought=thought,
         display=DisplayCanvas.masked(length=4, mask_token_id=-1),
     )
     metrics = summarize_runtime(result)
