@@ -6,13 +6,15 @@ import torch
 from torch import Tensor, nn
 from torch.nn import functional as F
 
+from cid.lifecycle import MODELED_LIFECYCLES
+
 
 @dataclass(frozen=True, slots=True)
 class TorchCIDConfig:
     vocab_size: int
     d_model: int = 512
     num_roles: int = 6
-    num_lifecycles: int = 5
+    num_lifecycles: int = len(MODELED_LIFECYCLES)
     num_refresh_actions: int = 3
     num_layers: int = 6
     num_heads: int = 8
@@ -26,6 +28,8 @@ class TorchCIDConfig:
             raise ValueError("vocab_size must be positive")
         if self.d_model % self.num_heads:
             raise ValueError("d_model must be divisible by num_heads")
+        if self.num_lifecycles != len(MODELED_LIFECYCLES):
+            raise ValueError("lifecycle head predicts ACTIVE/WAITING/STABLE/RETIRED only")
 
 
 @dataclass(slots=True)
@@ -48,7 +52,7 @@ class CIDTensorBatch:
 @dataclass(slots=True)
 class CIDTensorOutput:
     thought_semantic: Tensor
-    occupancy_logits: Tensor
+    allocation_logits: Tensor
     role_logits: Tensor
     uncertainty: Tensor
     noise_delta: Tensor
@@ -109,7 +113,7 @@ class TorchCIDCore(nn.Module):
         self.final_norm = nn.LayerNorm(d)
 
         self.thought_delta = nn.Linear(d, d)
-        self.occupancy_head = nn.Linear(d, 1)
+        self.allocation_head = nn.Linear(d, 1)
         self.role_head = nn.Linear(d, config.num_roles)
         self.uncertainty_head = nn.Linear(d, 1)
         self.noise_head = nn.Linear(d, 1)
@@ -203,7 +207,7 @@ class TorchCIDCore(nn.Module):
 
         return CIDTensorOutput(
             thought_semantic=thought + self.thought_delta(t_hidden),
-            occupancy_logits=self.occupancy_head(t_hidden).squeeze(-1),
+            allocation_logits=self.allocation_head(t_hidden).squeeze(-1),
             role_logits=self.role_head(t_hidden),
             uncertainty=torch.sigmoid(self.uncertainty_head(t_hidden)),
             noise_delta=torch.tanh(self.noise_head(t_hidden)),

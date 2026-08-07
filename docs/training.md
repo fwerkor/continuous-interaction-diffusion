@@ -14,7 +14,7 @@ Start from an existing masked-diffusion language model. Freeze most of the backb
 train:
 
 - TCT slot projection and role heads;
-- occupancy/allocation and lifecycle heads;
+- empty-slot allocation and occupied-cell lifecycle heads;
 - source/need confidence heads;
 - argument/anchor alignment heads;
 - percept encoder/cross-attention adapters;
@@ -24,6 +24,9 @@ Teacher trajectories should contain pre-arrival and post-arrival states, not onl
 They should also supervise cell creation, retirement, optional split/merge lineage, and stable cell
 identity across physical compaction. Arrival time, source freshness, cache availability, and
 physical slot placement are randomized so a model cannot assign permanent semantics to slot index.
+Allocation loss is masked to slots that are `EMPTY` at the current step. Lifecycle cross-entropy is
+masked to existing cells and has four classes: `ACTIVE`, `WAITING`, `STABLE`, and `RETIRED`.
+Runtime-gated transitions remain hard constraints during both training rollouts and inference.
 
 ## Stage 2 — joint T/Y refinement
 

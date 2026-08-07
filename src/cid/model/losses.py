@@ -11,7 +11,7 @@ from cid.model.torch_core import CIDTensorOutput
 @dataclass(frozen=True, slots=True)
 class CIDLossWeights:
     thought: float = 1.0
-    occupancy: float = 0.3
+    allocation: float = 0.3
     display: float = 1.0
     roles: float = 0.2
     uncertainty: float = 0.1
@@ -26,7 +26,8 @@ class CIDLossWeights:
 @dataclass(slots=True)
 class CIDTargets:
     thought_semantic: Tensor
-    slot_occupancy: Tensor
+    allocation_targets: Tensor
+    allocation_mask: Tensor
     display_ids: Tensor
     role_targets: Tensor
     uncertainty: Tensor
@@ -43,7 +44,7 @@ class CIDTargets:
 class CIDLoss:
     total: Tensor
     thought: Tensor
-    occupancy: Tensor
+    allocation: Tensor
     display: Tensor
     roles: Tensor
     uncertainty: Tensor
@@ -62,8 +63,10 @@ def cid_loss(
 ) -> CIDLoss:
     w = weights or CIDLossWeights()
     thought = F.mse_loss(output.thought_semantic, targets.thought_semantic)
-    occupancy = F.binary_cross_entropy_with_logits(
-        output.occupancy_logits, targets.slot_occupancy
+    allocation = _masked_binary_cross_entropy(
+        output.allocation_logits,
+        targets.allocation_targets,
+        targets.allocation_mask,
     )
     display = F.cross_entropy(
         output.display_logits.transpose(1, 2), targets.display_ids, ignore_index=-100
@@ -90,7 +93,7 @@ def cid_loss(
     )
     total = (
         w.thought * thought
-        + w.occupancy * occupancy
+        + w.allocation * allocation
         + w.display * display
         + w.roles * roles
         + w.uncertainty * uncertainty
@@ -104,7 +107,7 @@ def cid_loss(
     return CIDLoss(
         total=total,
         thought=thought,
-        occupancy=occupancy,
+        allocation=allocation,
         display=display,
         roles=roles,
         uncertainty=uncertainty,
@@ -123,3 +126,11 @@ def _masked_cosine_loss(query: Tensor, target: Tensor, mask: Tensor) -> Tensor:
     if selected.numel() == 0:
         return query.sum() * 0.0
     return (1.0 - selected).mean()
+
+
+def _masked_binary_cross_entropy(logits: Tensor, target: Tensor, mask: Tensor) -> Tensor:
+    losses = F.binary_cross_entropy_with_logits(logits, target, reduction="none")
+    selected = losses[mask.bool()]
+    if selected.numel() == 0:
+        return logits.sum() * 0.0
+    return selected.mean()

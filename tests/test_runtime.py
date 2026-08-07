@@ -3,7 +3,7 @@ from __future__ import annotations
 import asyncio
 import time
 from collections.abc import Mapping
-from dataclasses import dataclass
+from dataclasses import dataclass, replace
 from typing import Any
 
 from cid.contracts import (
@@ -17,7 +17,7 @@ from cid.contracts import (
 )
 from cid.metrics import summarize_runtime
 from cid.runtime import CIDRuntime, RuntimeConfig, SourceRegistry
-from cid.state import CognitiveField, DisplayCanvas
+from cid.state import CellLifecycle, CognitiveField, DisplayCanvas
 
 
 def seeded_thought(live_cells: int, capacity: int | None = None) -> CognitiveField:
@@ -181,6 +181,29 @@ class StableIdCompactionPolicy:
         )
 
 
+class WaitingLifecyclePolicy:
+    def step(self, context: ModelContext) -> ModelUpdate:
+        time.sleep(0.005)
+        cell_id = context.thought.live_cell_ids[0]
+        cells = list(context.thought.cells)
+        slot = context.thought.slot_of(cell_id)
+        requested = CellLifecycle.ACTIVE if context.step > 0 else CellLifecycle.WAITING
+        cells[slot] = replace(cells[slot], lifecycle=requested)
+        need = InformationNeed(
+            need_id="wait-for-source",
+            source_scores={"source": 1.0},
+            arguments={"key": "ready"},
+            confidence=1.0,
+            target_cells=(cell_id,),
+        )
+        return ModelUpdate(
+            thought=context.thought.advance(tuple(cells)),
+            display=context.display.advance(context.display.token_ids),
+            needs=(need,),
+            converged=bool(context.percepts),
+        )
+
+
 async def test_duplicate_needs_share_one_external_read() -> None:
     source = CountingSource(delay_s=0.015)
     registry = SourceRegistry()
@@ -290,3 +313,29 @@ async def test_binding_target_survives_physical_slot_compaction() -> None:
     assert result.converged
     assert result.thought.slot_of(target) == 0
     assert result.bindings[-1].target_cells == (target,)
+
+
+async def test_runtime_keeps_waiting_cell_blocked_until_observation_is_available() -> None:
+    source = CountingSource(delay_s=0.02)
+    registry = SourceRegistry()
+    registry.register(source)
+    runtime = CIDRuntime(registry, RuntimeConfig(max_steps=20))
+    thought = seeded_thought(1)
+    cell_id = thought.live_cell_ids[0]
+
+    result = await runtime.run(
+        WaitingLifecyclePolicy(),
+        thought=thought,
+        display=DisplayCanvas.masked(1, -1),
+    )
+
+    assert result.converged
+    assert result.thought.get(cell_id).lifecycle is CellLifecycle.ACTIVE
+    transitions = tuple(
+        event for event in result.trace.events if event.kind == "lifecycle_transition"
+    )
+    assert any(event.payload["current"] == "waiting" for event in transitions)
+    assert any(
+        event.payload["previous"] == "waiting" and event.payload["current"] == "active"
+        for event in transitions
+    )

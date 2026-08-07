@@ -9,6 +9,11 @@ from cid.contracts import (
     Percept,
     SourceDescriptor,
 )
+from cid.lifecycle import (
+    MODELED_LIFECYCLES,
+    LifecycleTransitionController,
+    LifecycleTransitionSignals,
+)
 from cid.runtime import CIDRuntime, RuntimeConfig, SourceRegistry
 from cid.state import (
     Anchor,
@@ -39,6 +44,9 @@ __all__ = [
     "FactStore",
     "FreshnessDemand",
     "InformationNeed",
+    "LifecycleTransitionController",
+    "LifecycleTransitionSignals",
+    "MODELED_LIFECYCLES",
     "ModelContext",
     "ModelUpdate",
     "Observation",

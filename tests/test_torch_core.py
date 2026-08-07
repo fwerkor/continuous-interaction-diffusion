@@ -1,3 +1,4 @@
+from dataclasses import replace
 from importlib import import_module
 
 import pytest
@@ -43,20 +44,31 @@ def test_torch_core_shapes_and_backward() -> None:
     output = model(batch)
 
     assert output.thought_semantic.shape == (batch_size, thought_slots, config.d_model)
-    assert output.occupancy_logits.shape == (batch_size, thought_slots)
+    assert output.allocation_logits.shape == (batch_size, thought_slots)
+    assert output.lifecycle_logits.shape == (
+        batch_size,
+        thought_slots,
+        config.num_lifecycles,
+    )
     assert output.display_logits.shape == (batch_size, display_length, config.vocab_size)
     assert output.source_logits.shape == (batch_size, thought_slots, source_count)
     assert output.refresh_logits.shape == (batch_size, thought_slots, config.num_refresh_actions)
 
+    occupied = batch.slot_occupancy.squeeze(-1).bool()
+    lifecycle_targets = torch.full(
+        (batch_size, thought_slots), -100, dtype=torch.long
+    )
+    lifecycle_targets[occupied] = torch.randint(
+        0, config.num_lifecycles, (int(occupied.sum()),), dtype=torch.long
+    )
     targets = CIDTargets(
         thought_semantic=torch.randn_like(output.thought_semantic),
-        slot_occupancy=torch.randint(0, 2, (batch_size, thought_slots)).float(),
+        allocation_targets=torch.randint(0, 2, (batch_size, thought_slots)).float(),
+        allocation_mask=~occupied,
         display_ids=torch.randint(0, config.vocab_size, (batch_size, display_length)),
         role_targets=torch.rand_like(output.role_logits),
         uncertainty=torch.rand_like(output.uncertainty),
-        lifecycle=torch.randint(
-            0, config.num_lifecycles, (batch_size, thought_slots), dtype=torch.long
-        ),
+        lifecycle=lifecycle_targets,
         need_targets=torch.rand(batch_size, thought_slots),
         source_targets=torch.randint(
             0, source_count, (batch_size, thought_slots), dtype=torch.long
@@ -73,6 +85,12 @@ def test_torch_core_shapes_and_backward() -> None:
     assert torch.isfinite(losses.total)
     losses.total.backward()
     assert model.thought_delta.weight.grad is not None
+
+    altered = output.allocation_logits.clone()
+    altered[occupied] = altered[occupied] + 1000.0
+    altered_output = replace(output, allocation_logits=altered)
+    altered_losses = cid_loss(altered_output, targets)
+    assert torch.allclose(losses.allocation, altered_losses.allocation)
 
 
 def test_torch_core_accepts_empty_external_memory_and_no_sources() -> None:

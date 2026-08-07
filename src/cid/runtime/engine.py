@@ -7,6 +7,7 @@ from copy import deepcopy
 from dataclasses import dataclass
 
 from cid.contracts import CIDPolicy, FreshnessDemand, ModelContext, Observation, Percept
+from cid.lifecycle import LifecycleTransitionController, LifecycleTransitionSignals
 from cid.runtime.bindings import Binding, BindingStatus, BindingTable
 from cid.runtime.sources import SourceRegistry
 from cid.runtime.trace import RuntimeTrace
@@ -52,6 +53,7 @@ class CIDRuntime:
         self.facts = FactStore()
         self.bindings = BindingTable()
         self.trace = RuntimeTrace()
+        self.lifecycle = LifecycleTransitionController()
         self._jobs: dict[str, _ExternalJob] = {}
         self._cache: dict[str, Observation] = {}
 
@@ -79,6 +81,7 @@ class CIDRuntime:
 
         try:
             for step in range(self.config.max_steps):
+                previous_thought = thought
                 self._drain_completed_jobs(step)
                 percepts = self._project_available(step)
                 context = ModelContext(
@@ -94,9 +97,13 @@ class CIDRuntime:
                 update = await asyncio.to_thread(policy.step, context)
                 self.trace.emit("model_step_finished", step, needs=len(update.needs))
                 completed_steps = step + 1
-                thought = update.thought
+                proposed_thought = update.thought
                 display = update.display
-                live_cell_ids = set(thought.live_cell_ids)
+                live_cell_ids = set(proposed_thought.live_cell_ids)
+                unknown_reopens = set(update.reopen_cells) - set(previous_thought.occupied_cell_ids)
+                if unknown_reopens:
+                    unknown = ", ".join(sorted(unknown_reopens))
+                    raise ValueError(f"model requested reopen for unknown cells: {unknown}")
 
                 for need in update.needs:
                     missing_targets = set(need.target_cells) - live_cell_ids
@@ -134,6 +141,25 @@ class CIDRuntime:
                     )
 
                 self._drain_completed_jobs(step)
+                thought = self.lifecycle.apply(
+                    previous_thought,
+                    proposed_thought,
+                    LifecycleTransitionSignals(
+                        waiting_cells=self.bindings.waiting_target_cells(),
+                        available_cells=self.bindings.available_target_cells(),
+                        reopen_cells=frozenset(update.reopen_cells),
+                    ),
+                )
+                final_live_cell_ids = set(thought.live_cell_ids)
+                for need in update.needs:
+                    missing_targets = set(need.target_cells) - final_live_cell_ids
+                    if missing_targets:
+                        missing = ", ".join(sorted(missing_targets))
+                        raise ValueError(
+                            f"information need {need.need_id!r} targets cells blocked by "
+                            f"lifecycle state: {missing}"
+                        )
+                self._trace_lifecycle_changes(previous_thought, thought, step)
                 unresolved = self._has_unresolved_active_binding()
                 if update.converged and not unresolved:
                     converged = True
@@ -296,3 +322,27 @@ class CIDRuntime:
             for binding in self.bindings.active()
             if binding.status is not BindingStatus.RETIRED
         )
+
+    def _trace_lifecycle_changes(
+        self, previous: CognitiveField, current: CognitiveField, step: int
+    ) -> None:
+        previous_ids = set(previous.occupied_cell_ids)
+        for cell_id in current.occupied_cell_ids:
+            current_cell = current.get(cell_id)
+            if cell_id not in previous_ids:
+                self.trace.emit(
+                    "cell_allocated",
+                    step,
+                    cell_id=cell_id,
+                    lifecycle=current_cell.lifecycle.value,
+                )
+                continue
+            old = previous.get(cell_id).lifecycle
+            if old is not current_cell.lifecycle:
+                self.trace.emit(
+                    "lifecycle_transition",
+                    step,
+                    cell_id=cell_id,
+                    previous=old.value,
+                    current=current_cell.lifecycle.value,
+                )

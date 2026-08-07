@@ -17,6 +17,10 @@ cognition changes.
 TCT uses a fixed physical capacity for efficient tensor execution but dynamic logical occupancy.
 Cognitive objects receive stable `cell_id` values, so they can be allocated, retired, reclaimed,
 split, merged, or physically compacted without binding tool/fact links to tensor position.
+Allocation is predicted separately from lifecycle: empty slots may allocate new `ACTIVE` cells,
+while existing cells transition among `ACTIVE / WAITING / STABLE / RETIRED` under runtime gates.
+Unresolved bindings hold `WAITING`, explicit revision signals reopen `STABLE`, and only runtime
+reclamation can turn `RETIRED` storage back into `EMPTY`.
 
 > This repository is the implementation workspace. The current code establishes the model
 > contract, asynchronous runtime, reference neural core, training data schema, and evaluation
@@ -36,6 +40,7 @@ split, merged, or physically compacted without binding tool/fact links to tensor
 
 ```text
 src/cid/state.py            Three-channel state and immutable fact snapshots
+src/cid/lifecycle.py        Event-aware cognitive lifecycle transition controller
 src/cid/contracts.py        Model/runtime information-need and percept contracts
 src/cid/runtime/            Async scheduler, bindings, source registry, traces
 src/cid/model/torch_core.py Trainable PyTorch reference core (optional dependency)

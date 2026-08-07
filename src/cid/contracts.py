@@ -108,7 +108,14 @@ class ModelUpdate:
     thought: CognitiveField
     display: DisplayCanvas
     needs: tuple[InformationNeed, ...] = ()
+    reopen_cells: tuple[str, ...] = ()
     converged: bool = False
+
+    def __post_init__(self) -> None:
+        if any(not cell_id for cell_id in self.reopen_cells):
+            raise ValueError("reopen cell IDs must be non-empty")
+        if len(set(self.reopen_cells)) != len(self.reopen_cells):
+            raise ValueError("reopen cell IDs must be unique")
 
 
 class CIDPolicy(Protocol):

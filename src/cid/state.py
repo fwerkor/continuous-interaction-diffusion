@@ -207,8 +207,8 @@ class CognitiveField:
         noise: float = 1.0,
         lifecycle: CellLifecycle = CellLifecycle.ACTIVE,
     ) -> tuple[CognitiveField, str]:
-        if lifecycle in (CellLifecycle.EMPTY, CellLifecycle.RETIRED):
-            raise ValueError("new cognitive cells must start in a live lifecycle state")
+        if lifecycle is not CellLifecycle.ACTIVE:
+            raise ValueError("new cognitive cells must start ACTIVE")
         if slot is None:
             try:
                 slot = next(index for index, cell in enumerate(self.cells) if not cell.occupied)

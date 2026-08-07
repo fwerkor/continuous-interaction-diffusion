@@ -25,12 +25,13 @@ slot contains:
 - soft role distribution;
 - uncertainty scalar;
 - local diffusion/editability scalar;
-- lifecycle logits;
+- lifecycle state;
 - sparse anchors and links carried by the runtime/data layer.
 
-The lifecycle is `EMPTY -> ACTIVE/WAITING/STABLE -> RETIRED -> EMPTY`. `EMPTY` means no cognitive
-object exists in that physical slot. `RETIRED` preserves the identity and lineage of a cognitive
-object that has stopped participating in current reasoning until the runtime reclaims its storage.
+`EMPTY` is a physical-storage state, not a neural lifecycle class. The allocation head is evaluated
+for empty slots and creates a new logical cell in `ACTIVE`. Existing cells use a separate lifecycle
+head over `ACTIVE / WAITING / STABLE / RETIRED`. `RETIRED` preserves identity and lineage until the
+runtime explicitly reclaims the storage back to `EMPTY`.
 
 This gives the model a fixed tensor shape
 
@@ -40,13 +41,28 @@ This gives the model a fixed tensor shape
 
 for efficient batching and distributed training while allowing actual cognitive occupancy to
 grow and shrink with task complexity. The PyTorch reference core receives an occupancy feature for
-every physical slot and predicts next-step occupancy in addition to lifecycle. Empty slots remain
-available as allocation candidates.
+every physical slot. Its allocation logits are trained only on currently empty slots; lifecycle
+logits are trained only for existing cells.
 
 Bindings, fact links, and cognitive edges never store physical slot indices. They reference stable
 `cell_id` values, so compaction can move a cell from one physical slot to another without changing
 its external identity. The state layer supports allocation, retirement, reclamation, compaction,
 split, and merge while keeping `N_max` constant.
+
+### 2.1 Event-aware lifecycle transitions
+
+Lifecycle logits are proposals rather than direct state writes. `LifecycleTransitionController`
+combines the proposal with binding and revision state before committing a transition:
+
+- `ACTIVE -> WAITING` is valid only when an unresolved binding targets that cell;
+- a `WAITING` cell cannot leave while any targeted binding remains unresolved;
+- once all targeted bindings are resolved, `WAITING -> ACTIVE` is runtime-enabled;
+- `STABLE -> ACTIVE` requires an explicit local `reopen_cells` signal;
+- `RETIRED` cannot be reactivated or converted to `EMPTY` by model output;
+- `RETIRED -> EMPTY` is runtime garbage collection through explicit reclamation.
+
+This keeps differentiable lifecycle prediction in the model while making external-event and memory
+safety invariants non-negotiable at runtime.
 
 ## 3. Shared refinement backbone
 
@@ -58,7 +74,7 @@ semantics.
 The reference `TorchCIDCore` is intentionally small and generic. It is not the final 4B model. Its
 API is the target for an adapter around an existing masked-diffusion LM: map model hidden states to
 the fixed-capacity TCT, retain the model's masked-token denoising for Y, and attach CID
-occupancy/role/intent/revision heads.
+allocation/lifecycle/role/intent/revision heads.
 
 ## 4. Information need before executable call
 
@@ -94,8 +110,9 @@ still unresolved. A hard step/wall-clock budget can still terminate the trajecto
 
 The neural core predicts support/conflict evidence per cognitive slot. Training converts those
 signals into local editability targets. Runtime-facing policies may also increase local noise for
-cells linked to a newly conflicting percept. We keep this mechanism explicit instead of hiding it
-inside a global remasking schedule so RQ4/RQ5 ablations are possible.
+cells linked to a newly conflicting percept and emit their stable IDs through `reopen_cells`.
+The transition controller is the gate that permits `STABLE -> ACTIVE`. We keep this mechanism
+explicit instead of hiding it inside a global remasking schedule so RQ4/RQ5 ablations are possible.
 
 ## 8. Source scope
 

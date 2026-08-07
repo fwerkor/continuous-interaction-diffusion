@@ -74,6 +74,22 @@ class BindingTable:
     def active(self) -> tuple[Binding, ...]:
         return tuple(b for b in self._by_need.values() if b.status is not BindingStatus.RETIRED)
 
+    def waiting_target_cells(self) -> frozenset[str]:
+        return frozenset(
+            cell_id
+            for binding in self.active()
+            if binding.observation is None
+            for cell_id in binding.target_cells
+        )
+
+    def available_target_cells(self) -> frozenset[str]:
+        return frozenset(
+            cell_id
+            for binding in self.active()
+            if binding.observation is not None
+            for cell_id in binding.target_cells
+        )
+
     def reconcile(
         self,
         needs: tuple[InformationNeed, ...],
