@@ -16,7 +16,7 @@ train:
 - TCT slot projection and role heads;
 - empty-slot allocation and occupied-cell lifecycle heads;
 - source/need confidence heads;
-- argument/anchor alignment heads;
+- argument and typed grounding heads;
 - percept encoder/cross-attention adapters;
 - local support/conflict and lifecycle heads.
 
@@ -27,6 +27,13 @@ physical slot placement are randomized so a model cannot assign permanent semant
 Allocation loss is masked to slots that are `EMPTY` at the current step. Lifecycle cross-entropy is
 masked to existing cells and has four classes: `ACTIVE`, `WAITING`, `STABLE`, and `RETIRED`.
 Runtime-gated transitions remain hard constraints during both training rollouts and inference.
+
+Grounding supervision is multi-valued per cell. Anchor slots learn presence, anchor kind, and a
+retrieval embedding for the canonical object. Link slots learn presence, relation type, target
+`ObjectKind`, and a target retrieval embedding. Presence masks let the model use fewer anchors or
+links than the fixed per-cell grounding capacity. The first training stage uses trajectory-local
+closed-world catalogs so grounding quality can be measured without requiring open-world entity
+linking.
 
 ## Stage 2 — joint T/Y refinement
 
@@ -51,9 +58,13 @@ with the same state/data contract rather than changing the system architecture d
 - target final display;
 - optional structured TCT supervision;
 - external events with arrival step/time and source version;
-- binding targets and affected regions.
+- binding targets and affected regions;
+- a closed-world `grounding_catalog` of canonical anchors and aliases;
+- per-step `grounding_targets` containing typed anchors and cognitive links for each supervised
+  cell.
 
-Binding targets refer to stable cognitive `cell_id` values rather than physical slot indices.
+Binding targets use typed `ObjectRef` values. Cell references carry stable `cell_id` values and
+display targets use explicit `DISPLAY_SPAN` references, so neither depends on physical TCT layout.
 
 The schema deliberately records *when* evidence becomes available. Flattening events into the
 initial prompt destroys the central CID training signal.

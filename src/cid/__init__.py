@@ -9,6 +9,16 @@ from cid.contracts import (
     Percept,
     SourceDescriptor,
 )
+from cid.grounding import (
+    Anchor,
+    AnchorKind,
+    ClosedWorldGrounder,
+    CognitiveLink,
+    GroundingEntry,
+    LinkRelation,
+    ObjectKind,
+    ObjectRef,
+)
 from cid.lifecycle import (
     MODELED_LIFECYCLES,
     LifecycleTransitionController,
@@ -16,7 +26,6 @@ from cid.lifecycle import (
 )
 from cid.runtime import CIDRuntime, RuntimeConfig, SourceRegistry
 from cid.state import (
-    Anchor,
     CellLifecycle,
     CognitiveCell,
     CognitiveField,
@@ -31,25 +40,32 @@ __version__ = "0.1.0"
 
 __all__ = [
     "Anchor",
+    "AnchorKind",
     "ArgumentDescriptor",
     "CIDPolicy",
     "CIDRuntime",
     "CellLifecycle",
+    "ClosedWorldGrounder",
     "CognitiveCell",
     "CognitiveField",
+    "CognitiveLink",
     "CognitiveRole",
     "DisplayCanvas",
     "FactItem",
     "FactSnapshot",
     "FactStore",
     "FreshnessDemand",
+    "GroundingEntry",
     "InformationNeed",
+    "LinkRelation",
     "LifecycleTransitionController",
     "LifecycleTransitionSignals",
     "MODELED_LIFECYCLES",
     "ModelContext",
     "ModelUpdate",
     "Observation",
+    "ObjectKind",
+    "ObjectRef",
     "Percept",
     "RuntimeConfig",
     "SourceDescriptor",

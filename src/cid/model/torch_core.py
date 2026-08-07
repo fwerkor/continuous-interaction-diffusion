@@ -6,6 +6,7 @@ import torch
 from torch import Tensor, nn
 from torch.nn import functional as F
 
+from cid.grounding import AnchorKind, LinkRelation, ObjectKind
 from cid.lifecycle import MODELED_LIFECYCLES
 
 
@@ -15,7 +16,12 @@ class TorchCIDConfig:
     d_model: int = 512
     num_roles: int = 6
     num_lifecycles: int = len(MODELED_LIFECYCLES)
+    num_anchor_kinds: int = len(AnchorKind)
+    num_link_relations: int = len(LinkRelation)
+    num_object_kinds: int = len(ObjectKind)
     num_refresh_actions: int = 3
+    max_anchor_slots: int = 4
+    max_link_slots: int = 8
     num_layers: int = 6
     num_heads: int = 8
     ff_multiplier: int = 4
@@ -30,6 +36,14 @@ class TorchCIDConfig:
             raise ValueError("d_model must be divisible by num_heads")
         if self.num_lifecycles != len(MODELED_LIFECYCLES):
             raise ValueError("lifecycle head predicts ACTIVE/WAITING/STABLE/RETIRED only")
+        if self.num_anchor_kinds != len(AnchorKind):
+            raise ValueError("num_anchor_kinds must match the typed grounding ABI")
+        if self.num_link_relations != len(LinkRelation):
+            raise ValueError("num_link_relations must match the typed grounding ABI")
+        if self.num_object_kinds != len(ObjectKind):
+            raise ValueError("num_object_kinds must match the typed grounding ABI")
+        if self.max_anchor_slots <= 0 or self.max_link_slots <= 0:
+            raise ValueError("grounding slot capacities must be positive")
 
 
 @dataclass(slots=True)
@@ -61,6 +75,12 @@ class CIDTensorOutput:
     need_logits: Tensor
     source_logits: Tensor
     anchor_query: Tensor
+    anchor_presence_logits: Tensor
+    anchor_kind_logits: Tensor
+    link_presence_logits: Tensor
+    link_relation_logits: Tensor
+    link_target_kind_logits: Tensor
+    link_target_query: Tensor
     revision_logits: Tensor
     refresh_logits: Tensor
 
@@ -121,7 +141,19 @@ class TorchCIDCore(nn.Module):
         self.display_head = nn.Linear(d, config.vocab_size, bias=False)
         self.need_head = nn.Linear(d, 1)
         self.source_query = nn.Linear(d, d, bias=False)
-        self.anchor_query = nn.Linear(d, d, bias=False)
+        self.anchor_query = nn.Linear(d, config.max_anchor_slots * d, bias=False)
+        self.anchor_presence_head = nn.Linear(d, config.max_anchor_slots)
+        self.anchor_kind_head = nn.Linear(
+            d, config.max_anchor_slots * config.num_anchor_kinds
+        )
+        self.link_presence_head = nn.Linear(d, config.max_link_slots)
+        self.link_relation_head = nn.Linear(
+            d, config.max_link_slots * config.num_link_relations
+        )
+        self.link_target_kind_head = nn.Linear(
+            d, config.max_link_slots * config.num_object_kinds
+        )
+        self.link_target_query = nn.Linear(d, config.max_link_slots * d, bias=False)
         self.revision_head = nn.Linear(d, 3)
         self.refresh_head = nn.Linear(d, config.num_refresh_actions)
 
@@ -205,6 +237,37 @@ class TorchCIDCore(nn.Module):
                 torch.finfo(source_logits.dtype).min,
             )
 
+        anchor_query = self.anchor_query(t_hidden).view(
+            batch_size,
+            thought_slots,
+            self.config.max_anchor_slots,
+            self.config.d_model,
+        )
+        anchor_kind_logits = self.anchor_kind_head(t_hidden).view(
+            batch_size,
+            thought_slots,
+            self.config.max_anchor_slots,
+            self.config.num_anchor_kinds,
+        )
+        link_relation_logits = self.link_relation_head(t_hidden).view(
+            batch_size,
+            thought_slots,
+            self.config.max_link_slots,
+            self.config.num_link_relations,
+        )
+        link_target_kind_logits = self.link_target_kind_head(t_hidden).view(
+            batch_size,
+            thought_slots,
+            self.config.max_link_slots,
+            self.config.num_object_kinds,
+        )
+        link_target_query = self.link_target_query(t_hidden).view(
+            batch_size,
+            thought_slots,
+            self.config.max_link_slots,
+            self.config.d_model,
+        )
+
         return CIDTensorOutput(
             thought_semantic=thought + self.thought_delta(t_hidden),
             allocation_logits=self.allocation_head(t_hidden).squeeze(-1),
@@ -215,7 +278,13 @@ class TorchCIDCore(nn.Module):
             display_logits=self.display_head(y_hidden),
             need_logits=self.need_head(t_hidden).squeeze(-1),
             source_logits=source_logits,
-            anchor_query=self.anchor_query(t_hidden),
+            anchor_query=anchor_query,
+            anchor_presence_logits=self.anchor_presence_head(t_hidden),
+            anchor_kind_logits=anchor_kind_logits,
+            link_presence_logits=self.link_presence_head(t_hidden),
+            link_relation_logits=link_relation_logits,
+            link_target_kind_logits=link_target_kind_logits,
+            link_target_query=link_target_query,
             revision_logits=self.revision_head(t_hidden),
             refresh_logits=self.refresh_head(t_hidden),
         )

@@ -2,6 +2,7 @@ import time
 
 import pytest
 
+from cid.grounding import LinkRelation, ObjectKind
 from cid.state import CellLifecycle, CognitiveField, CognitiveRole, FactItem, FactStore
 
 
@@ -100,8 +101,15 @@ def test_split_and_merge_preserve_logical_lineage() -> None:
     field, children = field.split(parent, ((0.7, 0.3), (0.2, 0.8)))
 
     assert field.get(parent).lifecycle is CellLifecycle.RETIRED
-    assert all(field.get(child).links == (parent,) for child in children)
+    for child in children:
+        (link,) = field.get(child).links
+        assert link.relation is LinkRelation.DERIVED_FROM
+        assert link.target.kind is ObjectKind.CELL
+        assert link.target.identifier == parent
 
     field, merged = field.merge(children, semantic=(0.5, 0.5))
-    assert field.get(merged).links == children
+    assert tuple(link.target.identifier for link in field.get(merged).links) == children
+    assert all(
+        link.relation is LinkRelation.DERIVED_FROM for link in field.get(merged).links
+    )
     assert all(field.get(child).lifecycle is CellLifecycle.RETIRED for child in children)

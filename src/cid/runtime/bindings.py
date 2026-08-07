@@ -7,6 +7,7 @@ from enum import StrEnum
 from typing import Any
 
 from cid.contracts import FreshnessDemand, InformationNeed, Observation
+from cid.grounding import ObjectRef
 
 
 class BindingStatus(StrEnum):
@@ -31,8 +32,8 @@ class Binding:
     arguments: dict[str, Any]
     freshness: FreshnessDemand
     max_age_s: float | None
-    target_cells: tuple[str, ...]
-    target_display: tuple[int, ...]
+    target_cells: tuple[ObjectRef, ...]
+    target_display: tuple[ObjectRef, ...]
     promote_to_fact: bool
     status: BindingStatus = BindingStatus.CANDIDATE
     observation: Observation | None = None
@@ -76,18 +77,18 @@ class BindingTable:
 
     def waiting_target_cells(self) -> frozenset[str]:
         return frozenset(
-            cell_id
+            target.identifier
             for binding in self.active()
             if binding.observation is None
-            for cell_id in binding.target_cells
+            for target in binding.target_cells
         )
 
     def available_target_cells(self) -> frozenset[str]:
         return frozenset(
-            cell_id
+            target.identifier
             for binding in self.active()
             if binding.observation is not None
-            for cell_id in binding.target_cells
+            for target in binding.target_cells
         )
 
     def reconcile(

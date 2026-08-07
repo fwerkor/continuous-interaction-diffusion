@@ -5,6 +5,7 @@ import asyncio
 import time
 
 from cid.contracts import FreshnessDemand, InformationNeed, ModelContext, ModelUpdate
+from cid.grounding import ObjectRef
 from cid.metrics import summarize_runtime
 from cid.runtime import CIDRuntime, RuntimeConfig, SourceRegistry, StaticMappingSource
 from cid.state import CognitiveField, CognitiveRole, DisplayCanvas
@@ -22,8 +23,8 @@ class DemoPolicy:
             arguments={"key": "latency_ms"},
             confidence=1.0,
             freshness=FreshnessDemand.ONCE,
-            target_cells=(self.target_cell_id,),
-            target_display=(0,),
+            target_cells=(ObjectRef.cell(self.target_cell_id),),
+            target_display=(ObjectRef.display_span(0, 1),),
             promote_to_fact=True,
         )
         if context.percepts:

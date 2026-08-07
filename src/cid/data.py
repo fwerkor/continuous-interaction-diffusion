@@ -6,6 +6,8 @@ from dataclasses import dataclass, field
 from pathlib import Path
 from typing import Any
 
+from cid.grounding import Anchor, CognitiveLink, GroundingEntry, ObjectKind, ObjectRef
+
 
 @dataclass(frozen=True, slots=True)
 class ExternalEvent:
@@ -29,16 +31,35 @@ class BindingTarget:
     source: str
     first_need_step: int
     executable_step: int | None
-    target_cells: tuple[str, ...] = ()
-    target_display: tuple[int, ...] = ()
+    target_cells: tuple[ObjectRef, ...] = ()
+    target_display: tuple[ObjectRef, ...] = ()
 
     def __post_init__(self) -> None:
         if self.first_need_step < 0:
             raise ValueError("first_need_step must be non-negative")
         if self.executable_step is not None and self.executable_step < self.first_need_step:
             raise ValueError("executable_step cannot precede first_need_step")
-        if any(not cell_id for cell_id in self.target_cells):
-            raise ValueError("target cell IDs must be non-empty")
+        if any(target.kind is not ObjectKind.CELL for target in self.target_cells):
+            raise ValueError("binding target_cells must contain cell references")
+        if any(target.kind is not ObjectKind.DISPLAY_SPAN for target in self.target_display):
+            raise ValueError("binding target_display must contain display-span references")
+
+
+@dataclass(frozen=True, slots=True)
+class GroundingTarget:
+    step: int
+    cell_id: str
+    anchors: tuple[Anchor, ...] = ()
+    links: tuple[CognitiveLink, ...] = ()
+
+    def __post_init__(self) -> None:
+        if self.step < 0:
+            raise ValueError("grounding target step must be non-negative")
+        if not self.cell_id:
+            raise ValueError("grounding target cell_id must be non-empty")
+        anchor_ids = tuple(anchor.anchor_id for anchor in self.anchors)
+        if len(anchor_ids) != len(set(anchor_ids)):
+            raise ValueError("grounding target anchor IDs must be unique")
 
 
 @dataclass(frozen=True, slots=True)
@@ -50,6 +71,8 @@ class TrajectoryExample:
     source_descriptors: tuple[Mapping[str, Any], ...] = ()
     events: tuple[ExternalEvent, ...] = ()
     binding_targets: tuple[BindingTarget, ...] = ()
+    grounding_catalog: tuple[GroundingEntry, ...] = ()
+    grounding_targets: tuple[GroundingTarget, ...] = ()
     thought_targets: tuple[Mapping[str, Any], ...] = ()
     metadata: Mapping[str, Any] = field(default_factory=dict)
 
@@ -72,10 +95,26 @@ class TrajectoryExample:
                     if target.get("executable_step") is None
                     else int(target["executable_step"])
                 ),
-                target_cells=tuple(str(cell_id) for cell_id in target.get("target_cells", ())),
-                target_display=tuple(int(index) for index in target.get("target_display", ())),
+                target_cells=tuple(
+                    ObjectRef.from_dict(item) for item in target.get("target_cells", ())
+                ),
+                target_display=tuple(
+                    ObjectRef.from_dict(item) for item in target.get("target_display", ())
+                ),
             )
             for target in raw.get("binding_targets", ())
+        )
+        grounding_catalog = tuple(
+            GroundingEntry.from_dict(entry) for entry in raw.get("grounding_catalog", ())
+        )
+        grounding_targets = tuple(
+            GroundingTarget(
+                step=int(target["step"]),
+                cell_id=str(target["cell_id"]),
+                anchors=tuple(Anchor.from_dict(item) for item in target.get("anchors", ())),
+                links=tuple(CognitiveLink.from_dict(item) for item in target.get("links", ())),
+            )
+            for target in raw.get("grounding_targets", ())
         )
         return cls(
             example_id=str(raw["example_id"]),
@@ -85,6 +124,8 @@ class TrajectoryExample:
             source_descriptors=tuple(dict(item) for item in raw.get("source_descriptors", ())),
             events=events,
             binding_targets=bindings,
+            grounding_catalog=grounding_catalog,
+            grounding_targets=grounding_targets,
             thought_targets=tuple(dict(item) for item in raw.get("thought_targets", ())),
             metadata=dict(raw.get("metadata", {})),
         )
@@ -131,10 +172,20 @@ def dump_jsonl(examples: Iterable[TrajectoryExample], path: str | Path) -> None:
                         "source": target.source,
                         "first_need_step": target.first_need_step,
                         "executable_step": target.executable_step,
-                        "target_cells": list(target.target_cells),
-                        "target_display": list(target.target_display),
+                        "target_cells": [item.to_dict() for item in target.target_cells],
+                        "target_display": [item.to_dict() for item in target.target_display],
                     }
                     for target in example.binding_targets
+                ],
+                "grounding_catalog": [entry.to_dict() for entry in example.grounding_catalog],
+                "grounding_targets": [
+                    {
+                        "step": target.step,
+                        "cell_id": target.cell_id,
+                        "anchors": [anchor.to_dict() for anchor in target.anchors],
+                        "links": [link.to_dict() for link in target.links],
+                    }
+                    for target in example.grounding_targets
                 ],
                 "thought_targets": [dict(item) for item in example.thought_targets],
                 "metadata": dict(example.metadata),

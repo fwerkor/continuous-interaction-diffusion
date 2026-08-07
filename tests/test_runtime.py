@@ -15,6 +15,13 @@ from cid.contracts import (
     Observation,
     SourceDescriptor,
 )
+from cid.grounding import (
+    Anchor,
+    AnchorKind,
+    ClosedWorldGrounder,
+    GroundingEntry,
+    ObjectRef,
+)
 from cid.metrics import summarize_runtime
 from cid.runtime import CIDRuntime, RuntimeConfig, SourceRegistry
 from cid.state import CellLifecycle, CognitiveField, DisplayCanvas
@@ -63,8 +70,8 @@ class DuplicateNeedPolicy:
             freshness=FreshnessDemand.ONCE,
         )
         needs = (
-            InformationNeed(need_id="need-a", target_cells=(cell_a,), **common),
-            InformationNeed(need_id="need-b", target_cells=(cell_b,), **common),
+            InformationNeed(need_id="need-a", target_cells=(ObjectRef.cell(cell_a),), **common),
+            InformationNeed(need_id="need-b", target_cells=(ObjectRef.cell(cell_b),), **common),
         )
         converged = len(context.percepts) == 2
         return ModelUpdate(
@@ -85,7 +92,7 @@ class PersistentNeedPolicy:
             arguments={"key": "value"},
             confidence=1.0,
             freshness=FreshnessDemand.ONCE,
-            target_cells=(target_cell,),
+            target_cells=(ObjectRef.cell(target_cell),),
         )
         projection_index = context.percepts[0].projection_index if context.percepts else 0
         return ModelUpdate(
@@ -117,6 +124,20 @@ class IncrementingDynamicSource:
         return Observation(value=self.reads, version=str(self.reads), observed_at=time.monotonic())
 
 
+@dataclass
+class AnchoredSource:
+    anchor: Anchor
+
+    @property
+    def descriptor(self) -> SourceDescriptor:
+        return SourceDescriptor(name="grounded", description="return grounded evidence")
+
+    async def read(self, arguments: Mapping[str, Any]) -> Observation:
+        del arguments
+        await asyncio.sleep(0)
+        return Observation(value="evidence", anchors=(self.anchor,))
+
+
 class AlwaysRefreshPolicy:
     def step(self, context: ModelContext) -> ModelUpdate:
         time.sleep(0.003)
@@ -126,7 +147,7 @@ class AlwaysRefreshPolicy:
             source_scores={"dynamic": 1.0},
             confidence=1.0,
             freshness=FreshnessDemand.ALWAYS,
-            target_cells=(target_cell,),
+            target_cells=(ObjectRef.cell(target_cell),),
         )
         latest = int(context.percepts[0].observation.value) if context.percepts else 0
         return ModelUpdate(
@@ -171,7 +192,7 @@ class StableIdCompactionPolicy:
             source_scores={"source": 1.0},
             arguments={"key": "value"},
             confidence=1.0,
-            target_cells=(self.target_cell_id,),
+            target_cells=(ObjectRef.cell(self.target_cell_id),),
         )
         return ModelUpdate(
             thought=compacted.advance(compacted.cells),
@@ -194,13 +215,36 @@ class WaitingLifecyclePolicy:
             source_scores={"source": 1.0},
             arguments={"key": "ready"},
             confidence=1.0,
-            target_cells=(cell_id,),
+            target_cells=(ObjectRef.cell(cell_id),),
         )
         return ModelUpdate(
             thought=context.thought.advance(tuple(cells)),
             display=context.display.advance(context.display.token_ids),
             needs=(need,),
             converged=bool(context.percepts),
+        )
+
+
+class GroundedRoutingPolicy:
+    def __init__(self, request_cell: str, related_cell: str) -> None:
+        self.request_cell = request_cell
+        self.related_cell = related_cell
+
+    def step(self, context: ModelContext) -> ModelUpdate:
+        need = InformationNeed(
+            need_id="grounded-evidence",
+            source_scores={"grounded": 1.0},
+            confidence=1.0,
+            target_cells=(ObjectRef.cell(self.request_cell),),
+        )
+        routed = bool(context.percepts) and ObjectRef.cell(self.related_cell) in (
+            context.percepts[0].target_cells
+        )
+        return ModelUpdate(
+            thought=context.thought.advance(context.thought.cells),
+            display=context.display.advance(context.display.token_ids),
+            needs=(need,),
+            converged=routed,
         )
 
 
@@ -312,7 +356,7 @@ async def test_binding_target_survives_physical_slot_compaction() -> None:
 
     assert result.converged
     assert result.thought.slot_of(target) == 0
-    assert result.bindings[-1].target_cells == (target,)
+    assert result.bindings[-1].target_cells == (ObjectRef.cell(target),)
 
 
 async def test_runtime_keeps_waiting_cell_blocked_until_observation_is_available() -> None:
@@ -339,3 +383,31 @@ async def test_runtime_keeps_waiting_cell_blocked_until_observation_is_available
         event.payload["previous"] == "waiting" and event.payload["current"] == "active"
         for event in transitions
     )
+
+
+async def test_observation_anchor_routes_percept_to_related_cognitive_cell() -> None:
+    anchor = Anchor(
+        anchor_id="a:model-a",
+        kind=AnchorKind.ENTITY,
+        value="Model A",
+        object_id="model:a",
+    )
+    grounder = ClosedWorldGrounder((GroundingEntry(anchor=anchor),))
+    registry = SourceRegistry()
+    registry.register(AnchoredSource(anchor))
+    runtime = CIDRuntime(registry, RuntimeConfig(max_steps=20), grounder=grounder)
+    thought = CognitiveField.empty(capacity=3, width=4)
+    thought, request_cell = thought.allocate()
+    thought, related_cell = thought.allocate(anchors=(anchor,))
+
+    result = await runtime.run(
+        GroundedRoutingPolicy(request_cell, related_cell),
+        thought=thought,
+        display=DisplayCanvas.masked(1, -1),
+    )
+
+    assert result.converged
+    projections = tuple(
+        event for event in result.trace.events if event.kind == "cognitive_projection"
+    )
+    assert any(event.payload["grounded_targets"] == 1 for event in projections)

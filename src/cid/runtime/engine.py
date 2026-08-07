@@ -7,6 +7,7 @@ from copy import deepcopy
 from dataclasses import dataclass
 
 from cid.contracts import CIDPolicy, FreshnessDemand, ModelContext, Observation, Percept
+from cid.grounding import ClosedWorldGrounder, ObjectRef
 from cid.lifecycle import LifecycleTransitionController, LifecycleTransitionSignals
 from cid.runtime.bindings import Binding, BindingStatus, BindingTable
 from cid.runtime.sources import SourceRegistry
@@ -47,9 +48,15 @@ class _ExternalJob:
 
 
 class CIDRuntime:
-    def __init__(self, sources: SourceRegistry, config: RuntimeConfig | None = None) -> None:
+    def __init__(
+        self,
+        sources: SourceRegistry,
+        config: RuntimeConfig | None = None,
+        grounder: ClosedWorldGrounder | None = None,
+    ) -> None:
         self.sources = sources
         self.config = config or RuntimeConfig()
+        self.grounder = grounder
         self.facts = FactStore()
         self.bindings = BindingTable()
         self.trace = RuntimeTrace()
@@ -83,7 +90,7 @@ class CIDRuntime:
             for step in range(self.config.max_steps):
                 previous_thought = thought
                 self._drain_completed_jobs(step)
-                percepts = self._project_available(step)
+                percepts = self._project_available(step, thought)
                 context = ModelContext(
                     facts=self.facts.snapshot(),
                     thought=thought,
@@ -100,13 +107,15 @@ class CIDRuntime:
                 proposed_thought = update.thought
                 display = update.display
                 live_cell_ids = set(proposed_thought.live_cell_ids)
-                unknown_reopens = set(update.reopen_cells) - set(previous_thought.occupied_cell_ids)
+                unknown_reopens = set(update.reopen_cell_ids) - set(
+                    previous_thought.occupied_cell_ids
+                )
                 if unknown_reopens:
                     unknown = ", ".join(sorted(unknown_reopens))
                     raise ValueError(f"model requested reopen for unknown cells: {unknown}")
 
                 for need in update.needs:
-                    missing_targets = set(need.target_cells) - live_cell_ids
+                    missing_targets = set(need.target_cell_ids) - live_cell_ids
                     if missing_targets:
                         missing = ", ".join(sorted(missing_targets))
                         raise ValueError(
@@ -147,12 +156,12 @@ class CIDRuntime:
                     LifecycleTransitionSignals(
                         waiting_cells=self.bindings.waiting_target_cells(),
                         available_cells=self.bindings.available_target_cells(),
-                        reopen_cells=frozenset(update.reopen_cells),
+                        reopen_cells=frozenset(update.reopen_cell_ids),
                     ),
                 )
                 final_live_cell_ids = set(thought.live_cell_ids)
                 for need in update.needs:
-                    missing_targets = set(need.target_cells) - final_live_cell_ids
+                    missing_targets = set(need.target_cell_ids) - final_live_cell_ids
                     if missing_targets:
                         missing = ", ".join(sorted(missing_targets))
                         raise ValueError(
@@ -190,18 +199,27 @@ class CIDRuntime:
             converged=converged,
         )
 
-    def _project_available(self, step: int) -> tuple[Percept, ...]:
+    def _project_available(self, step: int, thought: CognitiveField) -> tuple[Percept, ...]:
         percepts: list[Percept] = []
         for binding in self.bindings.active():
             if binding.observation is None:
                 continue
             binding.cognitive_projections += 1
+            target_cells = list(binding.target_cells)
+            if self.grounder is not None:
+                seen = set(target_cells)
+                for anchor in binding.observation.anchors:
+                    for cell_id in self.grounder.route(anchor, thought):
+                        target = ObjectRef.cell(cell_id)
+                        if target not in seen:
+                            target_cells.append(target)
+                            seen.add(target)
             percepts.append(
                 Percept(
                     binding_id=binding.binding_id,
                     source=binding.source,
                     observation=deepcopy(binding.observation),
-                    target_cells=binding.target_cells,
+                    target_cells=tuple(target_cells),
                     target_display=binding.target_display,
                     projection_index=binding.cognitive_projections,
                 )
@@ -211,6 +229,7 @@ class CIDRuntime:
                 step,
                 binding_id=binding.binding_id,
                 index=binding.cognitive_projections,
+                grounded_targets=len(target_cells) - len(binding.target_cells),
             )
         return tuple(percepts)
 

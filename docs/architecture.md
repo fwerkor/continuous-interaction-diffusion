@@ -64,6 +64,36 @@ combines the proposal with binding and revision state before committing a transi
 This keeps differentiable lifecycle prediction in the model while making external-event and memory
 safety invariants non-negotiable at runtime.
 
+### 2.2 Typed grounding layer
+
+TCT grounding is an explicit ABI rather than an untyped string convention. `ObjectRef` identifies
+the runtime object being referenced and distinguishes `CELL`, `FACT`, `BINDING`, `SOURCE`,
+`DISPLAY_SPAN`, `ANCHOR`, and external `SYMBOLIC_OBJECT` identities. Information-need targets,
+percept targets, reopen requests, and cognitive links use these references rather than physical
+slot indices or ambiguous strings.
+
+An `Anchor` gives a continuous cognitive cell a typed symbolic attachment. The initial schema
+supports entity, number, symbol, span, path, URL, and text anchors, with canonical `object_id`,
+confidence, numeric units, and token spans where applicable. A `CognitiveLink` is a typed edge with
+relations such as `SUPPORTS`, `CONFLICTS`, `DEPENDS_ON`, `DERIVED_FROM`, `REQUESTS`, `OBSERVES`,
+`CONSTRAINS`, and `REFERS_TO`. Split/merge lineage is represented with `DERIVED_FROM` cell edges.
+
+The neural interface allows multiple anchors and links per cognitive cell. It therefore uses small
+fixed grounding capacities per physical TCT slot and predicts dynamic presence, anchor type,
+canonical-object retrieval queries, link relation, link-target type, and link-target retrieval
+queries. This preserves fixed tensor shapes without assuming that one cognitive object can mention
+only one symbolic object or relation.
+
+For pre-training runtime tests, `ClosedWorldGrounder` provides deterministic resolution over a
+trajectory-local `GroundingEntry` catalog. Tool observations may carry typed anchors; when such an
+anchor matches an anchor already attached to a live cognitive cell, the runtime can add that cell
+to the percept's routing targets even when the original binding did not explicitly name it. This
+tests symbolic-to-continuous routing independently of learned entity linking.
+
+Open-world retrieval and canonicalization are intentionally not part of v0. The training/runtime
+ABI is fixed now so a learned resolver can replace the oracle later without changing TCT state,
+dataset, or checkpoint geometry.
+
 ## 3. Shared refinement backbone
 
 T and Y are refined by one backbone with channel/type embeddings, followed by channel-specific
@@ -74,12 +104,12 @@ semantics.
 The reference `TorchCIDCore` is intentionally small and generic. It is not the final 4B model. Its
 API is the target for an adapter around an existing masked-diffusion LM: map model hidden states to
 the fixed-capacity TCT, retain the model's masked-token denoising for Y, and attach CID
-allocation/lifecycle/role/intent/revision heads.
+allocation/lifecycle/role/intent/revision plus typed grounding heads.
 
 ## 4. Information need before executable call
 
 A runtime-visible need has a stable `need_id`, source probabilities, partially bound arguments,
-confidence, freshness demand, and target cell/display links. Runtime activation has two gates:
+confidence, freshness demand, and typed cell/display targets. Runtime activation has two gates:
 
 1. need confidence must cross the binding threshold;
 2. a source must be selected and its required arguments must be executable.
@@ -110,7 +140,7 @@ still unresolved. A hard step/wall-clock budget can still terminate the trajecto
 
 The neural core predicts support/conflict evidence per cognitive slot. Training converts those
 signals into local editability targets. Runtime-facing policies may also increase local noise for
-cells linked to a newly conflicting percept and emit their stable IDs through `reopen_cells`.
+cells linked to a newly conflicting percept and emit typed cell references through `reopen_cells`.
 The transition controller is the gate that permits `STABLE -> ACTIVE`. We keep this mechanism
 explicit instead of hiding it inside a global remasking schedule so RQ4/RQ5 ablations are possible.
 

@@ -20,7 +20,13 @@ class CIDLossWeights:
     source: float = 0.5
     revision: float = 0.2
     refresh: float = 0.2
-    ground: float = 0.2
+    anchor_presence: float = 0.1
+    anchor_kind: float = 0.1
+    anchor_ground: float = 0.2
+    link_presence: float = 0.1
+    link_relation: float = 0.1
+    link_target_kind: float = 0.1
+    link_ground: float = 0.2
 
 
 @dataclass(slots=True)
@@ -36,8 +42,17 @@ class CIDTargets:
     source_targets: Tensor
     revision_targets: Tensor
     refresh_targets: Tensor
+    anchor_presence_targets: Tensor
+    anchor_presence_mask: Tensor
+    anchor_kind_targets: Tensor
     anchor_embeddings: Tensor
     anchor_mask: Tensor
+    link_presence_targets: Tensor
+    link_presence_mask: Tensor
+    link_relation_targets: Tensor
+    link_target_kind_targets: Tensor
+    link_target_embeddings: Tensor
+    link_mask: Tensor
 
 
 @dataclass(frozen=True, slots=True)
@@ -53,7 +68,13 @@ class CIDLoss:
     source: Tensor
     revision: Tensor
     refresh: Tensor
-    ground: Tensor
+    anchor_presence: Tensor
+    anchor_kind: Tensor
+    anchor_ground: Tensor
+    link_presence: Tensor
+    link_relation: Tensor
+    link_target_kind: Tensor
+    link_ground: Tensor
 
 
 def cid_loss(
@@ -86,10 +107,40 @@ def cid_loss(
     refresh = F.cross_entropy(
         output.refresh_logits.transpose(1, 2), targets.refresh_targets, ignore_index=-100
     )
-    ground = _masked_cosine_loss(
+    anchor_presence = _masked_binary_cross_entropy(
+        output.anchor_presence_logits,
+        targets.anchor_presence_targets,
+        targets.anchor_presence_mask,
+    )
+    anchor_kind = _masked_cross_entropy(
+        output.anchor_kind_logits,
+        targets.anchor_kind_targets,
+        targets.anchor_mask,
+    )
+    anchor_ground = _masked_cosine_loss(
         output.anchor_query,
         targets.anchor_embeddings,
         targets.anchor_mask,
+    )
+    link_presence = _masked_binary_cross_entropy(
+        output.link_presence_logits,
+        targets.link_presence_targets,
+        targets.link_presence_mask,
+    )
+    link_relation = _masked_cross_entropy(
+        output.link_relation_logits,
+        targets.link_relation_targets,
+        targets.link_mask,
+    )
+    link_target_kind = _masked_cross_entropy(
+        output.link_target_kind_logits,
+        targets.link_target_kind_targets,
+        targets.link_mask,
+    )
+    link_ground = _masked_cosine_loss(
+        output.link_target_query,
+        targets.link_target_embeddings,
+        targets.link_mask,
     )
     total = (
         w.thought * thought
@@ -102,7 +153,13 @@ def cid_loss(
         + w.source * source
         + w.revision * revision
         + w.refresh * refresh
-        + w.ground * ground
+        + w.anchor_presence * anchor_presence
+        + w.anchor_kind * anchor_kind
+        + w.anchor_ground * anchor_ground
+        + w.link_presence * link_presence
+        + w.link_relation * link_relation
+        + w.link_target_kind * link_target_kind
+        + w.link_ground * link_ground
     )
     return CIDLoss(
         total=total,
@@ -116,7 +173,13 @@ def cid_loss(
         source=source,
         revision=revision,
         refresh=refresh,
-        ground=ground,
+        anchor_presence=anchor_presence,
+        anchor_kind=anchor_kind,
+        anchor_ground=anchor_ground,
+        link_presence=link_presence,
+        link_relation=link_relation,
+        link_target_kind=link_target_kind,
+        link_ground=link_ground,
     )
 
 
@@ -134,3 +197,11 @@ def _masked_binary_cross_entropy(logits: Tensor, target: Tensor, mask: Tensor) -
     if selected.numel() == 0:
         return logits.sum() * 0.0
     return selected.mean()
+
+
+def _masked_cross_entropy(logits: Tensor, target: Tensor, mask: Tensor) -> Tensor:
+    selected_logits = logits[mask.bool()]
+    selected_target = target[mask.bool()]
+    if selected_target.numel() == 0:
+        return logits.sum() * 0.0
+    return F.cross_entropy(selected_logits, selected_target)

@@ -53,6 +53,41 @@ def test_torch_core_shapes_and_backward() -> None:
     assert output.display_logits.shape == (batch_size, display_length, config.vocab_size)
     assert output.source_logits.shape == (batch_size, thought_slots, source_count)
     assert output.refresh_logits.shape == (batch_size, thought_slots, config.num_refresh_actions)
+    assert output.anchor_query.shape == (
+        batch_size,
+        thought_slots,
+        config.max_anchor_slots,
+        config.d_model,
+    )
+    assert output.anchor_presence_logits.shape == (
+        batch_size,
+        thought_slots,
+        config.max_anchor_slots,
+    )
+    assert output.anchor_kind_logits.shape == (
+        batch_size,
+        thought_slots,
+        config.max_anchor_slots,
+        config.num_anchor_kinds,
+    )
+    assert output.link_target_query.shape == (
+        batch_size,
+        thought_slots,
+        config.max_link_slots,
+        config.d_model,
+    )
+    assert output.link_relation_logits.shape == (
+        batch_size,
+        thought_slots,
+        config.max_link_slots,
+        config.num_link_relations,
+    )
+    assert output.link_target_kind_logits.shape == (
+        batch_size,
+        thought_slots,
+        config.max_link_slots,
+        config.num_object_kinds,
+    )
 
     occupied = batch.slot_occupancy.squeeze(-1).bool()
     lifecycle_targets = torch.full(
@@ -60,6 +95,36 @@ def test_torch_core_shapes_and_backward() -> None:
     )
     lifecycle_targets[occupied] = torch.randint(
         0, config.num_lifecycles, (int(occupied.sum()),), dtype=torch.long
+    )
+    anchor_presence_mask = occupied[:, :, None].expand(
+        -1, -1, config.max_anchor_slots
+    )
+    anchor_presence_targets = torch.zeros(
+        batch_size, thought_slots, config.max_anchor_slots
+    )
+    anchor_presence_targets[:, :, 0] = occupied.float()
+    anchor_mask = anchor_presence_targets.bool()
+    anchor_kind_targets = torch.full(
+        (batch_size, thought_slots, config.max_anchor_slots), -100, dtype=torch.long
+    )
+    anchor_kind_targets[anchor_mask] = torch.randint(
+        0, config.num_anchor_kinds, (int(anchor_mask.sum()),), dtype=torch.long
+    )
+    link_presence_mask = occupied[:, :, None].expand(-1, -1, config.max_link_slots)
+    link_presence_targets = torch.zeros(batch_size, thought_slots, config.max_link_slots)
+    link_presence_targets[:, :, 0] = occupied.float()
+    link_mask = link_presence_targets.bool()
+    link_relation_targets = torch.full(
+        (batch_size, thought_slots, config.max_link_slots), -100, dtype=torch.long
+    )
+    link_relation_targets[link_mask] = torch.randint(
+        0, config.num_link_relations, (int(link_mask.sum()),), dtype=torch.long
+    )
+    link_target_kind_targets = torch.full(
+        (batch_size, thought_slots, config.max_link_slots), -100, dtype=torch.long
+    )
+    link_target_kind_targets[link_mask] = torch.randint(
+        0, config.num_object_kinds, (int(link_mask.sum()),), dtype=torch.long
     )
     targets = CIDTargets(
         thought_semantic=torch.randn_like(output.thought_semantic),
@@ -77,8 +142,17 @@ def test_torch_core_shapes_and_backward() -> None:
         refresh_targets=torch.randint(
             0, config.num_refresh_actions, (batch_size, thought_slots), dtype=torch.long
         ),
+        anchor_presence_targets=anchor_presence_targets,
+        anchor_presence_mask=anchor_presence_mask,
+        anchor_kind_targets=anchor_kind_targets,
         anchor_embeddings=torch.randn_like(output.anchor_query),
-        anchor_mask=torch.ones(batch_size, thought_slots, dtype=torch.bool),
+        anchor_mask=anchor_mask,
+        link_presence_targets=link_presence_targets,
+        link_presence_mask=link_presence_mask,
+        link_relation_targets=link_relation_targets,
+        link_target_kind_targets=link_target_kind_targets,
+        link_target_embeddings=torch.randn_like(output.link_target_query),
+        link_mask=link_mask,
     )
     losses = cid_loss(output, targets)
 

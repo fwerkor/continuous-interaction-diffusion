@@ -7,6 +7,8 @@ from enum import StrEnum
 from types import MappingProxyType
 from typing import Any
 
+from cid.grounding import Anchor, CognitiveLink, LinkRelation, ObjectRef
+
 
 class CognitiveRole(StrEnum):
     HYPOTHESIS = "hypothesis"
@@ -23,17 +25,6 @@ class CellLifecycle(StrEnum):
     WAITING = "waiting"
     STABLE = "stable"
     RETIRED = "retired"
-
-
-@dataclass(frozen=True, slots=True)
-class Anchor:
-    kind: str
-    value: str
-    confidence: float = 1.0
-
-    def __post_init__(self) -> None:
-        if not 0.0 <= self.confidence <= 1.0:
-            raise ValueError("anchor confidence must be in [0, 1]")
 
 
 @dataclass(frozen=True, slots=True)
@@ -84,7 +75,7 @@ class CognitiveCell:
     cell_id: str | None = None
     roles: Mapping[CognitiveRole, float] = field(default_factory=dict)
     anchors: tuple[Anchor, ...] = ()
-    links: tuple[str, ...] = ()
+    links: tuple[CognitiveLink, ...] = ()
     uncertainty: float = 1.0
     noise: float = 1.0
     lifecycle: CellLifecycle = CellLifecycle.EMPTY
@@ -202,7 +193,7 @@ class CognitiveField:
         semantic: tuple[float, ...] | None = None,
         roles: Mapping[CognitiveRole, float] | None = None,
         anchors: tuple[Anchor, ...] = (),
-        links: tuple[str, ...] = (),
+        links: tuple[CognitiveLink, ...] = (),
         uncertainty: float = 1.0,
         noise: float = 1.0,
         lifecycle: CellLifecycle = CellLifecycle.ACTIVE,
@@ -298,7 +289,15 @@ class CognitiveField:
         field = self.retire(cell_id)
         children: list[str] = []
         for semantic in semantics:
-            field, child_id = field.allocate(semantic=semantic, links=(cell_id,))
+            field, child_id = field.allocate(
+                semantic=semantic,
+                links=(
+                    CognitiveLink(
+                        relation=LinkRelation.DERIVED_FROM,
+                        target=ObjectRef.cell(cell_id),
+                    ),
+                ),
+            )
             children.append(child_id)
         return field, tuple(children)
 
@@ -319,7 +318,16 @@ class CognitiveField:
         field = self
         for cell_id in cell_ids:
             field = field.retire(cell_id)
-        return field.allocate(semantic=semantic, links=cell_ids)
+        return field.allocate(
+            semantic=semantic,
+            links=tuple(
+                CognitiveLink(
+                    relation=LinkRelation.DERIVED_FROM,
+                    target=ObjectRef.cell(cell_id),
+                )
+                for cell_id in cell_ids
+            ),
+        )
 
     def advance(self, cells: tuple[CognitiveCell, ...]) -> CognitiveField:
         if len(cells) != self.capacity:
