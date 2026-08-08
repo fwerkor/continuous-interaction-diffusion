@@ -113,6 +113,8 @@ class CIDRuntime:
 
         try:
             for step in range(self.config.max_steps):
+                if self.sources.advance_runtime_step(step):
+                    await asyncio.sleep(0)
                 thought = self._maybe_reclaim(thought, step)
                 previous_thought = thought
                 self._drain_completed_jobs(step)

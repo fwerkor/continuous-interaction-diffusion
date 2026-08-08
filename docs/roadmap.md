@@ -77,8 +77,9 @@ an optimizer. Stage A now also has gradient accumulation, checkpoint/resume, dir
 variable-length micro-batching, native gradient checkpointing, and a `torchrun` DDP path for the
 frozen backbone. Runtime/task evaluation now has fixed definitions for latent-to-executable delay,
 observation assimilation lag, exact display, observation coverage, and stale-observation rate. A
-benchmark-specific replay runner remains; Stage 2 full-parameter training will use sharded state
-rather than this replicated DDP path.
+step-exact dataset replay runner now drives external versions from `TrajectoryExample.arrival_step`
+without wall-clock timing approximations. Model/tokenizer-specific benchmark suite orchestration
+remains; Stage 2 full-parameter training will use sharded state rather than this replicated DDP path.
 
 Train CID-specific heads and adapters first, with most backbone weights frozen. Measure source
 selection, argument binding, intent lead time, assimilation lag, exact copying, and stale-value

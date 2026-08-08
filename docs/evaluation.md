@@ -47,9 +47,17 @@ ever observed an earlier valid value.
 global observation coverage/staleness, and mean interaction delays. Exact-display accuracy is
 computed only over tasks for which expected display token IDs were supplied.
 
-## Benchmark harness boundary
+## Deterministic dataset replay
 
-The core evaluation code is intentionally tokenizer- and benchmark-independent. A benchmark runner
-may provide model-specific tokenization, source replayers, wall-clock budgets, and dataset splits,
-then feed each `RuntimeResult` into this contract. This keeps RQ metrics stable when the model,
-backbone, or task suite changes.
+`ScheduledReplaySource` and `run_replay_case()` provide a step-exact replay layer for
+`TrajectoryExample.events`. Replay sources implement the optional runtime-step hook, so an event
+with `arrival_step=4` becomes visible on CID step 4 regardless of CPU/GPU speed. Dynamic sources
+return the newest not-yet-observed version available at that step; later refreshes block until a
+new dataset version becomes visible. No wall-clock sleep multiplier is used to approximate dataset
+time.
+
+The replay runner constructs source descriptors and protected facts from the trajectory, executes
+the supplied `CIDPolicy`, then immediately evaluates the resulting runtime trace/final state with
+the metric contract above. Model-specific initialization still belongs outside the core: a neural
+benchmark harness chooses tokenizer-dependent display IDs, TCT width/capacity, checkpoints, and
+dataset splits before calling `run_replay_case()`.

@@ -2,9 +2,9 @@ from __future__ import annotations
 
 import time
 
-from cid.contracts import InformationNeed, ModelContext, ModelUpdate
+from cid.contracts import FreshnessDemand, InformationNeed, ModelContext, ModelUpdate
 from cid.data import ExternalEvent, TrajectoryExample
-from cid.evaluation import evaluate_runtime_result, summarize_evaluations
+from cid.evaluation import evaluate_runtime_result, run_replay_case, summarize_evaluations
 from cid.grounding import ObjectRef
 from cid.runtime import CIDRuntime, RuntimeConfig, SourceRegistry, StaticMappingSource
 from cid.state import CognitiveField, DisplayCanvas
@@ -28,6 +28,34 @@ class EvaluationPolicy:
             return ModelUpdate(
                 thought=context.thought.advance(context.thought.cells),
                 display=context.display.advance((37,)),
+                needs=(need,),
+                converged=True,
+            )
+        return ModelUpdate(
+            thought=context.thought.advance(context.thought.cells),
+            display=context.display.advance(context.display.token_ids),
+            needs=(need,),
+        )
+
+
+class ReplayPolicy:
+    def __init__(self, cell_id: str) -> None:
+        self.cell_id = cell_id
+
+    def step(self, context: ModelContext) -> ModelUpdate:
+        need = InformationNeed(
+            need_id="counter",
+            source_scores={"counter": 1.0},
+            arguments={"key": "value"},
+            confidence=1.0,
+            freshness=FreshnessDemand.ALWAYS,
+            target_cells=(ObjectRef.cell(self.cell_id),),
+        )
+        percept = context.percepts[0] if context.percepts else None
+        if percept is not None and percept.observation.version == "v2":
+            return ModelUpdate(
+                thought=context.thought.advance(context.thought.cells),
+                display=context.display.advance((int(percept.observation.value),)),
                 needs=(need,),
                 converged=True,
             )
@@ -112,3 +140,59 @@ async def test_runtime_evaluation_tracks_latency_freshness_and_display() -> None
     assert summary.exact_display_accuracy == 1.0
     assert summary.observation_coverage == 1.0
     assert summary.stale_observation_rate == 0.5
+
+
+async def test_replay_runner_delivers_dataset_events_on_exact_runtime_steps() -> None:
+    example = TrajectoryExample(
+        example_id="replay-dynamic",
+        prompt="Return the latest counter value.",
+        target_display="2",
+        source_descriptors=(
+            {
+                "name": "counter",
+                "description": "versioned counter",
+                "arguments": ({"name": "key", "required": True},),
+                "cacheable": False,
+                "dynamic": True,
+                "versioned": True,
+            },
+        ),
+        events=(
+            ExternalEvent(
+                source="counter",
+                value=1,
+                arrival_step=2,
+                version="v1",
+                arguments={"key": "value"},
+            ),
+            ExternalEvent(
+                source="counter",
+                value=2,
+                arrival_step=4,
+                version="v2",
+                arguments={"key": "value"},
+            ),
+        ),
+    )
+    field, cell_id = CognitiveField.empty(capacity=2, width=4).allocate()
+
+    replay = await run_replay_case(
+        ReplayPolicy(cell_id),
+        example,
+        thought=field,
+        display=DisplayCanvas.masked(length=1, mask_token_id=-1),
+        expected_display_ids=(2,),
+        runtime_config=RuntimeConfig(max_steps=8),
+    )
+
+    observation_steps = [
+        event.step
+        for event in replay.runtime.trace.events
+        if event.kind == "binding_observation_updated"
+    ]
+    assert observation_steps == [2, 4]
+    assert replay.evaluation.converged
+    assert replay.evaluation.exact_display is True
+    assert replay.evaluation.fresh_observations == 1
+    assert replay.evaluation.stale_observations == 0
+    assert replay.evaluation.interaction.mean_observation_to_projection_steps == 0.0

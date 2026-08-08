@@ -4,7 +4,7 @@ import asyncio
 import time
 from collections.abc import Mapping
 from dataclasses import dataclass
-from typing import Any, Protocol
+from typing import Any, Protocol, runtime_checkable
 
 from cid.contracts import ArgumentDescriptor, Observation, SourceDescriptor
 
@@ -13,6 +13,12 @@ class ReadOnlySource(Protocol):
     descriptor: SourceDescriptor
 
     async def read(self, arguments: Mapping[str, Any]) -> Observation:
+        ...
+
+
+@runtime_checkable
+class RuntimeStepAwareSource(Protocol):
+    def on_runtime_step(self, step: int) -> None:
         ...
 
 
@@ -34,6 +40,14 @@ class SourceRegistry:
 
     def descriptors(self) -> tuple[SourceDescriptor, ...]:
         return tuple(source.descriptor for source in self._sources.values())
+
+    def advance_runtime_step(self, step: int) -> bool:
+        advanced = False
+        for source in self._sources.values():
+            if isinstance(source, RuntimeStepAwareSource):
+                source.on_runtime_step(step)
+                advanced = True
+        return advanced
 
 
 @dataclass(slots=True)

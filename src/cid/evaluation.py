@@ -1,12 +1,19 @@
 from __future__ import annotations
 
+import asyncio
+import time
+from collections import defaultdict
+from collections.abc import Mapping
 from dataclasses import dataclass
 from typing import Any
 
-from cid.data import TrajectoryExample
+from cid.contracts import ArgumentDescriptor, CIDPolicy, Observation, SourceDescriptor
+from cid.data import ExternalEvent, TrajectoryExample
 from cid.metrics import InteractionMetrics, summarize_runtime
 from cid.runtime.bindings import canonical_work_key
-from cid.runtime.engine import RuntimeResult
+from cid.runtime.engine import CIDRuntime, RuntimeConfig, RuntimeResult
+from cid.runtime.sources import SourceRegistry
+from cid.state import CognitiveField, DisplayCanvas, FactItem
 
 
 @dataclass(frozen=True, slots=True)
@@ -36,6 +43,120 @@ class RuntimeEvaluationSummary:
     mean_latent_to_executable_steps: float
     mean_binding_to_observation_steps: float
     mean_observation_to_projection_steps: float
+
+
+@dataclass(frozen=True, slots=True)
+class ReplayEvaluationResult:
+    runtime: RuntimeResult
+    evaluation: RuntimeTaskEvaluation
+
+
+class ScheduledReplaySource:
+    """Read-only dataset source whose versions become visible on exact CID runtime steps."""
+
+    def __init__(
+        self,
+        descriptor: SourceDescriptor,
+        events: tuple[ExternalEvent, ...],
+    ) -> None:
+        self.descriptor = descriptor
+        grouped: dict[str, list[ExternalEvent]] = defaultdict(list)
+        for event in events:
+            if event.source != descriptor.name:
+                raise ValueError("replay source event name does not match its descriptor")
+            grouped[canonical_work_key(event.source, event.arguments)].append(event)
+        self._events = {
+            work_key: tuple(sorted(items, key=lambda item: item.arrival_step))
+            for work_key, items in grouped.items()
+        }
+        self._last_index: dict[str, int] = {}
+        self._step = -1
+        self._wake = asyncio.Event()
+
+    def on_runtime_step(self, step: int) -> None:
+        if step < self._step:
+            raise ValueError("replay source runtime step cannot move backwards")
+        self._step = step
+        wake = self._wake
+        self._wake = asyncio.Event()
+        wake.set()
+
+    async def read(self, arguments: Mapping[str, Any]) -> Observation:
+        work_key = canonical_work_key(self.descriptor.name, arguments)
+        events = self._events.get(work_key, ())
+        while True:
+            last_index = self._last_index.get(work_key, -1)
+            due = tuple(
+                (index, event)
+                for index, event in enumerate(events)
+                if index > last_index and event.arrival_step <= self._step
+            )
+            if due:
+                index, event = due[-1]
+                self._last_index[work_key] = index
+                return Observation(
+                    value=event.value,
+                    version=event.version,
+                    provenance=event.provenance or f"replay:{self.descriptor.name}",
+                    observed_at=time.monotonic(),
+                )
+            wake = self._wake
+            await wake.wait()
+
+
+def build_replay_registry(example: TrajectoryExample) -> SourceRegistry:
+    registry = SourceRegistry()
+    events_by_source: dict[str, list[ExternalEvent]] = defaultdict(list)
+    for event in example.events:
+        events_by_source[event.source].append(event)
+    for raw in example.source_descriptors:
+        descriptor = _source_descriptor(raw)
+        registry.register(
+            ScheduledReplaySource(
+                descriptor,
+                tuple(events_by_source.get(descriptor.name, ())),
+            )
+        )
+    return registry
+
+
+async def run_replay_case(
+    policy: CIDPolicy,
+    example: TrajectoryExample,
+    *,
+    thought: CognitiveField,
+    display: DisplayCanvas,
+    expected_display_ids: tuple[int, ...] | None = None,
+    runtime_config: RuntimeConfig | None = None,
+) -> ReplayEvaluationResult:
+    max_event_step = max((event.arrival_step for event in example.events), default=0)
+    config = runtime_config or RuntimeConfig(max_steps=max(16, max_event_step + 8))
+    runtime = CIDRuntime(build_replay_registry(example), config)
+    facts = tuple(
+        FactItem(
+            key=str(key),
+            value=value,
+            source_type="dataset",
+            timestamp=0.0,
+            provenance=example.example_id,
+        )
+        for key, value in example.protected_facts.items()
+    )
+    result = await runtime.run(
+        policy,
+        thought=thought,
+        display=display,
+        facts=facts,
+        prompt=example.prompt,
+    )
+    return ReplayEvaluationResult(
+        runtime=result,
+        evaluation=evaluate_runtime_result(
+            result,
+            example,
+            expected_display_ids=expected_display_ids,
+        ),
+    )
 
 
 def summarize_evaluations(
@@ -148,6 +269,26 @@ def _observation_matches(
     if expected_version is not None and observed_version != expected_version:
         return False
     return observed_value == expected_value
+
+
+def _source_descriptor(raw: Mapping[str, Any]) -> SourceDescriptor:
+    return SourceDescriptor(
+        name=str(raw["name"]),
+        description=str(raw.get("description", "")),
+        arguments=tuple(
+            ArgumentDescriptor(
+                name=str(argument["name"]),
+                kind=str(argument.get("kind", "any")),
+                description=str(argument.get("description", "")),
+                required=bool(argument.get("required", True)),
+            )
+            for argument in raw.get("arguments", ())
+        ),
+        cacheable=bool(raw.get("cacheable", True)),
+        dynamic=bool(raw.get("dynamic", False)),
+        streamable=bool(raw.get("streamable", False)),
+        versioned=bool(raw.get("versioned", False)),
+    )
 
 
 def _fraction(numerator: int, denominator: int) -> float:

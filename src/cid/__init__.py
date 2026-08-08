@@ -10,9 +10,13 @@ from cid.contracts import (
     SourceDescriptor,
 )
 from cid.evaluation import (
+    ReplayEvaluationResult,
     RuntimeEvaluationSummary,
     RuntimeTaskEvaluation,
+    ScheduledReplaySource,
+    build_replay_registry,
     evaluate_runtime_result,
+    run_replay_case,
     summarize_evaluations,
 )
 from cid.grounding import (
@@ -85,9 +89,13 @@ __all__ = [
     "RuntimeConfig",
     "RuntimeEvaluationSummary",
     "RuntimeTaskEvaluation",
+    "ReplayEvaluationResult",
+    "ScheduledReplaySource",
     "SourceDescriptor",
     "SourceRegistry",
     "STRONG_LINK_RELATIONS",
+    "build_replay_registry",
     "evaluate_runtime_result",
+    "run_replay_case",
     "summarize_evaluations",
 ]
