@@ -126,6 +126,19 @@ API is the target for an adapter around an existing masked-diffusion LM: map mod
 the fixed-capacity TCT, retain the model's masked-token denoising for Y, and attach CID
 allocation/lifecycle/role/intent/revision plus typed grounding heads.
 
+The first real bridge is `ILLaDACIDAdapter` for `GSAI-ML/iLLaDA-8B-Base`. iLLaDA accepts
+`inputs_embeds`, so CID concatenates TCT embeddings and ordinary iLLaDA display-token embeddings
+before the native bidirectional decoder. Display logits still come from the checkpoint's original
+LM head. The adapter does not replace or emulate iLLaDA's language-model stack.
+
+Empty TCT slots remain query positions because allocation must be predicted for them, but they are
+masked as attention keys. Occupied TCT cells and display tokens are visible keys. This prevents
+unused fixed-capacity storage from perturbing the display while allowing an empty slot to infer
+whether it should allocate from the current context. Facts and percepts remain separate external
+memory channels and enter through the shared CID cross-attention fusion after native backbone
+refinement. The external residual gate is initialized near zero so the untrained CID path starts
+close to the pretrained display behavior.
+
 ## 4. Information need before executable call
 
 A runtime-visible need has a stable `need_id`, source probabilities, partially bound arguments,

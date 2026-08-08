@@ -13,6 +13,11 @@ refresh, fact protection, and metrics independently of neural quality.
 Start from an existing masked-diffusion language model. Freeze most of the backbone initially and
 train:
 
+The first supported backbone is `GSAI-ML/iLLaDA-8B-Base`. `ILLaDACIDAdapter` reuses its native
+token embedding, bidirectional decoder, and LM head. With `freeze_backbone=True`, only the CID
+projections, external-perception fusion, and prediction heads are trainable; later stages can
+unfreeze the same backbone without changing the tensor/runtime ABI.
+
 - TCT slot projection and role heads;
 - empty-slot allocation and occupied-cell lifecycle heads;
 - source/need confidence heads;

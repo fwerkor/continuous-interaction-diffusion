@@ -24,6 +24,9 @@ quality.
 
 ## M1 — masked-diffusion backbone adapter
 
+Status: backbone bridge implemented for iLLaDA; runtime materialization and argument decoding remain
+before the M1 exit criterion is complete.
+
 Implement the first real model bridge around an existing masked-diffusion LM. The adapter should:
 
 1. reserve a fixed TCT capacity and learn allocation decisions for empty physical slots;

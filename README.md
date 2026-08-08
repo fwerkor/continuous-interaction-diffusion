@@ -56,7 +56,9 @@ src/cid/lifecycle.py        Event-aware cognitive lifecycle transition controlle
 src/cid/runtime/archive.py  Lightweight tombstones for reclaimed cognitive cells
 src/cid/contracts.py        Model/runtime information-need and percept contracts
 src/cid/runtime/            Async scheduler, bindings, source registry, traces
-src/cid/model/torch_core.py Trainable PyTorch reference core (optional dependency)
+src/cid/model/torch_core.py Small trainable PyTorch reference core
+src/cid/model/illada.py     Real iLLaDA masked-diffusion backbone adapter
+src/cid/model/components.py Shared CID fusion and prediction heads
 src/cid/data.py             Trajectory JSONL schema and validation
 src/cid/metrics.py          CID-specific interaction metrics
 docs/architecture.md        Concrete v0 architecture decisions
@@ -86,6 +88,36 @@ For the neural reference core:
 ```bash
 python -m pip install -e '.[train]'
 ```
+
+## iLLaDA backbone adapter
+
+CID now includes a real adapter for `GSAI-ML/iLLaDA-8B-Base`. The adapter keeps iLLaDA's native
+masked-token input embedding and LM head for the display channel, prepends fixed-capacity TCT
+slots to the same bidirectional sequence, and attaches CID-specific external-perception fusion and
+prediction heads. Empty TCT slots are masked as attention keys so they can query context for
+allocation without contaminating the current display.
+
+```python
+import torch
+
+from cid.model import ILLaDACIDAdapter
+
+model = ILLaDACIDAdapter.from_pretrained(
+    freeze_backbone=True,
+    dtype=torch.bfloat16,
+)
+```
+
+The loader pins the official checkpoint revision used by this repository and enables the model's
+required Hugging Face remote code. The full checkpoint is about 16.5 GB. For an interface smoke
+test using the official iLLaDA implementation without downloading the 8B weights:
+
+```bash
+python examples/illada_tiny_smoke.py
+```
+
+iLLaDA's tokenizer uses token id `5` for `<[MASK]>`; the same value is exported as
+`ILLADA_MASK_TOKEN_ID` for the upcoming diffusion tensorizer.
 
 ## Quick demo
 

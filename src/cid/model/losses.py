@@ -5,7 +5,7 @@ from dataclasses import dataclass
 from torch import Tensor
 from torch.nn import functional as F
 
-from cid.model.torch_core import CIDTensorOutput
+from cid.model.tensors import CIDTensorOutput
 
 
 @dataclass(frozen=True, slots=True)
