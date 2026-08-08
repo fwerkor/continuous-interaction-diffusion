@@ -21,12 +21,14 @@ class TorchCIDConfig:
     num_link_relations: int = len(LinkRelation)
     num_object_kinds: int = len(ObjectKind)
     num_refresh_actions: int = 3
+    max_argument_slots: int = 4
     max_anchor_slots: int = 4
     max_link_slots: int = 8
     num_layers: int = 6
     num_heads: int = 8
     ff_multiplier: int = 4
     max_thought_slots: int = 128
+    max_prompt_tokens: int = 1024
     max_display_tokens: int = 1024
     dropout: float = 0.0
 
@@ -43,6 +45,8 @@ class TorchCIDConfig:
             raise ValueError("num_link_relations must match the typed grounding ABI")
         if self.num_object_kinds != len(ObjectKind):
             raise ValueError("num_object_kinds must match the typed grounding ABI")
+        if self.max_argument_slots <= 0:
+            raise ValueError("argument slot capacity must be positive")
         if self.max_anchor_slots <= 0 or self.max_link_slots <= 0:
             raise ValueError("grounding slot capacities must be positive")
 
@@ -57,8 +61,9 @@ class TorchCIDCore(nn.Module):
 
         self.token_embedding = nn.Embedding(config.vocab_size, d)
         self.thought_position = nn.Embedding(config.max_thought_slots, d)
+        self.prompt_position = nn.Embedding(config.max_prompt_tokens, d)
         self.display_position = nn.Embedding(config.max_display_tokens, d)
-        self.channel_embedding = nn.Embedding(2, d)
+        self.channel_embedding = nn.Embedding(3, d)
         self.role_projection = nn.Linear(config.num_roles, d, bias=False)
         self.scalar_projection = nn.Linear(2, d, bias=False)
         self.occupancy_projection = nn.Linear(1, d, bias=False)
@@ -91,6 +96,7 @@ class TorchCIDCore(nn.Module):
             num_link_relations=config.num_link_relations,
             num_object_kinds=config.num_object_kinds,
             num_refresh_actions=config.num_refresh_actions,
+            max_argument_slots=config.max_argument_slots,
             max_anchor_slots=config.max_anchor_slots,
             max_link_slots=config.max_link_slots,
         )
@@ -106,19 +112,24 @@ class TorchCIDCore(nn.Module):
         batch_size, thought_slots, width = thought.shape
         if width != self.config.d_model:
             raise ValueError("thought_semantic width does not match d_model")
+        prompt_length = batch.prompt_ids.shape[1]
         display_length = batch.display_ids.shape[1]
         if thought_slots > self.config.max_thought_slots:
             raise ValueError("thought slot count exceeds configured maximum")
         if batch.slot_occupancy.shape != (batch_size, thought_slots, 1):
             raise ValueError("slot_occupancy must have shape [batch, thought_slots, 1]")
+        if prompt_length > self.config.max_prompt_tokens:
+            raise ValueError("prompt length exceeds configured maximum")
         if display_length > self.config.max_display_tokens:
             raise ValueError("display length exceeds configured maximum")
 
         device = thought.device
         t_pos = self.thought_position(torch.arange(thought_slots, device=device))[None, :, :]
+        p_pos = self.prompt_position(torch.arange(prompt_length, device=device))[None, :, :]
         y_pos = self.display_position(torch.arange(display_length, device=device))[None, :, :]
         t_channel = self.channel_embedding.weight[0][None, None, :]
-        y_channel = self.channel_embedding.weight[1][None, None, :]
+        p_channel = self.channel_embedding.weight[1][None, None, :]
+        y_channel = self.channel_embedding.weight[2][None, None, :]
 
         t_scalars = torch.cat((batch.uncertainty, batch.local_noise), dim=-1)
         thought_hidden = (
@@ -129,20 +140,26 @@ class TorchCIDCore(nn.Module):
             + t_pos
             + t_channel
         )
+        prompt_hidden = self.token_embedding(batch.prompt_ids) + p_pos + p_channel
         display_hidden = (
             self.token_embedding(batch.display_ids)
             + self.display_noise_projection(batch.display_noise)
             + y_pos
             + y_channel
         )
-        seed_hidden = torch.cat((thought_hidden, display_hidden), dim=1)
+        seed_hidden = torch.cat((thought_hidden, prompt_hidden, display_hidden), dim=1)
         thought_weight = batch.slot_occupancy.clamp(0.0, 1.0)
+        prompt_weight = torch.ones(
+            (batch_size, prompt_length, 1),
+            dtype=thought_weight.dtype,
+            device=device,
+        )
         display_weight = torch.ones(
             (batch_size, display_length, 1),
             dtype=thought_weight.dtype,
             device=device,
         )
-        context_weight = torch.cat((thought_weight, display_weight), dim=1)
+        context_weight = torch.cat((thought_weight, prompt_weight, display_weight), dim=1)
 
         hidden = self.backbone(seed_hidden)
         hidden = self.external_fusion(
@@ -155,7 +172,7 @@ class TorchCIDCore(nn.Module):
             percept_padding_mask=batch.percept_padding_mask,
         )
         t_hidden = hidden[:, :thought_slots]
-        y_hidden = hidden[:, thought_slots:]
+        y_hidden = hidden[:, thought_slots + prompt_length :]
         return self.output_heads(
             base_thought=thought,
             thought_hidden=t_hidden,

@@ -35,6 +35,7 @@ def test_torch_core_shapes_and_backward() -> None:
         slot_occupancy=torch.tensor(
             [[[1.0], [1.0], [0.0], [0.0]], [[1.0], [0.0], [0.0], [0.0]]]
         ),
+        prompt_ids=torch.randint(0, config.vocab_size, (batch_size, 5)),
         display_ids=torch.randint(0, config.vocab_size, (batch_size, display_length)),
         display_noise=torch.rand(batch_size, display_length, 1),
         fact_memory=torch.randn(batch_size, 2, config.d_model),
@@ -52,6 +53,17 @@ def test_torch_core_shapes_and_backward() -> None:
     )
     assert output.display_logits.shape == (batch_size, display_length, config.vocab_size)
     assert output.source_logits.shape == (batch_size, thought_slots, source_count)
+    assert output.argument_presence_logits.shape == (
+        batch_size,
+        thought_slots,
+        config.max_argument_slots,
+    )
+    assert output.argument_query.shape == (
+        batch_size,
+        thought_slots,
+        config.max_argument_slots,
+        config.d_model,
+    )
     assert output.refresh_logits.shape == (batch_size, thought_slots, config.num_refresh_actions)
     assert output.anchor_query.shape == (
         batch_size,
@@ -102,7 +114,7 @@ def test_torch_core_shapes_and_backward() -> None:
     anchor_presence_targets = torch.zeros(
         batch_size, thought_slots, config.max_anchor_slots
     )
-    anchor_presence_targets[:, :, 0] = occupied.float()
+    anchor_presence_targets[:, :, :2] = occupied[:, :, None].float()
     anchor_mask = anchor_presence_targets.bool()
     anchor_kind_targets = torch.full(
         (batch_size, thought_slots, config.max_anchor_slots), -100, dtype=torch.long
@@ -112,7 +124,7 @@ def test_torch_core_shapes_and_backward() -> None:
     )
     link_presence_mask = occupied[:, :, None].expand(-1, -1, config.max_link_slots)
     link_presence_targets = torch.zeros(batch_size, thought_slots, config.max_link_slots)
-    link_presence_targets[:, :, 0] = occupied.float()
+    link_presence_targets[:, :, :2] = occupied[:, :, None].float()
     link_mask = link_presence_targets.bool()
     link_relation_targets = torch.full(
         (batch_size, thought_slots, config.max_link_slots), -100, dtype=torch.long
@@ -128,15 +140,27 @@ def test_torch_core_shapes_and_backward() -> None:
     )
     targets = CIDTargets(
         thought_semantic=torch.randn_like(output.thought_semantic),
+        thought_mask=occupied,
         allocation_targets=torch.randint(0, 2, (batch_size, thought_slots)).float(),
         allocation_mask=~occupied,
         display_ids=torch.randint(0, config.vocab_size, (batch_size, display_length)),
         role_targets=torch.rand_like(output.role_logits),
         uncertainty=torch.rand_like(output.uncertainty),
+        noise_delta=torch.rand_like(output.noise_delta) * 2.0 - 1.0,
         lifecycle=lifecycle_targets,
         need_targets=torch.rand(batch_size, thought_slots),
         source_targets=torch.randint(
             0, source_count, (batch_size, thought_slots), dtype=torch.long
+        ),
+        argument_presence_targets=torch.zeros(
+            batch_size, thought_slots, config.max_argument_slots
+        ),
+        argument_presence_mask=occupied[:, :, None].expand(
+            -1, -1, config.max_argument_slots
+        ),
+        argument_embeddings=torch.randn_like(output.argument_query),
+        argument_mask=torch.zeros(
+            batch_size, thought_slots, config.max_argument_slots, dtype=torch.bool
         ),
         revision_targets=torch.randint(0, 3, (batch_size, thought_slots), dtype=torch.long),
         refresh_targets=torch.randint(
@@ -166,6 +190,46 @@ def test_torch_core_shapes_and_backward() -> None:
     altered_losses = cid_loss(altered_output, targets)
     assert torch.allclose(losses.allocation, altered_losses.allocation)
 
+    altered_need = output.need_logits.clone()
+    altered_need[~occupied] = altered_need[~occupied] + 1000.0
+    altered_need_losses = cid_loss(replace(output, need_logits=altered_need), targets)
+    assert torch.allclose(losses.intent, altered_need_losses.intent)
+
+    ignored_targets = replace(
+        targets,
+        display_ids=torch.full_like(targets.display_ids, -100),
+        lifecycle=torch.full_like(targets.lifecycle, -100),
+        source_targets=torch.full_like(targets.source_targets, -100),
+        revision_targets=torch.full_like(targets.revision_targets, -100),
+        refresh_targets=torch.full_like(targets.refresh_targets, -100),
+    )
+    ignored_losses = cid_loss(output, ignored_targets)
+    assert torch.isfinite(ignored_losses.total)
+    assert ignored_losses.display == 0
+    assert ignored_losses.lifecycle == 0
+    assert ignored_losses.source == 0
+    assert ignored_losses.revision == 0
+    assert ignored_losses.refresh == 0
+
+    anchor_order = torch.tensor([1, 0, *range(2, config.max_anchor_slots)])
+    link_order = torch.tensor([1, 0, *range(2, config.max_link_slots)])
+    permuted_targets = replace(
+        targets,
+        anchor_kind_targets=targets.anchor_kind_targets.index_select(2, anchor_order),
+        anchor_embeddings=targets.anchor_embeddings.index_select(2, anchor_order),
+        anchor_mask=targets.anchor_mask.index_select(2, anchor_order),
+        link_relation_targets=targets.link_relation_targets.index_select(2, link_order),
+        link_target_kind_targets=targets.link_target_kind_targets.index_select(2, link_order),
+        link_target_embeddings=targets.link_target_embeddings.index_select(2, link_order),
+        link_mask=targets.link_mask.index_select(2, link_order),
+    )
+    permuted_losses = cid_loss(output, permuted_targets)
+    assert torch.allclose(losses.anchor_kind, permuted_losses.anchor_kind)
+    assert torch.allclose(losses.anchor_ground, permuted_losses.anchor_ground)
+    assert torch.allclose(losses.link_relation, permuted_losses.link_relation)
+    assert torch.allclose(losses.link_target_kind, permuted_losses.link_target_kind)
+    assert torch.allclose(losses.link_ground, permuted_losses.link_ground)
+
 
 def test_torch_core_accepts_empty_external_memory_and_no_sources() -> None:
     config = TorchCIDConfig(vocab_size=32, d_model=16, num_layers=1, num_heads=4)
@@ -176,6 +240,7 @@ def test_torch_core_accepts_empty_external_memory_and_no_sources() -> None:
         uncertainty=torch.rand(1, 2, 1),
         local_noise=torch.rand(1, 2, 1),
         slot_occupancy=torch.zeros(1, 2, 1),
+        prompt_ids=torch.empty(1, 0, dtype=torch.long),
         display_ids=torch.randint(0, config.vocab_size, (1, 3)),
         display_noise=torch.rand(1, 3, 1),
         fact_memory=torch.empty(1, 0, config.d_model),

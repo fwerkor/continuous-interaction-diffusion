@@ -25,6 +25,7 @@ class ILLaDACIDConfig:
     num_link_relations: int = len(LinkRelation)
     num_object_kinds: int = len(ObjectKind)
     num_refresh_actions: int = 3
+    max_argument_slots: int = 4
     max_anchor_slots: int = 4
     max_link_slots: int = 8
     external_dropout: float = 0.0
@@ -40,6 +41,8 @@ class ILLaDACIDConfig:
             raise ValueError("num_link_relations must match the typed grounding ABI")
         if self.num_object_kinds != len(ObjectKind):
             raise ValueError("num_object_kinds must match the typed grounding ABI")
+        if self.max_argument_slots <= 0:
+            raise ValueError("argument slot capacity must be positive")
         if self.max_anchor_slots <= 0 or self.max_link_slots <= 0:
             raise ValueError("grounding slot capacities must be positive")
         if not 0.0 <= self.external_dropout < 1.0:
@@ -70,7 +73,7 @@ class ILLaDACIDAdapter(nn.Module):
         if self.d_model % num_heads:
             raise ValueError("iLLaDA hidden size must be divisible by its attention head count")
 
-        self.channel_embedding = nn.Embedding(2, self.d_model)
+        self.channel_embedding = nn.Embedding(3, self.d_model)
         self.role_projection = nn.Linear(self.config.num_roles, self.d_model, bias=False)
         self.scalar_projection = nn.Linear(2, self.d_model, bias=False)
         self.occupancy_projection = nn.Linear(1, self.d_model, bias=False)
@@ -90,6 +93,7 @@ class ILLaDACIDAdapter(nn.Module):
             num_link_relations=self.config.num_link_relations,
             num_object_kinds=self.config.num_object_kinds,
             num_refresh_actions=self.config.num_refresh_actions,
+            max_argument_slots=self.config.max_argument_slots,
             max_anchor_slots=self.config.max_anchor_slots,
             max_link_slots=self.config.max_link_slots,
         )
@@ -134,7 +138,7 @@ class ILLaDACIDAdapter(nn.Module):
         return self.backbone.get_output_embeddings()
 
     def forward(self, batch: CIDTensorBatch) -> CIDTensorOutput:
-        batch_size, thought_slots, display_length = self._validate_batch(batch)
+        batch_size, thought_slots, prompt_length, display_length = self._validate_batch(batch)
         model_dtype = self.input_embeddings.weight.dtype
         thought = batch.thought_semantic.to(dtype=model_dtype)
         role_features = batch.role_features.to(dtype=model_dtype)
@@ -154,20 +158,29 @@ class ILLaDACIDAdapter(nn.Module):
             + self.occupancy_projection(slot_occupancy)
             + self.channel_embedding.weight[0][None, None, :]
         )
+        prompt_hidden = (
+            self.input_embeddings(batch.prompt_ids)
+            + self.channel_embedding.weight[1][None, None, :]
+        )
         display_hidden = (
             self.input_embeddings(batch.display_ids)
             + self.display_noise_projection(display_noise)
-            + self.channel_embedding.weight[1][None, None, :]
+            + self.channel_embedding.weight[2][None, None, :]
         )
-        seed_hidden = torch.cat((thought_hidden, display_hidden), dim=1)
+        seed_hidden = torch.cat((thought_hidden, prompt_hidden, display_hidden), dim=1)
 
+        prompt_keys = torch.ones(
+            (batch_size, prompt_length),
+            dtype=torch.bool,
+            device=batch.display_ids.device,
+        )
         display_keys = torch.ones(
             (batch_size, display_length),
             dtype=torch.bool,
             device=batch.display_ids.device,
         )
         attention_mask = torch.cat(
-            (slot_occupancy.squeeze(-1).bool(), display_keys),
+            (slot_occupancy.squeeze(-1).bool(), prompt_keys, display_keys),
             dim=1,
         )
         decoder_output = self.backbone.get_decoder()(
@@ -178,6 +191,11 @@ class ILLaDACIDAdapter(nn.Module):
         hidden = decoder_output.last_hidden_state
 
         thought_weight = slot_occupancy.clamp(0.0, 1.0)
+        prompt_weight = torch.ones(
+            (batch_size, prompt_length, 1),
+            dtype=thought_weight.dtype,
+            device=thought_weight.device,
+        )
         display_weight = torch.ones(
             (batch_size, display_length, 1),
             dtype=thought_weight.dtype,
@@ -186,7 +204,7 @@ class ILLaDACIDAdapter(nn.Module):
         hidden = self.external_fusion(
             hidden,
             seed_hidden=seed_hidden,
-            context_weight=torch.cat((thought_weight, display_weight), dim=1),
+            context_weight=torch.cat((thought_weight, prompt_weight, display_weight), dim=1),
             facts=fact_memory,
             percepts=percept_memory,
             fact_padding_mask=batch.fact_padding_mask,
@@ -194,7 +212,7 @@ class ILLaDACIDAdapter(nn.Module):
         )
 
         t_hidden = hidden[:, :thought_slots]
-        y_hidden = hidden[:, thought_slots:]
+        y_hidden = hidden[:, thought_slots + prompt_length :]
         return self.output_heads(
             base_thought=thought,
             thought_hidden=t_hidden,
@@ -203,7 +221,7 @@ class ILLaDACIDAdapter(nn.Module):
             source_padding_mask=batch.source_padding_mask,
         )
 
-    def _validate_batch(self, batch: CIDTensorBatch) -> tuple[int, int, int]:
+    def _validate_batch(self, batch: CIDTensorBatch) -> tuple[int, int, int, int]:
         thought = batch.thought_semantic
         if thought.ndim != 3:
             raise ValueError("thought_semantic must have shape [batch, thought_slots, hidden]")
@@ -223,13 +241,20 @@ class ILLaDACIDAdapter(nn.Module):
         if batch.local_noise.shape != (batch_size, thought_slots, 1):
             raise ValueError("local_noise must have shape [batch, thought_slots, 1]")
 
+        if batch.prompt_ids.ndim != 2 or batch.prompt_ids.shape[0] != batch_size:
+            raise ValueError("prompt_ids must have shape [batch, prompt_tokens]")
+        prompt_length = batch.prompt_ids.shape[1]
+        if bool(((batch.prompt_ids < 0) | (batch.prompt_ids >= self.vocab_size)).any()):
+            raise ValueError("prompt contains token IDs outside the iLLaDA vocabulary")
         if batch.display_ids.ndim != 2 or batch.display_ids.shape[0] != batch_size:
             raise ValueError("display_ids must have shape [batch, display_tokens]")
         display_length = batch.display_ids.shape[1]
         if display_length > self.config.max_display_tokens:
             raise ValueError("display length exceeds configured maximum")
-        if thought_slots + display_length > self.max_position_embeddings:
-            raise ValueError("combined TCT and display length exceeds iLLaDA context capacity")
+        if thought_slots + prompt_length + display_length > self.max_position_embeddings:
+            raise ValueError(
+                "combined TCT, prompt, and display length exceeds iLLaDA context capacity"
+            )
         if batch.display_noise.shape != (batch_size, display_length, 1):
             raise ValueError("display_noise must have shape [batch, display_tokens, 1]")
 
@@ -242,7 +267,7 @@ class ILLaDACIDAdapter(nn.Module):
                 raise ValueError(
                     f"{name} must have shape [batch, items, {self.d_model}]"
                 )
-        return batch_size, thought_slots, display_length
+        return batch_size, thought_slots, prompt_length, display_length
 
     def _place_cid_modules_with_embeddings(self) -> None:
         weight = self.input_embeddings.weight

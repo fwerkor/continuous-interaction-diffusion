@@ -127,9 +127,11 @@ the fixed-capacity TCT, retain the model's masked-token denoising for Y, and att
 allocation/lifecycle/role/intent/revision plus typed grounding heads.
 
 The first real bridge is `ILLaDACIDAdapter` for `GSAI-ML/iLLaDA-8B-Base`. iLLaDA accepts
-`inputs_embeds`, so CID concatenates TCT embeddings and ordinary iLLaDA display-token embeddings
-before the native bidirectional decoder. Display logits still come from the checkpoint's original
-LM head. The adapter does not replace or emulate iLLaDA's language-model stack.
+`inputs_embeds`, so CID runs `[TCT | prompt | display]` through the native bidirectional decoder.
+The prompt is immutable token-level conditioning, not a fourth mutable cognitive channel and not a
+`FactItem`. This preserves its language structure while reserving F for externally protected facts.
+Display logits still come from the checkpoint's original LM head. The adapter does not replace or
+emulate iLLaDA's language-model stack.
 
 Empty TCT slots remain query positions because allocation must be predicted for them, but they are
 masked as attention keys. Occupied TCT cells and display tokens are visible keys. This prevents
@@ -139,6 +141,13 @@ memory channels and enter through the shared CID cross-attention fusion after na
 refinement. The external residual gate is initialized near zero so the untrained CID path starts
 close to the pretrained display behavior.
 
+The runtime-facing `ILLaDANeuralPolicy` tensorizes `ModelContext`, executes the adapter, reveals a
+subset of masked display tokens, and passes neural outputs through `CIDMaterializer`. Materialization
+turns allocation/lifecycle logits into TCT proposals, retrieves typed anchors and link targets from
+a trajectory-local catalog, decodes schema-positioned argument slots, emits persistent
+`InformationNeed` objects, and converts revision predictions into typed reopen references. Runtime
+lifecycle gates remain authoritative after materialization.
+
 ## 4. Information need before executable call
 
 A runtime-visible need has a stable `need_id`, source probabilities, partially bound arguments,
@@ -147,8 +156,9 @@ confidence, freshness demand, and typed cell/display targets. Runtime activation
 1. need confidence must cross the binding threshold;
 2. a source must be selected and its required arguments must be executable.
 
-The training model can expose useful source/need confidence before the second gate is satisfied.
-That lead time is directly measurable and corresponds to RQ1.
+The training model exposes argument presence and one retrieval query for each source-schema argument
+position. An information need may therefore become visible before all required argument slots are
+grounded. That lead time is directly measurable and corresponds to RQ1.
 
 ## 5. One need, persistent binding
 

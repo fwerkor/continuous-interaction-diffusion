@@ -59,6 +59,10 @@ src/cid/runtime/            Async scheduler, bindings, source registry, traces
 src/cid/model/torch_core.py Small trainable PyTorch reference core
 src/cid/model/illada.py     Real iLLaDA masked-diffusion backbone adapter
 src/cid/model/components.py Shared CID fusion and prediction heads
+src/cid/model/materialize.py Neural-output to runtime-contract materializer
+src/cid/model/diffusion.py  T/Y corruption and display reveal schedule
+src/cid/model/policy.py     iLLaDA context tensorizer and runtime neural policy
+src/cid/model/training.py   Distilled trajectory to training tensors/targets
 src/cid/data.py             Trajectory JSONL schema and validation
 src/cid/metrics.py          CID-specific interaction metrics
 docs/architecture.md        Concrete v0 architecture decisions
@@ -92,9 +96,10 @@ python -m pip install -e '.[train]'
 ## iLLaDA backbone adapter
 
 CID now includes a real adapter for `GSAI-ML/iLLaDA-8B-Base`. The adapter keeps iLLaDA's native
-masked-token input embedding and LM head for the display channel, prepends fixed-capacity TCT
-slots to the same bidirectional sequence, and attaches CID-specific external-perception fusion and
-prediction heads. Empty TCT slots are masked as attention keys so they can query context for
+masked-token input embedding and LM head for the display channel, runs `[TCT | prompt | display]`
+through the same bidirectional decoder, and attaches CID-specific external-perception fusion and
+prediction heads. The immutable prompt remains token-level conditioning rather than being flattened
+into protected Facts. Empty TCT slots are masked as attention keys so they can query context for
 allocation without contaminating the current display.
 
 ```python
@@ -117,7 +122,18 @@ python examples/illada_tiny_smoke.py
 ```
 
 iLLaDA's tokenizer uses token id `5` for `<[MASK]>`; the same value is exported as
-`ILLADA_MASK_TOKEN_ID` for the upcoming diffusion tensorizer.
+`ILLADA_MASK_TOKEN_ID`. `CIDDiffusionScheduler` now supplies masked-display corruption, continuous
+TCT corruption, and confidence-ranked iterative reveal.
+
+The neural path is executable end to end: `ILLaDAContextTensorizer` converts a runtime
+`ModelContext`, `ILLaDANeuralPolicy` performs a denoising step, and `CIDMaterializer` converts
+allocation/lifecycle/need/source/argument/grounding/revision/refresh predictions back into the
+typed runtime contract. Closed-world candidate retrieval is used for the first training stage.
+
+Training data uses typed per-step `ThoughtTarget` and `DisplayTarget` records rather than free-form
+dictionaries. `ILLaDATrajectoryTensorizer` constructs adjacent-step supervision and the CID loss
+performs permutation-invariant assignment for multi-anchor and multi-link targets. The test suite
+includes a complete tiny-backbone optimizer step with the pretrained backbone frozen.
 
 ## Quick demo
 

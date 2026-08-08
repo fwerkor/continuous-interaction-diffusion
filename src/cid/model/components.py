@@ -113,6 +113,7 @@ class CIDOutputHeads(nn.Module):
         num_link_relations: int,
         num_object_kinds: int,
         num_refresh_actions: int,
+        max_argument_slots: int,
         max_anchor_slots: int,
         max_link_slots: int,
     ) -> None:
@@ -121,6 +122,7 @@ class CIDOutputHeads(nn.Module):
         self.num_anchor_kinds = num_anchor_kinds
         self.num_link_relations = num_link_relations
         self.num_object_kinds = num_object_kinds
+        self.max_argument_slots = max_argument_slots
         self.max_anchor_slots = max_anchor_slots
         self.max_link_slots = max_link_slots
 
@@ -132,6 +134,8 @@ class CIDOutputHeads(nn.Module):
         self.lifecycle_head = nn.Linear(d_model, num_lifecycles)
         self.need_head = nn.Linear(d_model, 1)
         self.source_query = nn.Linear(d_model, d_model, bias=False)
+        self.argument_presence_head = nn.Linear(d_model, max_argument_slots)
+        self.argument_query = nn.Linear(d_model, max_argument_slots * d_model, bias=False)
         self.anchor_query = nn.Linear(d_model, max_anchor_slots * d_model, bias=False)
         self.anchor_presence_head = nn.Linear(d_model, max_anchor_slots)
         self.anchor_kind_head = nn.Linear(d_model, max_anchor_slots * num_anchor_kinds)
@@ -160,6 +164,13 @@ class CIDOutputHeads(nn.Module):
                 source_padding_mask[:, None, :],
                 torch.finfo(source_logits.dtype).min,
             )
+
+        argument_query = self.argument_query(thought_hidden).view(
+            batch_size,
+            thought_slots,
+            self.max_argument_slots,
+            self.d_model,
+        )
 
         anchor_query = self.anchor_query(thought_hidden).view(
             batch_size,
@@ -202,6 +213,8 @@ class CIDOutputHeads(nn.Module):
             display_logits=display_logits,
             need_logits=self.need_head(thought_hidden).squeeze(-1),
             source_logits=source_logits,
+            argument_presence_logits=self.argument_presence_head(thought_hidden),
+            argument_query=argument_query,
             anchor_query=anchor_query,
             anchor_presence_logits=self.anchor_presence_head(thought_hidden),
             anchor_kind_logits=anchor_kind_logits,

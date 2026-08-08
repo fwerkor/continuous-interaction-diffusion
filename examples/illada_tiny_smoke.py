@@ -40,6 +40,7 @@ def main() -> None:
         uncertainty=torch.rand(1, 4, 1),
         local_noise=torch.rand(1, 4, 1),
         slot_occupancy=torch.tensor([[[1.0], [1.0], [0.0], [0.0]]]),
+        prompt_ids=torch.tensor([[3, 4, 6]]),
         display_ids=torch.tensor([[ILLADA_MASK_TOKEN_ID, 7, ILLADA_MASK_TOKEN_ID, 9]]),
         display_noise=torch.rand(1, 4, 1),
         fact_memory=torch.randn(1, 2, config.hidden_size),

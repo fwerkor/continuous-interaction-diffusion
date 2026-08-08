@@ -25,6 +25,13 @@ unfreeze the same backbone without changing the tensor/runtime ABI.
 - percept encoder/cross-attention adapters;
 - local support/conflict and lifecycle heads.
 
+The first trainable data path is `ILLaDATrajectoryTensorizer`. It turns adjacent supervised
+trajectory snapshots into a model input and `CIDTargets`: current TCT occupancy is retained,
+continuous cognition is corrupted, the next display target is masked with the diffusion schedule,
+and allocation/lifecycle targets are derived from stable cell identity across the transition.
+New cells train allocation on previously empty slots; existing cells train lifecycle on their
+logical identity even if later compaction moves their physical storage.
+
 Teacher trajectories should contain pre-arrival and post-arrival states, not only final answers.
 They should also supervise cell creation, retirement, optional split/merge lineage, and stable cell
 identity across physical compaction. Arrival time, source freshness, cache availability, and
@@ -40,9 +47,16 @@ creates excessive short-lived cognition or retains cells unnecessarily.
 Grounding supervision is multi-valued per cell. Anchor slots learn presence, anchor kind, and a
 retrieval embedding for the canonical object. Link slots learn presence, relation type, target
 `ObjectKind`, and a target retrieval embedding. Presence masks let the model use fewer anchors or
-links than the fixed per-cell grounding capacity. The first training stage uses trajectory-local
-closed-world catalogs so grounding quality can be measured without requiring open-world entity
-linking.
+links than the fixed per-cell grounding capacity. Anchor/link target order is treated as a set:
+loss computation performs minimum-cost assignment between target objects and neural grounding
+slots, so the model cannot exploit an arbitrary teacher-side ordering convention. The first
+training stage uses trajectory-local closed-world catalogs so grounding quality can be measured
+without requiring open-world entity linking.
+
+Source arguments use a separate fixed-capacity slot set keyed by the selected source schema.
+Argument slot `k` corresponds to the `k`th declared argument of that source and predicts both
+presence and a retrieval query. This permits an information need to emerge before every required
+argument is executable, while keeping argument names/types under the runtime-owned source schema.
 
 ## Stage 2 — joint T/Y refinement
 
@@ -65,7 +79,9 @@ with the same state/data contract rather than changing the system architecture d
 - user/task input and protected facts;
 - source descriptors;
 - target final display;
-- optional structured TCT supervision;
+- per-step `ThoughtTarget` snapshots with stable cell ID, physical slot, semantic transport text,
+  roles, uncertainty, editability/noise, and lifecycle;
+- optional per-step `DisplayTarget` text for pre-/post-arrival revision supervision;
 - external events with arrival step/time and source version;
 - binding targets and affected regions;
 - a closed-world `grounding_catalog` of canonical anchors and aliases;
@@ -74,6 +90,14 @@ with the same state/data contract rather than changing the system architecture d
 
 Binding targets use typed `ObjectRef` values. Cell references carry stable `cell_id` values and
 display targets use explicit `DISPLAY_SPAN` references, so neither depends on physical TCT layout.
+Binding targets also record target arguments, executable timing, confidence, and freshness demand,
+which directly supervise need/source/argument/refresh heads. Optional per-argument availability
+steps let a trajectory supervise partially bound calls before the whole source invocation becomes
+executable.
+
+`ThoughtTarget.semantic_text` is a dataset transport format rather than runtime chain-of-thought.
+The tensorizer embeds it into the latent TCT target; the deployed model only carries continuous
+cell semantics, typed anchors/links, and runtime-visible needs.
 
 The schema deliberately records *when* evidence becomes available. Flattening events into the
 initial prompt destroys the central CID training signal.

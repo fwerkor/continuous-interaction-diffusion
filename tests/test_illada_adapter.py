@@ -74,6 +74,7 @@ def make_batch(*, batch_size: int = 2, thought_slots: int = 4, display_length: i
         uncertainty=torch.rand(batch_size, thought_slots, 1),
         local_noise=torch.rand(batch_size, thought_slots, 1),
         slot_occupancy=occupancy,
+        prompt_ids=torch.randint(0, TinyILLaDAConfig.vocab_size, (batch_size, 2)),
         display_ids=torch.randint(0, TinyILLaDAConfig.vocab_size, (batch_size, display_length)),
         display_noise=torch.rand(batch_size, display_length, 1),
         fact_memory=torch.randn(batch_size, 2, d_model),
@@ -98,7 +99,7 @@ def test_illada_adapter_uses_shared_bidirectional_sequence_and_native_lm_head() 
     assert output.link_target_query.shape == (2, 4, 8, TinyILLaDAConfig.hidden_size)
     assert output.source_logits.shape == (2, 4, 2)
     assert adapter.output_embeddings is backbone.lm_head
-    assert backbone.decoder.last_attention_mask.shape == (2, 10)
+    assert backbone.decoder.last_attention_mask.shape == (2, 12)
     assert torch.equal(
         backbone.decoder.last_attention_mask[:, :4],
         batch.slot_occupancy.squeeze(-1).bool(),

@@ -24,8 +24,7 @@ quality.
 
 ## M1 — masked-diffusion backbone adapter
 
-Status: backbone bridge implemented for iLLaDA; runtime materialization and argument decoding remain
-before the M1 exit criterion is complete.
+Status: implemented for `GSAI-ML/iLLaDA-8B-Base`.
 
 Implement the first real model bridge around an existing masked-diffusion LM. The adapter should:
 
@@ -42,7 +41,14 @@ roles attach to cell content and type rather than hard-coded positions.
 Exit criterion: an untrained or lightly trained adapter can run complete CID trajectories with the
 same runtime used by the oracle policies.
 
+The repository now satisfies this criterion with a tiny iLLaDA-compatible end-to-end runtime test.
+The neural path includes immutable prompt conditioning, closed-world anchor/link/argument retrieval,
+schema-conditioned argument slots, display reveal scheduling, and runtime-facing materialization.
+
 ## M2 — synthetic trajectory factory
+
+Status: next major milestone. The trajectory schema and single-transition tensorizer are ready; the
+large-scale teacher/data-generation factory is not yet implemented.
 
 Build data generators for the five evaluation families: static copying, delayed retrieval, dynamic
 state tracking, streaming evidence, and competing sources. Every generated sample must include
@@ -53,6 +59,10 @@ Exit criterion: millions of reproducible trajectories can be generated with cont
 latency, freshness, cache state, and counterfactual arrival schedules.
 
 ## M3 — adapter training
+
+Infrastructure status: a supervised trajectory transition can already be tensorized, corrupted,
+forwarded through the iLLaDA adapter, scored with the CID objective, backpropagated, and updated with
+an optimizer. Large-scale batching, distributed training, checkpoint/resume, and evaluation remain.
 
 Train CID-specific heads and adapters first, with most backbone weights frozen. Measure source
 selection, argument binding, intent lead time, assimilation lag, exact copying, and stale-value

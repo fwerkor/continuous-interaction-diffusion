@@ -109,6 +109,7 @@ class ModelContext:
     sources: tuple[SourceDescriptor, ...]
     percepts: tuple[Percept, ...]
     step: int
+    prompt: str = ""
 
 
 @dataclass(frozen=True, slots=True)

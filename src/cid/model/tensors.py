@@ -12,6 +12,7 @@ class CIDTensorBatch:
     uncertainty: Tensor
     local_noise: Tensor
     slot_occupancy: Tensor
+    prompt_ids: Tensor
     display_ids: Tensor
     display_noise: Tensor
     fact_memory: Tensor
@@ -33,6 +34,8 @@ class CIDTensorOutput:
     display_logits: Tensor
     need_logits: Tensor
     source_logits: Tensor
+    argument_presence_logits: Tensor
+    argument_query: Tensor
     anchor_query: Tensor
     anchor_presence_logits: Tensor
     anchor_kind_logits: Tensor

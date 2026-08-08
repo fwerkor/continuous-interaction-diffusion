@@ -88,6 +88,7 @@ class CIDRuntime:
         thought: CognitiveField,
         display: DisplayCanvas,
         facts: Iterable[FactItem] = (),
+        prompt: str = "",
     ) -> RuntimeResult:
         if self._jobs:
             raise RuntimeError("a CIDRuntime instance cannot run concurrent trajectories")
@@ -123,6 +124,7 @@ class CIDRuntime:
                     sources=descriptors,
                     percepts=percepts,
                     step=step,
+                    prompt=prompt,
                 )
 
                 self.trace.emit("model_step_started", step, percepts=len(percepts))
