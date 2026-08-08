@@ -18,6 +18,8 @@ class CIDTensorBatch:
     fact_memory: Tensor
     percept_memory: Tensor
     source_memory: Tensor
+    prompt_padding_mask: Tensor | None = None
+    display_padding_mask: Tensor | None = None
     fact_padding_mask: Tensor | None = None
     percept_padding_mask: Tensor | None = None
     source_padding_mask: Tensor | None = None

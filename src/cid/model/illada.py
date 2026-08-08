@@ -129,6 +129,15 @@ class ILLaDACIDAdapter(nn.Module):
         for parameter in self.backbone.parameters():
             parameter.requires_grad_(trainable)
 
+    def set_gradient_checkpointing(self, enabled: bool) -> None:
+        method_name = (
+            "gradient_checkpointing_enable" if enabled else "gradient_checkpointing_disable"
+        )
+        method = getattr(self.backbone, method_name, None)
+        if method is None:
+            raise RuntimeError("iLLaDA backbone does not expose gradient checkpointing controls")
+        method()
+
     @property
     def input_embeddings(self) -> nn.Module:
         return self.backbone.get_input_embeddings()
@@ -169,14 +178,16 @@ class ILLaDACIDAdapter(nn.Module):
         )
         seed_hidden = torch.cat((thought_hidden, prompt_hidden, display_hidden), dim=1)
 
-        prompt_keys = torch.ones(
-            (batch_size, prompt_length),
-            dtype=torch.bool,
+        prompt_keys = self._valid_keys(
+            batch.prompt_padding_mask,
+            batch_size=batch_size,
+            length=prompt_length,
             device=batch.display_ids.device,
         )
-        display_keys = torch.ones(
-            (batch_size, display_length),
-            dtype=torch.bool,
+        display_keys = self._valid_keys(
+            batch.display_padding_mask,
+            batch_size=batch_size,
+            length=display_length,
             device=batch.display_ids.device,
         )
         attention_mask = torch.cat(
@@ -191,16 +202,8 @@ class ILLaDACIDAdapter(nn.Module):
         hidden = decoder_output.last_hidden_state
 
         thought_weight = slot_occupancy.clamp(0.0, 1.0)
-        prompt_weight = torch.ones(
-            (batch_size, prompt_length, 1),
-            dtype=thought_weight.dtype,
-            device=thought_weight.device,
-        )
-        display_weight = torch.ones(
-            (batch_size, display_length, 1),
-            dtype=thought_weight.dtype,
-            device=thought_weight.device,
-        )
+        prompt_weight = prompt_keys.to(dtype=thought_weight.dtype).unsqueeze(-1)
+        display_weight = display_keys.to(dtype=thought_weight.dtype).unsqueeze(-1)
         hidden = self.external_fusion(
             hidden,
             seed_hidden=seed_hidden,
@@ -244,11 +247,23 @@ class ILLaDACIDAdapter(nn.Module):
         if batch.prompt_ids.ndim != 2 or batch.prompt_ids.shape[0] != batch_size:
             raise ValueError("prompt_ids must have shape [batch, prompt_tokens]")
         prompt_length = batch.prompt_ids.shape[1]
+        self._validate_padding_mask(
+            batch.prompt_padding_mask,
+            batch_size=batch_size,
+            length=prompt_length,
+            name="prompt_padding_mask",
+        )
         if bool(((batch.prompt_ids < 0) | (batch.prompt_ids >= self.vocab_size)).any()):
             raise ValueError("prompt contains token IDs outside the iLLaDA vocabulary")
         if batch.display_ids.ndim != 2 or batch.display_ids.shape[0] != batch_size:
             raise ValueError("display_ids must have shape [batch, display_tokens]")
         display_length = batch.display_ids.shape[1]
+        self._validate_padding_mask(
+            batch.display_padding_mask,
+            batch_size=batch_size,
+            length=display_length,
+            name="display_padding_mask",
+        )
         if display_length > self.config.max_display_tokens:
             raise ValueError("display length exceeds configured maximum")
         if thought_slots + prompt_length + display_length > self.max_position_embeddings:
@@ -268,6 +283,29 @@ class ILLaDACIDAdapter(nn.Module):
                     f"{name} must have shape [batch, items, {self.d_model}]"
                 )
         return batch_size, thought_slots, prompt_length, display_length
+
+    @staticmethod
+    def _validate_padding_mask(
+        mask: torch.Tensor | None,
+        *,
+        batch_size: int,
+        length: int,
+        name: str,
+    ) -> None:
+        if mask is not None and mask.shape != (batch_size, length):
+            raise ValueError(f"{name} must have shape [batch, tokens]")
+
+    @staticmethod
+    def _valid_keys(
+        padding_mask: torch.Tensor | None,
+        *,
+        batch_size: int,
+        length: int,
+        device: torch.device,
+    ) -> torch.Tensor:
+        if padding_mask is None:
+            return torch.ones((batch_size, length), dtype=torch.bool, device=device)
+        return ~padding_mask.to(device=device, dtype=torch.bool)
 
     def _place_cid_modules_with_embeddings(self) -> None:
         weight = self.input_embeddings.weight

@@ -99,7 +99,14 @@ class CIDExternalFusion(nn.Module):
             percept_padding_mask = torch.zeros(
                 (batch_size, percept_count), dtype=torch.bool, device=percepts.device
             )
-        return memory, torch.cat((fact_padding_mask, percept_padding_mask), dim=1)
+        padding_mask = torch.cat((fact_padding_mask, percept_padding_mask), dim=1)
+        empty_rows = padding_mask.all(dim=1)
+        if bool(empty_rows.any()):
+            memory = memory.clone()
+            padding_mask = padding_mask.clone()
+            memory[empty_rows, 0] = self.null_external[0, 0]
+            padding_mask[empty_rows, 0] = False
+        return memory, padding_mask
 
 
 class CIDOutputHeads(nn.Module):

@@ -73,6 +73,15 @@ DDP initialization synchronization, while trainable CID parameters are synchroni
 is serialized across local ranks to avoid staging six simultaneous 8B CPU copies before transfer to
 the GPUs.
 
+`CIDTrainingStep` remains a single-example representation. `collate_training_steps()` pads prompt,
+display, fact, percept, and source dimensions into a variable-length micro-batch and supplies the
+corresponding attention/padding masks. `CIDTrainerConfig.micro_batch_size` controls this local batch;
+gradient accumulation then scales the effective batch independently. Accumulated gradients are
+normalized by the number of examples rather than by the number of micro-batches, so a smaller final
+micro-batch is not overweighted. Native iLLaDA gradient checkpointing is enabled by the launcher by
+default to reduce activation memory while retaining gradients to CID inputs through the frozen
+backbone.
+
 This DDP path is for the frozen-backbone Stage A phase. Joint/full-parameter training in Stage 2
 requires sharded model/optimizer state (FSDP or equivalent) rather than replicating Adam state on
 every GPU.

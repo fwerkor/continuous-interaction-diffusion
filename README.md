@@ -159,6 +159,7 @@ cid train \
   --data data/synthetic.jsonl \
   --output-dir runs/stage-a \
   --thought-capacity 8 \
+  --micro-batch-size 2 \
   --gradient-accumulation-steps 8 \
   --dtype bf16
 ```
@@ -170,6 +171,7 @@ torchrun --standalone --nproc-per-node=6 -m cid.cli train \
   --data data/synthetic.jsonl \
   --output-dir runs/stage-a-6gpu \
   --thought-capacity 8 \
+  --micro-batch-size 2 \
   --gradient-accumulation-steps 8 \
   --dtype bf16
 ```
@@ -178,6 +180,11 @@ Each rank loads the pinned 8B backbone serially before moving it to its GPU, avo
 CPU copies during startup. DDP synchronizes only trainable CID state; frozen backbone parameters and
 buffers are excluded from initialization sync. Transition lists are shuffled deterministically,
 padded to equal rank lengths, and sharded before training.
+
+The trainer pads variable-length prompt/display/external-memory sequences inside each micro-batch.
+Gradient checkpointing is enabled by default for the native iLLaDA stack and can be disabled with
+`--no-gradient-checkpointing`. With the six-GPU example above, the effective transition batch is
+`2 × 8 × 6 = 96`; start at micro-batch 1 if the real trajectory lengths are substantially larger.
 
 Stage A checkpoints contain trainable CID parameters, optimizer state, progress, and RNG state; they
 do not duplicate the frozen 8B backbone. Resume with `--resume <checkpoint>`. For inference,

@@ -149,19 +149,31 @@ class TorchCIDCore(nn.Module):
         )
         seed_hidden = torch.cat((thought_hidden, prompt_hidden, display_hidden), dim=1)
         thought_weight = batch.slot_occupancy.clamp(0.0, 1.0)
-        prompt_weight = torch.ones(
-            (batch_size, prompt_length, 1),
-            dtype=thought_weight.dtype,
+        prompt_keys = self._valid_keys(
+            batch.prompt_padding_mask,
+            batch_size=batch_size,
+            length=prompt_length,
             device=device,
         )
-        display_weight = torch.ones(
-            (batch_size, display_length, 1),
-            dtype=thought_weight.dtype,
+        display_keys = self._valid_keys(
+            batch.display_padding_mask,
+            batch_size=batch_size,
+            length=display_length,
             device=device,
         )
+        prompt_weight = prompt_keys.to(dtype=thought_weight.dtype).unsqueeze(-1)
+        display_weight = display_keys.to(dtype=thought_weight.dtype).unsqueeze(-1)
         context_weight = torch.cat((thought_weight, prompt_weight, display_weight), dim=1)
 
-        hidden = self.backbone(seed_hidden)
+        key_padding_mask = torch.cat(
+            (
+                ~batch.slot_occupancy.squeeze(-1).bool(),
+                ~prompt_keys,
+                ~display_keys,
+            ),
+            dim=1,
+        )
+        hidden = self.backbone(seed_hidden, src_key_padding_mask=key_padding_mask)
         hidden = self.external_fusion(
             hidden,
             seed_hidden=seed_hidden,
@@ -180,3 +192,17 @@ class TorchCIDCore(nn.Module):
             source_memory=batch.source_memory,
             source_padding_mask=batch.source_padding_mask,
         )
+
+    @staticmethod
+    def _valid_keys(
+        padding_mask: torch.Tensor | None,
+        *,
+        batch_size: int,
+        length: int,
+        device: torch.device,
+    ) -> torch.Tensor:
+        if padding_mask is None:
+            return torch.ones((batch_size, length), dtype=torch.bool, device=device)
+        if padding_mask.shape != (batch_size, length):
+            raise ValueError("padding mask must have shape [batch, tokens]")
+        return ~padding_mask.to(device=device, dtype=torch.bool)

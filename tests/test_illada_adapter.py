@@ -49,6 +49,7 @@ class TinyILLaDABackbone(nn.Module):
         self.decoder = TinyILLaDADecoder(self.config.hidden_size)
         self.lm_head = nn.Linear(self.config.hidden_size, self.config.vocab_size, bias=False)
         self.lm_head.weight = self.embed_tokens.weight
+        self.gradient_checkpointing = False
 
     def get_input_embeddings(self):
         return self.embed_tokens
@@ -58,6 +59,12 @@ class TinyILLaDABackbone(nn.Module):
 
     def get_decoder(self):
         return self.decoder
+
+    def gradient_checkpointing_enable(self):
+        self.gradient_checkpointing = True
+
+    def gradient_checkpointing_disable(self):
+        self.gradient_checkpointing = False
 
 
 def make_batch(*, batch_size: int = 2, thought_slots: int = 4, display_length: int = 6):
@@ -135,6 +142,16 @@ def test_illada_adapter_accepts_empty_external_memory() -> None:
 
     assert torch.isfinite(output.display_logits).all()
     assert output.source_logits.shape == (1, 2, 0)
+
+
+def test_illada_adapter_controls_backbone_gradient_checkpointing() -> None:
+    backbone = TinyILLaDABackbone()
+    adapter = ILLaDACIDAdapter(backbone)
+
+    adapter.set_gradient_checkpointing(True)
+    assert backbone.gradient_checkpointing
+    adapter.set_gradient_checkpointing(False)
+    assert not backbone.gradient_checkpointing
 
 
 def test_illada_adapter_enforces_backbone_context_capacity() -> None:

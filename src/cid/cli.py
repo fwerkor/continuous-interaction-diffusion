@@ -153,6 +153,8 @@ def _train_stage_a(args: argparse.Namespace) -> None:
             adapter = load_adapter()
         if adapter is None:
             raise RuntimeError("failed to load iLLaDA adapter on this training rank")
+        if args.gradient_checkpointing:
+            adapter.set_gradient_checkpointing(True)
 
         tokenizer_kwargs: dict[str, object] = {"trust_remote_code": True}
         if args.model == ILLADA_8B_BASE:
@@ -173,6 +175,7 @@ def _train_stage_a(args: argparse.Namespace) -> None:
             CIDTrainerConfig(
                 learning_rate=args.learning_rate,
                 weight_decay=args.weight_decay,
+                micro_batch_size=args.micro_batch_size,
                 gradient_accumulation_steps=args.gradient_accumulation_steps,
                 max_grad_norm=args.max_grad_norm,
                 timestep_min=args.timestep_min,
@@ -198,10 +201,13 @@ def _train_stage_a(args: argparse.Namespace) -> None:
             parameter.numel() for parameter in adapter.parameters() if parameter.requires_grad
         )
         if rank == 0:
+            effective_batch = (
+                args.micro_batch_size * args.gradient_accumulation_steps * world_size
+            )
             print(
                 f"device={device} world_size={world_size} dtype={args.dtype} "
                 f"examples={len(examples)} transitions={len(transitions)} "
-                f"trainable_parameters={trainable}"
+                f"trainable_parameters={trainable} effective_batch={effective_batch}"
             )
 
         for epoch in range(1, args.epochs + 1):
@@ -269,6 +275,7 @@ def main() -> None:
     train.add_argument("--epochs", type=int, default=1)
     train.add_argument("--learning-rate", type=float, default=1e-4)
     train.add_argument("--weight-decay", type=float, default=0.01)
+    train.add_argument("--micro-batch-size", type=int, default=1)
     train.add_argument("--gradient-accumulation-steps", type=int, default=8)
     train.add_argument("--max-grad-norm", type=float, default=1.0)
     train.add_argument("--timestep-min", type=float, default=0.05)
@@ -278,6 +285,11 @@ def main() -> None:
     train.add_argument("--seed", type=int, default=0)
     train.add_argument("--max-examples", type=int)
     train.add_argument("--no-shuffle", action="store_true")
+    train.add_argument(
+        "--gradient-checkpointing",
+        action=argparse.BooleanOptionalAction,
+        default=True,
+    )
     args = parser.parse_args()
     if args.command == "demo":
         asyncio.run(_run_demo())

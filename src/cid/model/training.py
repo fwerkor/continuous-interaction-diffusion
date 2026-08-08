@@ -32,10 +32,110 @@ class CIDTrainingStep:
     targets: CIDTargets
 
 
+@dataclass(slots=True)
+class CIDTrainingBatch:
+    example_ids: tuple[str, ...]
+    source_steps: tuple[int, ...]
+    target_steps: tuple[int, ...]
+    batch: CIDTensorBatch
+    targets: CIDTargets
+
+
+def collate_training_steps(
+    steps: tuple[CIDTrainingStep, ...],
+    *,
+    pad_token_id: int,
+) -> CIDTrainingBatch:
+    if not steps:
+        raise ValueError("cannot collate an empty CID training batch")
+    if any(step.batch.thought_semantic.shape[0] != 1 for step in steps):
+        raise ValueError("CIDTrainingStep inputs must each contain exactly one example")
+
+    prompt_ids, prompt_padding_mask = _pad_2d(
+        tuple(step.batch.prompt_ids for step in steps),
+        pad_value=pad_token_id,
+    )
+    display_ids, display_padding_mask = _pad_2d(
+        tuple(step.batch.display_ids for step in steps),
+        pad_value=pad_token_id,
+    )
+    display_noise, _ = _pad_3d(tuple(step.batch.display_noise for step in steps))
+    fact_memory, fact_padding_mask = _pad_3d(
+        tuple(step.batch.fact_memory for step in steps)
+    )
+    percept_memory, percept_padding_mask = _pad_3d(
+        tuple(step.batch.percept_memory for step in steps)
+    )
+    source_memory, source_padding_mask = _pad_3d(
+        tuple(step.batch.source_memory for step in steps)
+    )
+    display_labels, _ = _pad_2d(
+        tuple(step.targets.display_ids for step in steps),
+        pad_value=-100,
+    )
+
+    batch = CIDTensorBatch(
+        thought_semantic=torch.cat(tuple(step.batch.thought_semantic for step in steps)),
+        role_features=torch.cat(tuple(step.batch.role_features for step in steps)),
+        uncertainty=torch.cat(tuple(step.batch.uncertainty for step in steps)),
+        local_noise=torch.cat(tuple(step.batch.local_noise for step in steps)),
+        slot_occupancy=torch.cat(tuple(step.batch.slot_occupancy for step in steps)),
+        prompt_ids=prompt_ids,
+        display_ids=display_ids,
+        display_noise=display_noise,
+        fact_memory=fact_memory,
+        percept_memory=percept_memory,
+        source_memory=source_memory,
+        prompt_padding_mask=prompt_padding_mask,
+        display_padding_mask=display_padding_mask,
+        fact_padding_mask=fact_padding_mask,
+        percept_padding_mask=percept_padding_mask,
+        source_padding_mask=source_padding_mask,
+    )
+    targets = CIDTargets(
+        thought_semantic=_cat_targets(steps, "thought_semantic"),
+        thought_mask=_cat_targets(steps, "thought_mask"),
+        allocation_targets=_cat_targets(steps, "allocation_targets"),
+        allocation_mask=_cat_targets(steps, "allocation_mask"),
+        display_ids=display_labels,
+        role_targets=_cat_targets(steps, "role_targets"),
+        uncertainty=_cat_targets(steps, "uncertainty"),
+        noise_delta=_cat_targets(steps, "noise_delta"),
+        lifecycle=_cat_targets(steps, "lifecycle"),
+        need_targets=_cat_targets(steps, "need_targets"),
+        source_targets=_cat_targets(steps, "source_targets"),
+        argument_presence_targets=_cat_targets(steps, "argument_presence_targets"),
+        argument_presence_mask=_cat_targets(steps, "argument_presence_mask"),
+        argument_embeddings=_cat_targets(steps, "argument_embeddings"),
+        argument_mask=_cat_targets(steps, "argument_mask"),
+        revision_targets=_cat_targets(steps, "revision_targets"),
+        refresh_targets=_cat_targets(steps, "refresh_targets"),
+        anchor_presence_targets=_cat_targets(steps, "anchor_presence_targets"),
+        anchor_presence_mask=_cat_targets(steps, "anchor_presence_mask"),
+        anchor_kind_targets=_cat_targets(steps, "anchor_kind_targets"),
+        anchor_embeddings=_cat_targets(steps, "anchor_embeddings"),
+        anchor_mask=_cat_targets(steps, "anchor_mask"),
+        link_presence_targets=_cat_targets(steps, "link_presence_targets"),
+        link_presence_mask=_cat_targets(steps, "link_presence_mask"),
+        link_relation_targets=_cat_targets(steps, "link_relation_targets"),
+        link_target_kind_targets=_cat_targets(steps, "link_target_kind_targets"),
+        link_target_embeddings=_cat_targets(steps, "link_target_embeddings"),
+        link_mask=_cat_targets(steps, "link_mask"),
+    )
+    return CIDTrainingBatch(
+        example_ids=tuple(step.example_id for step in steps),
+        source_steps=tuple(step.source_step for step in steps),
+        target_steps=tuple(step.target_step for step in steps),
+        batch=batch,
+        targets=targets,
+    )
+
+
 @dataclass(frozen=True, slots=True)
 class CIDTrainerConfig:
     learning_rate: float = 1e-4
     weight_decay: float = 0.01
+    micro_batch_size: int = 1
     gradient_accumulation_steps: int = 1
     max_grad_norm: float = 1.0
     timestep_min: float = 0.05
@@ -47,6 +147,8 @@ class CIDTrainerConfig:
             raise ValueError("learning_rate must be positive")
         if self.weight_decay < 0.0:
             raise ValueError("weight_decay must be non-negative")
+        if self.micro_batch_size <= 0:
+            raise ValueError("micro_batch_size must be positive")
         if self.gradient_accumulation_steps <= 0:
             raise ValueError("gradient_accumulation_steps must be positive")
         if self.max_grad_norm <= 0.0:
@@ -104,6 +206,10 @@ class CIDTrainer:
         self.shuffle_rng = random.Random(self.config.seed)
         self.state = CIDTrainerState()
         self._pending_accumulation = 0
+        self._pending_examples = 0
+        self.pad_token_id = getattr(tensorizer.tokenizer, "pad_token_id", None)
+        if self.pad_token_id is None:
+            raise ValueError("training tokenizer must define pad_token_id")
         self.optimizer.zero_grad(set_to_none=True)
 
     @property
@@ -111,25 +217,41 @@ class CIDTrainer:
         return tuple(name for name, _ in self._trainable)
 
     def train_transition(self, example: TrajectoryExample, source_step: int) -> CIDLoss:
+        return self.train_microbatch(((example, source_step),))
+
+    def train_microbatch(
+        self,
+        transitions: tuple[tuple[TrajectoryExample, int], ...],
+    ) -> CIDLoss:
+        if not transitions:
+            raise ValueError("training micro-batch cannot be empty")
         self.forward_model.train()
-        timestep = self._sample_timestep()
-        sample = self.tensorizer.tensorize(
-            example,
-            source_step,
-            timestep=timestep,
-            generator=self.generator,
-        )
-        output = self.forward_model(sample.batch)
-        losses = cid_loss(output, sample.targets)
-        if not bool(torch.isfinite(losses.total)):
-            raise FloatingPointError(
-                f"non-finite CID loss for {example.example_id} transition {source_step}"
+        samples = tuple(
+            self.tensorizer.tensorize(
+                example,
+                source_step,
+                timestep=self._sample_timestep(),
+                generator=self.generator,
             )
-        scaled = losses.total / self.config.gradient_accumulation_steps
-        scaled.backward()
+            for example, source_step in transitions
+        )
+        training_batch = collate_training_steps(
+            samples,
+            pad_token_id=int(self.pad_token_id),
+        )
+        output = self.forward_model(training_batch.batch)
+        losses = cid_loss(output, training_batch.targets)
+        if not bool(torch.isfinite(losses.total)):
+            names = ", ".join(training_batch.example_ids)
+            raise FloatingPointError(
+                f"non-finite CID loss for training micro-batch: {names}"
+            )
+        batch_size = len(transitions)
+        (losses.total * batch_size).backward()
         self._pending_accumulation += 1
+        self._pending_examples += batch_size
         self.state = CIDTrainerState(
-            transitions_seen=self.state.transitions_seen + 1,
+            transitions_seen=self.state.transitions_seen + batch_size,
             optimizer_steps=self.state.optimizer_steps,
         )
         if self._pending_accumulation >= self.config.gradient_accumulation_steps:
@@ -167,9 +289,10 @@ class CIDTrainer:
             order = list(transitions)
             if shuffle:
                 self.shuffle_rng.shuffle(order)
-            for example, source_step in order:
-                loss = self.train_transition(example, source_step)
-                losses.append(float(loss.total.detach().float()))
+            for start in range(0, len(order), self.config.micro_batch_size):
+                microbatch = tuple(order[start : start + self.config.micro_batch_size])
+                loss = self.train_microbatch(microbatch)
+                losses.extend([float(loss.total.detach().float())] * len(microbatch))
         self.flush()
         return CIDTrainReport(
             transitions=len(losses),
@@ -246,9 +369,15 @@ class CIDTrainer:
             optimizer_steps=int(state["optimizer_steps"]),
         )
         self._pending_accumulation = 0
+        self._pending_examples = 0
         self.optimizer.zero_grad(set_to_none=True)
 
     def _optimizer_step(self) -> None:
+        if self._pending_examples <= 0:
+            raise RuntimeError("optimizer step requires accumulated examples")
+        for _, parameter in self._trainable:
+            if parameter.grad is not None:
+                parameter.grad.div_(self._pending_examples)
         torch.nn.utils.clip_grad_norm_(
             (parameter for _, parameter in self._trainable),
             self.config.max_grad_norm,
@@ -256,6 +385,7 @@ class CIDTrainer:
         self.optimizer.step()
         self.optimizer.zero_grad(set_to_none=True)
         self._pending_accumulation = 0
+        self._pending_examples = 0
         self.state = CIDTrainerState(
             transitions_seen=self.state.transitions_seen,
             optimizer_steps=self.state.optimizer_steps + 1,
@@ -690,6 +820,52 @@ class ILLaDATrajectoryTensorizer:
             if target.step == step:
                 return target.text
         return example.target_display
+
+
+def _cat_targets(steps: tuple[CIDTrainingStep, ...], name: str) -> Tensor:
+    return torch.cat(tuple(getattr(step.targets, name) for step in steps), dim=0)
+
+
+def _pad_2d(
+    tensors: tuple[Tensor, ...],
+    *,
+    pad_value: int | float,
+) -> tuple[Tensor, Tensor]:
+    max_length = max(tensor.shape[1] for tensor in tensors)
+    output = tensors[0].new_full((len(tensors), max_length), pad_value)
+    padding_mask = torch.ones(
+        (len(tensors), max_length),
+        dtype=torch.bool,
+        device=tensors[0].device,
+    )
+    for row, tensor in enumerate(tensors):
+        if tensor.ndim != 2 or tensor.shape[0] != 1:
+            raise ValueError("sequence tensors must have shape [1, length]")
+        length = tensor.shape[1]
+        output[row, :length] = tensor[0]
+        padding_mask[row, :length] = False
+    return output, padding_mask
+
+
+def _pad_3d(tensors: tuple[Tensor, ...]) -> tuple[Tensor, Tensor]:
+    if any(tensor.ndim != 3 or tensor.shape[0] != 1 for tensor in tensors):
+        raise ValueError("feature tensors must have shape [1, length, width]")
+    width = tensors[0].shape[2]
+    if any(tensor.shape[2] != width for tensor in tensors):
+        raise ValueError("feature tensors in one batch must have the same width")
+    max_length = max(tensor.shape[1] for tensor in tensors)
+    output = tensors[0].new_zeros((len(tensors), max_length, width))
+    padding_mask = torch.ones(
+        (len(tensors), max_length),
+        dtype=torch.bool,
+        device=tensors[0].device,
+    )
+    for row, tensor in enumerate(tensors):
+        length = tensor.shape[1]
+        output[row, :length] = tensor[0]
+        padding_mask[row, :length] = False
+    return output, padding_mask
+
 
 def _source_text(descriptor: Mapping[str, Any]) -> str:
     arguments = ",".join(

@@ -21,6 +21,7 @@ ILLaDATrajectoryTensorizer = cid_model.ILLaDATrajectoryTensorizer
 CIDTrainer = cid_model.CIDTrainer
 CIDTrainerConfig = cid_model.CIDTrainerConfig
 CIDTrainerState = cid_model.CIDTrainerState
+collate_training_steps = cid_model.collate_training_steps
 load_cid_adapter_checkpoint = cid_model.load_cid_adapter_checkpoint
 shard_transitions = cid_model.shard_transitions
 trajectory_transitions = cid_model.trajectory_transitions
@@ -218,6 +219,68 @@ def test_trajectory_tensorizer_runs_full_optimizer_step() -> None:
 
     assert not torch.equal(before, adapter.output_heads.allocation_head.weight)
     assert all(parameter.grad is None for parameter in adapter.backbone.parameters())
+
+
+def test_training_collator_pads_variable_sequences_and_external_memory() -> None:
+    adapter = make_adapter()
+    tensorizer = ILLaDATrajectoryTensorizer(adapter, TinyTokenizer())
+    first = tensorizer.tensorize(make_trajectory(), source_step=0, timestep=1.0)
+    second_example = replace(
+        make_trajectory(),
+        example_id="train-2",
+        prompt="Short.",
+        target_display="12345",
+        protected_facts={},
+        source_descriptors=(),
+        binding_targets=(),
+        grounding_targets=(),
+        display_targets=(DisplayTarget(step=1, text="12345"),),
+    )
+    second = tensorizer.tensorize(second_example, source_step=0, timestep=1.0)
+
+    training_batch = collate_training_steps((first, second), pad_token_id=1)
+
+    assert training_batch.batch.thought_semantic.shape[0] == 2
+    assert training_batch.batch.prompt_padding_mask.shape[0] == 2
+    assert training_batch.batch.prompt_padding_mask[1].any()
+    assert training_batch.batch.display_padding_mask[0].any()
+    assert training_batch.batch.fact_memory.shape[:2] == (2, 1)
+    assert not training_batch.batch.fact_padding_mask[0, 0]
+    assert training_batch.batch.fact_padding_mask[1, 0]
+    assert training_batch.batch.source_memory.shape[:2] == (2, 1)
+    assert training_batch.batch.source_padding_mask[1, 0]
+    assert training_batch.targets.display_ids.shape == training_batch.batch.display_ids.shape
+
+    output = adapter(training_batch.batch)
+    losses = cid_loss(output, training_batch.targets)
+    assert output.display_logits.shape[:2] == training_batch.batch.display_ids.shape
+    assert torch.isfinite(losses.total)
+    losses.total.backward()
+
+
+def test_trainer_uses_configured_micro_batches() -> None:
+    adapter = make_adapter(seed=66)
+    trainer = CIDTrainer(
+        adapter,
+        ILLaDATrajectoryTensorizer(adapter, TinyTokenizer()),
+        CIDTrainerConfig(
+            learning_rate=1e-3,
+            micro_batch_size=2,
+            gradient_accumulation_steps=2,
+            timestep_min=1.0,
+            timestep_max=1.0,
+        ),
+    )
+    examples = (
+        make_trajectory(),
+        replace(make_trajectory(), example_id="train-microbatch-2"),
+    )
+
+    report = trainer.train_examples(examples, epochs=2, shuffle=False)
+
+    assert report.transitions == 4
+    assert report.optimizer_steps == 1
+    assert trainer.state.transitions_seen == 4
 
 
 def test_trainer_checkpoint_restores_trainable_state_optimizer_and_progress(tmp_path) -> None:
