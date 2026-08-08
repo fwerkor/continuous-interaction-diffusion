@@ -21,7 +21,7 @@ from cid.model.encoding import ILLaDATextEncoder, stable_text
 from cid.model.illada import ILLADA_MASK_TOKEN_ID, ILLaDACIDAdapter
 from cid.model.losses import CIDLoss, CIDTargets, cid_loss
 from cid.model.materialize import RevisionAction
-from cid.model.tensors import CIDTensorBatch
+from cid.model.tensors import CIDTensorBatch, CIDTensorOutput
 from cid.state import CognitiveRole
 
 
@@ -41,6 +41,32 @@ class CIDTrainingBatch:
     target_steps: tuple[int, ...]
     batch: CIDTensorBatch
     targets: CIDTargets
+
+
+@dataclass(frozen=True, slots=True)
+class CIDRolloutState:
+    """Detached model state that may replace the next teacher-forced T/Y input."""
+
+    thought_semantic: Tensor
+    role_features: Tensor
+    uncertainty: Tensor
+    slot_occupancy: Tensor
+    display_ids: Tensor
+
+
+@dataclass(frozen=True, slots=True)
+class CIDRolloutWindow:
+    example: TrajectoryExample
+    source_steps: tuple[int, ...]
+
+    def __post_init__(self) -> None:
+        if not self.source_steps:
+            raise ValueError("rollout window requires at least one transition")
+        if any(
+            right != left + 1
+            for left, right in zip(self.source_steps, self.source_steps[1:], strict=False)
+        ):
+            raise ValueError("rollout window source steps must be contiguous")
 
 
 def collate_training_steps(
@@ -143,6 +169,13 @@ class CIDTrainerConfig:
     max_grad_norm: float = 1.0
     timestep_min: float = 0.05
     timestep_max: float = 1.0
+    rollout_horizon: int = 3
+    teacher_forcing_epochs: int = 1
+    rollout_ramp_epochs: int = 2
+    rollout_allocation_threshold: float = 0.5
+    rollout_display_reveal_fraction: float = 1.0
+    rollout_display_revision_fraction: float = 0.25
+    rollout_display_revision_margin: float = 0.05
     seed: int = 0
 
     def __post_init__(self) -> None:
@@ -158,6 +191,19 @@ class CIDTrainerConfig:
             raise ValueError("max_grad_norm must be positive")
         if not 0.0 <= self.timestep_min <= self.timestep_max <= 1.0:
             raise ValueError("timestep range must satisfy 0 <= min <= max <= 1")
+        if self.rollout_horizon <= 0:
+            raise ValueError("rollout_horizon must be positive")
+        if self.teacher_forcing_epochs < 0 or self.rollout_ramp_epochs < 0:
+            raise ValueError("rollout curriculum epoch counts must be non-negative")
+        for name in (
+            "rollout_allocation_threshold",
+            "rollout_display_reveal_fraction",
+            "rollout_display_revision_fraction",
+        ):
+            if not 0.0 <= getattr(self, name) <= 1.0:
+                raise ValueError(f"{name} must be in [0, 1]")
+        if self.rollout_display_revision_margin < 0.0:
+            raise ValueError("rollout_display_revision_margin must be non-negative")
 
 
 @dataclass(frozen=True, slots=True)
@@ -241,6 +287,64 @@ class CIDTrainer:
             )
             for example, source_step in transitions
         )
+        losses, _, _ = self._forward_backward(samples)
+        return losses
+
+    def train_rollout_microbatch(
+        self,
+        windows: tuple[CIDRolloutWindow, ...],
+        *,
+        rollout_probability: float,
+    ) -> tuple[float, int]:
+        if not windows:
+            raise ValueError("rollout micro-batch cannot be empty")
+        if not 0.0 <= rollout_probability <= 1.0:
+            raise ValueError("rollout_probability must be in [0, 1]")
+        lengths = {len(window.source_steps) for window in windows}
+        if len(lengths) != 1:
+            raise ValueError("rollout micro-batch windows must have the same length")
+
+        rollout_states: list[CIDRolloutState | None] = [None] * len(windows)
+        loss_sum = 0.0
+        transition_count = 0
+        for offset in range(next(iter(lengths))):
+            samples: list[CIDTrainingStep] = []
+            for index, window in enumerate(windows):
+                use_rollout = (
+                    offset > 0
+                    and rollout_states[index] is not None
+                    and self.shuffle_rng.random() < rollout_probability
+                )
+                samples.append(
+                    self.tensorizer.tensorize(
+                        window.example,
+                        window.source_steps[offset],
+                        timestep=self._sample_timestep(),
+                        generator=self.generator,
+                        rollout_state=rollout_states[index] if use_rollout else None,
+                    )
+                )
+            losses, output, training_batch = self._forward_backward(tuple(samples))
+            batch_size = len(samples)
+            loss_sum += float(losses.total.detach().float()) * batch_size
+            transition_count += batch_size
+            rollout_states = [
+                self._rollout_state_from_prediction(
+                    sample,
+                    training_batch,
+                    output,
+                    batch_index=index,
+                )
+                for index, sample in enumerate(samples)
+            ]
+        return loss_sum, transition_count
+
+    def _forward_backward(
+        self,
+        samples: tuple[CIDTrainingStep, ...],
+    ) -> tuple[CIDLoss, CIDTensorOutput, CIDTrainingBatch]:
+        if not samples:
+            raise ValueError("training samples cannot be empty")
         training_batch = collate_training_steps(
             samples,
             pad_token_id=int(self.pad_token_id),
@@ -252,7 +356,7 @@ class CIDTrainer:
             raise FloatingPointError(
                 f"non-finite CID loss for training micro-batch: {names}"
             )
-        batch_size = len(transitions)
+        batch_size = len(samples)
         (losses.total * batch_size).backward()
         self._pending_accumulation += 1
         self._pending_examples += batch_size
@@ -263,7 +367,41 @@ class CIDTrainer:
         )
         if self._pending_accumulation >= self.config.gradient_accumulation_steps:
             self._optimizer_step()
-        return losses
+        return losses, output, training_batch
+
+    def _rollout_state_from_prediction(
+        self,
+        sample: CIDTrainingStep,
+        training_batch: CIDTrainingBatch,
+        output: CIDTensorOutput,
+        *,
+        batch_index: int,
+    ) -> CIDRolloutState:
+        input_batch = training_batch.batch
+        occupancy = input_batch.slot_occupancy[batch_index : batch_index + 1].detach().bool()
+        allocation = (
+            torch.sigmoid(output.allocation_logits[batch_index : batch_index + 1])
+            >= self.config.rollout_allocation_threshold
+        ).unsqueeze(-1)
+        occupancy = occupancy | (~occupancy & allocation)
+
+        display_length = sample.batch.display_ids.shape[1]
+        display_ids = self.tensorizer.scheduler.refine_display(
+            input_batch.display_ids[batch_index : batch_index + 1, :display_length],
+            output.display_logits[batch_index : batch_index + 1, :display_length],
+            reveal_fraction=self.config.rollout_display_reveal_fraction,
+            revision_fraction=self.config.rollout_display_revision_fraction,
+            revision_margin=self.config.rollout_display_revision_margin,
+        )
+        return CIDRolloutState(
+            thought_semantic=output.thought_semantic[batch_index : batch_index + 1].detach(),
+            role_features=torch.sigmoid(
+                output.role_logits[batch_index : batch_index + 1]
+            ).detach(),
+            uncertainty=output.uncertainty[batch_index : batch_index + 1].detach(),
+            slot_occupancy=occupancy.to(dtype=sample.batch.slot_occupancy.dtype).detach(),
+            display_ids=display_ids.detach(),
+        )
 
     def train_examples(
         self,
@@ -278,6 +416,60 @@ class CIDTrainer:
         if not transitions:
             raise ValueError("training data contains no adjacent thought transitions")
         return self.train_transitions(transitions, epochs=epochs, shuffle=shuffle)
+
+    def train_rollout_windows(
+        self,
+        windows: tuple[CIDRolloutWindow, ...],
+        *,
+        epochs: int = 1,
+        shuffle: bool = True,
+    ) -> CIDTrainReport:
+        if epochs <= 0:
+            raise ValueError("epochs must be positive")
+        if not windows:
+            raise ValueError("training data contains no rollout windows")
+        total_loss = 0.0
+        total_transitions = 0
+        start_optimizer_steps = self.state.optimizer_steps
+        for _ in range(epochs):
+            rollout_probability = self.rollout_probability()
+            buckets: dict[int, list[CIDRolloutWindow]] = {}
+            for window in windows:
+                buckets.setdefault(len(window.source_steps), []).append(window)
+            for length in sorted(buckets):
+                bucket = buckets[length]
+                if shuffle:
+                    self.shuffle_rng.shuffle(bucket)
+                for start in range(0, len(bucket), self.config.micro_batch_size):
+                    microbatch = tuple(bucket[start : start + self.config.micro_batch_size])
+                    loss_sum, transitions = self.train_rollout_microbatch(
+                        microbatch,
+                        rollout_probability=rollout_probability,
+                    )
+                    total_loss += loss_sum
+                    total_transitions += transitions
+            self.state = CIDTrainerState(
+                transitions_seen=self.state.transitions_seen,
+                optimizer_steps=self.state.optimizer_steps,
+                epochs_completed=self.state.epochs_completed + 1,
+            )
+        self.flush()
+        return CIDTrainReport(
+            transitions=total_transitions,
+            optimizer_steps=self.state.optimizer_steps - start_optimizer_steps,
+            mean_loss=total_loss / total_transitions,
+        )
+
+    def rollout_probability(self) -> float:
+        if self.config.rollout_horizon <= 1:
+            return 0.0
+        completed = self.state.epochs_completed
+        if completed < self.config.teacher_forcing_epochs:
+            return 0.0
+        if self.config.rollout_ramp_epochs == 0:
+            return 1.0
+        ramp_step = completed - self.config.teacher_forcing_epochs + 1
+        return min(1.0, ramp_step / self.config.rollout_ramp_epochs)
 
     def train_transitions(
         self,
@@ -506,6 +698,7 @@ class ILLaDATrajectoryTensorizer:
         *,
         timestep: float = 0.5,
         generator: torch.Generator | None = None,
+        rollout_state: CIDRolloutState | None = None,
     ) -> CIDTrainingStep:
         if not 0.0 <= timestep <= 1.0:
             raise ValueError("timestep must be in [0, 1]")
@@ -520,7 +713,6 @@ class ILLaDATrajectoryTensorizer:
         capacity = self.adapter.config.max_thought_slots
         current_by_id = {cell.cell_id: cell for cell in current}
         target_by_id = {cell.cell_id: cell for cell in target}
-        current_by_slot = {cell.slot: cell for cell in current}
         target_output_slots = self._target_output_slots(current, target, capacity)
 
         current_vectors = self._semantic_vectors(current)
@@ -535,12 +727,21 @@ class ILLaDATrajectoryTensorizer:
         occupancy = torch.zeros((1, capacity, 1), device=device, dtype=dtype)
         role_order = tuple(CognitiveRole)
 
-        for cell in current:
-            thought_semantic[0, cell.slot] = current_vectors[cell.cell_id]
-            occupancy[0, cell.slot, 0] = 1.0
-            uncertainty[0, cell.slot, 0] = cell.uncertainty
-            for role_index, role in enumerate(role_order):
-                role_features[0, cell.slot, role_index] = cell.roles.get(role, 0.0)
+        if rollout_state is None:
+            for cell in current:
+                thought_semantic[0, cell.slot] = current_vectors[cell.cell_id]
+                occupancy[0, cell.slot, 0] = 1.0
+                uncertainty[0, cell.slot, 0] = cell.uncertainty
+                for role_index, role in enumerate(role_order):
+                    role_features[0, cell.slot, role_index] = cell.roles.get(role, 0.0)
+        else:
+            self._validate_rollout_state(rollout_state)
+            thought_semantic.copy_(
+                rollout_state.thought_semantic.to(device=device, dtype=dtype)
+            )
+            role_features.copy_(rollout_state.role_features.to(device=device, dtype=dtype))
+            uncertainty.copy_(rollout_state.uncertainty.to(device=device, dtype=dtype))
+            occupancy.copy_(rollout_state.slot_occupancy.to(device=device, dtype=dtype))
 
         timestep_tensor = torch.tensor([timestep], device=device)
         thought_corruption = self.scheduler.corrupt_thought(
@@ -554,13 +755,28 @@ class ILLaDATrajectoryTensorizer:
         target_display_ids = self.text_encoder.tokenize(
             target_display, add_special_tokens=False
         )
-        display_corruption = self.scheduler.corrupt_display(
-            target_display_ids,
-            timestep_tensor,
-            vocab_size=self.adapter.vocab_size,
-            replacement_fraction=self.display_replacement_fraction,
-            generator=generator,
-        )
+        if rollout_state is None:
+            display_corruption = self.scheduler.corrupt_display(
+                target_display_ids,
+                timestep_tensor,
+                vocab_size=self.adapter.vocab_size,
+                replacement_fraction=self.display_replacement_fraction,
+                generator=generator,
+            )
+            display_input_ids = display_corruption.token_ids
+            display_labels = display_corruption.labels
+            display_noise = display_corruption.noise
+        else:
+            display_input_ids = self._resize_rollout_display(
+                rollout_state.display_ids,
+                target_display_ids.shape[1],
+                device=device,
+            )
+            display_labels = target_display_ids.clone()
+            display_labels[display_input_ids == target_display_ids] = -100
+            display_noise = (
+                display_input_ids == ILLADA_MASK_TOKEN_ID
+            ).to(dtype=dtype).unsqueeze(-1)
 
         prompt_ids = self.text_encoder.tokenize(example.prompt, add_special_tokens=True)
         fact_memory = self.text_encoder.encode_texts(
@@ -593,8 +809,8 @@ class ILLaDATrajectoryTensorizer:
             local_noise=thought_corruption.noise,
             slot_occupancy=occupancy,
             prompt_ids=prompt_ids,
-            display_ids=display_corruption.token_ids,
-            display_noise=display_corruption.noise,
+            display_ids=display_input_ids,
+            display_noise=display_noise,
             fact_memory=fact_memory,
             percept_memory=percept_memory,
             source_memory=source_memory,
@@ -604,11 +820,11 @@ class ILLaDATrajectoryTensorizer:
             source_step=source_step,
             target_step=target_step,
             current_by_id=current_by_id,
-            current_by_slot=current_by_slot,
             target_by_id=target_by_id,
             target_output_slots=target_output_slots,
             target_vectors=target_vectors,
-            display_labels=display_corruption.labels,
+            display_labels=display_labels,
+            input_occupancy=occupancy,
             dtype=dtype,
             device=device,
         )
@@ -620,6 +836,46 @@ class ILLaDATrajectoryTensorizer:
             targets=targets,
         )
 
+    def _validate_rollout_state(self, state: CIDRolloutState) -> None:
+        expected_thought = (1, self.adapter.config.max_thought_slots, self.adapter.d_model)
+        if tuple(state.thought_semantic.shape) != expected_thought:
+            raise ValueError("rollout thought semantic shape does not match adapter geometry")
+        expected_roles = (
+            1,
+            self.adapter.config.max_thought_slots,
+            self.adapter.config.num_roles,
+        )
+        if tuple(state.role_features.shape) != expected_roles:
+            raise ValueError("rollout role feature shape does not match adapter geometry")
+        expected_scalar = (1, self.adapter.config.max_thought_slots, 1)
+        if tuple(state.uncertainty.shape) != expected_scalar:
+            raise ValueError("rollout uncertainty shape does not match adapter geometry")
+        if tuple(state.slot_occupancy.shape) != expected_scalar:
+            raise ValueError("rollout occupancy shape does not match adapter geometry")
+        if state.display_ids.ndim != 2 or state.display_ids.shape[0] != 1:
+            raise ValueError("rollout display IDs must have shape [1, tokens]")
+
+    @staticmethod
+    def _resize_rollout_display(
+        display_ids: Tensor,
+        target_length: int,
+        *,
+        device: torch.device,
+    ) -> Tensor:
+        result = torch.full(
+            (1, target_length),
+            ILLADA_MASK_TOKEN_ID,
+            dtype=torch.long,
+            device=device,
+        )
+        copy_length = min(target_length, display_ids.shape[1])
+        if copy_length:
+            result[:, :copy_length] = display_ids[:, :copy_length].to(
+                device=device,
+                dtype=torch.long,
+            )
+        return result
+
     def _targets(
         self,
         *,
@@ -627,11 +883,11 @@ class ILLaDATrajectoryTensorizer:
         source_step: int,
         target_step: int,
         current_by_id: Mapping[str, ThoughtTarget],
-        current_by_slot: Mapping[int, ThoughtTarget],
         target_by_id: Mapping[str, ThoughtTarget],
         target_output_slots: Mapping[str, int],
         target_vectors: Mapping[str, Tensor],
         display_labels: Tensor,
+        input_occupancy: Tensor,
         dtype: torch.dtype,
         device: torch.device,
     ) -> CIDTargets:
@@ -654,9 +910,7 @@ class ILLaDATrajectoryTensorizer:
             dtype=dtype,
         )
         allocation_targets = torch.zeros((1, n), device=device, dtype=dtype)
-        allocation_mask = torch.tensor(
-            [[slot not in current_by_slot for slot in range(n)]], device=device, dtype=torch.bool
-        )
+        allocation_mask = ~input_occupancy.squeeze(-1).bool()
         role_targets = torch.zeros((1, n, c.num_roles), device=device, dtype=dtype)
         uncertainty = torch.ones((1, n, 1), device=device, dtype=dtype)
         noise_delta = torch.zeros((1, n, 1), device=device, dtype=dtype)
@@ -960,6 +1214,42 @@ def trajectory_transitions(
     return tuple(transitions)
 
 
+def trajectory_rollout_windows(
+    examples: tuple[TrajectoryExample, ...],
+    *,
+    max_horizon: int,
+) -> tuple[CIDRolloutWindow, ...]:
+    if max_horizon <= 0:
+        raise ValueError("max_horizon must be positive")
+    windows: list[CIDRolloutWindow] = []
+    for example in examples:
+        source_steps = tuple(
+            step
+            for step in sorted({target.step for target in example.thought_targets})
+            if any(target.step == step + 1 for target in example.thought_targets)
+        )
+        if not source_steps:
+            continue
+        run: list[int] = [source_steps[0]]
+        runs: list[tuple[int, ...]] = []
+        for step in source_steps[1:]:
+            if step == run[-1] + 1:
+                run.append(step)
+            else:
+                runs.append(tuple(run))
+                run = [step]
+        runs.append(tuple(run))
+        for contiguous in runs:
+            for start in range(0, len(contiguous), max_horizon):
+                windows.append(
+                    CIDRolloutWindow(
+                        example=example,
+                        source_steps=contiguous[start : start + max_horizon],
+                    )
+                )
+    return tuple(windows)
+
+
 def shard_transitions(
     transitions: tuple[tuple[TrajectoryExample, int], ...],
     *,
@@ -982,6 +1272,34 @@ def shard_transitions(
     if padding:
         order.extend(order[:padding])
     return tuple(order[rank::world_size])
+
+
+def shard_rollout_windows(
+    windows: tuple[CIDRolloutWindow, ...],
+    *,
+    world_size: int,
+    rank: int,
+    seed: int,
+    epoch: int,
+    shuffle: bool = True,
+) -> tuple[CIDRolloutWindow, ...]:
+    if world_size <= 0:
+        raise ValueError("world_size must be positive")
+    if not 0 <= rank < world_size:
+        raise ValueError("rank must be in [0, world_size)")
+    if not windows:
+        return ()
+    local: list[CIDRolloutWindow] = []
+    lengths = sorted({len(window.source_steps) for window in windows})
+    for length in lengths:
+        bucket = [window for window in windows if len(window.source_steps) == length]
+        if shuffle:
+            random.Random(seed + epoch * 1009 + length).shuffle(bucket)
+        padding = (-len(bucket)) % world_size
+        if padding:
+            bucket.extend(bucket[:padding])
+        local.extend(bucket[rank::world_size])
+    return tuple(local)
 
 
 def wrap_stage_a_ddp(
@@ -1152,4 +1470,49 @@ def load_stage_b_checkpoint(
         weights_only=False,
     )
     trainer.restore_local_progress_state(local_state)
+    dist.barrier()
+
+
+def load_stage_b_model_checkpoint(
+    model: torch.nn.Module,
+    adapter: ILLaDACIDAdapter,
+    path: str | Path,
+) -> None:
+    """Load only Stage B model shards for distributed inference/evaluation."""
+
+    import torch.distributed as dist
+    import torch.distributed.checkpoint as dcp
+    from torch.distributed.checkpoint.state_dict import (
+        StateDictOptions,
+        get_model_state_dict,
+        set_model_state_dict,
+    )
+
+    if not dist.is_initialized():
+        raise RuntimeError("Stage B model loading requires an initialized process group")
+    source = Path(path)
+    metadata = json.loads((source / "metadata.json").read_text(encoding="utf-8"))
+    if metadata.get("format_version") != 1 or metadata.get("kind") != "cid-stage-b-fsdp":
+        raise ValueError("unsupported Stage B checkpoint format")
+    if int(metadata["world_size"]) != dist.get_world_size():
+        raise ValueError("Stage B evaluation requires the checkpoint's original world size")
+    if metadata["adapter_config"] != asdict(adapter.config):
+        raise ValueError("Stage B checkpoint adapter configuration does not match")
+    backbone = metadata["backbone"]
+    if (
+        int(backbone["hidden_size"]) != adapter.d_model
+        or int(backbone["vocab_size"]) != adapter.vocab_size
+        or str(backbone["model_type"]) != str(adapter.backbone.config.model_type)
+    ):
+        raise ValueError("Stage B checkpoint backbone geometry does not match")
+
+    options = StateDictOptions(full_state_dict=False, cpu_offload=True)
+    model_state = get_model_state_dict(model, options=options)
+    distributed_state = {"model": model_state}
+    dcp.load(distributed_state, checkpoint_id=source / "distributed")
+    set_model_state_dict(
+        model,
+        distributed_state["model"],
+        options=options,
+    )
     dist.barrier()

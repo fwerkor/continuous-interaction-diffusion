@@ -236,8 +236,16 @@ torchrun --standalone --nproc-per-node=6 -m cid.cli train \
 
 Each rank loads the pinned 8B backbone serially before moving it to its GPU, avoiding six concurrent
 CPU copies during startup. DDP synchronizes only trainable CID state; frozen backbone parameters and
-buffers are excluded from initialization sync. Transition lists are shuffled deterministically,
-padded to equal rank lengths, and sharded before training.
+buffers are excluded from initialization sync. Consecutive trajectory transitions are grouped into
+rollout windows, bucketed by window length, padded to equal rank counts, and sharded before training.
+
+Training uses scheduled sampling instead of remaining permanently teacher-forced. By default the
+first epoch uses teacher T/Y inputs, the next two epochs linearly ramp the probability of feeding the
+model's own detached prediction into the following transition, and later epochs use self-rollout.
+The default rollout horizon is three transitions. Configure this with
+`--rollout-horizon`, `--teacher-forcing-epochs`, and `--rollout-ramp-epochs`. Teacher trajectories
+continue to provide the next-step supervision and event schedule; predicted T/Y replaces only the
+input state, preventing incorrect rollouts from becoming self-generated labels.
 
 The trainer pads variable-length prompt/display/external-memory sequences inside each micro-batch.
 Gradient checkpointing is enabled by default for the native iLLaDA stack and can be disabled with
@@ -295,6 +303,42 @@ Resume currently requires the same world size and the exact same training JSONL 
 epoch numbering and per-rank RNG state continue from the checkpoint. The launcher serializes the
 initial full-model load across ranks to limit host-RAM pressure; the final A6000 memory envelope must
 still be measured on the real cards before increasing micro-batch size.
+
+### Neural replay benchmark
+
+`cid benchmark` runs a trained CID checkpoint through the same step-exact replay sources used by the
+runtime evaluator and writes both per-case JSONL and an aggregate JSON summary. The default starts
+from an empty TCT; `--seed-teacher-state` is available only as a diagnostic that isolates downstream
+interaction behavior from initial cognitive allocation.
+
+For a Stage A CID-only checkpoint:
+
+```bash
+cid benchmark \
+  --data data/validation.jsonl \
+  --checkpoint runs/stage-a/stage-a-step-00001000.pt \
+  --checkpoint-kind stage-a \
+  --output runs/eval/cases.jsonl \
+  --summary-output runs/eval/summary.json \
+  --dtype bf16
+```
+
+Stage B checkpoints remain sharded, so evaluation uses the original FSDP world size instead of
+gathering the 8B model onto one rank:
+
+```bash
+torchrun --standalone --nproc-per-node=6 -m cid.cli benchmark \
+  --data data/validation.jsonl \
+  --checkpoint runs/stage-b-6gpu/stage-b-step-00002000 \
+  --checkpoint-kind stage-b \
+  --output runs/eval-stage-b/cases.jsonl \
+  --summary-output runs/eval-stage-b/summary.json \
+  --dtype bf16
+```
+
+The summary reports convergence, exact display accuracy, observation coverage/staleness,
+latent-to-executable delay, binding-to-observation delay, and observation-to-projection lag. Stage B
+benchmark loading restores model shards only; it does not construct or load optimizer state.
 
 ## Quick demo
 

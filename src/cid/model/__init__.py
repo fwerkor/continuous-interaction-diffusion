@@ -29,6 +29,8 @@ from cid.model.policy import (
 from cid.model.tensors import CIDTensorBatch, CIDTensorOutput
 from cid.model.torch_core import TorchCIDConfig, TorchCIDCore
 from cid.model.training import (
+    CIDRolloutState,
+    CIDRolloutWindow,
     CIDTrainer,
     CIDTrainerConfig,
     CIDTrainerState,
@@ -39,8 +41,11 @@ from cid.model.training import (
     collate_training_steps,
     load_cid_adapter_checkpoint,
     load_stage_b_checkpoint,
+    load_stage_b_model_checkpoint,
     save_stage_b_checkpoint,
+    shard_rollout_windows,
     shard_transitions,
+    trajectory_rollout_windows,
     trajectory_transitions,
     wrap_stage_a_ddp,
     wrap_stage_b_fsdp,
@@ -49,6 +54,8 @@ from cid.model.training import (
 __all__ = [
     "CIDLoss",
     "CIDLossWeights",
+    "CIDRolloutState",
+    "CIDRolloutWindow",
     "CIDDiffusionScheduler",
     "CIDMaterializer",
     "CIDMaterializerConfig",
@@ -75,8 +82,11 @@ __all__ = [
     "collate_training_steps",
     "load_cid_adapter_checkpoint",
     "load_stage_b_checkpoint",
+    "load_stage_b_model_checkpoint",
     "save_stage_b_checkpoint",
+    "shard_rollout_windows",
     "shard_transitions",
+    "trajectory_rollout_windows",
     "trajectory_transitions",
     "wrap_stage_a_ddp",
     "wrap_stage_b_fsdp",

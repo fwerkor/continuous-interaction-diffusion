@@ -20,10 +20,18 @@ from cid.state import CognitiveRole, FactItem
 
 
 class ILLaDAContextTensorizer:
-    def __init__(self, adapter: ILLaDACIDAdapter, tokenizer: Any) -> None:
+    def __init__(
+        self,
+        adapter: ILLaDACIDAdapter,
+        tokenizer: Any,
+        *,
+        text_encoder: ILLaDATextEncoder | None = None,
+    ) -> None:
         self.adapter = adapter
         self.tokenizer = tokenizer
-        self.text_encoder = ILLaDATextEncoder(adapter, tokenizer)
+        self.text_encoder = text_encoder or ILLaDATextEncoder(adapter, tokenizer)
+        if self.text_encoder.d_model != adapter.d_model:
+            raise ValueError("runtime text encoder width must match the iLLaDA adapter")
 
     @classmethod
     def from_pretrained(
@@ -41,9 +49,8 @@ class ILLaDAContextTensorizer:
         return cls(adapter, tokenizer)
 
     def __call__(self, context: ModelContext) -> CIDTensorBatch:
-        weight = self.adapter.input_embeddings.weight
-        device = weight.device
-        dtype = weight.dtype
+        device = self.text_encoder.device
+        dtype = self.text_encoder.dtype
         thought = context.thought
         if thought.width != self.adapter.d_model:
             raise ValueError("runtime TCT width does not match iLLaDA hidden size")
@@ -185,6 +192,7 @@ class ILLaDANeuralPolicy:
         catalog: ClosedWorldMaterializationCatalog | None = None,
         scheduler: CIDDiffusionScheduler | None = None,
         config: ILLaDANeuralPolicyConfig | None = None,
+        forward_model: torch.nn.Module | None = None,
     ) -> None:
         if tensorizer.adapter is not adapter:
             raise ValueError("tensorizer and neural policy must share the same adapter")
@@ -194,11 +202,12 @@ class ILLaDANeuralPolicy:
         self.catalog = catalog or ClosedWorldMaterializationCatalog()
         self.scheduler = scheduler or CIDDiffusionScheduler(ILLADA_MASK_TOKEN_ID)
         self.config = config or ILLaDANeuralPolicyConfig()
+        self.forward_model = forward_model or adapter
 
     def step(self, context: ModelContext) -> ModelUpdate:
         batch = self.tensorizer(context)
         with torch.no_grad():
-            output = self.adapter(batch)
+            output = self.forward_model(batch)
             display_ids = self.scheduler.refine_display(
                 batch.display_ids,
                 output.display_logits,

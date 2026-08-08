@@ -26,11 +26,15 @@ ILLaDATrajectoryTensorizer = cid_model.ILLaDATrajectoryTensorizer
 CIDTrainer = cid_model.CIDTrainer
 CIDTrainerConfig = cid_model.CIDTrainerConfig
 CIDTrainerState = cid_model.CIDTrainerState
+CIDRolloutState = cid_model.CIDRolloutState
 collate_training_steps = cid_model.collate_training_steps
 load_cid_adapter_checkpoint = cid_model.load_cid_adapter_checkpoint
 load_stage_b_checkpoint = cid_model.load_stage_b_checkpoint
+load_stage_b_model_checkpoint = cid_model.load_stage_b_model_checkpoint
 save_stage_b_checkpoint = cid_model.save_stage_b_checkpoint
+shard_rollout_windows = cid_model.shard_rollout_windows
 shard_transitions = cid_model.shard_transitions
+trajectory_rollout_windows = cid_model.trajectory_rollout_windows
 trajectory_transitions = cid_model.trajectory_transitions
 wrap_stage_a_ddp = cid_model.wrap_stage_a_ddp
 wrap_stage_b_fsdp = cid_model.wrap_stage_b_fsdp
@@ -607,6 +611,19 @@ def test_stage_b_fsdp_runs_full_parameter_optimizer_step_on_cpu(tmp_path) -> Non
             saved_weight,
             restored_adapter.backbone.get_decoder().layers[0].projection.weight,
         )
+
+        inference_adapter = make_adapter(seed=91)
+        inference_adapter.set_backbone_trainable(True)
+        inference_fsdp = wrap_stage_b_fsdp(
+            inference_adapter,
+            device_id=torch.device("cpu"),
+            compute_dtype=torch.bfloat16,
+        )
+        load_stage_b_model_checkpoint(inference_fsdp, inference_adapter, checkpoint)
+        assert torch.equal(
+            saved_weight,
+            inference_adapter.backbone.get_decoder().layers[0].projection.weight,
+        )
         assert (checkpoint / "metadata.json").is_file()
         assert (checkpoint / "rank-0000.pt").is_file()
     finally:
@@ -640,3 +657,125 @@ def test_stage_b_fsdp_full_shard_two_rank_smoke(tmp_path) -> None:
 
     assert completed.returncode == 0, completed.stdout + completed.stderr
     assert (checkpoint / ".metadata").is_file()
+
+
+def make_rollout_trajectory() -> TrajectoryExample:
+    base = make_trajectory()
+    step_two = tuple(
+        replace(
+            target,
+            step=2,
+            semantic_text=f"{target.semantic_text} Revised with another interaction step.",
+            lifecycle=CellLifecycle.STABLE,
+            uncertainty=max(0.0, target.uncertainty - 0.1),
+            noise=max(0.0, target.noise - 0.1),
+        )
+        for target in base.thought_targets
+        if target.step == 1
+    )
+    return replace(
+        base,
+        example_id="rollout-1",
+        thought_targets=(*base.thought_targets, *step_two),
+        display_targets=(*base.display_targets, DisplayTarget(step=2, text="38")),
+        target_display="38",
+    )
+
+
+def test_rollout_state_replaces_teacher_input_t_and_y() -> None:
+    adapter = make_adapter(seed=101)
+    tensorizer = ILLaDATrajectoryTensorizer(adapter, TinyTokenizer())
+    example = make_rollout_trajectory()
+    slots = adapter.config.max_thought_slots
+    rollout = CIDRolloutState(
+        thought_semantic=torch.full((1, slots, adapter.d_model), 0.25),
+        role_features=torch.full((1, slots, adapter.config.num_roles), 0.75),
+        uncertainty=torch.full((1, slots, 1), 0.2),
+        slot_occupancy=torch.ones((1, slots, 1)),
+        display_ids=torch.tensor([[17]]),
+    )
+
+    sample = tensorizer.tensorize(
+        example,
+        source_step=1,
+        timestep=0.0,
+        rollout_state=rollout,
+    )
+
+    assert torch.allclose(sample.batch.thought_semantic, rollout.thought_semantic)
+    assert torch.allclose(sample.batch.role_features, rollout.role_features)
+    assert torch.allclose(sample.batch.uncertainty, rollout.uncertainty)
+    assert torch.equal(sample.batch.slot_occupancy, rollout.slot_occupancy)
+    assert sample.batch.display_ids[0, 0] == 17
+    assert sample.targets.display_ids[0, 0] != -100
+
+
+def test_self_rollout_feeds_previous_prediction_into_next_transition() -> None:
+    class RecordingTensorizer(ILLaDATrajectoryTensorizer):
+        def __init__(self, adapter, tokenizer) -> None:
+            super().__init__(adapter, tokenizer)
+            self.rollout_flags: list[bool] = []
+
+        def tensorize(self, *args, rollout_state=None, **kwargs):
+            self.rollout_flags.append(rollout_state is not None)
+            return super().tensorize(*args, rollout_state=rollout_state, **kwargs)
+
+    adapter = make_adapter(seed=102)
+    tensorizer = RecordingTensorizer(adapter, TinyTokenizer())
+    trainer = CIDTrainer(
+        adapter,
+        tensorizer,
+        CIDTrainerConfig(
+            learning_rate=1e-3,
+            rollout_horizon=2,
+            teacher_forcing_epochs=0,
+            rollout_ramp_epochs=0,
+            timestep_min=0.0,
+            timestep_max=0.0,
+        ),
+    )
+    windows = trajectory_rollout_windows(
+        (make_rollout_trajectory(),),
+        max_horizon=2,
+    )
+
+    report = trainer.train_rollout_windows(windows, epochs=1, shuffle=False)
+
+    assert report.transitions == 2
+    assert tensorizer.rollout_flags == [False, True]
+    assert trainer.state.epochs_completed == 1
+
+
+def test_rollout_curriculum_and_window_sharding_are_deterministic() -> None:
+    adapter = make_adapter(seed=103)
+    trainer = CIDTrainer(
+        adapter,
+        ILLaDATrajectoryTensorizer(adapter, TinyTokenizer()),
+        CIDTrainerConfig(
+            rollout_horizon=3,
+            teacher_forcing_epochs=1,
+            rollout_ramp_epochs=2,
+        ),
+    )
+    assert trainer.rollout_probability() == 0.0
+    trainer.state = CIDTrainerState(epochs_completed=1)
+    assert trainer.rollout_probability() == 0.5
+    trainer.state = CIDTrainerState(epochs_completed=2)
+    assert trainer.rollout_probability() == 1.0
+
+    examples = tuple(
+        replace(make_rollout_trajectory(), example_id=f"rollout-{index}")
+        for index in range(5)
+    )
+    windows = trajectory_rollout_windows(examples, max_horizon=3)
+    shards = tuple(
+        shard_rollout_windows(
+            windows,
+            world_size=3,
+            rank=rank,
+            seed=7,
+            epoch=2,
+        )
+        for rank in range(3)
+    )
+    assert {tuple(len(window.source_steps) for window in shard) for shard in shards} == {(2, 2)}

@@ -2,8 +2,10 @@ from __future__ import annotations
 
 import argparse
 import asyncio
+import json
 import os
 import time
+from dataclasses import asdict
 from pathlib import Path
 
 from cid.contracts import FreshnessDemand, InformationNeed, ModelContext, ModelUpdate
@@ -21,6 +23,7 @@ from cid.distill import (
     review_teacher_plans,
     teacher_tasks_from_trajectories,
 )
+from cid.evaluation import summarize_evaluations
 from cid.grounding import ObjectRef
 from cid.metrics import summarize_runtime
 from cid.runtime import CIDRuntime, RuntimeConfig, SourceRegistry, StaticMappingSource
@@ -167,6 +170,163 @@ def _dataset_manifest(args: argparse.Namespace) -> None:
     )
 
 
+def _benchmark(args: argparse.Namespace) -> None:
+    import torch
+    import torch.distributed as dist
+    from transformers import AutoTokenizer
+
+    from cid.model import (
+        ILLADA_8B_BASE,
+        ILLADA_8B_BASE_REVISION,
+        ILLaDACIDAdapter,
+        ILLaDACIDConfig,
+        load_cid_adapter_checkpoint,
+        load_stage_b_model_checkpoint,
+        wrap_stage_b_fsdp,
+    )
+    from cid.model.benchmark import run_neural_benchmark_case
+    from cid.model.encoding import ILLaDATextEncoder
+
+    checkpoint = Path(args.checkpoint)
+    stage_b = args.checkpoint_kind == "stage-b"
+    world_size = int(os.environ.get("WORLD_SIZE", "1"))
+    rank = int(os.environ.get("RANK", "0"))
+    local_rank = int(os.environ.get("LOCAL_RANK", "0"))
+    distributed = stage_b
+    if stage_b:
+        if world_size < 2:
+            raise RuntimeError("Stage B benchmark must run under multi-GPU torchrun")
+        if not torch.cuda.is_available():
+            raise RuntimeError("Stage B benchmark requires CUDA GPUs")
+        torch.cuda.set_device(local_rank)
+        dist.init_process_group(backend="nccl")
+        rank = dist.get_rank()
+        world_size = dist.get_world_size()
+        device = torch.device("cuda", local_rank)
+        metadata = json.loads((checkpoint / "metadata.json").read_text(encoding="utf-8"))
+        adapter_config = ILLaDACIDConfig(**metadata["adapter_config"])
+    else:
+        if world_size > 1:
+            raise RuntimeError("Stage A benchmark is single-process; omit torchrun")
+        device_name = args.device
+        if device_name == "auto":
+            device_name = "cuda" if torch.cuda.is_available() else "cpu"
+        device = torch.device(device_name)
+        raw = torch.load(checkpoint, map_location="cpu", weights_only=False)
+        adapter_config = ILLaDACIDConfig(**raw["adapter_config"])
+
+    dtype = {
+        "bf16": torch.bfloat16,
+        "fp16": torch.float16,
+        "fp32": torch.float32,
+    }[args.dtype]
+    tokenizer_kwargs: dict[str, object] = {"trust_remote_code": True}
+    if args.model == ILLADA_8B_BASE:
+        tokenizer_kwargs["revision"] = ILLADA_8B_BASE_REVISION
+    tokenizer = AutoTokenizer.from_pretrained(args.model, **tokenizer_kwargs)
+
+    try:
+        def load_adapter() -> ILLaDACIDAdapter:
+            return ILLaDACIDAdapter.from_pretrained(
+                args.model,
+                config=adapter_config,
+                freeze_backbone=True,
+                torch_dtype=torch.float32 if stage_b else dtype,
+                low_cpu_mem_usage=True,
+            ).to(device)
+
+        adapter = None
+        if stage_b:
+            for loading_rank in range(world_size):
+                if rank == loading_rank:
+                    adapter = load_adapter()
+                dist.barrier()
+        else:
+            adapter = load_adapter()
+        if adapter is None:
+            raise RuntimeError("failed to load benchmark iLLaDA adapter")
+
+        if stage_b:
+            text_encoder = ILLaDATextEncoder.from_frozen_snapshot(
+                adapter,
+                tokenizer,
+                device=device,
+                dtype=dtype,
+            )
+            adapter.set_backbone_trainable(True)
+            forward_model = wrap_stage_b_fsdp(
+                adapter,
+                device_id=device,
+                compute_dtype=dtype,
+            )
+            load_stage_b_model_checkpoint(forward_model, adapter, checkpoint)
+        else:
+            load_cid_adapter_checkpoint(adapter, checkpoint)
+            text_encoder = ILLaDATextEncoder(adapter, tokenizer)
+            forward_model = adapter
+
+        adapter.eval()
+        forward_model.eval()
+        examples = load_jsonl(args.data)
+        if args.max_examples is not None:
+            examples = examples[: args.max_examples]
+        if not examples:
+            raise ValueError("benchmark dataset is empty")
+
+        async def run_cases():
+            results = []
+            for index, example in enumerate(examples, start=1):
+                result = await run_neural_benchmark_case(
+                    adapter,
+                    tokenizer,
+                    example,
+                    text_encoder=text_encoder,
+                    forward_model=forward_model,
+                    seed_teacher_state=args.seed_teacher_state,
+                    denoising_steps=args.denoising_steps,
+                    max_steps=args.max_steps,
+                )
+                results.append(result)
+                if distributed:
+                    dist.barrier()
+                if rank == 0 and args.progress_every and index % args.progress_every == 0:
+                    print(f"benchmarked={index}/{len(examples)}")
+            return tuple(results)
+
+        results = asyncio.run(run_cases())
+        if rank == 0:
+            output = Path(args.output)
+            summary_output = Path(args.summary_output)
+            output.parent.mkdir(parents=True, exist_ok=True)
+            summary_output.parent.mkdir(parents=True, exist_ok=True)
+            with output.open("w", encoding="utf-8") as handle:
+                for result in results:
+                    handle.write(
+                        json.dumps(result.to_dict(), ensure_ascii=False, separators=(",", ":"))
+                        + "\n"
+                    )
+            summary = summarize_evaluations(tuple(result.evaluation for result in results))
+            payload = {
+                "checkpoint": str(checkpoint),
+                "checkpoint_kind": args.checkpoint_kind,
+                "model": args.model,
+                "seed_teacher_state": args.seed_teacher_state,
+                "metrics": asdict(summary),
+            }
+            summary_output.write_text(
+                json.dumps(payload, ensure_ascii=False, sort_keys=True, indent=2) + "\n",
+                encoding="utf-8",
+            )
+            print(
+                f"tasks={summary.tasks} exact={summary.exact_display_accuracy:.4f} "
+                f"converged={summary.convergence_rate:.4f} "
+                f"coverage={summary.observation_coverage:.4f} output={output}"
+            )
+    finally:
+        if distributed and dist.is_initialized():
+            dist.destroy_process_group()
+
+
 def _train_stage_a(args: argparse.Namespace) -> None:
     import torch
     import torch.distributed as dist
@@ -180,8 +340,8 @@ def _train_stage_a(args: argparse.Namespace) -> None:
         ILLaDACIDAdapter,
         ILLaDACIDConfig,
         ILLaDATrajectoryTensorizer,
-        shard_transitions,
-        trajectory_transitions,
+        shard_rollout_windows,
+        trajectory_rollout_windows,
         wrap_stage_a_ddp,
     )
 
@@ -262,6 +422,9 @@ def _train_stage_a(args: argparse.Namespace) -> None:
                 max_grad_norm=args.max_grad_norm,
                 timestep_min=args.timestep_min,
                 timestep_max=args.timestep_max,
+                rollout_horizon=args.rollout_horizon,
+                teacher_forcing_epochs=args.teacher_forcing_epochs,
+                rollout_ramp_epochs=args.rollout_ramp_epochs,
                 seed=args.seed,
             ),
             forward_model=forward_model,
@@ -274,9 +437,13 @@ def _train_stage_a(args: argparse.Namespace) -> None:
         examples = load_jsonl(args.data)
         if args.max_examples is not None:
             examples = examples[: args.max_examples]
-        transitions = trajectory_transitions(examples)
-        if not transitions:
+        windows = trajectory_rollout_windows(
+            examples,
+            max_horizon=args.rollout_horizon,
+        )
+        if not windows:
             raise ValueError("training data contains no adjacent thought transitions")
+        transition_count_total = sum(len(window.source_steps) for window in windows)
         output_dir = Path(args.output_dir)
         output_dir.mkdir(parents=True, exist_ok=True)
         trainable = sum(
@@ -288,21 +455,22 @@ def _train_stage_a(args: argparse.Namespace) -> None:
             )
             print(
                 f"device={device} world_size={world_size} dtype={args.dtype} "
-                f"examples={len(examples)} transitions={len(transitions)} "
+                f"examples={len(examples)} transitions={transition_count_total} "
                 f"trainable_parameters={trainable} effective_batch={effective_batch}"
             )
 
         first_epoch = trainer.state.epochs_completed + 1
         for epoch in range(first_epoch, first_epoch + args.epochs):
-            local_transitions = shard_transitions(
-                transitions,
+            local_windows = shard_rollout_windows(
+                windows,
                 world_size=world_size,
                 rank=rank,
                 seed=args.seed,
                 epoch=epoch,
                 shuffle=not args.no_shuffle,
             )
-            report = trainer.train_transitions(local_transitions, epochs=1, shuffle=False)
+            rollout_probability = trainer.rollout_probability()
+            report = trainer.train_rollout_windows(local_windows, epochs=1, shuffle=False)
 
             loss_sum = report.mean_loss * report.transitions
             transition_count = report.transitions
@@ -324,7 +492,7 @@ def _train_stage_a(args: argparse.Namespace) -> None:
                 print(
                     f"epoch={epoch} transitions={transition_count} "
                     f"optimizer_steps={report.optimizer_steps} mean_loss={mean_loss:.6f} "
-                    f"checkpoint={checkpoint}"
+                    f"rollout_probability={rollout_probability:.3f} checkpoint={checkpoint}"
                 )
             if distributed:
                 dist.barrier()
@@ -349,8 +517,8 @@ def _train_stage_b(args: argparse.Namespace) -> None:
         load_cid_adapter_checkpoint,
         load_stage_b_checkpoint,
         save_stage_b_checkpoint,
-        shard_transitions,
-        trajectory_transitions,
+        shard_rollout_windows,
+        trajectory_rollout_windows,
         wrap_stage_b_fsdp,
     )
     from cid.model.encoding import ILLaDATextEncoder
@@ -446,6 +614,9 @@ def _train_stage_b(args: argparse.Namespace) -> None:
                 max_grad_norm=args.max_grad_norm,
                 timestep_min=args.timestep_min,
                 timestep_max=args.timestep_max,
+                rollout_horizon=args.rollout_horizon,
+                teacher_forcing_epochs=args.teacher_forcing_epochs,
+                rollout_ramp_epochs=args.rollout_ramp_epochs,
                 seed=args.seed,
             ),
             optimizer=optimizer,
@@ -466,9 +637,13 @@ def _train_stage_b(args: argparse.Namespace) -> None:
         examples = load_jsonl(args.data)
         if args.max_examples is not None:
             examples = examples[: args.max_examples]
-        transitions = trajectory_transitions(examples)
-        if not transitions:
+        windows = trajectory_rollout_windows(
+            examples,
+            max_horizon=args.rollout_horizon,
+        )
+        if not windows:
             raise ValueError("training data contains no adjacent thought transitions")
+        transition_count_total = sum(len(window.source_steps) for window in windows)
         output_dir = Path(args.output_dir)
         if rank == 0:
             output_dir.mkdir(parents=True, exist_ok=True)
@@ -477,22 +652,23 @@ def _train_stage_b(args: argparse.Namespace) -> None:
             )
             print(
                 f"stage=B device={device} world_size={world_size} dtype={args.dtype} "
-                f"examples={len(examples)} transitions={len(transitions)} "
+                f"examples={len(examples)} transitions={transition_count_total} "
                 f"effective_batch={effective_batch}"
             )
         dist.barrier()
 
         first_epoch = trainer.state.epochs_completed + 1
         for epoch in range(first_epoch, first_epoch + args.epochs):
-            local_transitions = shard_transitions(
-                transitions,
+            local_windows = shard_rollout_windows(
+                windows,
                 world_size=world_size,
                 rank=rank,
                 seed=args.seed,
                 epoch=epoch,
                 shuffle=not args.no_shuffle,
             )
-            report = trainer.train_transitions(local_transitions, epochs=1, shuffle=False)
+            rollout_probability = trainer.rollout_probability()
+            report = trainer.train_rollout_windows(local_windows, epochs=1, shuffle=False)
             aggregate = torch.tensor(
                 [report.mean_loss * report.transitions, float(report.transitions)],
                 device=device,
@@ -514,7 +690,7 @@ def _train_stage_b(args: argparse.Namespace) -> None:
                 print(
                     f"epoch={epoch} transitions={transition_count} "
                     f"optimizer_steps={report.optimizer_steps} mean_loss={mean_loss:.6f} "
-                    f"checkpoint={checkpoint}"
+                    f"rollout_probability={rollout_probability:.3f} checkpoint={checkpoint}"
                 )
     finally:
         if dist.is_initialized():
@@ -565,6 +741,27 @@ def main() -> None:
     )
     manifest.add_argument("--data", required=True)
     manifest.add_argument("--output", required=True)
+    benchmark = subparsers.add_parser(
+        "benchmark",
+        help="run a neural CID checkpoint on deterministic replay trajectories",
+    )
+    benchmark.add_argument("--data", required=True)
+    benchmark.add_argument("--checkpoint", required=True)
+    benchmark.add_argument(
+        "--checkpoint-kind",
+        choices=("stage-a", "stage-b"),
+        default="stage-a",
+    )
+    benchmark.add_argument("--model", default="GSAI-ML/iLLaDA-8B-Base")
+    benchmark.add_argument("--output", required=True)
+    benchmark.add_argument("--summary-output", required=True)
+    benchmark.add_argument("--device", default="auto")
+    benchmark.add_argument("--dtype", choices=("bf16", "fp16", "fp32"), default="bf16")
+    benchmark.add_argument("--denoising-steps", type=int, default=8)
+    benchmark.add_argument("--max-steps", type=int, default=32)
+    benchmark.add_argument("--max-examples", type=int)
+    benchmark.add_argument("--progress-every", type=int, default=10)
+    benchmark.add_argument("--seed-teacher-state", action="store_true")
     train = subparsers.add_parser(
         "train",
         help="run Stage A CID adapter training with a frozen iLLaDA backbone",
@@ -583,6 +780,9 @@ def main() -> None:
     train.add_argument("--max-grad-norm", type=float, default=1.0)
     train.add_argument("--timestep-min", type=float, default=0.05)
     train.add_argument("--timestep-max", type=float, default=1.0)
+    train.add_argument("--rollout-horizon", type=int, default=3)
+    train.add_argument("--teacher-forcing-epochs", type=int, default=1)
+    train.add_argument("--rollout-ramp-epochs", type=int, default=2)
     train.add_argument("--thought-capacity", type=int, default=8)
     train.add_argument("--max-display-tokens", type=int, default=1024)
     train.add_argument("--seed", type=int, default=0)
@@ -611,6 +811,9 @@ def main() -> None:
     train_full.add_argument("--max-grad-norm", type=float, default=1.0)
     train_full.add_argument("--timestep-min", type=float, default=0.05)
     train_full.add_argument("--timestep-max", type=float, default=1.0)
+    train_full.add_argument("--rollout-horizon", type=int, default=3)
+    train_full.add_argument("--teacher-forcing-epochs", type=int, default=1)
+    train_full.add_argument("--rollout-ramp-epochs", type=int, default=2)
     train_full.add_argument("--thought-capacity", type=int, default=8)
     train_full.add_argument("--max-display-tokens", type=int, default=1024)
     train_full.add_argument("--seed", type=int, default=0)
@@ -634,6 +837,8 @@ def main() -> None:
         _review_distillation(args)
     elif args.command == "dataset-manifest":
         _dataset_manifest(args)
+    elif args.command == "benchmark":
+        _benchmark(args)
     elif args.command == "train":
         _train_stage_a(args)
     elif args.command == "train-full":

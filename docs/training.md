@@ -95,6 +95,14 @@ backbone. The iLLaDA adapter also constructs per-sample RoPE `position_ids` from
 display lengths. Padding introduced by another sample therefore does not alter the logical
 positions of a trajectory's display tokens.
 
+Adjacent transitions are also grouped into bounded `CIDRolloutWindow` sequences. Training starts
+with teacher-forced T/Y inputs, then scheduled sampling linearly increases the chance that the
+previous detached model prediction replaces the next transition's source state, and finally reaches
+self-rollout. The teacher trajectory continues to define the correct next-state targets and external
+event schedule. Predicted cognition therefore changes the model's input distribution without being
+reused as its own label. Allocation masking follows the actually fed occupancy state, including
+rollout errors, while runtime lifecycle legality remains outside the learned transition head.
+
 This DDP path is for the frozen-backbone Stage A phase.
 
 ### Stage B FSDP full-parameter launcher
@@ -124,6 +132,20 @@ mutually exclusive with Stage B `--resume`, which already restores the entire mo
 The repository tests the FSDP path both with a CPU world-size-1 checkpoint round trip and a true
 two-rank Gloo `FULL_SHARD` forward/backward/distributed-checkpoint smoke. The real 8B A6000 memory
 ceiling still needs to be measured before raising local micro-batch size above one.
+
+### Neural replay benchmark
+
+`cid benchmark` loads either a Stage A CID-only checkpoint or a Stage B sharded model checkpoint and
+runs the neural policy against the step-exact replay sources in `cid.evaluation`. The default starts
+from an empty TCT and a masked display. `--seed-teacher-state` supplies only the dataset's step-0 TCT
+and is intended as a diagnostic for separating initial allocation failures from downstream binding,
+assimilation, revision, and convergence behavior.
+
+Stage A evaluation is single-process. Stage B evaluation runs under the checkpoint's original FSDP
+world size and restores model shards only; no optimizer is constructed or loaded. Per-case JSONL
+records final text/token IDs, runtime steps, and the complete task evaluation. The summary JSON
+aggregates convergence, exact display accuracy, observation coverage/staleness, latent-to-executable
+delay, binding-to-observation delay, and observation-to-projection lag.
 
 ### Teacher distillation compiler
 
