@@ -95,6 +95,7 @@ class ClosedWorldMaterializationCatalog:
 @dataclass(frozen=True, slots=True)
 class CIDMaterializerConfig:
     allocation_threshold: float = 0.8
+    convergence_threshold: float = 0.5
     need_threshold: float = 0.6
     argument_presence_threshold: float = 0.5
     anchor_presence_threshold: float = 0.5
@@ -106,6 +107,7 @@ class CIDMaterializerConfig:
     def __post_init__(self) -> None:
         for name in (
             "allocation_threshold",
+            "convergence_threshold",
             "need_threshold",
             "argument_presence_threshold",
             "anchor_presence_threshold",
@@ -143,13 +145,17 @@ class CIDMaterializer:
         display = self._materialize_display(context.display, display_token_ids)
         needs = self._materialize_needs(output, context, thought, catalog, batch_index)
         reopen_cells = self._materialize_revisions(output, thought, batch_index)
+        convergence = float(torch.sigmoid(output.convergence_logits[batch_index]).detach())
 
         return ModelUpdate(
             thought=thought,
             display=display,
             needs=needs,
             reopen_cells=reopen_cells,
-            converged=display.unresolved == 0,
+            converged=(
+                display.unresolved == 0
+                and convergence >= self.config.convergence_threshold
+            ),
         )
 
     def _materialize_cells(
@@ -387,6 +393,8 @@ class CIDMaterializer:
     ) -> None:
         if not 0 <= batch_index < output.thought_semantic.shape[0]:
             raise IndexError("batch_index is outside model output")
+        if output.convergence_logits.shape != (output.thought_semantic.shape[0],):
+            raise ValueError("model convergence logits must have shape [batch]")
         if output.thought_semantic.shape[1] != context.thought.capacity:
             raise ValueError("model thought slot count does not match runtime TCT capacity")
         if output.display_logits.shape[1] != len(context.display.token_ids):

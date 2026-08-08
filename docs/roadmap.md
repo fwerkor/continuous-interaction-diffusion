@@ -80,8 +80,10 @@ observation assimilation lag, exact display, observation coverage, and stale-obs
 step-exact dataset replay runner now drives external versions from `TrajectoryExample.arrival_step`
 without wall-clock timing approximations. Stage B full-parameter training now uses FSDP FULL_SHARD,
 FP32 master parameters, BF16 mixed precision, a frozen target-embedding snapshot, FSDP-aware global
-gradient clipping, and sharded model/optimizer checkpoints. Model/tokenizer-specific benchmark suite
-orchestration and real-8B A6000 memory/throughput characterization remain.
+gradient clipping, and sharded model/optimizer checkpoints. Display training now includes visible
+replacement noise and inference supports bounded visible-token rewrites; a learned convergence head
+prevents premature termination merely because the display has no remaining masks. Model/tokenizer-
+specific benchmark suite orchestration and real-8B A6000 memory/throughput characterization remain.
 
 Train CID-specific heads and adapters first, with most backbone weights frozen. Measure source
 selection, argument binding, intent lead time, assimilation lag, exact copying, and stale-value

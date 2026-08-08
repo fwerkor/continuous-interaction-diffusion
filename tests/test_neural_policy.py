@@ -97,6 +97,9 @@ class TinyTokenizer:
 
 async def test_neural_policy_runs_tiny_illada_inside_async_runtime() -> None:
     adapter = ILLaDACIDAdapter(TinyBackbone(), freeze_backbone=True)
+    with torch.no_grad():
+        adapter.output_heads.convergence_head.weight.zero_()
+        adapter.output_heads.convergence_head.bias.fill_(10.0)
     tokenizer = TinyTokenizer()
     tensorizer = ILLaDAContextTensorizer(adapter, tokenizer)
     materializer = CIDMaterializer(
@@ -133,6 +136,8 @@ async def test_neural_policy_runs_tiny_illada_inside_async_runtime() -> None:
 async def test_neural_policy_materializes_executable_need_and_reads_source() -> None:
     adapter = ILLaDACIDAdapter(TinyBackbone(), freeze_backbone=True)
     with torch.no_grad():
+        adapter.output_heads.convergence_head.weight.zero_()
+        adapter.output_heads.convergence_head.bias.fill_(10.0)
         adapter.output_heads.allocation_head.weight.zero_()
         adapter.output_heads.allocation_head.bias.fill_(-10.0)
         adapter.output_heads.need_head.weight.zero_()

@@ -225,6 +225,7 @@ class ILLaDACIDAdapter(nn.Module):
         return self.output_heads(
             base_thought=thought,
             thought_hidden=t_hidden,
+            thought_occupancy=slot_occupancy,
             display_logits=self.output_embeddings(y_hidden),
             source_memory=source_memory,
             source_padding_mask=batch.source_padding_mask,

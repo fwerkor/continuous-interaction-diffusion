@@ -28,6 +28,7 @@ class CIDTensorBatch:
 @dataclass(slots=True)
 class CIDTensorOutput:
     thought_semantic: Tensor
+    convergence_logits: Tensor
     allocation_logits: Tensor
     role_logits: Tensor
     uncertainty: Tensor

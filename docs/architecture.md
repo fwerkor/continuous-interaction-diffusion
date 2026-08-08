@@ -147,12 +147,16 @@ memory channels and enter through the shared CID cross-attention fusion after na
 refinement. The external residual gate is initialized near zero so the untrained CID path starts
 close to the pretrained display behavior.
 
-The runtime-facing `ILLaDANeuralPolicy` tensorizes `ModelContext`, executes the adapter, reveals a
-subset of masked display tokens, and passes neural outputs through `CIDMaterializer`. Materialization
-turns allocation/lifecycle logits into TCT proposals, retrieves typed anchors and link targets from
-a trajectory-local catalog, decodes schema-positioned argument slots, emits persistent
-`InformationNeed` objects, and converts revision predictions into typed reopen references. Runtime
-lifecycle gates remain authoritative after materialization.
+The runtime-facing `ILLaDANeuralPolicy` tensorizes `ModelContext`, executes the adapter, refines the
+display canvas, and passes neural outputs through `CIDMaterializer`. Masked display positions are
+revealed progressively; already-visible positions may also be rewritten when a different token has
+sufficient probability advantage, which is the display-side path for post-arrival correction.
+Materialization turns allocation/lifecycle logits into TCT proposals, retrieves typed anchors and
+link targets from a trajectory-local catalog, decodes schema-positioned argument slots, emits
+persistent `InformationNeed` objects, and converts revision predictions into typed reopen
+references. A separate convergence head predicts whether the trajectory is actually terminal; a
+fully unmasked Y alone is not treated as convergence. Runtime lifecycle/binding gates remain
+authoritative after materialization.
 
 ## 4. Information need before executable call
 

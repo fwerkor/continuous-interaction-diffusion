@@ -29,6 +29,7 @@ def make_output(*, d_model: int = 4) -> CIDTensorOutput:
         thought_semantic=torch.tensor(
             [[[1.0, 0.0, 0.0, 0.0], [0.0, 1.0, 0.0, 0.0], [0.0, 0.0, 0.0, 0.0]]]
         ),
+        convergence_logits=torch.tensor([10.0]),
         allocation_logits=torch.tensor([[-10.0, 10.0, -10.0]]),
         role_logits=torch.zeros(batch, slots, 6),
         uncertainty=torch.full((batch, slots, 1), 0.2),
@@ -182,3 +183,27 @@ def test_materializer_rejects_runtime_model_geometry_mismatch() -> None:
 
     with pytest.raises(ValueError, match="slot count"):
         CIDMaterializer().materialize(make_output(), context)
+
+
+def test_materializer_requires_learned_convergence_even_when_display_is_filled() -> None:
+    field = CognitiveField.empty(capacity=3, width=4)
+    context = ModelContext(
+        facts=FactStore().snapshot(),
+        thought=field,
+        display=DisplayCanvas.masked(length=3, mask_token_id=5),
+        sources=(),
+        percepts=(),
+        step=0,
+    )
+    output = make_output()
+    output.convergence_logits[0] = -10.0
+    output.source_logits = torch.empty(1, 3, 0)
+
+    update = CIDMaterializer().materialize(
+        output,
+        context,
+        display_token_ids=(7, 8, 9),
+    )
+
+    assert update.display.unresolved == 0
+    assert not update.converged

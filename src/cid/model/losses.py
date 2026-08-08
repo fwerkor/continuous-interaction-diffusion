@@ -12,6 +12,7 @@ from cid.model.tensors import CIDTensorOutput
 @dataclass(frozen=True, slots=True)
 class CIDLossWeights:
     thought: float = 1.0
+    convergence: float = 0.2
     allocation: float = 0.3
     display: float = 1.0
     roles: float = 0.2
@@ -37,6 +38,7 @@ class CIDLossWeights:
 class CIDTargets:
     thought_semantic: Tensor
     thought_mask: Tensor
+    convergence_targets: Tensor
     allocation_targets: Tensor
     allocation_mask: Tensor
     display_ids: Tensor
@@ -69,6 +71,7 @@ class CIDTargets:
 class CIDLoss:
     total: Tensor
     thought: Tensor
+    convergence: Tensor
     allocation: Tensor
     display: Tensor
     roles: Tensor
@@ -113,6 +116,10 @@ def cid_loss(
         output.thought_semantic,
         targets.thought_semantic,
         targets.thought_mask,
+    )
+    convergence = F.binary_cross_entropy_with_logits(
+        output.convergence_logits,
+        targets.convergence_targets,
     )
     allocation = _masked_binary_cross_entropy(
         output.allocation_logits,
@@ -211,6 +218,7 @@ def cid_loss(
     )
     total = (
         w.thought * thought
+        + w.convergence * convergence
         + w.allocation * allocation
         + w.display * display
         + w.roles * roles
@@ -234,6 +242,7 @@ def cid_loss(
     return CIDLoss(
         total=total,
         thought=thought,
+        convergence=convergence,
         allocation=allocation,
         display=display,
         roles=roles,

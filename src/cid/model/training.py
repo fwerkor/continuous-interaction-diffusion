@@ -97,6 +97,7 @@ def collate_training_steps(
     targets = CIDTargets(
         thought_semantic=_cat_targets(steps, "thought_semantic"),
         thought_mask=_cat_targets(steps, "thought_mask"),
+        convergence_targets=_cat_targets(steps, "convergence_targets"),
         allocation_targets=_cat_targets(steps, "allocation_targets"),
         allocation_mask=_cat_targets(steps, "allocation_mask"),
         display_ids=display_labels,
@@ -486,12 +487,16 @@ class ILLaDATrajectoryTensorizer:
         scheduler: CIDDiffusionScheduler | None = None,
         *,
         text_encoder: ILLaDATextEncoder | None = None,
+        display_replacement_fraction: float = 0.25,
     ) -> None:
         self.adapter = adapter
         self.tokenizer = tokenizer
         self.text_encoder = text_encoder or ILLaDATextEncoder(adapter, tokenizer)
         if self.text_encoder.d_model != adapter.d_model:
             raise ValueError("training text encoder width must match the iLLaDA adapter")
+        if not 0.0 <= display_replacement_fraction <= 1.0:
+            raise ValueError("display_replacement_fraction must be in [0, 1]")
+        self.display_replacement_fraction = display_replacement_fraction
         self.scheduler = scheduler or CIDDiffusionScheduler(ILLADA_MASK_TOKEN_ID)
 
     def tensorize(
@@ -552,6 +557,8 @@ class ILLaDATrajectoryTensorizer:
         display_corruption = self.scheduler.corrupt_display(
             target_display_ids,
             timestep_tensor,
+            vocab_size=self.adapter.vocab_size,
+            replacement_fraction=self.display_replacement_fraction,
             generator=generator,
         )
 
@@ -637,9 +644,15 @@ class ILLaDATrajectoryTensorizer:
         relation_order = tuple(LinkRelation)
         object_order = tuple(ObjectKind)
         freshness_order = tuple(FreshnessDemand)
+        final_step = max(target.step for target in example.thought_targets)
 
         thought_target = torch.zeros((1, n, self.adapter.d_model), device=device, dtype=dtype)
         thought_mask = torch.zeros((1, n), device=device, dtype=torch.bool)
+        convergence_targets = torch.tensor(
+            [float(target_step == final_step)],
+            device=device,
+            dtype=dtype,
+        )
         allocation_targets = torch.zeros((1, n), device=device, dtype=dtype)
         allocation_mask = torch.tensor(
             [[slot not in current_by_slot for slot in range(n)]], device=device, dtype=torch.bool
@@ -789,6 +802,7 @@ class ILLaDATrajectoryTensorizer:
         return CIDTargets(
             thought_semantic=thought_target,
             thought_mask=thought_mask,
+            convergence_targets=convergence_targets,
             allocation_targets=allocation_targets,
             allocation_mask=allocation_mask,
             display_ids=display_labels,

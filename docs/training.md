@@ -32,6 +32,14 @@ and allocation/lifecycle targets are derived from stable cell identity across th
 New cells train allocation on previously empty slots; existing cells train lifecycle on their
 logical identity even if later compaction moves their physical storage.
 
+Display corruption also includes visible replacement noise. Some selected target tokens are
+replaced with wrong non-mask vocabulary tokens while the clean token remains the supervision
+target. This teaches the display head to correct already-visible stale text after new evidence
+arrives, rather than learning only MASK-to-token completion. At inference, masked positions are
+revealed by confidence and a bounded fraction of visible positions may be rewritten when the best
+alternative exceeds the current token probability by a configured margin. The mask token itself is
+excluded from output candidates.
+
 Teacher trajectories should contain pre-arrival and post-arrival states, not only final answers.
 They should also supervise cell creation, retirement, optional split/merge lineage, and stable cell
 identity across physical compaction. Arrival time, source freshness, cache availability, and
@@ -39,6 +47,9 @@ physical slot placement are randomized so a model cannot assign permanent semant
 Allocation loss is masked to slots that are `EMPTY` at the current step. Lifecycle cross-entropy is
 masked to existing cells and has four classes: `ACTIVE`, `WAITING`, `STABLE`, and `RETIRED`.
 Runtime-gated transitions remain hard constraints during both training rollouts and inference.
+Every transition also has a trajectory-level convergence target. Intermediate steps supervise
+`converged=0`; only the final supervised state is positive. The neural runtime therefore does not
+treat "no MASK tokens remain" as sufficient evidence that the task is finished.
 Training rollouts should also randomize slot pressure. Retired cells are archived and reclaimed by
 runtime policy rather than model logits; supervision should not teach the model to encode garbage
 collection decisions in TCT. Reclamation traces can be used to measure whether a trained model

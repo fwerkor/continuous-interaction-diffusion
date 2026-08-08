@@ -163,10 +163,16 @@ class ILLaDAContextTensorizer:
 @dataclass(frozen=True, slots=True)
 class ILLaDANeuralPolicyConfig:
     denoising_steps: int = 8
+    display_revision_fraction: float = 0.125
+    display_revision_margin: float = 0.15
 
     def __post_init__(self) -> None:
         if self.denoising_steps <= 0:
             raise ValueError("denoising_steps must be positive")
+        if not 0.0 <= self.display_revision_fraction <= 1.0:
+            raise ValueError("display_revision_fraction must be in [0, 1]")
+        if self.display_revision_margin < 0.0:
+            raise ValueError("display_revision_margin must be non-negative")
 
 
 class ILLaDANeuralPolicy:
@@ -193,10 +199,12 @@ class ILLaDANeuralPolicy:
         batch = self.tensorizer(context)
         with torch.no_grad():
             output = self.adapter(batch)
-            display_ids = self.scheduler.reveal_display(
+            display_ids = self.scheduler.refine_display(
                 batch.display_ids,
                 output.display_logits,
                 reveal_fraction=self._reveal_fraction(context.step),
+                revision_fraction=self.config.display_revision_fraction,
+                revision_margin=self.config.display_revision_margin,
             )
         return self.materializer.materialize(
             output,

@@ -125,12 +125,16 @@ python examples/illada_tiny_smoke.py
 
 iLLaDA's tokenizer uses token id `5` for `<[MASK]>`; the same value is exported as
 `ILLADA_MASK_TOKEN_ID`. `CIDDiffusionScheduler` now supplies masked-display corruption, continuous
-TCT corruption, and confidence-ranked iterative reveal.
+TCT corruption, confidence-ranked iterative reveal, and bounded visible-token revision. Training
+mixes ordinary mask corruption with visible wrong-token replacement so the display head learns to
+correct stale text after new evidence arrives instead of treating every revealed token as final.
 
 The neural path is executable end to end: `ILLaDAContextTensorizer` converts a runtime
 `ModelContext`, `ILLaDANeuralPolicy` performs a denoising step, and `CIDMaterializer` converts
 allocation/lifecycle/need/source/argument/grounding/revision/refresh predictions back into the
-typed runtime contract. Closed-world candidate retrieval is used for the first training stage.
+typed runtime contract. A separate learned convergence logit decides when a fully denoised display
+is actually terminal; filling the last MASK no longer ends a neural trajectory by itself.
+Closed-world candidate retrieval is used for the first training stage.
 
 Training data uses typed per-step `ThoughtTarget` and `DisplayTarget` records rather than free-form
 dictionaries. `ILLaDATrajectoryTensorizer` constructs adjacent-step supervision and the CID loss

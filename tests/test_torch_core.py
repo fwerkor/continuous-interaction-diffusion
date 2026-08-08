@@ -141,6 +141,7 @@ def test_torch_core_shapes_and_backward() -> None:
     targets = CIDTargets(
         thought_semantic=torch.randn_like(output.thought_semantic),
         thought_mask=occupied,
+        convergence_targets=torch.rand(batch_size),
         allocation_targets=torch.randint(0, 2, (batch_size, thought_slots)).float(),
         allocation_mask=~occupied,
         display_ids=torch.randint(0, config.vocab_size, (batch_size, display_length)),

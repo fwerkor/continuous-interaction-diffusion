@@ -188,6 +188,7 @@ class TorchCIDCore(nn.Module):
         return self.output_heads(
             base_thought=thought,
             thought_hidden=t_hidden,
+            thought_occupancy=batch.slot_occupancy,
             display_logits=self.display_head(y_hidden),
             source_memory=batch.source_memory,
             source_padding_mask=batch.source_padding_mask,

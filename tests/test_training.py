@@ -206,10 +206,16 @@ def test_trajectory_tensorizer_runs_full_optimizer_step() -> None:
     adapter = make_adapter()
     tensorizer = ILLaDATrajectoryTensorizer(adapter, TinyTokenizer())
     sample = tensorizer.tensorize(make_trajectory(), source_step=0, timestep=1.0)
+    target_display_ids = TinyTokenizer()(
+        "37",
+        add_special_tokens=False,
+        return_tensors="pt",
+    )["input_ids"]
 
     assert sample.batch.thought_semantic.shape == (1, 4, TinyConfig.hidden_size)
     assert sample.batch.prompt_ids.shape[1] > 0
-    assert sample.batch.display_ids.eq(5).all()
+    assert torch.equal(sample.targets.display_ids, target_display_ids)
+    assert torch.all(sample.batch.display_ids != target_display_ids)
     assert sample.targets.allocation_targets[0, 1] == 1
     assert sample.targets.allocation_mask[0, 1]
     assert sample.targets.thought_mask[0, :2].all()
@@ -268,6 +274,26 @@ def test_frozen_text_encoder_snapshot_is_independent_from_live_backbone() -> Non
     sample = tensorizer.tensorize(make_trajectory(), source_step=0, timestep=1.0)
     assert sample.batch.thought_semantic.dtype is torch.bfloat16
     assert sample.batch.fact_memory.dtype is torch.bfloat16
+
+
+def test_trajectory_tensorizer_supervises_convergence_only_on_final_step() -> None:
+    adapter = make_adapter()
+    tensorizer = ILLaDATrajectoryTensorizer(adapter, TinyTokenizer())
+    base = make_trajectory()
+    step_one = tuple(target for target in base.thought_targets if target.step == 1)
+    extended = replace(
+        base,
+        thought_targets=(
+            *base.thought_targets,
+            *(replace(target, step=2) for target in step_one),
+        ),
+    )
+
+    middle = tensorizer.tensorize(extended, source_step=0, timestep=1.0)
+    final = tensorizer.tensorize(extended, source_step=1, timestep=1.0)
+
+    assert middle.targets.convergence_targets.item() == 0.0
+    assert final.targets.convergence_targets.item() == 1.0
 
 
 def test_training_collator_pads_variable_sequences_and_external_memory() -> None:

@@ -134,6 +134,7 @@ class CIDOutputHeads(nn.Module):
         self.max_link_slots = max_link_slots
 
         self.thought_delta = nn.Linear(d_model, d_model)
+        self.convergence_head = nn.Linear(d_model, 1)
         self.allocation_head = nn.Linear(d_model, 1)
         self.role_head = nn.Linear(d_model, num_roles)
         self.uncertainty_head = nn.Linear(d_model, 1)
@@ -158,11 +159,22 @@ class CIDOutputHeads(nn.Module):
         *,
         base_thought: Tensor,
         thought_hidden: Tensor,
+        thought_occupancy: Tensor,
         display_logits: Tensor,
         source_memory: Tensor,
         source_padding_mask: Tensor | None = None,
     ) -> CIDTensorOutput:
         batch_size, thought_slots, _ = thought_hidden.shape
+        occupancy_weight = thought_occupancy.to(dtype=thought_hidden.dtype).clamp(0.0, 1.0)
+        occupied_count = occupancy_weight.sum(dim=1)
+        occupied_summary = (thought_hidden * occupancy_weight).sum(dim=1)
+        occupied_summary = occupied_summary / occupied_count.clamp_min(1.0)
+        fallback_summary = thought_hidden.mean(dim=1)
+        summary = torch.where(
+            (occupied_count > 0.0).expand_as(occupied_summary),
+            occupied_summary,
+            fallback_summary,
+        )
         source_query = F.normalize(self.source_query(thought_hidden), dim=-1)
         normalized_sources = F.normalize(source_memory, dim=-1)
         source_logits = torch.einsum("bnd,bsd->bns", source_query, normalized_sources)
@@ -212,6 +224,7 @@ class CIDOutputHeads(nn.Module):
 
         return CIDTensorOutput(
             thought_semantic=base_thought + self.thought_delta(thought_hidden),
+            convergence_logits=self.convergence_head(summary).squeeze(-1),
             allocation_logits=self.allocation_head(thought_hidden).squeeze(-1),
             role_logits=self.role_head(thought_hidden),
             uncertainty=torch.sigmoid(self.uncertainty_head(thought_hidden)),
