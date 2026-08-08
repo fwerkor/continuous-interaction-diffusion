@@ -78,8 +78,10 @@ variable-length micro-batching, native gradient checkpointing, and a `torchrun` 
 frozen backbone. Runtime/task evaluation now has fixed definitions for latent-to-executable delay,
 observation assimilation lag, exact display, observation coverage, and stale-observation rate. A
 step-exact dataset replay runner now drives external versions from `TrajectoryExample.arrival_step`
-without wall-clock timing approximations. Model/tokenizer-specific benchmark suite orchestration
-remains; Stage 2 full-parameter training will use sharded state rather than this replicated DDP path.
+without wall-clock timing approximations. Stage B full-parameter training now uses FSDP FULL_SHARD,
+FP32 master parameters, BF16 mixed precision, a frozen target-embedding snapshot, FSDP-aware global
+gradient clipping, and sharded model/optimizer checkpoints. Model/tokenizer-specific benchmark suite
+orchestration and real-8B A6000 memory/throughput characterization remain.
 
 Train CID-specific heads and adapters first, with most backbone weights frozen. Measure source
 selection, argument binding, intent lead time, assimilation lag, exact copying, and stale-value

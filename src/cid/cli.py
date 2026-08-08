@@ -292,7 +292,8 @@ def _train_stage_a(args: argparse.Namespace) -> None:
                 f"trainable_parameters={trainable} effective_batch={effective_batch}"
             )
 
-        for epoch in range(1, args.epochs + 1):
+        first_epoch = trainer.state.epochs_completed + 1
+        for epoch in range(first_epoch, first_epoch + args.epochs):
             local_transitions = shard_transitions(
                 transitions,
                 world_size=world_size,
@@ -329,6 +330,194 @@ def _train_stage_a(args: argparse.Namespace) -> None:
                 dist.barrier()
     finally:
         if distributed and dist.is_initialized():
+            dist.destroy_process_group()
+
+
+def _train_stage_b(args: argparse.Namespace) -> None:
+    import torch
+    import torch.distributed as dist
+    from transformers import AutoTokenizer
+
+    from cid.model import (
+        ILLADA_8B_BASE,
+        ILLADA_8B_BASE_REVISION,
+        CIDTrainer,
+        CIDTrainerConfig,
+        ILLaDACIDAdapter,
+        ILLaDACIDConfig,
+        ILLaDATrajectoryTensorizer,
+        load_cid_adapter_checkpoint,
+        load_stage_b_checkpoint,
+        save_stage_b_checkpoint,
+        shard_transitions,
+        trajectory_transitions,
+        wrap_stage_b_fsdp,
+    )
+    from cid.model.encoding import ILLaDATextEncoder
+
+    if args.resume and args.init_cid_checkpoint:
+        raise ValueError("--resume and --init-cid-checkpoint are mutually exclusive")
+    world_size = int(os.environ.get("WORLD_SIZE", "1"))
+    if world_size < 2:
+        raise RuntimeError("Stage B full-parameter training must run under multi-GPU torchrun")
+    if not torch.cuda.is_available():
+        raise RuntimeError("Stage B full-parameter training requires CUDA GPUs")
+
+    compute_dtype = {
+        "bf16": torch.bfloat16,
+        "fp16": torch.float16,
+    }[args.dtype]
+    local_rank = int(os.environ.get("LOCAL_RANK", "0"))
+    torch.cuda.set_device(local_rank)
+    device = torch.device("cuda", local_rank)
+    dist.init_process_group(backend="nccl")
+    rank = dist.get_rank()
+    world_size = dist.get_world_size()
+
+    try:
+        dataset_manifest = inspect_dataset(args.data)
+        if dataset_manifest.thought_capacity_required > args.thought_capacity:
+            raise ValueError(
+                "training data requires a larger TCT capacity: "
+                f"{dataset_manifest.thought_capacity_required} > {args.thought_capacity}"
+            )
+        tokenizer_kwargs: dict[str, object] = {"trust_remote_code": True}
+        if args.model == ILLADA_8B_BASE:
+            tokenizer_kwargs["revision"] = ILLADA_8B_BASE_REVISION
+        tokenizer = AutoTokenizer.from_pretrained(args.model, **tokenizer_kwargs)
+        adapter_config = ILLaDACIDConfig(
+            max_thought_slots=args.thought_capacity,
+            max_display_tokens=args.max_display_tokens,
+        )
+
+        def load_adapter() -> tuple[ILLaDACIDAdapter, ILLaDATextEncoder]:
+            model = ILLaDACIDAdapter.from_pretrained(
+                args.model,
+                config=adapter_config,
+                freeze_backbone=True,
+                torch_dtype=torch.float32,
+                low_cpu_mem_usage=True,
+            ).to(device)
+            if args.init_cid_checkpoint:
+                load_cid_adapter_checkpoint(model, args.init_cid_checkpoint)
+            snapshot = ILLaDATextEncoder.from_frozen_snapshot(
+                model,
+                tokenizer,
+                device=device,
+                dtype=compute_dtype,
+            )
+            model.set_backbone_trainable(True)
+            if args.gradient_checkpointing:
+                model.set_gradient_checkpointing(True)
+            return model, snapshot
+
+        adapter = None
+        text_encoder = None
+        for loading_rank in range(world_size):
+            if rank == loading_rank:
+                adapter, text_encoder = load_adapter()
+            dist.barrier()
+        if adapter is None or text_encoder is None:
+            raise RuntimeError("failed to load Stage B iLLaDA model on this training rank")
+
+        fsdp_model = wrap_stage_b_fsdp(
+            adapter,
+            device_id=device,
+            compute_dtype=compute_dtype,
+        )
+        optimizer = torch.optim.AdamW(
+            fsdp_model.parameters(),
+            lr=args.learning_rate,
+            weight_decay=args.weight_decay,
+        )
+        tensorizer = ILLaDATrajectoryTensorizer(
+            adapter,
+            tokenizer,
+            text_encoder=text_encoder,
+        )
+        trainer = CIDTrainer(
+            adapter,
+            tensorizer,
+            CIDTrainerConfig(
+                learning_rate=args.learning_rate,
+                weight_decay=args.weight_decay,
+                micro_batch_size=args.micro_batch_size,
+                gradient_accumulation_steps=args.gradient_accumulation_steps,
+                max_grad_norm=args.max_grad_norm,
+                timestep_min=args.timestep_min,
+                timestep_max=args.timestep_max,
+                seed=args.seed,
+            ),
+            optimizer=optimizer,
+            forward_model=fsdp_model,
+            gradient_clipper=fsdp_model.clip_grad_norm_,
+        )
+        if args.resume:
+            load_stage_b_checkpoint(
+                fsdp_model,
+                optimizer,
+                trainer,
+                args.resume,
+                expected_dataset_sha256=dataset_manifest.sha256,
+            )
+        else:
+            trainer.reseed(args.seed + rank)
+
+        examples = load_jsonl(args.data)
+        if args.max_examples is not None:
+            examples = examples[: args.max_examples]
+        transitions = trajectory_transitions(examples)
+        if not transitions:
+            raise ValueError("training data contains no adjacent thought transitions")
+        output_dir = Path(args.output_dir)
+        if rank == 0:
+            output_dir.mkdir(parents=True, exist_ok=True)
+            effective_batch = (
+                args.micro_batch_size * args.gradient_accumulation_steps * world_size
+            )
+            print(
+                f"stage=B device={device} world_size={world_size} dtype={args.dtype} "
+                f"examples={len(examples)} transitions={len(transitions)} "
+                f"effective_batch={effective_batch}"
+            )
+        dist.barrier()
+
+        first_epoch = trainer.state.epochs_completed + 1
+        for epoch in range(first_epoch, first_epoch + args.epochs):
+            local_transitions = shard_transitions(
+                transitions,
+                world_size=world_size,
+                rank=rank,
+                seed=args.seed,
+                epoch=epoch,
+                shuffle=not args.no_shuffle,
+            )
+            report = trainer.train_transitions(local_transitions, epochs=1, shuffle=False)
+            aggregate = torch.tensor(
+                [report.mean_loss * report.transitions, float(report.transitions)],
+                device=device,
+                dtype=torch.float64,
+            )
+            dist.all_reduce(aggregate)
+            mean_loss = float(aggregate[0] / aggregate[1])
+            transition_count = int(aggregate[1])
+
+            checkpoint = output_dir / f"stage-b-step-{trainer.state.optimizer_steps:08d}"
+            save_stage_b_checkpoint(
+                fsdp_model,
+                optimizer,
+                trainer,
+                checkpoint,
+                dataset_sha256=dataset_manifest.sha256,
+            )
+            if rank == 0:
+                print(
+                    f"epoch={epoch} transitions={transition_count} "
+                    f"optimizer_steps={report.optimizer_steps} mean_loss={mean_loss:.6f} "
+                    f"checkpoint={checkpoint}"
+                )
+    finally:
+        if dist.is_initialized():
             dist.destroy_process_group()
 
 
@@ -404,6 +593,34 @@ def main() -> None:
         action=argparse.BooleanOptionalAction,
         default=True,
     )
+    train_full = subparsers.add_parser(
+        "train-full",
+        help="run Stage B full-parameter iLLaDA training with FSDP FULL_SHARD",
+    )
+    train_full.add_argument("--data", required=True)
+    train_full.add_argument("--output-dir", required=True)
+    train_full.add_argument("--model", default="GSAI-ML/iLLaDA-8B-Base")
+    train_full.add_argument("--resume")
+    train_full.add_argument("--init-cid-checkpoint")
+    train_full.add_argument("--dtype", choices=("bf16", "fp16"), default="bf16")
+    train_full.add_argument("--epochs", type=int, default=1)
+    train_full.add_argument("--learning-rate", type=float, default=1e-5)
+    train_full.add_argument("--weight-decay", type=float, default=0.01)
+    train_full.add_argument("--micro-batch-size", type=int, default=1)
+    train_full.add_argument("--gradient-accumulation-steps", type=int, default=8)
+    train_full.add_argument("--max-grad-norm", type=float, default=1.0)
+    train_full.add_argument("--timestep-min", type=float, default=0.05)
+    train_full.add_argument("--timestep-max", type=float, default=1.0)
+    train_full.add_argument("--thought-capacity", type=int, default=8)
+    train_full.add_argument("--max-display-tokens", type=int, default=1024)
+    train_full.add_argument("--seed", type=int, default=0)
+    train_full.add_argument("--max-examples", type=int)
+    train_full.add_argument("--no-shuffle", action="store_true")
+    train_full.add_argument(
+        "--gradient-checkpointing",
+        action=argparse.BooleanOptionalAction,
+        default=True,
+    )
     args = parser.parse_args()
     if args.command == "demo":
         asyncio.run(_run_demo())
@@ -419,6 +636,8 @@ def main() -> None:
         _dataset_manifest(args)
     elif args.command == "train":
         _train_stage_a(args)
+    elif args.command == "train-full":
+        _train_stage_b(args)
 
 
 if __name__ == "__main__":

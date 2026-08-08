@@ -84,9 +84,35 @@ backbone. The iLLaDA adapter also constructs per-sample RoPE `position_ids` from
 display lengths. Padding introduced by another sample therefore does not alter the logical
 positions of a trajectory's display tokens.
 
-This DDP path is for the frozen-backbone Stage A phase. Joint/full-parameter training in Stage 2
-requires sharded model/optimizer state (FSDP or equivalent) rather than replicating Adam state on
-every GPU.
+This DDP path is for the frozen-backbone Stage A phase.
+
+### Stage B FSDP full-parameter launcher
+
+`cid train-full` is the full-parameter continuation path for the six-A6000 setup. It requires a
+multi-GPU `torchrun` job and wraps each native iLLaDA decoder layer with FSDP `FULL_SHARD` using
+`use_orig_params=True`. The underlying trainable parameters remain FP32 master weights; BF16 is the
+default forward and gradient-reduction dtype. `CIDTrainer` delegates gradient clipping to FSDP so
+the norm is computed across shards instead of clipping each rank's local fragment independently.
+
+The trajectory tensorizer cannot call a sharded token embedding outside FSDP forward. Before the
+model is wrapped, Stage B therefore copies the pretrained input embedding into a frozen BF16 text
+encoder. Dataset semantic transport text, external-memory records, and grounding/argument retrieval
+targets are encoded through that fixed snapshot. Prompt and display IDs remain ordinary model
+inputs and use the live, trainable embedding inside the FSDP forward. Besides avoiding illegal
+out-of-forward access to sharded parameters, this keeps target embeddings stationary while the
+language model changes.
+
+Stage B checkpoints use `torch.distributed.checkpoint` for model and optimizer state. No rank
+materializes a full 8B state dict. Rank-local trainer files preserve diffusion RNG, shuffle RNG,
+transition/optimizer counts, and completed epoch count. Metadata pins backbone geometry, CID
+adapter config, original world size, and the training JSONL SHA-256. Resume rejects a different
+dataset or world size and continues the next global epoch rather than restarting the shuffle seed.
+
+An optional Stage A CID-only checkpoint may initialize the CID heads before full unfreezing. It is
+mutually exclusive with Stage B `--resume`, which already restores the entire model and optimizer.
+The repository tests the FSDP path both with a CPU world-size-1 checkpoint round trip and a true
+two-rank Gloo `FULL_SHARD` forward/backward/distributed-checkpoint smoke. The real 8B A6000 memory
+ceiling still needs to be measured before raising local micro-batch size above one.
 
 ### Teacher distillation compiler
 

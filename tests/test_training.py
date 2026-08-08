@@ -1,13 +1,18 @@
 from __future__ import annotations
 
+import os
+import subprocess
+import sys
 from dataclasses import replace
 from importlib import import_module
+from pathlib import Path
 from types import SimpleNamespace
 
 import pytest
 
 from cid.data import BindingTarget, DisplayTarget, GroundingTarget, ThoughtTarget, TrajectoryExample
 from cid.grounding import Anchor, AnchorKind, CognitiveLink, LinkRelation, ObjectRef
+from cid.model.encoding import ILLaDATextEncoder
 from cid.state import CellLifecycle, CognitiveRole
 
 torch = pytest.importorskip("torch")
@@ -23,9 +28,12 @@ CIDTrainerConfig = cid_model.CIDTrainerConfig
 CIDTrainerState = cid_model.CIDTrainerState
 collate_training_steps = cid_model.collate_training_steps
 load_cid_adapter_checkpoint = cid_model.load_cid_adapter_checkpoint
+load_stage_b_checkpoint = cid_model.load_stage_b_checkpoint
+save_stage_b_checkpoint = cid_model.save_stage_b_checkpoint
 shard_transitions = cid_model.shard_transitions
 trajectory_transitions = cid_model.trajectory_transitions
 wrap_stage_a_ddp = cid_model.wrap_stage_a_ddp
+wrap_stage_b_fsdp = cid_model.wrap_stage_b_fsdp
 cid_loss = cid_model.cid_loss
 
 
@@ -37,10 +45,19 @@ class TinyConfig:
     max_position_embeddings = 64
 
 
-class TinyDecoder(nn.Module):
+class TinyDecoderLayer(nn.Module):
     def __init__(self) -> None:
         super().__init__()
         self.projection = nn.Linear(TinyConfig.hidden_size, TinyConfig.hidden_size, bias=False)
+
+    def forward(self, hidden):
+        return self.projection(hidden)
+
+
+class TinyDecoder(nn.Module):
+    def __init__(self) -> None:
+        super().__init__()
+        self.layers = nn.ModuleList([TinyDecoderLayer()])
 
     def forward(self, *, inputs_embeds, attention_mask, position_ids, return_dict):
         del position_ids
@@ -48,7 +65,7 @@ class TinyDecoder(nn.Module):
         weights = attention_mask.to(inputs_embeds.dtype).unsqueeze(-1)
         context = (inputs_embeds * weights).sum(dim=1, keepdim=True)
         context = context / weights.sum(dim=1, keepdim=True).clamp_min(1.0)
-        return SimpleNamespace(last_hidden_state=inputs_embeds + self.projection(context))
+        return SimpleNamespace(last_hidden_state=inputs_embeds + self.layers[0](context))
 
 
 class TinyBackbone(nn.Module):
@@ -222,6 +239,37 @@ def test_trajectory_tensorizer_runs_full_optimizer_step() -> None:
     assert all(parameter.grad is None for parameter in adapter.backbone.parameters())
 
 
+def test_frozen_text_encoder_snapshot_is_independent_from_live_backbone() -> None:
+    adapter = make_adapter()
+    tokenizer = TinyTokenizer()
+    snapshot = ILLaDATextEncoder.from_frozen_snapshot(
+        adapter,
+        tokenizer,
+        device="cpu",
+        dtype=torch.bfloat16,
+    )
+    before = snapshot.encode_one("stable target", detach=True).clone()
+
+    with torch.no_grad():
+        adapter.input_embeddings.weight.add_(1.0)
+
+    after = snapshot.encode_one("stable target", detach=True)
+    live = ILLaDATextEncoder(adapter, tokenizer).encode_one("stable target", detach=True)
+    assert torch.equal(before, after)
+    assert not torch.allclose(after.float(), live.float())
+    assert snapshot.dtype is torch.bfloat16
+    assert all(not parameter.requires_grad for parameter in snapshot._embedding.parameters())
+
+    tensorizer = ILLaDATrajectoryTensorizer(
+        adapter,
+        tokenizer,
+        text_encoder=snapshot,
+    )
+    sample = tensorizer.tensorize(make_trajectory(), source_step=0, timestep=1.0)
+    assert sample.batch.thought_semantic.dtype is torch.bfloat16
+    assert sample.batch.fact_memory.dtype is torch.bfloat16
+
+
 def test_training_collator_pads_variable_sequences_and_external_memory() -> None:
     adapter = make_adapter()
     tensorizer = ILLaDATrajectoryTensorizer(adapter, TinyTokenizer())
@@ -304,6 +352,7 @@ def test_trainer_checkpoint_restores_trainable_state_optimizer_and_progress(tmp_
     assert report.optimizer_steps == 1
     assert trainer.state.transitions_seen == 2
     assert trainer.state.optimizer_steps == 1
+    assert trainer.state.epochs_completed == 2
 
     path = tmp_path / "stage-a.pt"
     trainer.save_checkpoint(path)
@@ -331,7 +380,11 @@ def test_trainer_checkpoint_restores_trainable_state_optimizer_and_progress(tmp_
     inference_adapter = make_adapter(seed=77)
     inference_adapter.set_backbone_trainable(True)
     loaded_state = load_cid_adapter_checkpoint(inference_adapter, path)
-    assert loaded_state == CIDTrainerState(transitions_seen=2, optimizer_steps=1)
+    assert loaded_state == CIDTrainerState(
+        transitions_seen=2,
+        optimizer_steps=1,
+        epochs_completed=2,
+    )
     inference_parameters = dict(inference_adapter.named_parameters())
     for name in trainer.trainable_parameter_names:
         assert torch.equal(original_parameters[name], inference_parameters[name])
@@ -408,3 +461,156 @@ def test_stage_a_ddp_handles_batches_with_unused_external_modules(tmp_path) -> N
         assert torch.isfinite(torch.tensor(report.mean_loss))
     finally:
         dist.destroy_process_group()
+
+
+@pytest.mark.filterwarnings("ignore:FSDP is switching to use.*NO_SHARD.*")
+@pytest.mark.filterwarnings("ignore:When using .*NO_SHARD.*")
+def test_stage_b_fsdp_runs_full_parameter_optimizer_step_on_cpu(tmp_path) -> None:
+    if not dist.is_available():
+        pytest.skip("torch.distributed is unavailable")
+    init_file = tmp_path / "fsdp-init"
+    dist.init_process_group(
+        "gloo",
+        init_method=f"file://{init_file}",
+        rank=0,
+        world_size=1,
+    )
+    try:
+        adapter = make_adapter(seed=91)
+        adapter.set_backbone_trainable(True)
+        snapshot = ILLaDATextEncoder.from_frozen_snapshot(
+            adapter,
+            TinyTokenizer(),
+            device="cpu",
+            dtype=torch.bfloat16,
+        )
+        fsdp = wrap_stage_b_fsdp(
+            adapter,
+            device_id=torch.device("cpu"),
+            compute_dtype=torch.bfloat16,
+        )
+        optimizer = torch.optim.AdamW(fsdp.parameters(), lr=1e-3)
+        trainer = CIDTrainer(
+            adapter,
+            ILLaDATrajectoryTensorizer(
+                adapter,
+                TinyTokenizer(),
+                text_encoder=snapshot,
+            ),
+            CIDTrainerConfig(
+                learning_rate=1e-3,
+                timestep_min=1.0,
+                timestep_max=1.0,
+            ),
+            optimizer=optimizer,
+            forward_model=fsdp,
+            gradient_clipper=fsdp.clip_grad_norm_,
+        )
+        before = adapter.backbone.get_decoder().layers[0].projection.weight.detach().clone()
+
+        report = trainer.train_examples((make_trajectory(),), epochs=1, shuffle=False)
+
+        assert report.transitions == 1
+        assert report.optimizer_steps == 1
+        assert not torch.equal(
+            before,
+            adapter.backbone.get_decoder().layers[0].projection.weight,
+        )
+        assert all(parameter.requires_grad for parameter in adapter.backbone.parameters())
+
+        checkpoint = tmp_path / "stage-b-checkpoint"
+        saved_weight = (
+            adapter.backbone.get_decoder().layers[0].projection.weight.detach().clone()
+        )
+        save_stage_b_checkpoint(
+            fsdp,
+            optimizer,
+            trainer,
+            checkpoint,
+            dataset_sha256="dataset-v1",
+        )
+
+        restored_adapter = make_adapter(seed=91)
+        restored_adapter.set_backbone_trainable(True)
+        restored_snapshot = ILLaDATextEncoder.from_frozen_snapshot(
+            restored_adapter,
+            TinyTokenizer(),
+            device="cpu",
+            dtype=torch.bfloat16,
+        )
+        restored_fsdp = wrap_stage_b_fsdp(
+            restored_adapter,
+            device_id=torch.device("cpu"),
+            compute_dtype=torch.bfloat16,
+        )
+        restored_optimizer = torch.optim.AdamW(restored_fsdp.parameters(), lr=1e-3)
+        restored_trainer = CIDTrainer(
+            restored_adapter,
+            ILLaDATrajectoryTensorizer(
+                restored_adapter,
+                TinyTokenizer(),
+                text_encoder=restored_snapshot,
+            ),
+            CIDTrainerConfig(
+                learning_rate=1e-3,
+                timestep_min=1.0,
+                timestep_max=1.0,
+            ),
+            optimizer=restored_optimizer,
+            forward_model=restored_fsdp,
+            gradient_clipper=restored_fsdp.clip_grad_norm_,
+        )
+        with pytest.raises(ValueError, match="dataset SHA-256"):
+            load_stage_b_checkpoint(
+                restored_fsdp,
+                restored_optimizer,
+                restored_trainer,
+                checkpoint,
+                expected_dataset_sha256="different-dataset",
+            )
+        load_stage_b_checkpoint(
+            restored_fsdp,
+            restored_optimizer,
+            restored_trainer,
+            checkpoint,
+            expected_dataset_sha256="dataset-v1",
+        )
+
+        assert restored_trainer.state == trainer.state
+        assert torch.equal(
+            saved_weight,
+            restored_adapter.backbone.get_decoder().layers[0].projection.weight,
+        )
+        assert (checkpoint / "metadata.json").is_file()
+        assert (checkpoint / "rank-0000.pt").is_file()
+    finally:
+        dist.destroy_process_group()
+
+
+def test_stage_b_fsdp_full_shard_two_rank_smoke(tmp_path) -> None:
+    if not dist.is_available():
+        pytest.skip("torch.distributed is unavailable")
+    checkpoint = tmp_path / "distributed-checkpoint"
+    worker = Path(__file__).with_name("fsdp_stage_b_worker.py")
+    env = os.environ.copy()
+    env["CID_FSDP_SMOKE_DIR"] = str(checkpoint)
+
+    completed = subprocess.run(
+        [
+            sys.executable,
+            "-m",
+            "torch.distributed.run",
+            "--standalone",
+            "--nproc-per-node=2",
+            str(worker),
+        ],
+        cwd=Path(__file__).resolve().parents[1],
+        env=env,
+        capture_output=True,
+        text=True,
+        timeout=60,
+        check=False,
+    )
+
+    assert completed.returncode == 0, completed.stdout + completed.stderr
+    assert (checkpoint / ".metadata").is_file()

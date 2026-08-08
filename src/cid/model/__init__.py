@@ -38,9 +38,12 @@ from cid.model.training import (
     ILLaDATrajectoryTensorizer,
     collate_training_steps,
     load_cid_adapter_checkpoint,
+    load_stage_b_checkpoint,
+    save_stage_b_checkpoint,
     shard_transitions,
     trajectory_transitions,
     wrap_stage_a_ddp,
+    wrap_stage_b_fsdp,
 )
 
 __all__ = [
@@ -71,9 +74,12 @@ __all__ = [
     "ILLaDATrajectoryTensorizer",
     "collate_training_steps",
     "load_cid_adapter_checkpoint",
+    "load_stage_b_checkpoint",
+    "save_stage_b_checkpoint",
     "shard_transitions",
     "trajectory_transitions",
     "wrap_stage_a_ddp",
+    "wrap_stage_b_fsdp",
     "AnchorCandidate",
     "ArgumentCandidate",
     "ObjectCandidate",

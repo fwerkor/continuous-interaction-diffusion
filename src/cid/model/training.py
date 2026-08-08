@@ -1,8 +1,10 @@
 from __future__ import annotations
 
+import json
 import random
-from collections.abc import Mapping
+from collections.abc import Callable, Mapping
 from dataclasses import asdict, dataclass
+from functools import partial
 from inspect import signature
 from pathlib import Path
 from typing import Any
@@ -161,6 +163,7 @@ class CIDTrainerConfig:
 class CIDTrainerState:
     transitions_seen: int = 0
     optimizer_steps: int = 0
+    epochs_completed: int = 0
 
 
 @dataclass(frozen=True, slots=True)
@@ -181,11 +184,13 @@ class CIDTrainer:
         *,
         optimizer: torch.optim.Optimizer | None = None,
         forward_model: torch.nn.Module | None = None,
+        gradient_clipper: Callable[[float], Tensor | float] | None = None,
     ) -> None:
         if tensorizer.adapter is not adapter:
             raise ValueError("trainer and trajectory tensorizer must share the same adapter")
         self.adapter = adapter
         self.forward_model = forward_model or adapter
+        self.gradient_clipper = gradient_clipper
         self.tensorizer = tensorizer
         self.config = config or CIDTrainerConfig()
         self._trainable = tuple(
@@ -253,6 +258,7 @@ class CIDTrainer:
         self.state = CIDTrainerState(
             transitions_seen=self.state.transitions_seen + batch_size,
             optimizer_steps=self.state.optimizer_steps,
+            epochs_completed=self.state.epochs_completed,
         )
         if self._pending_accumulation >= self.config.gradient_accumulation_steps:
             self._optimizer_step()
@@ -293,6 +299,11 @@ class CIDTrainer:
                 microbatch = tuple(order[start : start + self.config.micro_batch_size])
                 loss = self.train_microbatch(microbatch)
                 losses.extend([float(loss.total.detach().float())] * len(microbatch))
+            self.state = CIDTrainerState(
+                transitions_seen=self.state.transitions_seen,
+                optimizer_steps=self.state.optimizer_steps,
+                epochs_completed=self.state.epochs_completed + 1,
+            )
         self.flush()
         return CIDTrainReport(
             transitions=len(losses),
@@ -307,6 +318,31 @@ class CIDTrainer:
     def flush(self) -> None:
         if self._pending_accumulation:
             self._optimizer_step()
+
+    def local_progress_state(self) -> dict[str, Any]:
+        if self._pending_accumulation:
+            raise RuntimeError("flush accumulated gradients before exporting trainer state")
+        return {
+            "trainer_config": asdict(self.config),
+            "trainer_state": asdict(self.state),
+            "generator_state": self.generator.get_state().cpu(),
+            "shuffle_state": self.shuffle_rng.getstate(),
+        }
+
+    def restore_local_progress_state(self, state: Mapping[str, Any]) -> None:
+        if state["trainer_config"] != asdict(self.config):
+            raise ValueError("checkpoint trainer configuration does not match this trainer")
+        trainer_state = state["trainer_state"]
+        self.state = CIDTrainerState(
+            transitions_seen=int(trainer_state["transitions_seen"]),
+            optimizer_steps=int(trainer_state["optimizer_steps"]),
+            epochs_completed=int(trainer_state.get("epochs_completed", 0)),
+        )
+        self.generator.set_state(state["generator_state"])
+        self.shuffle_rng.setstate(state["shuffle_state"])
+        self._pending_accumulation = 0
+        self._pending_examples = 0
+        self.optimizer.zero_grad(set_to_none=True)
 
     def save_checkpoint(self, path: str | Path) -> None:
         if self._pending_accumulation:
@@ -367,6 +403,7 @@ class CIDTrainer:
         self.state = CIDTrainerState(
             transitions_seen=int(state["transitions_seen"]),
             optimizer_steps=int(state["optimizer_steps"]),
+            epochs_completed=int(state.get("epochs_completed", 0)),
         )
         self._pending_accumulation = 0
         self._pending_examples = 0
@@ -378,10 +415,13 @@ class CIDTrainer:
         for _, parameter in self._trainable:
             if parameter.grad is not None:
                 parameter.grad.div_(self._pending_examples)
-        torch.nn.utils.clip_grad_norm_(
-            (parameter for _, parameter in self._trainable),
-            self.config.max_grad_norm,
-        )
+        if self.gradient_clipper is None:
+            torch.nn.utils.clip_grad_norm_(
+                (parameter for _, parameter in self._trainable),
+                self.config.max_grad_norm,
+            )
+        else:
+            self.gradient_clipper(self.config.max_grad_norm)
         self.optimizer.step()
         self.optimizer.zero_grad(set_to_none=True)
         self._pending_accumulation = 0
@@ -389,6 +429,7 @@ class CIDTrainer:
         self.state = CIDTrainerState(
             transitions_seen=self.state.transitions_seen,
             optimizer_steps=self.state.optimizer_steps + 1,
+            epochs_completed=self.state.epochs_completed,
         )
 
     def _sample_timestep(self) -> float:
@@ -431,6 +472,7 @@ def load_cid_adapter_checkpoint(
     return CIDTrainerState(
         transitions_seen=int(state["transitions_seen"]),
         optimizer_steps=int(state["optimizer_steps"]),
+        epochs_completed=int(state.get("epochs_completed", 0)),
     )
 
 
@@ -442,10 +484,14 @@ class ILLaDATrajectoryTensorizer:
         adapter: ILLaDACIDAdapter,
         tokenizer: Any,
         scheduler: CIDDiffusionScheduler | None = None,
+        *,
+        text_encoder: ILLaDATextEncoder | None = None,
     ) -> None:
         self.adapter = adapter
         self.tokenizer = tokenizer
-        self.text_encoder = ILLaDATextEncoder(adapter, tokenizer)
+        self.text_encoder = text_encoder or ILLaDATextEncoder(adapter, tokenizer)
+        if self.text_encoder.d_model != adapter.d_model:
+            raise ValueError("training text encoder width must match the iLLaDA adapter")
         self.scheduler = scheduler or CIDDiffusionScheduler(ILLADA_MASK_TOKEN_ID)
 
     def tensorize(
@@ -464,8 +510,8 @@ class ILLaDATrajectoryTensorizer:
         if not target:
             raise ValueError(f"trajectory has no thought targets for step {target_step}")
 
-        device = self.adapter.input_embeddings.weight.device
-        dtype = self.adapter.input_embeddings.weight.dtype
+        device = self.text_encoder.device
+        dtype = self.text_encoder.dtype
         capacity = self.adapter.config.max_thought_slots
         current_by_id = {cell.cell_id: cell for cell in current}
         target_by_id = {cell.cell_id: cell for cell in target}
@@ -947,3 +993,149 @@ def wrap_stage_a_ddp(
     else:
         kwargs["broadcast_buffers"] = False
     return DistributedDataParallel(adapter, **kwargs)
+
+
+def wrap_stage_b_fsdp(
+    adapter: ILLaDACIDAdapter,
+    *,
+    device_id: int | torch.device,
+    compute_dtype: torch.dtype = torch.bfloat16,
+) -> torch.nn.Module:
+    from torch.distributed.fsdp import (
+        FullyShardedDataParallel,
+        MixedPrecision,
+        ShardingStrategy,
+    )
+    from torch.distributed.fsdp.wrap import transformer_auto_wrap_policy
+
+    decoder = adapter.backbone.get_decoder()
+    layers = getattr(decoder, "layers", None)
+    if layers is None or len(layers) == 0:
+        raise ValueError("iLLaDA decoder must expose non-empty layers for FSDP auto-wrap")
+    layer_class = type(layers[0])
+    auto_wrap_policy = partial(
+        transformer_auto_wrap_policy,
+        transformer_layer_cls={layer_class},
+    )
+    return FullyShardedDataParallel(
+        adapter,
+        auto_wrap_policy=auto_wrap_policy,
+        sharding_strategy=ShardingStrategy.FULL_SHARD,
+        mixed_precision=MixedPrecision(
+            param_dtype=compute_dtype,
+            reduce_dtype=compute_dtype,
+            buffer_dtype=compute_dtype,
+        ),
+        device_id=device_id,
+        sync_module_states=False,
+        limit_all_gathers=True,
+        use_orig_params=True,
+    )
+
+
+def save_stage_b_checkpoint(
+    model: torch.nn.Module,
+    optimizer: torch.optim.Optimizer,
+    trainer: CIDTrainer,
+    path: str | Path,
+    *,
+    dataset_sha256: str | None = None,
+) -> None:
+    import torch.distributed as dist
+    import torch.distributed.checkpoint as dcp
+    from torch.distributed.checkpoint.state_dict import StateDictOptions, get_state_dict
+
+    if not dist.is_initialized():
+        raise RuntimeError("Stage B checkpointing requires an initialized process group")
+    destination = Path(path)
+    if dist.get_rank() == 0:
+        destination.mkdir(parents=True, exist_ok=True)
+    dist.barrier()
+
+    options = StateDictOptions(full_state_dict=False, cpu_offload=True)
+    model_state, optimizer_state = get_state_dict(model, optimizer, options=options)
+    dcp.save(
+        {"model": model_state, "optimizer": optimizer_state},
+        checkpoint_id=destination / "distributed",
+    )
+    torch.save(
+        trainer.local_progress_state(),
+        destination / f"rank-{dist.get_rank():04d}.pt",
+    )
+    if dist.get_rank() == 0:
+        metadata = {
+            "format_version": 1,
+            "kind": "cid-stage-b-fsdp",
+            "world_size": dist.get_world_size(),
+            "dataset_sha256": dataset_sha256,
+            "adapter_config": asdict(trainer.adapter.config),
+            "backbone": {
+                "model_type": str(trainer.adapter.backbone.config.model_type),
+                "hidden_size": trainer.adapter.d_model,
+                "vocab_size": trainer.adapter.vocab_size,
+            },
+        }
+        (destination / "metadata.json").write_text(
+            json.dumps(metadata, sort_keys=True, indent=2) + "\n",
+            encoding="utf-8",
+        )
+    dist.barrier()
+
+
+def load_stage_b_checkpoint(
+    model: torch.nn.Module,
+    optimizer: torch.optim.Optimizer,
+    trainer: CIDTrainer,
+    path: str | Path,
+    *,
+    expected_dataset_sha256: str | None = None,
+) -> None:
+    import torch.distributed as dist
+    import torch.distributed.checkpoint as dcp
+    from torch.distributed.checkpoint.state_dict import (
+        StateDictOptions,
+        get_state_dict,
+        set_state_dict,
+    )
+
+    if not dist.is_initialized():
+        raise RuntimeError("Stage B checkpointing requires an initialized process group")
+    source = Path(path)
+    metadata = json.loads((source / "metadata.json").read_text(encoding="utf-8"))
+    if metadata.get("format_version") != 1 or metadata.get("kind") != "cid-stage-b-fsdp":
+        raise ValueError("unsupported Stage B checkpoint format")
+    if int(metadata["world_size"]) != dist.get_world_size():
+        raise ValueError("Stage B resume currently requires the original world size")
+    if (
+        expected_dataset_sha256 is not None
+        and metadata.get("dataset_sha256") != expected_dataset_sha256
+    ):
+        raise ValueError("Stage B checkpoint dataset SHA-256 does not match training data")
+    if metadata["adapter_config"] != asdict(trainer.adapter.config):
+        raise ValueError("Stage B checkpoint adapter configuration does not match")
+    backbone = metadata["backbone"]
+    if (
+        int(backbone["hidden_size"]) != trainer.adapter.d_model
+        or int(backbone["vocab_size"]) != trainer.adapter.vocab_size
+        or str(backbone["model_type"]) != str(trainer.adapter.backbone.config.model_type)
+    ):
+        raise ValueError("Stage B checkpoint backbone geometry does not match")
+
+    options = StateDictOptions(full_state_dict=False, cpu_offload=True)
+    model_state, optimizer_state = get_state_dict(model, optimizer, options=options)
+    distributed_state = {"model": model_state, "optimizer": optimizer_state}
+    dcp.load(distributed_state, checkpoint_id=source / "distributed")
+    set_state_dict(
+        model,
+        optimizer,
+        model_state_dict=distributed_state["model"],
+        optim_state_dict=distributed_state["optimizer"],
+        options=options,
+    )
+    local_state = torch.load(
+        source / f"rank-{dist.get_rank():04d}.pt",
+        map_location="cpu",
+        weights_only=False,
+    )
+    trainer.restore_local_progress_state(local_state)
+    dist.barrier()

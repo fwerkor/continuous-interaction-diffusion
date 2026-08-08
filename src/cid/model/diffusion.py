@@ -77,7 +77,12 @@ class CIDDiffusionScheduler:
         if occupancy.shape != (*semantic.shape[:2], 1):
             raise ValueError("occupancy must have shape [batch, slots, 1]")
         timestep = self._batch_timesteps(semantic.shape[0], timesteps, semantic.device)
-        alpha = torch.cos(timestep * (math.pi / 2)).square().view(-1, 1, 1)
+        alpha = (
+            torch.cos(timestep * (math.pi / 2))
+            .square()
+            .to(dtype=semantic.dtype)
+            .view(-1, 1, 1)
+        )
         epsilon = torch.randn(
             semantic.shape,
             dtype=semantic.dtype,
@@ -88,7 +93,11 @@ class CIDDiffusionScheduler:
         occupied = occupancy.bool()
         corrupted = torch.where(occupied, corrupted, torch.zeros_like(corrupted))
         epsilon = torch.where(occupied, epsilon, torch.zeros_like(epsilon))
-        local_noise = timestep.view(-1, 1, 1).expand(-1, semantic.shape[1], -1)
+        local_noise = (
+            timestep.to(dtype=semantic.dtype)
+            .view(-1, 1, 1)
+            .expand(-1, semantic.shape[1], -1)
+        )
         local_noise = torch.where(occupied, local_noise, torch.zeros_like(local_noise))
         return ThoughtCorruption(semantic=corrupted, noise=local_noise, epsilon=epsilon)
 

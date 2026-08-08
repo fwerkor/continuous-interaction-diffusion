@@ -247,6 +247,51 @@ do not duplicate the frozen 8B backbone. Resume with `--resume <checkpoint>`. Fo
 `load_cid_adapter_checkpoint()` loads the CID-only state into an iLLaDA adapter without constructing
 a trainer.
 
+### Stage B full-parameter training
+
+After the CID heads have learned the basic runtime contract, `train-full` unfreezes the whole 8B
+model and uses FSDP `FULL_SHARD` across the six GPUs. Parameters remain FP32 master weights while
+forward/reduction compute uses BF16 by default. Each native iLLaDA decoder layer is an auto-wrap
+unit, so parameter, gradient, and Adam state are sharded instead of replicated on every A6000.
+
+```bash
+torchrun --standalone --nproc-per-node=6 -m cid.cli train-full \
+  --data data/distilled.jsonl \
+  --output-dir runs/stage-b-6gpu \
+  --init-cid-checkpoint runs/stage-a/stage-a-step-00001000.pt \
+  --thought-capacity 8 \
+  --micro-batch-size 1 \
+  --gradient-accumulation-steps 8 \
+  --learning-rate 1e-5 \
+  --dtype bf16
+```
+
+Stage B creates a frozen BF16 snapshot of the pretrained input embedding before FSDP wrapping. The
+snapshot is used only to encode dataset transport targets and external-memory text. Prompt/display
+token IDs still use the live trainable iLLaDA embedding inside the FSDP forward. This avoids calling
+a sharded embedding outside FSDP and keeps the target retrieval space stable while the backbone
+updates.
+
+Full-parameter checkpoints are directories written with `torch.distributed.checkpoint`; model and
+optimizer states stay sharded and are never gathered as an 8B checkpoint on rank 0. Each rank also
+saves its own diffusion/shuffle RNG state and progress. Resume with:
+
+```bash
+torchrun --standalone --nproc-per-node=6 -m cid.cli train-full \
+  --data data/distilled.jsonl \
+  --output-dir runs/stage-b-6gpu \
+  --resume runs/stage-b-6gpu/stage-b-step-00002000 \
+  --thought-capacity 8 \
+  --micro-batch-size 1 \
+  --gradient-accumulation-steps 8 \
+  --dtype bf16
+```
+
+Resume currently requires the same world size and the exact same training JSONL SHA-256. Global
+epoch numbering and per-rank RNG state continue from the checkpoint. The launcher serializes the
+initial full-model load across ranks to limit host-RAM pressure; the final A6000 memory envelope must
+still be measured on the real cards before increasing micro-batch size.
+
 ## Quick demo
 
 ```bash
