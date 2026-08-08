@@ -1,4 +1,5 @@
 import json
+from dataclasses import replace
 
 import pytest
 
@@ -13,9 +14,12 @@ from cid.distill import (
     TeacherTask,
     build_teacher_request,
     compile_teacher_plans,
+    dump_teacher_plans,
     dump_teacher_requests,
+    dump_teacher_reviews,
     dump_teacher_tasks,
     load_teacher_tasks,
+    review_teacher_plans,
     teacher_tasks_from_trajectories,
 )
 from cid.grounding import Anchor, AnchorKind, CognitiveLink, LinkRelation, ObjectRef
@@ -254,3 +258,48 @@ def test_teacher_task_request_files_are_stable_and_drop_event_schedule(tmp_path)
     assert {item["task_id"] for item in request_records} == {item.task_id for item in tasks}
     task_payload = json.loads(tasks_path.read_text().splitlines()[0])
     assert all("arrival_step" not in item for item in task_payload["evidence"])
+
+
+def test_teacher_quality_review_rejects_future_leaks_and_bad_arguments() -> None:
+    task, plan = make_teacher_task_and_plan()
+    pre = plan.frames[1]
+    leaking = replace(
+        plan,
+        frames=(
+            plan.frames[0],
+            replace(pre, display="37 ms"),
+            *plan.frames[2:],
+        ),
+    )
+    (review,) = review_teacher_plans((task,), (leaking,))
+    assert not review.accepted
+    assert any("leaks future evidence" in reason for reason in review.reasons)
+
+    bad_need = replace(plan.needs[0], arguments={"key": "wrong-key"})
+    bad_arguments = replace(plan, needs=(bad_need,))
+    (review,) = review_teacher_plans((task,), (bad_arguments,))
+    assert not review.accepted
+    assert any("does not match supplied evidence" in reason for reason in review.reasons)
+
+    with pytest.raises(ValueError, match="failed quality review"):
+        compile_teacher_plans((task,), (leaking,))
+
+
+def test_teacher_quality_review_deduplicates_semantic_plans(tmp_path) -> None:
+    task, plan = make_teacher_task_and_plan()
+    second_task = replace(task, task_id="teacher-2")
+    second_plan = replace(plan, task_id="teacher-2")
+
+    reviews = review_teacher_plans((task, second_task), (plan, second_plan))
+
+    assert reviews[0].accepted
+    assert not reviews[1].accepted
+    assert reviews[0].fingerprint == reviews[1].fingerprint
+    assert reviews[1].reasons == ("semantic duplicate of teacher-1",)
+
+    plans_path = tmp_path / "plans.jsonl"
+    reviews_path = tmp_path / "reviews.jsonl"
+    dump_teacher_plans((plan,), plans_path)
+    dump_teacher_reviews(reviews, reviews_path)
+    assert json.loads(plans_path.read_text())["task_id"] == "teacher-1"
+    assert len(reviews_path.read_text().splitlines()) == 2

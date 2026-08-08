@@ -4,6 +4,7 @@ import json
 import random
 from collections.abc import Iterable, Mapping
 from dataclasses import dataclass, field, replace
+from hashlib import sha256
 from pathlib import Path
 from typing import Any
 
@@ -158,6 +159,18 @@ class TeacherCellPlan:
             links=tuple(CognitiveLink.from_dict(item) for item in raw.get("links", ())),
         )
 
+    def to_dict(self) -> dict[str, Any]:
+        return {
+            "cell_id": self.cell_id,
+            "semantic_text": self.semantic_text,
+            "roles": {role.value: weight for role, weight in self.roles.items()},
+            "uncertainty": self.uncertainty,
+            "noise": self.noise,
+            "lifecycle": self.lifecycle.value,
+            "anchors": [anchor.to_dict() for anchor in self.anchors],
+            "links": [link.to_dict() for link in self.links],
+        }
+
 
 @dataclass(frozen=True, slots=True)
 class TeacherFrame:
@@ -180,6 +193,13 @@ class TeacherFrame:
             display=str(raw["display"]),
             cells=tuple(TeacherCellPlan.from_dict(item) for item in raw.get("cells", ())),
         )
+
+    def to_dict(self) -> dict[str, Any]:
+        return {
+            "phase": self.phase,
+            "display": self.display,
+            "cells": [cell.to_dict() for cell in self.cells],
+        }
 
 
 @dataclass(frozen=True, slots=True)
@@ -231,6 +251,21 @@ class TeacherNeed:
             max_age_s=None if raw.get("max_age_s") is None else float(raw["max_age_s"]),
         )
 
+    def to_dict(self) -> dict[str, Any]:
+        raw: dict[str, Any] = {
+            "need_id": self.need_id,
+            "cell_id": self.cell_id,
+            "evidence_id": self.evidence_id,
+            "phase": self.phase,
+            "source": self.source,
+            "arguments": dict(self.arguments),
+            "confidence": self.confidence,
+            "freshness": self.freshness.value,
+        }
+        if self.max_age_s is not None:
+            raw["max_age_s"] = self.max_age_s
+        return raw
+
 
 @dataclass(frozen=True, slots=True)
 class TeacherPlan:
@@ -262,6 +297,14 @@ class TeacherPlan:
             needs=tuple(TeacherNeed.from_dict(item) for item in raw.get("needs", ())),
         )
 
+    def to_dict(self) -> dict[str, Any]:
+        return {
+            "task_id": self.task_id,
+            "final_answer": self.final_answer,
+            "frames": [frame.to_dict() for frame in self.frames],
+            "needs": [need.to_dict() for need in self.needs],
+        }
+
 
 @dataclass(frozen=True, slots=True)
 class TeacherScheduleConfig:
@@ -281,6 +324,22 @@ class TeacherScheduleConfig:
 class TeacherRequest:
     task_id: str
     prompt: str
+
+
+@dataclass(frozen=True, slots=True)
+class TeacherReview:
+    task_id: str
+    accepted: bool
+    reasons: tuple[str, ...]
+    fingerprint: str
+
+    def to_dict(self) -> dict[str, Any]:
+        return {
+            "task_id": self.task_id,
+            "accepted": self.accepted,
+            "reasons": list(self.reasons),
+            "fingerprint": self.fingerprint,
+        }
 
 
 def build_teacher_request(task: TeacherTask) -> TeacherRequest:
@@ -375,6 +434,13 @@ def compile_teacher_plans(
     config: TeacherScheduleConfig | None = None,
 ) -> tuple[TrajectoryExample, ...]:
     config = config or TeacherScheduleConfig()
+    reviews = review_teacher_plans(tasks, plans)
+    rejected = tuple(review for review in reviews if not review.accepted)
+    if rejected:
+        detail = "; ".join(
+            f"{review.task_id}: {', '.join(review.reasons)}" for review in rejected
+        )
+        raise ValueError(f"teacher plans failed quality review: {detail}")
     plan_by_id = {plan.task_id: plan for plan in plans}
     if len(plan_by_id) != len(plans):
         raise ValueError("teacher plan task IDs must be unique")
@@ -389,6 +455,43 @@ def compile_teacher_plans(
     return tuple(
         _compile_one(task, plan_by_id[task.task_id], config, rng) for task in tasks
     )
+
+
+def review_teacher_plans(
+    tasks: tuple[TeacherTask, ...],
+    plans: tuple[TeacherPlan, ...],
+) -> tuple[TeacherReview, ...]:
+    plan_by_id = {plan.task_id: plan for plan in plans}
+    if len(plan_by_id) != len(plans):
+        raise ValueError("teacher plan task IDs must be unique")
+    task_ids = {task.task_id for task in tasks}
+    missing = [task.task_id for task in tasks if task.task_id not in plan_by_id]
+    if missing:
+        raise ValueError(f"missing teacher plans for tasks: {missing}")
+    extra = sorted(set(plan_by_id) - task_ids)
+    if extra:
+        raise ValueError(f"teacher plans contain unknown task IDs: {extra}")
+
+    reviews: list[TeacherReview] = []
+    seen_fingerprints: dict[str, str] = {}
+    for task in tasks:
+        plan = plan_by_id[task.task_id]
+        reasons = list(_teacher_quality_reasons(task, plan))
+        fingerprint = _teacher_fingerprint(task, plan)
+        duplicate_of = seen_fingerprints.get(fingerprint)
+        if duplicate_of is not None:
+            reasons.append(f"semantic duplicate of {duplicate_of}")
+        else:
+            seen_fingerprints[fingerprint] = task.task_id
+        reviews.append(
+            TeacherReview(
+                task_id=task.task_id,
+                accepted=not reasons,
+                reasons=tuple(reasons),
+                fingerprint=fingerprint,
+            )
+        )
+    return tuple(reviews)
 
 
 def dump_teacher_requests(tasks: Iterable[TeacherTask], path: str | Path) -> None:
@@ -411,6 +514,32 @@ def dump_teacher_tasks(tasks: Iterable[TeacherTask], path: str | Path) -> None:
             handle.write(
                 json.dumps(
                     task.to_dict(),
+                    ensure_ascii=False,
+                    separators=(",", ":"),
+                )
+                + "\n"
+            )
+
+
+def dump_teacher_plans(plans: Iterable[TeacherPlan], path: str | Path) -> None:
+    with Path(path).open("w", encoding="utf-8") as handle:
+        for plan in plans:
+            handle.write(
+                json.dumps(
+                    plan.to_dict(),
+                    ensure_ascii=False,
+                    separators=(",", ":"),
+                )
+                + "\n"
+            )
+
+
+def dump_teacher_reviews(reviews: Iterable[TeacherReview], path: str | Path) -> None:
+    with Path(path).open("w", encoding="utf-8") as handle:
+        for review in reviews:
+            handle.write(
+                json.dumps(
+                    review.to_dict(),
                     ensure_ascii=False,
                     separators=(",", ":"),
                 )
@@ -716,3 +845,163 @@ def _reject_unknown_keys(
     unknown = sorted(str(key) for key in raw if str(key) not in allowed)
     if unknown:
         raise ValueError(f"{label} contains unsupported fields: {unknown}")
+
+
+def _teacher_quality_reasons(
+    task: TeacherTask,
+    plan: TeacherPlan,
+) -> tuple[str, ...]:
+    reasons: list[str] = []
+    if task.task_id != plan.task_id:
+        return ("task/plan IDs do not match",)
+
+    frame_by_phase = {frame.phase: frame for frame in plan.frames}
+    expected_after = tuple(f"after:{item.evidence_id}" for item in task.evidence)
+    missing_phases = tuple(phase for phase in expected_after if phase not in frame_by_phase)
+    if missing_phases:
+        reasons.append(f"missing evidence frames: {list(missing_phases)}")
+    allowed = {"initial", "pre", "final", *expected_after}
+    unknown_phases = sorted(set(frame_by_phase) - allowed)
+    if unknown_phases:
+        reasons.append(f"unsupported phases: {unknown_phases}")
+
+    semantic_frames = [frame_by_phase["initial"]]
+    if "pre" in frame_by_phase:
+        semantic_frames.append(frame_by_phase["pre"])
+    semantic_frames.extend(
+        frame_by_phase[phase] for phase in expected_after if phase in frame_by_phase
+    )
+    if "final" in frame_by_phase:
+        semantic_frames.append(frame_by_phase["final"])
+    try:
+        _validate_monotonic_cells(semantic_frames)
+    except ValueError as exc:
+        reasons.append(str(exc))
+    try:
+        _validate_need_contract(task, plan, frame_by_phase)
+    except (StopIteration, ValueError) as exc:
+        reasons.append(str(exc) or "invalid teacher need contract")
+
+    evidence_by_id = {item.evidence_id: item for item in task.evidence}
+    source_by_name = {
+        str(item.get("name", "")): item for item in task.source_descriptors
+    }
+    for need in plan.needs:
+        evidence = evidence_by_id.get(need.evidence_id)
+        descriptor = source_by_name.get(need.source)
+        if evidence is None or descriptor is None:
+            continue
+        for argument in descriptor.get("arguments", ()):
+            if not bool(argument.get("required", True)):
+                continue
+            name = str(argument.get("name", ""))
+            if name not in need.arguments:
+                reasons.append(f"need {need.need_id} is missing required argument {name!r}")
+                continue
+            if name not in evidence.arguments:
+                reasons.append(
+                    f"evidence {evidence.evidence_id} is missing required argument {name!r}"
+                )
+                continue
+            if need.arguments[name] != evidence.arguments[name]:
+                reasons.append(
+                    f"need {need.need_id} argument {name!r} does not match supplied evidence"
+                )
+
+    final_frame = semantic_frames[-1]
+    if final_frame.display.strip() != plan.final_answer.strip():
+        reasons.append("final frame display does not match final_answer")
+    if not any(
+        cell.roles.get(CognitiveRole.CONCLUSION, 0.0) > 0.0
+        for cell in final_frame.cells
+    ):
+        reasons.append("final frame has no conclusion-role cell")
+    reasons.extend(_future_evidence_leaks(task, semantic_frames))
+    return tuple(dict.fromkeys(reasons))
+
+
+def _future_evidence_leaks(
+    task: TeacherTask,
+    frames: list[TeacherFrame],
+) -> tuple[str, ...]:
+    baseline = _normalized_text(
+        " ".join(
+            (
+                task.prompt,
+                json.dumps(task.protected_facts, ensure_ascii=False, sort_keys=True, default=str),
+                json.dumps(
+                    task.source_descriptors,
+                    ensure_ascii=False,
+                    sort_keys=True,
+                    default=str,
+                ),
+            )
+        )
+    )
+    evidence_by_id = {item.evidence_id: item for item in task.evidence}
+    evidence_order = tuple(item.evidence_id for item in task.evidence)
+    available: set[str] = set()
+    reasons: list[str] = []
+    for frame in frames:
+        if frame.phase.startswith("after:"):
+            evidence_id = frame.phase.removeprefix("after:")
+            if evidence_id in evidence_by_id:
+                available.add(evidence_id)
+        elif frame.phase == "final":
+            available.update(evidence_order)
+
+        frame_text = _frame_visibility_text(frame)
+        for evidence_id in evidence_order:
+            if evidence_id in available:
+                continue
+            evidence = evidence_by_id[evidence_id]
+            for marker in _evidence_markers(evidence.value):
+                normalized_marker = _normalized_text(marker)
+                if normalized_marker in baseline:
+                    continue
+                if normalized_marker and normalized_marker in frame_text:
+                    reasons.append(
+                        f"phase {frame.phase!r} leaks future evidence {evidence_id!r}"
+                    )
+                    break
+    return tuple(reasons)
+
+
+def _frame_visibility_text(frame: TeacherFrame) -> str:
+    parts = [frame.display]
+    for cell in frame.cells:
+        parts.append(cell.semantic_text)
+        parts.extend(str(anchor.value) for anchor in cell.anchors)
+    return _normalized_text(" ".join(parts))
+
+
+def _evidence_markers(value: Any) -> tuple[str, ...]:
+    if isinstance(value, bool) or value is None:
+        return ()
+    if isinstance(value, (int, float)):
+        return (str(value),)
+    if isinstance(value, str):
+        marker = value.strip()
+        return (marker,) if len(marker) >= 3 else ()
+    marker = json.dumps(value, ensure_ascii=False, sort_keys=True, default=str)
+    return (marker,) if len(marker) >= 4 else ()
+
+
+def _normalized_text(value: str) -> str:
+    return " ".join(value.casefold().split())
+
+
+def _teacher_fingerprint(task: TeacherTask, plan: TeacherPlan) -> str:
+    task_payload = task.to_dict()
+    task_payload.pop("task_id", None)
+    task_payload.pop("metadata", None)
+    plan_payload = plan.to_dict()
+    plan_payload.pop("task_id", None)
+    payload = json.dumps(
+        {"task": task_payload, "plan": plan_payload},
+        ensure_ascii=False,
+        sort_keys=True,
+        default=str,
+        separators=(",", ":"),
+    )
+    return sha256(payload.encode("utf-8")).hexdigest()

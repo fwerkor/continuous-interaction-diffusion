@@ -63,8 +63,11 @@ and grounding where applicable. This is intended for pipeline validation and mec
 `prepare-distillation` now converts those tasks into timing-free teacher requests and
 `compile-distillation` maps semantic teacher plans back into the same `TrajectoryExample` ABI while
 sampling event schedules and physical slots independently. The compiler also inserts runtime-valid
-WAITING/arrival-assimilation lifecycle states. Remaining M2 work is production-scale teacher calling,
-quality filtering/deduplication, and dataset mixture/versioning rather than another ABI change.
+WAITING/arrival-assimilation lifecycle states. `review-distillation` now provides deterministic
+future-evidence leak checks, argument consistency checks, final-state checks, and semantic
+deduplication; `dataset-manifest` pins compiled JSONL files by SHA-256 and structural statistics.
+Remaining M2 work is production-scale teacher calling and explicit dataset-mixture policy rather
+than another ABI change.
 
 ## M3 — adapter training
 

@@ -8,13 +8,17 @@ from pathlib import Path
 
 from cid.contracts import FreshnessDemand, InformationNeed, ModelContext, ModelUpdate
 from cid.data import dump_jsonl, load_jsonl
+from cid.dataset import dump_dataset_manifest, inspect_dataset
 from cid.distill import (
     TeacherScheduleConfig,
     compile_teacher_plans,
+    dump_teacher_plans,
     dump_teacher_requests,
+    dump_teacher_reviews,
     dump_teacher_tasks,
     load_teacher_plans,
     load_teacher_tasks,
+    review_teacher_plans,
     teacher_tasks_from_trajectories,
 )
 from cid.grounding import ObjectRef
@@ -130,6 +134,36 @@ def _compile_distillation(args: argparse.Namespace) -> None:
     )
     print(
         f"compiled={len(examples)} transitions={transition_count} path={output}"
+    )
+
+
+def _review_distillation(args: argparse.Namespace) -> None:
+    tasks = load_teacher_tasks(args.tasks)
+    plans = load_teacher_plans(args.plans)
+    reviews = review_teacher_plans(tasks, plans)
+    accepted_ids = {review.task_id for review in reviews if review.accepted}
+    accepted = tuple(plan for plan in plans if plan.task_id in accepted_ids)
+
+    plans_output = Path(args.accepted_plans_output)
+    report_output = Path(args.report_output)
+    plans_output.parent.mkdir(parents=True, exist_ok=True)
+    report_output.parent.mkdir(parents=True, exist_ok=True)
+    dump_teacher_plans(accepted, plans_output)
+    dump_teacher_reviews(reviews, report_output)
+    rejected = len(reviews) - len(accepted)
+    print(
+        f"reviewed={len(reviews)} accepted={len(accepted)} rejected={rejected} "
+        f"plans_path={plans_output} report_path={report_output}"
+    )
+
+
+def _dataset_manifest(args: argparse.Namespace) -> None:
+    manifest = inspect_dataset(args.data)
+    output = Path(args.output)
+    dump_dataset_manifest(manifest, output)
+    print(
+        f"examples={manifest.examples} transitions={manifest.transitions} "
+        f"sha256={manifest.sha256} path={output}"
     )
 
 
@@ -328,6 +362,20 @@ def main() -> None:
     compile_distillation.add_argument("--min-delay-steps", type=int, default=1)
     compile_distillation.add_argument("--max-delay-steps", type=int, default=4)
     compile_distillation.add_argument("--seed", type=int, default=0)
+    review = subparsers.add_parser(
+        "review-distillation",
+        help="quality-filter and deduplicate semantic teacher plans",
+    )
+    review.add_argument("--tasks", required=True)
+    review.add_argument("--plans", required=True)
+    review.add_argument("--accepted-plans-output", required=True)
+    review.add_argument("--report-output", required=True)
+    manifest = subparsers.add_parser(
+        "dataset-manifest",
+        help="write a deterministic manifest for a CID trajectory JSONL dataset",
+    )
+    manifest.add_argument("--data", required=True)
+    manifest.add_argument("--output", required=True)
     train = subparsers.add_parser(
         "train",
         help="run Stage A CID adapter training with a frozen iLLaDA backbone",
@@ -365,6 +413,10 @@ def main() -> None:
         _prepare_distillation(args)
     elif args.command == "compile-distillation":
         _compile_distillation(args)
+    elif args.command == "review-distillation":
+        _review_distillation(args)
+    elif args.command == "dataset-manifest":
+        _dataset_manifest(args)
     elif args.command == "train":
         _train_stage_a(args)
 

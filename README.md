@@ -165,9 +165,20 @@ or physical TCT slots. Save one returned plan JSON object per line, then compile
 normal training ABI:
 
 ```bash
-cid compile-distillation \
+cid review-distillation \
   --tasks data/teacher-tasks.jsonl \
   --plans data/teacher-plans.jsonl \
+  --accepted-plans-output data/teacher-plans.accepted.jsonl \
+  --report-output data/teacher-review.jsonl
+```
+
+The review rejects future-evidence leakage, required-argument mismatches, missing final conclusion
+state, and exact semantic duplicates before the plans reach training.
+
+```bash
+cid compile-distillation \
+  --tasks data/teacher-tasks.jsonl \
+  --plans data/teacher-plans.accepted.jsonl \
   --output data/distilled.jsonl \
   --thought-capacity 8 \
   --min-delay-steps 1 \
@@ -179,6 +190,17 @@ The compiler independently randomizes event latency and physical slot placement,
 `WAITING` states while external evidence is outstanding, forces arrival-time assimilation through
 `ACTIVE`, and only then permits the teacher's stable post-evidence state. Teacher plan parsing is
 strict: unknown fields and any attempt to control timing or slot placement are rejected.
+
+Pin the exact JSONL used for a run with a deterministic manifest:
+
+```bash
+cid dataset-manifest \
+  --data data/distilled.jsonl \
+  --output data/distilled.manifest.json
+```
+
+The manifest records the raw-file SHA-256, example/transition counts, source set, scenario tags,
+maximum trajectory depth, and minimum TCT capacity required by the data.
 
 ### Stage A training
 

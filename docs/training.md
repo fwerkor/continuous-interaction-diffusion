@@ -112,6 +112,7 @@ TrajectoryExample tasks
     -> prepare-distillation
     -> timing-free teacher request JSONL
     -> strong teacher semantic plan JSONL
+    -> review-distillation
     -> compile-distillation
     -> randomized supervised TrajectoryExample JSONL
 ```
@@ -119,6 +120,18 @@ TrajectoryExample tasks
 This separation is intentional. Distillation should improve semantic supervision quality without
 allowing teacher-specific call timing or a fixed physical slot convention to become part of the
 student's learned policy.
+
+`review-distillation` is a deterministic pre-compiler gate. It rejects semantic plans that expose
+future evidence before the corresponding `after:<evidence>` phase, bind required source arguments
+to values inconsistent with the supplied evidence, omit a conclusion-bearing final state, or
+duplicate an already accepted task/plan payload. The review report carries a stable content
+fingerprint for every plan, so filtering decisions can be audited independently of the training
+run.
+
+After compilation, `dataset-manifest` records the exact JSONL SHA-256 together with example and
+transition counts, scenario/distillation tags, source names, maximum trajectory depth, and required
+TCT capacity. This gives every training run a deterministic dataset identity instead of relying on
+mutable filenames.
 
 ## Stage 2 — joint T/Y refinement
 
