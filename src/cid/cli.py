@@ -2,11 +2,12 @@ from __future__ import annotations
 
 import argparse
 import asyncio
+import os
 import time
 from pathlib import Path
 
 from cid.contracts import FreshnessDemand, InformationNeed, ModelContext, ModelUpdate
-from cid.data import dump_jsonl
+from cid.data import dump_jsonl, load_jsonl
 from cid.grounding import ObjectRef
 from cid.metrics import summarize_runtime
 from cid.runtime import CIDRuntime, RuntimeConfig, SourceRegistry, StaticMappingSource
@@ -84,6 +85,165 @@ def _generate_synthetic(args: argparse.Namespace) -> None:
     print(f"wrote={len(examples)} path={output}")
 
 
+def _train_stage_a(args: argparse.Namespace) -> None:
+    import torch
+    import torch.distributed as dist
+    from transformers import AutoTokenizer
+
+    from cid.model import (
+        ILLADA_8B_BASE,
+        ILLADA_8B_BASE_REVISION,
+        CIDTrainer,
+        CIDTrainerConfig,
+        ILLaDACIDAdapter,
+        ILLaDACIDConfig,
+        ILLaDATrajectoryTensorizer,
+        shard_transitions,
+        trajectory_transitions,
+        wrap_stage_a_ddp,
+    )
+
+    dtype = {
+        "bf16": torch.bfloat16,
+        "fp16": torch.float16,
+        "fp32": torch.float32,
+    }[args.dtype]
+    world_size = int(os.environ.get("WORLD_SIZE", "1"))
+    distributed = world_size > 1
+    rank = int(os.environ.get("RANK", "0"))
+    local_rank = int(os.environ.get("LOCAL_RANK", "0"))
+    if distributed:
+        use_cuda = args.device != "cpu" and torch.cuda.is_available()
+        backend = "nccl" if use_cuda else "gloo"
+        dist.init_process_group(backend=backend)
+        rank = dist.get_rank()
+        world_size = dist.get_world_size()
+        if use_cuda:
+            torch.cuda.set_device(local_rank)
+            device = f"cuda:{local_rank}"
+        else:
+            device = "cpu"
+    else:
+        device = args.device
+        if device == "auto":
+            device = "cuda" if torch.cuda.is_available() else "cpu"
+
+    try:
+        adapter_config = ILLaDACIDConfig(
+            max_thought_slots=args.thought_capacity,
+            max_display_tokens=args.max_display_tokens,
+        )
+
+        def load_adapter() -> ILLaDACIDAdapter:
+            model = ILLaDACIDAdapter.from_pretrained(
+                args.model,
+                config=adapter_config,
+                freeze_backbone=True,
+                torch_dtype=dtype,
+            )
+            return model.to(device)
+
+        adapter = None
+        if distributed:
+            for loading_rank in range(world_size):
+                if rank == loading_rank:
+                    adapter = load_adapter()
+                dist.barrier()
+        else:
+            adapter = load_adapter()
+        if adapter is None:
+            raise RuntimeError("failed to load iLLaDA adapter on this training rank")
+
+        tokenizer_kwargs: dict[str, object] = {"trust_remote_code": True}
+        if args.model == ILLADA_8B_BASE:
+            tokenizer_kwargs["revision"] = ILLADA_8B_BASE_REVISION
+        tokenizer = AutoTokenizer.from_pretrained(args.model, **tokenizer_kwargs)
+        tensorizer = ILLaDATrajectoryTensorizer(adapter, tokenizer)
+        forward_model = (
+            wrap_stage_a_ddp(
+                adapter,
+                device_ids=[local_rank] if str(device).startswith("cuda") else None,
+            )
+            if distributed
+            else adapter
+        )
+        trainer = CIDTrainer(
+            adapter,
+            tensorizer,
+            CIDTrainerConfig(
+                learning_rate=args.learning_rate,
+                weight_decay=args.weight_decay,
+                gradient_accumulation_steps=args.gradient_accumulation_steps,
+                max_grad_norm=args.max_grad_norm,
+                timestep_min=args.timestep_min,
+                timestep_max=args.timestep_max,
+                seed=args.seed,
+            ),
+            forward_model=forward_model,
+        )
+        if args.resume:
+            trainer.load_checkpoint(args.resume)
+        if distributed:
+            trainer.reseed(args.seed + rank + trainer.state.transitions_seen * 104729)
+
+        examples = load_jsonl(args.data)
+        if args.max_examples is not None:
+            examples = examples[: args.max_examples]
+        transitions = trajectory_transitions(examples)
+        if not transitions:
+            raise ValueError("training data contains no adjacent thought transitions")
+        output_dir = Path(args.output_dir)
+        output_dir.mkdir(parents=True, exist_ok=True)
+        trainable = sum(
+            parameter.numel() for parameter in adapter.parameters() if parameter.requires_grad
+        )
+        if rank == 0:
+            print(
+                f"device={device} world_size={world_size} dtype={args.dtype} "
+                f"examples={len(examples)} transitions={len(transitions)} "
+                f"trainable_parameters={trainable}"
+            )
+
+        for epoch in range(1, args.epochs + 1):
+            local_transitions = shard_transitions(
+                transitions,
+                world_size=world_size,
+                rank=rank,
+                seed=args.seed,
+                epoch=epoch,
+                shuffle=not args.no_shuffle,
+            )
+            report = trainer.train_transitions(local_transitions, epochs=1, shuffle=False)
+
+            loss_sum = report.mean_loss * report.transitions
+            transition_count = report.transitions
+            if distributed:
+                aggregate = torch.tensor(
+                    [loss_sum, float(transition_count)],
+                    device=device,
+                    dtype=torch.float64,
+                )
+                dist.all_reduce(aggregate)
+                loss_sum = float(aggregate[0])
+                transition_count = int(aggregate[1])
+                dist.barrier()
+            mean_loss = loss_sum / transition_count
+
+            checkpoint = output_dir / f"stage-a-step-{trainer.state.optimizer_steps:08d}.pt"
+            if rank == 0:
+                trainer.save_checkpoint(checkpoint)
+                print(
+                    f"epoch={epoch} transitions={transition_count} "
+                    f"optimizer_steps={report.optimizer_steps} mean_loss={mean_loss:.6f} "
+                    f"checkpoint={checkpoint}"
+                )
+            if distributed:
+                dist.barrier()
+    finally:
+        if distributed and dist.is_initialized():
+            dist.destroy_process_group()
+
+
 def main() -> None:
     parser = argparse.ArgumentParser(prog="cid")
     subparsers = parser.add_subparsers(dest="command", required=True)
@@ -96,11 +256,35 @@ def main() -> None:
     synthetic.add_argument("--count-per-family", type=int, default=32)
     synthetic.add_argument("--seed", type=int, default=0)
     synthetic.add_argument("--thought-capacity", type=int, default=8)
+    train = subparsers.add_parser(
+        "train",
+        help="run Stage A CID adapter training with a frozen iLLaDA backbone",
+    )
+    train.add_argument("--data", required=True)
+    train.add_argument("--output-dir", required=True)
+    train.add_argument("--model", default="GSAI-ML/iLLaDA-8B-Base")
+    train.add_argument("--resume")
+    train.add_argument("--device", default="auto")
+    train.add_argument("--dtype", choices=("bf16", "fp16", "fp32"), default="bf16")
+    train.add_argument("--epochs", type=int, default=1)
+    train.add_argument("--learning-rate", type=float, default=1e-4)
+    train.add_argument("--weight-decay", type=float, default=0.01)
+    train.add_argument("--gradient-accumulation-steps", type=int, default=8)
+    train.add_argument("--max-grad-norm", type=float, default=1.0)
+    train.add_argument("--timestep-min", type=float, default=0.05)
+    train.add_argument("--timestep-max", type=float, default=1.0)
+    train.add_argument("--thought-capacity", type=int, default=8)
+    train.add_argument("--max-display-tokens", type=int, default=1024)
+    train.add_argument("--seed", type=int, default=0)
+    train.add_argument("--max-examples", type=int)
+    train.add_argument("--no-shuffle", action="store_true")
     args = parser.parse_args()
     if args.command == "demo":
         asyncio.run(_run_demo())
     elif args.command == "generate-synthetic":
         _generate_synthetic(args)
+    elif args.command == "train":
+        _train_stage_a(args)
 
 
 if __name__ == "__main__":

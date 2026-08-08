@@ -1,7 +1,10 @@
 from __future__ import annotations
 
+import random
 from collections.abc import Mapping
-from dataclasses import dataclass
+from dataclasses import asdict, dataclass
+from inspect import signature
+from pathlib import Path
 from typing import Any
 
 import torch
@@ -14,7 +17,7 @@ from cid.lifecycle import MODELED_LIFECYCLES
 from cid.model.diffusion import CIDDiffusionScheduler
 from cid.model.encoding import ILLaDATextEncoder, stable_text
 from cid.model.illada import ILLADA_MASK_TOKEN_ID, ILLaDACIDAdapter
-from cid.model.losses import CIDTargets
+from cid.model.losses import CIDLoss, CIDTargets, cid_loss
 from cid.model.materialize import RevisionAction
 from cid.model.tensors import CIDTensorBatch
 from cid.state import CognitiveRole
@@ -27,6 +30,278 @@ class CIDTrainingStep:
     target_step: int
     batch: CIDTensorBatch
     targets: CIDTargets
+
+
+@dataclass(frozen=True, slots=True)
+class CIDTrainerConfig:
+    learning_rate: float = 1e-4
+    weight_decay: float = 0.01
+    gradient_accumulation_steps: int = 1
+    max_grad_norm: float = 1.0
+    timestep_min: float = 0.05
+    timestep_max: float = 1.0
+    seed: int = 0
+
+    def __post_init__(self) -> None:
+        if self.learning_rate <= 0.0:
+            raise ValueError("learning_rate must be positive")
+        if self.weight_decay < 0.0:
+            raise ValueError("weight_decay must be non-negative")
+        if self.gradient_accumulation_steps <= 0:
+            raise ValueError("gradient_accumulation_steps must be positive")
+        if self.max_grad_norm <= 0.0:
+            raise ValueError("max_grad_norm must be positive")
+        if not 0.0 <= self.timestep_min <= self.timestep_max <= 1.0:
+            raise ValueError("timestep range must satisfy 0 <= min <= max <= 1")
+
+
+@dataclass(frozen=True, slots=True)
+class CIDTrainerState:
+    transitions_seen: int = 0
+    optimizer_steps: int = 0
+
+
+@dataclass(frozen=True, slots=True)
+class CIDTrainReport:
+    transitions: int
+    optimizer_steps: int
+    mean_loss: float
+
+
+class CIDTrainer:
+    CHECKPOINT_VERSION = 1
+
+    def __init__(
+        self,
+        adapter: ILLaDACIDAdapter,
+        tensorizer: ILLaDATrajectoryTensorizer,
+        config: CIDTrainerConfig | None = None,
+        *,
+        optimizer: torch.optim.Optimizer | None = None,
+        forward_model: torch.nn.Module | None = None,
+    ) -> None:
+        if tensorizer.adapter is not adapter:
+            raise ValueError("trainer and trajectory tensorizer must share the same adapter")
+        self.adapter = adapter
+        self.forward_model = forward_model or adapter
+        self.tensorizer = tensorizer
+        self.config = config or CIDTrainerConfig()
+        self._trainable = tuple(
+            (name, parameter)
+            for name, parameter in adapter.named_parameters()
+            if parameter.requires_grad
+        )
+        if not self._trainable:
+            raise ValueError("trainer requires at least one trainable parameter")
+        self.optimizer = optimizer or torch.optim.AdamW(
+            (parameter for _, parameter in self._trainable),
+            lr=self.config.learning_rate,
+            weight_decay=self.config.weight_decay,
+        )
+        device = adapter.input_embeddings.weight.device
+        self.generator = torch.Generator(device=device)
+        self.generator.manual_seed(self.config.seed)
+        self.shuffle_rng = random.Random(self.config.seed)
+        self.state = CIDTrainerState()
+        self._pending_accumulation = 0
+        self.optimizer.zero_grad(set_to_none=True)
+
+    @property
+    def trainable_parameter_names(self) -> tuple[str, ...]:
+        return tuple(name for name, _ in self._trainable)
+
+    def train_transition(self, example: TrajectoryExample, source_step: int) -> CIDLoss:
+        self.forward_model.train()
+        timestep = self._sample_timestep()
+        sample = self.tensorizer.tensorize(
+            example,
+            source_step,
+            timestep=timestep,
+            generator=self.generator,
+        )
+        output = self.forward_model(sample.batch)
+        losses = cid_loss(output, sample.targets)
+        if not bool(torch.isfinite(losses.total)):
+            raise FloatingPointError(
+                f"non-finite CID loss for {example.example_id} transition {source_step}"
+            )
+        scaled = losses.total / self.config.gradient_accumulation_steps
+        scaled.backward()
+        self._pending_accumulation += 1
+        self.state = CIDTrainerState(
+            transitions_seen=self.state.transitions_seen + 1,
+            optimizer_steps=self.state.optimizer_steps,
+        )
+        if self._pending_accumulation >= self.config.gradient_accumulation_steps:
+            self._optimizer_step()
+        return losses
+
+    def train_examples(
+        self,
+        examples: tuple[TrajectoryExample, ...],
+        *,
+        epochs: int = 1,
+        shuffle: bool = True,
+    ) -> CIDTrainReport:
+        if epochs <= 0:
+            raise ValueError("epochs must be positive")
+        transitions = trajectory_transitions(examples)
+        if not transitions:
+            raise ValueError("training data contains no adjacent thought transitions")
+        return self.train_transitions(transitions, epochs=epochs, shuffle=shuffle)
+
+    def train_transitions(
+        self,
+        transitions: tuple[tuple[TrajectoryExample, int], ...],
+        *,
+        epochs: int = 1,
+        shuffle: bool = True,
+    ) -> CIDTrainReport:
+        if epochs <= 0:
+            raise ValueError("epochs must be positive")
+        if not transitions:
+            raise ValueError("training data contains no adjacent thought transitions")
+        losses: list[float] = []
+        start_optimizer_steps = self.state.optimizer_steps
+        for _ in range(epochs):
+            order = list(transitions)
+            if shuffle:
+                self.shuffle_rng.shuffle(order)
+            for example, source_step in order:
+                loss = self.train_transition(example, source_step)
+                losses.append(float(loss.total.detach().float()))
+        self.flush()
+        return CIDTrainReport(
+            transitions=len(losses),
+            optimizer_steps=self.state.optimizer_steps - start_optimizer_steps,
+            mean_loss=sum(losses) / len(losses),
+        )
+
+    def reseed(self, seed: int) -> None:
+        self.generator.manual_seed(seed)
+        self.shuffle_rng.seed(seed)
+
+    def flush(self) -> None:
+        if self._pending_accumulation:
+            self._optimizer_step()
+
+    def save_checkpoint(self, path: str | Path) -> None:
+        if self._pending_accumulation:
+            raise RuntimeError("flush accumulated gradients before saving a checkpoint")
+        destination = Path(path)
+        destination.parent.mkdir(parents=True, exist_ok=True)
+        trainable_state = {
+            name: parameter.detach().cpu().clone() for name, parameter in self._trainable
+        }
+        torch.save(
+            {
+                "format_version": self.CHECKPOINT_VERSION,
+                "trainer_config": asdict(self.config),
+                "trainer_state": asdict(self.state),
+                "adapter_config": asdict(self.adapter.config),
+                "backbone": {
+                    "model_type": str(self.adapter.backbone.config.model_type),
+                    "hidden_size": self.adapter.d_model,
+                    "vocab_size": self.adapter.vocab_size,
+                },
+                "trainable_names": self.trainable_parameter_names,
+                "model_state": trainable_state,
+                "optimizer_state": self.optimizer.state_dict(),
+                "generator_state": self.generator.get_state().cpu(),
+                "shuffle_state": self.shuffle_rng.getstate(),
+            },
+            destination,
+        )
+
+    def load_checkpoint(self, path: str | Path) -> None:
+        checkpoint = torch.load(path, map_location="cpu", weights_only=False)
+        if checkpoint.get("format_version") != self.CHECKPOINT_VERSION:
+            raise ValueError("unsupported CID trainer checkpoint version")
+        if checkpoint["trainer_config"] != asdict(self.config):
+            raise ValueError("checkpoint trainer configuration does not match this trainer")
+        if checkpoint["adapter_config"] != asdict(self.adapter.config):
+            raise ValueError("checkpoint CID adapter configuration does not match this adapter")
+        if tuple(checkpoint["trainable_names"]) != self.trainable_parameter_names:
+            raise ValueError("checkpoint trainable parameter set does not match this adapter")
+        backbone = checkpoint["backbone"]
+        if (
+            int(backbone["hidden_size"]) != self.adapter.d_model
+            or int(backbone["vocab_size"]) != self.adapter.vocab_size
+            or str(backbone["model_type"]) != str(self.adapter.backbone.config.model_type)
+        ):
+            raise ValueError("checkpoint backbone geometry does not match this adapter")
+
+        saved_state = checkpoint["model_state"]
+        with torch.no_grad():
+            for name, parameter in self._trainable:
+                parameter.copy_(
+                    saved_state[name].to(device=parameter.device, dtype=parameter.dtype)
+                )
+        self.optimizer.load_state_dict(checkpoint["optimizer_state"])
+        self.generator.set_state(checkpoint["generator_state"])
+        self.shuffle_rng.setstate(checkpoint["shuffle_state"])
+        state = checkpoint["trainer_state"]
+        self.state = CIDTrainerState(
+            transitions_seen=int(state["transitions_seen"]),
+            optimizer_steps=int(state["optimizer_steps"]),
+        )
+        self._pending_accumulation = 0
+        self.optimizer.zero_grad(set_to_none=True)
+
+    def _optimizer_step(self) -> None:
+        torch.nn.utils.clip_grad_norm_(
+            (parameter for _, parameter in self._trainable),
+            self.config.max_grad_norm,
+        )
+        self.optimizer.step()
+        self.optimizer.zero_grad(set_to_none=True)
+        self._pending_accumulation = 0
+        self.state = CIDTrainerState(
+            transitions_seen=self.state.transitions_seen,
+            optimizer_steps=self.state.optimizer_steps + 1,
+        )
+
+    def _sample_timestep(self) -> float:
+        if self.config.timestep_min == self.config.timestep_max:
+            return self.config.timestep_min
+        value = torch.rand((), device=self.generator.device, generator=self.generator)
+        span = self.config.timestep_max - self.config.timestep_min
+        return self.config.timestep_min + float(value) * span
+
+
+def load_cid_adapter_checkpoint(
+    adapter: ILLaDACIDAdapter,
+    path: str | Path,
+) -> CIDTrainerState:
+    """Load the CID model state from a trainer checkpoint without restoring an optimizer."""
+
+    checkpoint = torch.load(path, map_location="cpu", weights_only=False)
+    if checkpoint.get("format_version") != CIDTrainer.CHECKPOINT_VERSION:
+        raise ValueError("unsupported CID trainer checkpoint version")
+    backbone = checkpoint["backbone"]
+    if (
+        int(backbone["hidden_size"]) != adapter.d_model
+        or int(backbone["vocab_size"]) != adapter.vocab_size
+        or str(backbone["model_type"]) != str(adapter.backbone.config.model_type)
+    ):
+        raise ValueError("checkpoint backbone geometry does not match this adapter")
+    if checkpoint["adapter_config"] != asdict(adapter.config):
+        raise ValueError("checkpoint CID adapter configuration does not match this adapter")
+
+    parameters = dict(adapter.named_parameters())
+    with torch.no_grad():
+        for name, saved in checkpoint["model_state"].items():
+            parameter = parameters.get(name)
+            if parameter is None:
+                raise ValueError(f"checkpoint parameter is missing from adapter: {name}")
+            if tuple(parameter.shape) != tuple(saved.shape):
+                raise ValueError(f"checkpoint parameter shape mismatch: {name}")
+            parameter.copy_(saved.to(device=parameter.device, dtype=parameter.dtype))
+    state = checkpoint["trainer_state"]
+    return CIDTrainerState(
+        transitions_seen=int(state["transitions_seen"]),
+        optimizer_steps=int(state["optimizer_steps"]),
+    )
 
 
 class ILLaDATrajectoryTensorizer:
@@ -435,3 +710,64 @@ def _object_text(ref: ObjectRef) -> str:
     if ref.kind is ObjectKind.DISPLAY_SPAN:
         return f"{ref.kind.value}:{ref.span[0]}:{ref.span[1]}"
     return f"{ref.kind.value}:{ref.identifier}"
+
+
+def trajectory_transitions(
+    examples: tuple[TrajectoryExample, ...],
+) -> tuple[tuple[TrajectoryExample, int], ...]:
+    transitions: list[tuple[TrajectoryExample, int]] = []
+    for example in examples:
+        steps = {target.step for target in example.thought_targets}
+        transitions.extend(
+            (example, step) for step in sorted(steps) if step + 1 in steps
+        )
+    return tuple(transitions)
+
+
+def shard_transitions(
+    transitions: tuple[tuple[TrajectoryExample, int], ...],
+    *,
+    world_size: int,
+    rank: int,
+    seed: int,
+    epoch: int,
+    shuffle: bool = True,
+) -> tuple[tuple[TrajectoryExample, int], ...]:
+    if world_size <= 0:
+        raise ValueError("world_size must be positive")
+    if not 0 <= rank < world_size:
+        raise ValueError("rank must be in [0, world_size)")
+    if not transitions:
+        return ()
+    order = list(transitions)
+    if shuffle:
+        random.Random(seed + epoch).shuffle(order)
+    padding = (-len(order)) % world_size
+    if padding:
+        order.extend(order[:padding])
+    return tuple(order[rank::world_size])
+
+
+def wrap_stage_a_ddp(
+    adapter: ILLaDACIDAdapter,
+    *,
+    device_ids: list[int] | None,
+) -> torch.nn.Module:
+    from torch.nn.parallel import DistributedDataParallel
+
+    ignored_state = tuple(
+        name for name, parameter in adapter.named_parameters() if not parameter.requires_grad
+    ) + tuple(name for name, _ in adapter.backbone.named_buffers(prefix="backbone"))
+    DistributedDataParallel._set_params_and_buffers_to_ignore_for_model(
+        adapter,
+        ignored_state,
+    )
+    kwargs: dict[str, object] = {
+        "device_ids": device_ids,
+        "find_unused_parameters": True,
+    }
+    if "forward_sync_buffers" in signature(DistributedDataParallel).parameters:
+        kwargs["forward_sync_buffers"] = False
+    else:
+        kwargs["broadcast_buffers"] = False
+    return DistributedDataParallel(adapter, **kwargs)

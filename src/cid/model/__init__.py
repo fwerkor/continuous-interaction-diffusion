@@ -28,7 +28,18 @@ from cid.model.policy import (
 )
 from cid.model.tensors import CIDTensorBatch, CIDTensorOutput
 from cid.model.torch_core import TorchCIDConfig, TorchCIDCore
-from cid.model.training import CIDTrainingStep, ILLaDATrajectoryTensorizer
+from cid.model.training import (
+    CIDTrainer,
+    CIDTrainerConfig,
+    CIDTrainerState,
+    CIDTrainingStep,
+    CIDTrainReport,
+    ILLaDATrajectoryTensorizer,
+    load_cid_adapter_checkpoint,
+    shard_transitions,
+    trajectory_transitions,
+    wrap_stage_a_ddp,
+)
 
 __all__ = [
     "CIDLoss",
@@ -40,6 +51,10 @@ __all__ = [
     "CIDTensorBatch",
     "CIDTensorOutput",
     "CIDTrainingStep",
+    "CIDTrainer",
+    "CIDTrainerConfig",
+    "CIDTrainerState",
+    "CIDTrainReport",
     "ClosedWorldMaterializationCatalog",
     "DisplayCorruption",
     "ILLADA_8B_BASE",
@@ -51,6 +66,10 @@ __all__ = [
     "ILLaDANeuralPolicy",
     "ILLaDANeuralPolicyConfig",
     "ILLaDATrajectoryTensorizer",
+    "load_cid_adapter_checkpoint",
+    "shard_transitions",
+    "trajectory_transitions",
+    "wrap_stage_a_ddp",
     "AnchorCandidate",
     "ArgumentCandidate",
     "ObjectCandidate",

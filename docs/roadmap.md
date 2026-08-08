@@ -67,7 +67,9 @@ sampling event schedules independently from teacher semantics.
 
 Infrastructure status: a supervised trajectory transition can already be tensorized, corrupted,
 forwarded through the iLLaDA adapter, scored with the CID objective, backpropagated, and updated with
-an optimizer. Large-scale batching, distributed training, checkpoint/resume, and evaluation remain.
+an optimizer. Stage A now also has gradient accumulation, checkpoint/resume, direct CID-state loading,
+and a `torchrun` DDP path for the frozen backbone. Variable-length batching and the evaluation harness
+remain; Stage 2 full-parameter training will use sharded state rather than this replicated DDP path.
 
 Train CID-specific heads and adapters first, with most backbone weights frozen. Measure source
 selection, argument binding, intent lead time, assimilation lag, exact copying, and stale-value

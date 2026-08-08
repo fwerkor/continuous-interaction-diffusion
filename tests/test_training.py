@@ -1,5 +1,6 @@
 from __future__ import annotations
 
+from dataclasses import replace
 from importlib import import_module
 from types import SimpleNamespace
 
@@ -11,11 +12,19 @@ from cid.state import CellLifecycle, CognitiveRole
 
 torch = pytest.importorskip("torch")
 nn = import_module("torch.nn")
+dist = import_module("torch.distributed")
 cid_model = import_module("cid.model")
 
 ILLaDACIDAdapter = cid_model.ILLaDACIDAdapter
 ILLaDACIDConfig = cid_model.ILLaDACIDConfig
 ILLaDATrajectoryTensorizer = cid_model.ILLaDATrajectoryTensorizer
+CIDTrainer = cid_model.CIDTrainer
+CIDTrainerConfig = cid_model.CIDTrainerConfig
+CIDTrainerState = cid_model.CIDTrainerState
+load_cid_adapter_checkpoint = cid_model.load_cid_adapter_checkpoint
+shard_transitions = cid_model.shard_transitions
+trajectory_transitions = cid_model.trajectory_transitions
+wrap_stage_a_ddp = cid_model.wrap_stage_a_ddp
 cid_loss = cid_model.cid_loss
 
 
@@ -165,12 +174,17 @@ def make_trajectory() -> TrajectoryExample:
     )
 
 
-def test_trajectory_tensorizer_runs_full_optimizer_step() -> None:
-    adapter = ILLaDACIDAdapter(
+def make_adapter(*, seed: int = 123) -> ILLaDACIDAdapter:
+    torch.manual_seed(seed)
+    return ILLaDACIDAdapter(
         TinyBackbone(),
         ILLaDACIDConfig(max_thought_slots=4, max_display_tokens=16),
         freeze_backbone=True,
     )
+
+
+def test_trajectory_tensorizer_runs_full_optimizer_step() -> None:
+    adapter = make_adapter()
     tensorizer = ILLaDATrajectoryTensorizer(adapter, TinyTokenizer())
     sample = tensorizer.tensorize(make_trajectory(), source_step=0, timestep=1.0)
 
@@ -204,3 +218,129 @@ def test_trajectory_tensorizer_runs_full_optimizer_step() -> None:
 
     assert not torch.equal(before, adapter.output_heads.allocation_head.weight)
     assert all(parameter.grad is None for parameter in adapter.backbone.parameters())
+
+
+def test_trainer_checkpoint_restores_trainable_state_optimizer_and_progress(tmp_path) -> None:
+    config = CIDTrainerConfig(
+        learning_rate=1e-3,
+        gradient_accumulation_steps=2,
+        timestep_min=1.0,
+        timestep_max=1.0,
+        seed=9,
+    )
+    adapter = make_adapter(seed=77)
+    trainer = CIDTrainer(
+        adapter,
+        ILLaDATrajectoryTensorizer(adapter, TinyTokenizer()),
+        config,
+    )
+    report = trainer.train_examples((make_trajectory(),), epochs=2, shuffle=True)
+
+    assert report.transitions == 2
+    assert report.optimizer_steps == 1
+    assert trainer.state.transitions_seen == 2
+    assert trainer.state.optimizer_steps == 1
+
+    path = tmp_path / "stage-a.pt"
+    trainer.save_checkpoint(path)
+
+    restored_adapter = make_adapter(seed=77)
+    restored = CIDTrainer(
+        restored_adapter,
+        ILLaDATrajectoryTensorizer(restored_adapter, TinyTokenizer()),
+        config,
+    )
+    restored.load_checkpoint(path)
+
+    assert restored.state == trainer.state
+    assert restored.trainable_parameter_names == trainer.trainable_parameter_names
+    original_parameters = dict(adapter.named_parameters())
+    restored_parameters = dict(restored_adapter.named_parameters())
+    for name in trainer.trainable_parameter_names:
+        assert torch.equal(original_parameters[name], restored_parameters[name])
+    assert all(parameter.grad is None for parameter in restored_adapter.backbone.parameters())
+
+    original_loss = trainer.train_transition(make_trajectory(), 0)
+    restored_loss = restored.train_transition(make_trajectory(), 0)
+    assert torch.allclose(original_loss.total, restored_loss.total)
+
+    inference_adapter = make_adapter(seed=77)
+    inference_adapter.set_backbone_trainable(True)
+    loaded_state = load_cid_adapter_checkpoint(inference_adapter, path)
+    assert loaded_state == CIDTrainerState(transitions_seen=2, optimizer_steps=1)
+    inference_parameters = dict(inference_adapter.named_parameters())
+    for name in trainer.trainable_parameter_names:
+        assert torch.equal(original_parameters[name], inference_parameters[name])
+
+
+def test_transition_sharding_is_balanced_deterministic_and_complete() -> None:
+    examples = tuple(
+        replace(make_trajectory(), example_id=f"train-{index}") for index in range(5)
+    )
+    transitions = trajectory_transitions(examples)
+
+    shards = tuple(
+        shard_transitions(
+            transitions,
+            world_size=3,
+            rank=rank,
+            seed=41,
+            epoch=2,
+        )
+        for rank in range(3)
+    )
+    repeated = tuple(
+        shard_transitions(
+            transitions,
+            world_size=3,
+            rank=rank,
+            seed=41,
+            epoch=2,
+        )
+        for rank in range(3)
+    )
+
+    assert shards == repeated
+    assert {len(shard) for shard in shards} == {2}
+    observed_ids = {example.example_id for shard in shards for example, _ in shard}
+    assert observed_ids == {example.example_id for example in examples}
+
+
+def test_stage_a_ddp_handles_batches_with_unused_external_modules(tmp_path) -> None:
+    if not dist.is_available():
+        pytest.skip("torch.distributed is unavailable")
+    init_file = tmp_path / "ddp-init"
+    dist.init_process_group(
+        "gloo",
+        init_method=f"file://{init_file}",
+        rank=0,
+        world_size=1,
+    )
+    try:
+        adapter = make_adapter(seed=88)
+        forward_model = wrap_stage_a_ddp(adapter, device_ids=None)
+        trainer = CIDTrainer(
+            adapter,
+            ILLaDATrajectoryTensorizer(adapter, TinyTokenizer()),
+            CIDTrainerConfig(
+                learning_rate=1e-3,
+                timestep_min=1.0,
+                timestep_max=1.0,
+            ),
+            forward_model=forward_model,
+        )
+        no_external = replace(
+            make_trajectory(),
+            protected_facts={},
+            source_descriptors=(),
+            binding_targets=(),
+            grounding_targets=(),
+        )
+
+        report = trainer.train_examples((no_external,), epochs=2, shuffle=False)
+
+        assert report.transitions == 2
+        assert report.optimizer_steps == 2
+        assert torch.isfinite(torch.tensor(report.mean_loss))
+    finally:
+        dist.destroy_process_group()

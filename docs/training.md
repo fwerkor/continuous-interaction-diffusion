@@ -58,6 +58,25 @@ Argument slot `k` corresponds to the `k`th declared argument of that source and 
 presence and a retrieval query. This permits an information need to emerge before every required
 argument is executable, while keeping argument names/types under the runtime-owned source schema.
 
+### Stage A launcher and checkpoints
+
+`CIDTrainer` is the first executable Stage A trainer. It supports random diffusion timesteps,
+gradient accumulation, gradient clipping, deterministic transition shuffling, optimizer resume, and
+CID-only checkpoints. When the iLLaDA backbone is frozen, checkpoints contain only trainable CID
+parameters plus optimizer/progress/RNG state; the pinned pretrained backbone is reloaded separately.
+`load_cid_adapter_checkpoint()` restores those CID parameters directly for runtime evaluation.
+
+`cid train` runs this path on one device. Under `torchrun`, it switches to DDP automatically. Each
+rank receives the same shuffled transition order and a padded equal-length shard so every rank
+executes the same number of backward passes. Frozen backbone parameters/buffers are excluded from
+DDP initialization synchronization, while trainable CID parameters are synchronized. Model loading
+is serialized across local ranks to avoid staging six simultaneous 8B CPU copies before transfer to
+the GPUs.
+
+This DDP path is for the frozen-backbone Stage A phase. Joint/full-parameter training in Stage 2
+requires sharded model/optimizer state (FSDP or equivalent) rather than replicating Adam state on
+every GPU.
+
 ## Stage 2 — joint T/Y refinement
 
 Unfreeze selected backbone blocks and optimize coupled thought/display denoising. The main training

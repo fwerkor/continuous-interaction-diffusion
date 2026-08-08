@@ -149,6 +149,41 @@ cid generate-synthetic \
 The generator covers static copying, delayed retrieval, dynamic state tracking, streaming evidence,
 and competing sources. Physical TCT slot placement is randomized independently of logical cell ID.
 
+### Stage A training
+
+Stage A freezes the pretrained iLLaDA backbone and trains the CID projections, external-perception
+fusion, and prediction heads. A single A6000 can run the launcher directly:
+
+```bash
+cid train \
+  --data data/synthetic.jsonl \
+  --output-dir runs/stage-a \
+  --thought-capacity 8 \
+  --gradient-accumulation-steps 8 \
+  --dtype bf16
+```
+
+With six GPUs, use `torchrun`; the command detects the distributed environment automatically:
+
+```bash
+torchrun --standalone --nproc-per-node=6 -m cid.cli train \
+  --data data/synthetic.jsonl \
+  --output-dir runs/stage-a-6gpu \
+  --thought-capacity 8 \
+  --gradient-accumulation-steps 8 \
+  --dtype bf16
+```
+
+Each rank loads the pinned 8B backbone serially before moving it to its GPU, avoiding six concurrent
+CPU copies during startup. DDP synchronizes only trainable CID state; frozen backbone parameters and
+buffers are excluded from initialization sync. Transition lists are shuffled deterministically,
+padded to equal rank lengths, and sharded before training.
+
+Stage A checkpoints contain trainable CID parameters, optimizer state, progress, and RNG state; they
+do not duplicate the frozen 8B backbone. Resume with `--resume <checkpoint>`. For inference,
+`load_cid_adapter_checkpoint()` loads the CID-only state into an iLLaDA adapter without constructing
+a trainer.
+
 ## Quick demo
 
 ```bash
