@@ -12,10 +12,10 @@ import pytest
 
 from cid.data import BindingTarget, DisplayTarget, GroundingTarget, ThoughtTarget, TrajectoryExample
 from cid.grounding import Anchor, AnchorKind, CognitiveLink, LinkRelation, ObjectRef
-from cid.model.encoding import ILLaDATextEncoder
 from cid.state import CellLifecycle, CognitiveRole
 
 torch = pytest.importorskip("torch")
+ILLaDATextEncoder = import_module("cid.model.encoding").ILLaDATextEncoder
 nn = import_module("torch.nn")
 dist = import_module("torch.distributed")
 cid_model = import_module("cid.model")
