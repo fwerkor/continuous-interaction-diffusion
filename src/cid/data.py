@@ -226,7 +226,10 @@ class TrajectoryExample:
             prompt=str(raw["prompt"]),
             target_display=str(raw["target_display"]),
             protected_facts=dict(raw.get("protected_facts", {})),
-            source_descriptors=tuple(dict(item) for item in raw.get("source_descriptors", ())),
+            source_descriptors=tuple(
+                _source_descriptor_from_dict(item)
+                for item in raw.get("source_descriptors", ())
+            ),
             events=events,
             binding_targets=bindings,
             grounding_catalog=grounding_catalog,
@@ -318,3 +321,11 @@ def dump_jsonl(examples: Iterable[TrajectoryExample], path: str | Path) -> None:
                 "metadata": dict(example.metadata),
             }
             handle.write(json.dumps(raw, ensure_ascii=False, separators=(",", ":")) + "\n")
+
+
+def _source_descriptor_from_dict(raw: Mapping[str, Any]) -> dict[str, Any]:
+    descriptor = dict(raw)
+    descriptor["arguments"] = tuple(
+        dict(argument) for argument in descriptor.get("arguments", ())
+    )
+    return descriptor

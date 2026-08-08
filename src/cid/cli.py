@@ -3,12 +3,15 @@ from __future__ import annotations
 import argparse
 import asyncio
 import time
+from pathlib import Path
 
 from cid.contracts import FreshnessDemand, InformationNeed, ModelContext, ModelUpdate
+from cid.data import dump_jsonl
 from cid.grounding import ObjectRef
 from cid.metrics import summarize_runtime
 from cid.runtime import CIDRuntime, RuntimeConfig, SourceRegistry, StaticMappingSource
 from cid.state import CognitiveField, CognitiveRole, DisplayCanvas
+from cid.synthetic import SyntheticConfig, generate_synthetic
 
 
 class DemoPolicy:
@@ -67,13 +70,37 @@ async def _run_demo() -> None:
     )
 
 
+def _generate_synthetic(args: argparse.Namespace) -> None:
+    examples = generate_synthetic(
+        SyntheticConfig(
+            count_per_family=args.count_per_family,
+            seed=args.seed,
+            thought_capacity=args.thought_capacity,
+        )
+    )
+    output = Path(args.output)
+    output.parent.mkdir(parents=True, exist_ok=True)
+    dump_jsonl(examples, output)
+    print(f"wrote={len(examples)} path={output}")
+
+
 def main() -> None:
     parser = argparse.ArgumentParser(prog="cid")
     subparsers = parser.add_subparsers(dest="command", required=True)
     subparsers.add_parser("demo", help="run the asynchronous static-source demo")
+    synthetic = subparsers.add_parser(
+        "generate-synthetic",
+        help="generate deterministic CID mechanism-training trajectories",
+    )
+    synthetic.add_argument("--output", required=True)
+    synthetic.add_argument("--count-per-family", type=int, default=32)
+    synthetic.add_argument("--seed", type=int, default=0)
+    synthetic.add_argument("--thought-capacity", type=int, default=8)
     args = parser.parse_args()
     if args.command == "demo":
         asyncio.run(_run_demo())
+    elif args.command == "generate-synthetic":
+        _generate_synthetic(args)
 
 
 if __name__ == "__main__":

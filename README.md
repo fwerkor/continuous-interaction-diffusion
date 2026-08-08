@@ -63,6 +63,7 @@ src/cid/model/materialize.py Neural-output to runtime-contract materializer
 src/cid/model/diffusion.py  T/Y corruption and display reveal schedule
 src/cid/model/policy.py     iLLaDA context tensorizer and runtime neural policy
 src/cid/model/training.py   Distilled trajectory to training tensors/targets
+src/cid/synthetic.py        Reproducible five-family mechanism trajectory factory
 src/cid/data.py             Trajectory JSONL schema and validation
 src/cid/metrics.py          CID-specific interaction metrics
 docs/architecture.md        Concrete v0 architecture decisions
@@ -134,6 +135,19 @@ Training data uses typed per-step `ThoughtTarget` and `DisplayTarget` records ra
 dictionaries. `ILLaDATrajectoryTensorizer` constructs adjacent-step supervision and the CID loss
 performs permutation-invariant assignment for multi-anchor and multi-link targets. The test suite
 includes a complete tiny-backbone optimizer step with the pretrained backbone frozen.
+
+For deterministic mechanism-training data before teacher distillation is available:
+
+```bash
+cid generate-synthetic \
+  --output data/synthetic.jsonl \
+  --count-per-family 1000 \
+  --seed 0 \
+  --thought-capacity 8
+```
+
+The generator covers static copying, delayed retrieval, dynamic state tracking, streaming evidence,
+and competing sources. Physical TCT slot placement is randomized independently of logical cell ID.
 
 ## Quick demo
 
