@@ -75,8 +75,10 @@ Infrastructure status: a supervised trajectory transition can already be tensori
 forwarded through the iLLaDA adapter, scored with the CID objective, backpropagated, and updated with
 an optimizer. Stage A now also has gradient accumulation, checkpoint/resume, direct CID-state loading,
 variable-length micro-batching, native gradient checkpointing, and a `torchrun` DDP path for the
-frozen backbone. The evaluation harness remains; Stage 2 full-parameter training will use sharded
-state rather than this replicated DDP path.
+frozen backbone. Runtime/task evaluation now has fixed definitions for latent-to-executable delay,
+observation assimilation lag, exact display, observation coverage, and stale-observation rate. A
+benchmark-specific replay runner remains; Stage 2 full-parameter training will use sharded state
+rather than this replicated DDP path.
 
 Train CID-specific heads and adapters first, with most backbone weights frozen. Measure source
 selection, argument binding, intent lead time, assimilation lag, exact copying, and stale-value

@@ -9,6 +9,12 @@ from cid.contracts import (
     Percept,
     SourceDescriptor,
 )
+from cid.evaluation import (
+    RuntimeEvaluationSummary,
+    RuntimeTaskEvaluation,
+    evaluate_runtime_result,
+    summarize_evaluations,
+)
 from cid.grounding import (
     STRONG_LINK_RELATIONS,
     Anchor,
@@ -77,7 +83,11 @@ __all__ = [
     "ObjectRef",
     "Percept",
     "RuntimeConfig",
+    "RuntimeEvaluationSummary",
+    "RuntimeTaskEvaluation",
     "SourceDescriptor",
     "SourceRegistry",
     "STRONG_LINK_RELATIONS",
+    "evaluate_runtime_result",
+    "summarize_evaluations",
 ]

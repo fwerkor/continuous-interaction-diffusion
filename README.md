@@ -68,6 +68,7 @@ src/cid/data.py             Trajectory JSONL schema and validation
 src/cid/metrics.py          CID-specific interaction metrics
 docs/architecture.md        Concrete v0 architecture decisions
 docs/training.md            Staged training plan
+docs/evaluation.md          Runtime/task evaluation metric contract
 examples/                   Small executable runtime examples
 tests/                      Runtime invariants and concurrency tests
 ```

@@ -13,6 +13,9 @@ class InteractionMetrics:
     cache_hits: int
     deduplicated_jobs: int
     mean_intent_lead_steps: float
+    mean_latent_to_executable_steps: float
+    mean_binding_to_observation_steps: float
+    mean_observation_to_projection_steps: float
     model_steps_during_io: int
     tool_wait_overlap_s: float
     reclaimed_cells: int
@@ -27,6 +30,9 @@ def summarize_runtime(result: RuntimeResult) -> InteractionMetrics:
         cache_hits=_count(events, "cache_hit"),
         deduplicated_jobs=_count(events, "job_deduplicated"),
         mean_intent_lead_steps=_mean_intent_lead_steps(events),
+        mean_latent_to_executable_steps=_mean_latent_to_executable_steps(events),
+        mean_binding_to_observation_steps=_mean_binding_to_observation_steps(events),
+        mean_observation_to_projection_steps=_mean_observation_to_projection_steps(events),
         model_steps_during_io=_model_steps_during_io(events),
         tool_wait_overlap_s=_tool_wait_overlap(events),
         reclaimed_cells=_count(events, "cell_reclaimed"),
@@ -56,6 +62,67 @@ def _mean_intent_lead_steps(events: tuple[TraceEvent, ...]) -> float:
         if need_id in first_need
     ]
     return sum(leads) / len(leads) if leads else 0.0
+
+
+def _mean_latent_to_executable_steps(events: tuple[TraceEvent, ...]) -> float:
+    first_need: dict[str, int] = {}
+    first_executable: dict[str, int] = {}
+    for event in events:
+        if event.kind != "information_need":
+            continue
+        need_id = event.payload.get("need_id")
+        if not isinstance(need_id, str):
+            continue
+        first_need.setdefault(need_id, event.step)
+        if event.payload.get("executable") is True:
+            first_executable.setdefault(need_id, event.step)
+    delays = [
+        executable_step - first_need[need_id]
+        for need_id, executable_step in first_executable.items()
+        if need_id in first_need
+    ]
+    return _mean(delays)
+
+
+def _mean_binding_to_observation_steps(events: tuple[TraceEvent, ...]) -> float:
+    first_binding: dict[str, int] = {}
+    first_observation: dict[str, int] = {}
+    for event in events:
+        binding_id = event.payload.get("binding_id")
+        if not isinstance(binding_id, str):
+            continue
+        if event.kind == "binding_active":
+            first_binding.setdefault(binding_id, event.step)
+        elif event.kind in {"binding_observation_updated", "cache_hit"}:
+            first_observation.setdefault(binding_id, event.step)
+    delays = [
+        observation_step - first_binding[binding_id]
+        for binding_id, observation_step in first_observation.items()
+        if binding_id in first_binding
+    ]
+    return _mean(delays)
+
+
+def _mean_observation_to_projection_steps(events: tuple[TraceEvent, ...]) -> float:
+    first_observation: dict[str, int] = {}
+    first_projection_after_observation: dict[str, int] = {}
+    for event in events:
+        binding_id = event.payload.get("binding_id")
+        if not isinstance(binding_id, str):
+            continue
+        if event.kind in {"binding_observation_updated", "cache_hit"}:
+            first_observation.setdefault(binding_id, event.step)
+        elif event.kind == "cognitive_projection" and binding_id in first_observation:
+            first_projection_after_observation.setdefault(binding_id, event.step)
+    delays = [
+        projection_step - first_observation[binding_id]
+        for binding_id, projection_step in first_projection_after_observation.items()
+    ]
+    return _mean(delays)
+
+
+def _mean(values: list[int]) -> float:
+    return sum(values) / len(values) if values else 0.0
 
 
 def _model_intervals(events: tuple[TraceEvent, ...]) -> list[tuple[float, float]]:
