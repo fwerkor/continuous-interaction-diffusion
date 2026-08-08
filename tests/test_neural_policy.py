@@ -31,8 +31,9 @@ class TinyConfig:
 
 
 class IdentityDecoder(nn.Module):
-    def forward(self, *, inputs_embeds, attention_mask, return_dict):
+    def forward(self, *, inputs_embeds, attention_mask, position_ids, return_dict):
         del attention_mask
+        del position_ids
         assert return_dict
         return SimpleNamespace(last_hidden_state=inputs_embeds)
 

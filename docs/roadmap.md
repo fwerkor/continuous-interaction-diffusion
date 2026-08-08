@@ -47,7 +47,7 @@ schema-conditioned argument slots, display reveal scheduling, and runtime-facing
 
 ## M2 — synthetic trajectory factory
 
-Status: deterministic mechanism generator implemented; teacher distillation remains.
+Status: deterministic mechanism generator and timing-separated teacher compiler implemented.
 
 Build data generators for the five evaluation families: static copying, delayed retrieval, dynamic
 state tracking, streaming evidence, and competing sources. Every generated sample must include
@@ -60,8 +60,11 @@ latency, freshness, cache state, and counterfactual arrival schedules.
 `cid generate-synthetic` now covers the five evaluation families with randomized physical TCT slot
 placement, typed per-step cognition/display targets, external-event timing, binding supervision,
 and grounding where applicable. This is intended for pipeline validation and mechanism pretraining;
-the next M2 step is a high-quality teacher factory that emits the same `TrajectoryExample` ABI while
-sampling event schedules independently from teacher semantics.
+`prepare-distillation` now converts those tasks into timing-free teacher requests and
+`compile-distillation` maps semantic teacher plans back into the same `TrajectoryExample` ABI while
+sampling event schedules and physical slots independently. The compiler also inserts runtime-valid
+WAITING/arrival-assimilation lifecycle states. Remaining M2 work is production-scale teacher calling,
+quality filtering/deduplication, and dataset mixture/versioning rather than another ABI change.
 
 ## M3 — adapter training
 

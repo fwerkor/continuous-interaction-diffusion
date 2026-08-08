@@ -149,6 +149,37 @@ cid generate-synthetic \
 The generator covers static copying, delayed retrieval, dynamic state tracking, streaming evidence,
 and competing sources. Physical TCT slot placement is randomized independently of logical cell ID.
 
+For high-quality distillation, first strip runtime timing and physical-slot choices out of the
+teacher input:
+
+```bash
+cid prepare-distillation \
+  --data data/synthetic.jsonl \
+  --tasks-output data/teacher-tasks.jsonl \
+  --requests-output data/teacher-requests.jsonl
+```
+
+Each request asks the teacher for concise typed cognitive-state summaries, needs, anchors, and
+links. The teacher is explicitly forbidden from choosing diffusion steps, evidence arrival times,
+or physical TCT slots. Save one returned plan JSON object per line, then compile it back into the
+normal training ABI:
+
+```bash
+cid compile-distillation \
+  --tasks data/teacher-tasks.jsonl \
+  --plans data/teacher-plans.jsonl \
+  --output data/distilled.jsonl \
+  --thought-capacity 8 \
+  --min-delay-steps 1 \
+  --max-delay-steps 4 \
+  --seed 0
+```
+
+The compiler independently randomizes event latency and physical slot placement, inserts
+`WAITING` states while external evidence is outstanding, forces arrival-time assimilation through
+`ACTIVE`, and only then permits the teacher's stable post-evidence state. Teacher plan parsing is
+strict: unknown fields and any attempt to control timing or slot placement are rejected.
+
 ### Stage A training
 
 Stage A freezes the pretrained iLLaDA backbone and trains the CID projections, external-perception
@@ -185,6 +216,8 @@ The trainer pads variable-length prompt/display/external-memory sequences inside
 Gradient checkpointing is enabled by default for the native iLLaDA stack and can be disabled with
 `--no-gradient-checkpointing`. With the six-GPU example above, the effective transition batch is
 `2 × 8 × 6 = 96`; start at micro-batch 1 if the real trajectory lengths are substantially larger.
+Per-sample RoPE position IDs are computed from valid token counts, so padding a short prompt beside
+a longer sample cannot shift the logical display positions seen by iLLaDA.
 
 Stage A checkpoints contain trainable CID parameters, optimizer state, progress, and RNG state; they
 do not duplicate the frozen 8B backbone. Resume with `--resume <checkpoint>`. For inference,

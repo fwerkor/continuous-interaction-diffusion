@@ -80,11 +80,45 @@ gradient accumulation then scales the effective batch independently. Accumulated
 normalized by the number of examples rather than by the number of micro-batches, so a smaller final
 micro-batch is not overweighted. Native iLLaDA gradient checkpointing is enabled by the launcher by
 default to reduce activation memory while retaining gradients to CID inputs through the frozen
-backbone.
+backbone. The iLLaDA adapter also constructs per-sample RoPE `position_ids` from valid prompt and
+display lengths. Padding introduced by another sample therefore does not alter the logical
+positions of a trajectory's display tokens.
 
 This DDP path is for the frozen-backbone Stage A phase. Joint/full-parameter training in Stage 2
 requires sharded model/optimizer state (FSDP or equivalent) rather than replicating Adam state on
 every GPU.
+
+### Teacher distillation compiler
+
+`cid.distill` keeps semantic teacher supervision separate from runtime scheduling. A `TeacherTask`
+contains the immutable prompt, protected facts, source schemas, and evidence values, but deliberately
+omits their original arrival steps. `build_teacher_request()` asks a strong teacher for a compact
+semantic plan made of typed cognitive frames and information needs. It explicitly rejects private
+reasoning transcripts as a target representation: `semantic_text` is a short state summary used only
+as dataset transport for a latent target.
+
+Teacher plans cannot choose physical TCT slots, diffusion steps, evidence arrival times, or cache
+schedules. The parser rejects those fields and any unknown control fields rather than silently
+discarding them. `compile_teacher_plans()` then independently samples physical slot placement and
+event delays. While a required observation is outstanding, the compiler inserts `WAITING` frames;
+at arrival it forces the affected cell through `ACTIVE` for assimilation before applying a teacher
+state that may become `STABLE`. The result is the same `TrajectoryExample` ABI consumed by the
+synthetic generator and Stage A trainer.
+
+The offline flow is:
+
+```text
+TrajectoryExample tasks
+    -> prepare-distillation
+    -> timing-free teacher request JSONL
+    -> strong teacher semantic plan JSONL
+    -> compile-distillation
+    -> randomized supervised TrajectoryExample JSONL
+```
+
+This separation is intentional. Distillation should improve semantic supervision quality without
+allowing teacher-specific call timing or a fixed physical slot convention to become part of the
+student's learned policy.
 
 ## Stage 2 — joint T/Y refinement
 

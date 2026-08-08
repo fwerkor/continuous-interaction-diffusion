@@ -30,10 +30,12 @@ class TinyILLaDADecoder(nn.Module):
         super().__init__()
         self.projection = nn.Linear(hidden_size, hidden_size, bias=False)
         self.last_attention_mask = None
+        self.last_position_ids = None
 
-    def forward(self, *, inputs_embeds, attention_mask, return_dict):
+    def forward(self, *, inputs_embeds, attention_mask, position_ids, return_dict):
         assert return_dict
         self.last_attention_mask = attention_mask.detach().clone()
+        self.last_position_ids = position_ids.detach().clone()
         weights = attention_mask.to(inputs_embeds.dtype).unsqueeze(-1)
         context = (inputs_embeds * weights).sum(dim=1, keepdim=True)
         context = context / weights.sum(dim=1, keepdim=True).clamp_min(1.0)
@@ -112,6 +114,10 @@ def test_illada_adapter_uses_shared_bidirectional_sequence_and_native_lm_head() 
         batch.slot_occupancy.squeeze(-1).bool(),
     )
     assert backbone.decoder.last_attention_mask[:, 4:].all()
+    assert torch.equal(
+        backbone.decoder.last_position_ids,
+        torch.arange(12).expand(2, -1),
+    )
 
     loss = output.display_logits.float().mean() + output.thought_semantic.float().square().mean()
     loss.backward()
@@ -142,6 +148,28 @@ def test_illada_adapter_accepts_empty_external_memory() -> None:
 
     assert torch.isfinite(output.display_logits).all()
     assert output.source_logits.shape == (1, 2, 0)
+
+
+def test_illada_adapter_position_ids_ignore_batch_padding_width() -> None:
+    backbone = TinyILLaDABackbone()
+    adapter = ILLaDACIDAdapter(backbone)
+    batch = make_batch(batch_size=2, thought_slots=4, display_length=5)
+    batch.prompt_ids = torch.randint(0, TinyILLaDAConfig.vocab_size, (2, 4))
+    batch.prompt_padding_mask = torch.tensor(
+        [[False, False, True, True], [False, False, False, False]]
+    )
+    batch.display_padding_mask = torch.tensor(
+        [[False, False, False, True, True], [False, False, False, False, False]]
+    )
+
+    adapter(batch)
+
+    first = backbone.decoder.last_position_ids[0]
+    second = backbone.decoder.last_position_ids[1]
+    assert first[:4].tolist() == [0, 1, 2, 3]
+    assert first[4:8].tolist() == [4, 5, 0, 0]
+    assert first[8:].tolist() == [6, 7, 8, 0, 0]
+    assert second.tolist() == list(range(13))
 
 
 def test_illada_adapter_controls_backbone_gradient_checkpointing() -> None:

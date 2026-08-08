@@ -194,9 +194,15 @@ class ILLaDACIDAdapter(nn.Module):
             (slot_occupancy.squeeze(-1).bool(), prompt_keys, display_keys),
             dim=1,
         )
+        position_ids = self._logical_position_ids(
+            thought_slots=thought_slots,
+            prompt_keys=prompt_keys,
+            display_keys=display_keys,
+        )
         decoder_output = self.backbone.get_decoder()(
             inputs_embeds=seed_hidden,
             attention_mask=attention_mask,
+            position_ids=position_ids,
             return_dict=True,
         )
         hidden = decoder_output.last_hidden_state
@@ -266,7 +272,24 @@ class ILLaDACIDAdapter(nn.Module):
         )
         if display_length > self.config.max_display_tokens:
             raise ValueError("display length exceeds configured maximum")
-        if thought_slots + prompt_length + display_length > self.max_position_embeddings:
+        prompt_keys = self._valid_keys(
+            batch.prompt_padding_mask,
+            batch_size=batch_size,
+            length=prompt_length,
+            device=batch.prompt_ids.device,
+        )
+        display_keys = self._valid_keys(
+            batch.display_padding_mask,
+            batch_size=batch_size,
+            length=display_length,
+            device=batch.display_ids.device,
+        )
+        logical_lengths = (
+            thought_slots
+            + prompt_keys.sum(dim=1)
+            + display_keys.sum(dim=1)
+        )
+        if bool((logical_lengths > self.max_position_embeddings).any()):
             raise ValueError(
                 "combined TCT, prompt, and display length exceeds iLLaDA context capacity"
             )
@@ -306,6 +329,35 @@ class ILLaDACIDAdapter(nn.Module):
         if padding_mask is None:
             return torch.ones((batch_size, length), dtype=torch.bool, device=device)
         return ~padding_mask.to(device=device, dtype=torch.bool)
+
+    @staticmethod
+    def _logical_position_ids(
+        *,
+        thought_slots: int,
+        prompt_keys: torch.Tensor,
+        display_keys: torch.Tensor,
+    ) -> torch.Tensor:
+        batch_size = prompt_keys.shape[0]
+        device = prompt_keys.device
+        thought_positions = torch.arange(thought_slots, device=device).expand(batch_size, -1)
+
+        prompt_offsets = prompt_keys.long().cumsum(dim=1) - 1
+        prompt_positions = thought_slots + prompt_offsets
+        prompt_positions = torch.where(
+            prompt_keys,
+            prompt_positions,
+            torch.zeros_like(prompt_positions),
+        )
+
+        prompt_lengths = prompt_keys.sum(dim=1, keepdim=True).long()
+        display_offsets = display_keys.long().cumsum(dim=1) - 1
+        display_positions = thought_slots + prompt_lengths + display_offsets
+        display_positions = torch.where(
+            display_keys,
+            display_positions,
+            torch.zeros_like(display_positions),
+        )
+        return torch.cat((thought_positions, prompt_positions, display_positions), dim=1)
 
     def _place_cid_modules_with_embeddings(self) -> None:
         weight = self.input_embeddings.weight

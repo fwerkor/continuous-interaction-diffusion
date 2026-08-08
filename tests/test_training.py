@@ -42,7 +42,8 @@ class TinyDecoder(nn.Module):
         super().__init__()
         self.projection = nn.Linear(TinyConfig.hidden_size, TinyConfig.hidden_size, bias=False)
 
-    def forward(self, *, inputs_embeds, attention_mask, return_dict):
+    def forward(self, *, inputs_embeds, attention_mask, position_ids, return_dict):
+        del position_ids
         assert return_dict
         weights = attention_mask.to(inputs_embeds.dtype).unsqueeze(-1)
         context = (inputs_embeds * weights).sum(dim=1, keepdim=True)

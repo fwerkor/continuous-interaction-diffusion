@@ -133,6 +133,12 @@ The prompt is immutable token-level conditioning, not a fourth mutable cognitive
 Display logits still come from the checkpoint's original LM head. The adapter does not replace or
 emulate iLLaDA's language-model stack.
 
+Training micro-batches may pad prompt and display regions to different widths. The adapter therefore
+passes explicit per-sample RoPE `position_ids`: TCT positions remain fixed, valid prompt tokens are
+contiguous after TCT, and valid display tokens begin immediately after that sample's real prompt
+length. Padding positions are attention-masked and cannot shift the logical location of another
+sample's display tokens.
+
 Empty TCT slots remain query positions because allocation must be predicted for them, but they are
 masked as attention keys. Occupied TCT cells and display tokens are visible keys. This prevents
 unused fixed-capacity storage from perturbing the display while allowing an empty slot to infer

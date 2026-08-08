@@ -8,6 +8,15 @@ from pathlib import Path
 
 from cid.contracts import FreshnessDemand, InformationNeed, ModelContext, ModelUpdate
 from cid.data import dump_jsonl, load_jsonl
+from cid.distill import (
+    TeacherScheduleConfig,
+    compile_teacher_plans,
+    dump_teacher_requests,
+    dump_teacher_tasks,
+    load_teacher_plans,
+    load_teacher_tasks,
+    teacher_tasks_from_trajectories,
+)
 from cid.grounding import ObjectRef
 from cid.metrics import summarize_runtime
 from cid.runtime import CIDRuntime, RuntimeConfig, SourceRegistry, StaticMappingSource
@@ -83,6 +92,45 @@ def _generate_synthetic(args: argparse.Namespace) -> None:
     output.parent.mkdir(parents=True, exist_ok=True)
     dump_jsonl(examples, output)
     print(f"wrote={len(examples)} path={output}")
+
+
+def _prepare_distillation(args: argparse.Namespace) -> None:
+    examples = load_jsonl(args.data)
+    tasks = teacher_tasks_from_trajectories(examples)
+    tasks_output = Path(args.tasks_output)
+    requests_output = Path(args.requests_output)
+    tasks_output.parent.mkdir(parents=True, exist_ok=True)
+    requests_output.parent.mkdir(parents=True, exist_ok=True)
+    dump_teacher_tasks(tasks, tasks_output)
+    dump_teacher_requests(tasks, requests_output)
+    print(
+        f"tasks={len(tasks)} tasks_path={tasks_output} requests_path={requests_output}"
+    )
+
+
+def _compile_distillation(args: argparse.Namespace) -> None:
+    tasks = load_teacher_tasks(args.tasks)
+    plans = load_teacher_plans(args.plans)
+    examples = compile_teacher_plans(
+        tasks,
+        plans,
+        TeacherScheduleConfig(
+            thought_capacity=args.thought_capacity,
+            min_delay_steps=args.min_delay_steps,
+            max_delay_steps=args.max_delay_steps,
+            seed=args.seed,
+        ),
+    )
+    output = Path(args.output)
+    output.parent.mkdir(parents=True, exist_ok=True)
+    dump_jsonl(examples, output)
+    transition_count = sum(
+        max(0, len({target.step for target in example.thought_targets}) - 1)
+        for example in examples
+    )
+    print(
+        f"compiled={len(examples)} transitions={transition_count} path={output}"
+    )
 
 
 def _train_stage_a(args: argparse.Namespace) -> None:
@@ -262,6 +310,24 @@ def main() -> None:
     synthetic.add_argument("--count-per-family", type=int, default=32)
     synthetic.add_argument("--seed", type=int, default=0)
     synthetic.add_argument("--thought-capacity", type=int, default=8)
+    prepare = subparsers.add_parser(
+        "prepare-distillation",
+        help="convert CID trajectories into timing-free teacher task/request JSONL",
+    )
+    prepare.add_argument("--data", required=True)
+    prepare.add_argument("--tasks-output", required=True)
+    prepare.add_argument("--requests-output", required=True)
+    compile_distillation = subparsers.add_parser(
+        "compile-distillation",
+        help="compile semantic teacher plans with independently randomized event schedules",
+    )
+    compile_distillation.add_argument("--tasks", required=True)
+    compile_distillation.add_argument("--plans", required=True)
+    compile_distillation.add_argument("--output", required=True)
+    compile_distillation.add_argument("--thought-capacity", type=int, default=8)
+    compile_distillation.add_argument("--min-delay-steps", type=int, default=1)
+    compile_distillation.add_argument("--max-delay-steps", type=int, default=4)
+    compile_distillation.add_argument("--seed", type=int, default=0)
     train = subparsers.add_parser(
         "train",
         help="run Stage A CID adapter training with a frozen iLLaDA backbone",
@@ -295,6 +361,10 @@ def main() -> None:
         asyncio.run(_run_demo())
     elif args.command == "generate-synthetic":
         _generate_synthetic(args)
+    elif args.command == "prepare-distillation":
+        _prepare_distillation(args)
+    elif args.command == "compile-distillation":
+        _compile_distillation(args)
     elif args.command == "train":
         _train_stage_a(args)
 
