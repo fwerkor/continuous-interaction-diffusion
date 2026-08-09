@@ -2,6 +2,8 @@ from __future__ import annotations
 
 import json
 import random
+import re
+import string
 from collections.abc import Iterable, Mapping
 from dataclasses import dataclass, field, replace
 from hashlib import sha256
@@ -349,6 +351,7 @@ class TeacherScheduleConfig:
     thought_capacity: int = 8
     min_delay_steps: int = 1
     max_delay_steps: int = 4
+    variants_per_task: int = 1
     seed: int = 0
 
     def __post_init__(self) -> None:
@@ -356,6 +359,8 @@ class TeacherScheduleConfig:
             raise ValueError("thought_capacity must be positive")
         if self.min_delay_steps <= 0 or self.max_delay_steps < self.min_delay_steps:
             raise ValueError("teacher event delays must satisfy 0 < min <= max")
+        if self.variants_per_task <= 0:
+            raise ValueError("variants_per_task must be positive")
 
 
 @dataclass(frozen=True, slots=True)
@@ -493,9 +498,22 @@ def compile_teacher_plans(
         raise ValueError(f"teacher plans contain unknown task IDs: {extra}")
 
     rng = random.Random(config.seed)
-    return tuple(
-        _compile_one(task, plan_by_id[task.task_id], config, rng) for task in tasks
-    )
+    compiled: list[TrajectoryExample] = []
+    for task in tasks:
+        for variant_index in range(config.variants_per_task):
+            example = _compile_one(task, plan_by_id[task.task_id], config, rng)
+            if config.variants_per_task > 1:
+                example = replace(
+                    example,
+                    example_id=f"{task.task_id}::schedule-{variant_index:02d}",
+                    metadata={
+                        **dict(example.metadata),
+                        "semantic_task_id": task.task_id,
+                        "schedule_variant": variant_index,
+                    },
+                )
+            compiled.append(example)
+    return tuple(compiled)
 
 
 def review_teacher_plans(
@@ -642,41 +660,26 @@ def _compile_one(
         )
     )
 
-    scheduled: list[tuple[int, TeacherFrame]] = [(0, frame_by_phase["initial"])]
-    current_step = 0
-    current_frame = frame_by_phase["initial"]
-    if "pre" in frame_by_phase:
-        current_step += 1
-        current_frame = frame_by_phase["pre"]
-        scheduled.append((current_step, current_frame))
-
-    arrival_steps: dict[str, int] = {}
     needs_by_evidence = {
         evidence.evidence_id: tuple(
             need for need in plan.needs if need.evidence_id == evidence.evidence_id
         )
         for evidence in task.evidence
     }
-    for evidence in task.evidence:
-        delay = rng.randint(config.min_delay_steps, config.max_delay_steps)
-        arrival_step = current_step + delay
-        waiting_ids = {need.cell_id for need in needs_by_evidence[evidence.evidence_id]}
-        for step in range(current_step + 1, arrival_step):
-            scheduled.append((step, _waiting_frame(current_frame, waiting_ids)))
-        current_step = arrival_step
-        teacher_after = frame_by_phase[f"after:{evidence.evidence_id}"]
-        arrival_frame = _arrival_frame(teacher_after, waiting_ids)
-        scheduled.append((current_step, arrival_frame))
-        arrival_steps[evidence.evidence_id] = arrival_step
-        current_frame = teacher_after
-        if arrival_frame != teacher_after:
-            current_step += 1
-            scheduled.append((current_step, teacher_after))
-
-    if "final" in frame_by_phase:
-        current_step += 1
-        current_frame = frame_by_phase["final"]
-        scheduled.append((current_step, current_frame))
+    launch_steps, arrival_steps = _event_schedule(
+        task,
+        plan,
+        frame_by_phase,
+        config,
+        rng,
+    )
+    scheduled = _schedule_frames(
+        task,
+        frame_by_phase,
+        needs_by_evidence,
+        launch_steps,
+        arrival_steps,
+    )
 
     phase_first_step: dict[str, int] = {}
     for step, frame in scheduled:
@@ -740,9 +743,104 @@ def _compile_one(
         metadata={
             **dict(task.metadata),
             "distillation": "teacher-semantic-plan-v1",
+            "event_launch_steps": launch_steps,
             "event_arrival_steps": arrival_steps,
         },
     )
+
+
+def _event_schedule(
+    task: TeacherTask,
+    plan: TeacherPlan,
+    frame_by_phase: Mapping[str, TeacherFrame],
+    config: TeacherScheduleConfig,
+    rng: random.Random,
+) -> tuple[dict[str, int], dict[str, int]]:
+    phase_steps: dict[str, int] = {"initial": 0}
+    if "pre" in frame_by_phase:
+        phase_steps["pre"] = 1
+    needs_by_evidence = {
+        evidence.evidence_id: tuple(
+            need for need in plan.needs if need.evidence_id == evidence.evidence_id
+        )
+        for evidence in task.evidence
+    }
+    launch_steps: dict[str, int] = {}
+    arrival_steps: dict[str, int] = {}
+    previous_arrival = -1
+    for evidence in task.evidence:
+        evidence_needs = needs_by_evidence[evidence.evidence_id]
+        activation_steps: list[int] = []
+        for need in evidence_needs:
+            if need.phase not in phase_steps:
+                raise ValueError(
+                    f"teacher need phase {need.phase!r} is not causally available before "
+                    f"evidence {evidence.evidence_id!r}"
+                )
+            activation_steps.append(phase_steps[need.phase])
+        dependency_steps = [arrival_steps[item] for item in evidence.depends_on]
+        launch_step = max((*activation_steps, *dependency_steps, 0))
+        launch_steps[evidence.evidence_id] = launch_step
+        proposed_arrival = launch_step + rng.randint(
+            config.min_delay_steps, config.max_delay_steps
+        )
+        # Teacher semantic frames are generated in evidence-list order. Sibling calls may launch
+        # together, but their sampled arrivals remain strictly ordered so the same semantic plan is
+        # valid while I/O still overlaps in flight.
+        arrival_step = max(proposed_arrival, previous_arrival + 1)
+        arrival_steps[evidence.evidence_id] = arrival_step
+        phase_steps[f"after:{evidence.evidence_id}"] = arrival_step
+        previous_arrival = arrival_step
+    return launch_steps, arrival_steps
+
+
+def _schedule_frames(
+    task: TeacherTask,
+    frame_by_phase: Mapping[str, TeacherFrame],
+    needs_by_evidence: Mapping[str, tuple[TeacherNeed, ...]],
+    launch_steps: Mapping[str, int],
+    arrival_steps: Mapping[str, int],
+) -> list[tuple[int, TeacherFrame]]:
+    arrival_by_step = {step: evidence_id for evidence_id, step in arrival_steps.items()}
+    if len(arrival_by_step) != len(arrival_steps):
+        raise ValueError("compiled evidence arrivals must be unique by runtime step")
+    last_arrival = max(arrival_steps.values(), default=0)
+    scheduled: list[tuple[int, TeacherFrame]] = []
+    current_semantic = frame_by_phase["initial"]
+    initial_pre_step = 1 if "pre" in frame_by_phase else None
+    horizon = max(last_arrival, initial_pre_step or 0)
+
+    for step in range(horizon + 1):
+        arriving_evidence_id = arrival_by_step.get(step)
+        if arriving_evidence_id is not None:
+            current_semantic = frame_by_phase[f"after:{arriving_evidence_id}"]
+        elif initial_pre_step == step:
+            current_semantic = frame_by_phase["pre"]
+
+        waiting_ids: set[str] = set()
+        for evidence in task.evidence:
+            evidence_id = evidence.evidence_id
+            if launch_steps[evidence_id] < step < arrival_steps[evidence_id]:
+                waiting_ids.update(need.cell_id for need in needs_by_evidence[evidence_id])
+        arriving_ids = (
+            set()
+            if arriving_evidence_id is None
+            else {
+                need.cell_id for need in needs_by_evidence[arriving_evidence_id]
+            }
+        )
+        runtime_frame = _runtime_frame(current_semantic, waiting_ids, arriving_ids)
+        scheduled.append((step, runtime_frame))
+
+    current_step = horizon
+    last_runtime_frame = scheduled[-1][1]
+    if last_runtime_frame != current_semantic:
+        current_step += 1
+        scheduled.append((current_step, current_semantic))
+    if "final" in frame_by_phase:
+        current_step += 1
+        scheduled.append((current_step, frame_by_phase["final"]))
+    return scheduled
 
 
 def _binding_target(
@@ -807,21 +905,21 @@ def _validate_monotonic_cells(frames: list[TeacherFrame]) -> None:
         previous = current
 
 
-def _waiting_frame(frame: TeacherFrame, waiting_ids: set[str]) -> TeacherFrame:
+def _runtime_frame(
+    frame: TeacherFrame,
+    waiting_ids: set[str],
+    arriving_ids: set[str],
+) -> TeacherFrame:
     cells = tuple(
-        replace(cell, lifecycle=CellLifecycle.WAITING)
-        if cell.cell_id in waiting_ids and cell.lifecycle is not CellLifecycle.RETIRED
-        else cell
-        for cell in frame.cells
-    )
-    return TeacherFrame(phase=frame.phase, display=frame.display, cells=cells)
-
-
-def _arrival_frame(frame: TeacherFrame, waiting_ids: set[str]) -> TeacherFrame:
-    cells = tuple(
-        replace(cell, lifecycle=CellLifecycle.ACTIVE)
-        if cell.cell_id in waiting_ids and cell.lifecycle is not CellLifecycle.RETIRED
-        else cell
+        (
+            replace(cell, lifecycle=CellLifecycle.ACTIVE)
+            if cell.cell_id in arriving_ids and cell.lifecycle is not CellLifecycle.RETIRED
+            else (
+                replace(cell, lifecycle=CellLifecycle.WAITING)
+                if cell.cell_id in waiting_ids and cell.lifecycle is not CellLifecycle.RETIRED
+                else cell
+            )
+        )
         for cell in frame.cells
     )
     return TeacherFrame(phase=frame.phase, display=frame.display, cells=cells)
@@ -957,8 +1055,76 @@ def _teacher_quality_reasons(
         for cell in final_frame.cells
     ):
         reasons.append("final frame has no conclusion-role cell")
+    reference_reason = _reference_answer_reason(task, plan)
+    if reference_reason is not None:
+        reasons.append(reference_reason)
     reasons.extend(_future_evidence_leaks(task, semantic_frames))
     return tuple(dict.fromkeys(reasons))
+
+
+def _reference_answer_reason(task: TeacherTask, plan: TeacherPlan) -> str | None:
+    reference = task.reference_answer
+    if reference is None:
+        return None
+    kind = str(task.metadata.get("task_kind", ""))
+    if kind in {
+        "multi_hop_qa",
+        "multiple_choice_knowledge_reasoning",
+        "science_multiple_choice",
+    }:
+        if not _normalized_answer_match(plan.final_answer, reference):
+            return "final_answer does not match the public reference answer"
+        return None
+    if kind == "math_word_problem" and not _numeric_or_normalized_answer_match(
+        plan.final_answer, reference
+    ):
+        return "final_answer does not match the public numerical reference answer"
+    return None
+
+
+def _normalized_answer_match(prediction: str, reference: str) -> bool:
+    predicted = _qa_normalize(prediction)
+    expected = _qa_normalize(reference)
+    if predicted == expected:
+        return True
+    if not predicted or not expected:
+        return False
+    predicted_tokens = predicted.split()
+    expected_tokens = expected.split()
+    if len(predicted_tokens) <= len(expected_tokens):
+        return False
+    width = len(expected_tokens)
+    return any(
+        predicted_tokens[index : index + width] == expected_tokens
+        for index in range(len(predicted_tokens) - width + 1)
+    )
+
+
+def _numeric_or_normalized_answer_match(prediction: str, reference: str) -> bool:
+    if _normalized_answer_match(prediction, reference):
+        return True
+    predicted_numbers = _number_tokens(prediction)
+    reference_numbers = _number_tokens(reference)
+    if not predicted_numbers or not reference_numbers:
+        return False
+    return predicted_numbers[-1] == reference_numbers[-1]
+
+
+def _qa_normalize(value: str) -> str:
+    lowered = value.casefold().replace("_", " ")
+    no_punctuation = "".join(
+        " " if char in string.punctuation else char for char in lowered
+    )
+    tokens = [token for token in no_punctuation.split() if token not in {"a", "an", "the"}]
+    return " ".join(tokens)
+
+
+def _number_tokens(value: str) -> tuple[str, ...]:
+    normalized = value.replace(",", "")
+    return tuple(
+        match.group(0).lstrip("+")
+        for match in re.finditer(r"[-+]?\d+(?:\.\d+)?", normalized)
+    )
 
 
 def _future_evidence_leaks(

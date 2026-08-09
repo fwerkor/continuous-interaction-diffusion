@@ -125,6 +125,7 @@ def _compile_distillation(args: argparse.Namespace) -> None:
             thought_capacity=args.thought_capacity,
             min_delay_steps=args.min_delay_steps,
             max_delay_steps=args.max_delay_steps,
+            variants_per_task=args.variants_per_task,
             seed=args.seed,
         ),
     )
@@ -201,6 +202,53 @@ def _prepare_public_distillation(args: argparse.Namespace) -> None:
         f"requests_path={args.requests_output} causal_jobs={args.causal_jobs_output} "
         f"manifest={args.manifest_output}"
     )
+
+
+def _teacher_wave_export(args: argparse.Namespace) -> None:
+    from cid.teacher_wave import export_teacher_wave
+
+    report = export_teacher_wave(
+        args.jobs,
+        args.state,
+        args.output,
+        max_requests=args.max_requests,
+    )
+    print(
+        f"jobs={report['jobs']} complete_tasks={report['complete_tasks']} "
+        f"exported={report['exported_requests']} path={args.output}"
+    )
+
+
+def _teacher_wave_import(args: argparse.Namespace) -> None:
+    from cid.teacher_wave import import_teacher_wave
+
+    report = import_teacher_wave(
+        args.jobs,
+        args.requests,
+        args.responses,
+        args.state,
+        rejects_path=args.rejects_output,
+    )
+    print(
+        f"imported={report['imported']} unchanged={report['unchanged']} "
+        f"rejected={report['rejected']} state_records={report['state_records']} "
+        f"state={args.state}"
+    )
+
+
+def _teacher_wave_finalize(args: argparse.Namespace) -> None:
+    from cid.teacher_wave import finalize_teacher_wave
+
+    tasks = load_teacher_tasks(args.tasks)
+    plans = finalize_teacher_wave(tasks, args.jobs, args.state, args.output)
+    print(f"plans={len(plans)} path={args.output}")
+
+
+def _teacher_wave_status(args: argparse.Namespace) -> None:
+    from cid.teacher_wave import teacher_wave_status
+
+    report = teacher_wave_status(args.jobs, args.state)
+    print(json.dumps(report, ensure_ascii=False, sort_keys=True))
 
 
 def _benchmark(args: argparse.Namespace) -> None:
@@ -759,6 +807,7 @@ def main() -> None:
     compile_distillation.add_argument("--thought-capacity", type=int, default=8)
     compile_distillation.add_argument("--min-delay-steps", type=int, default=1)
     compile_distillation.add_argument("--max-delay-steps", type=int, default=4)
+    compile_distillation.add_argument("--variants-per-task", type=int, default=1)
     compile_distillation.add_argument("--seed", type=int, default=0)
     review = subparsers.add_parser(
         "review-distillation",
@@ -808,6 +857,37 @@ def main() -> None:
     )
     public_distill.add_argument("--seed", type=int, default=20260809)
     public_distill.add_argument("--unnecessary-tool-fraction", type=float, default=0.10)
+    wave_export = subparsers.add_parser(
+        "teacher-wave-export",
+        help="export the next causally visible teacher stage for each incomplete task",
+    )
+    wave_export.add_argument("--jobs", required=True)
+    wave_export.add_argument("--state", required=True)
+    wave_export.add_argument("--output", required=True)
+    wave_export.add_argument("--max-requests", type=int)
+    wave_import = subparsers.add_parser(
+        "teacher-wave-import",
+        help="validate and persist teacher responses for one exported causal wave",
+    )
+    wave_import.add_argument("--jobs", required=True)
+    wave_import.add_argument("--requests", required=True)
+    wave_import.add_argument("--responses", required=True)
+    wave_import.add_argument("--state", required=True)
+    wave_import.add_argument("--rejects-output")
+    wave_finalize = subparsers.add_parser(
+        "teacher-wave-finalize",
+        help="assemble complete causal teacher state into TeacherPlan JSONL",
+    )
+    wave_finalize.add_argument("--tasks", required=True)
+    wave_finalize.add_argument("--jobs", required=True)
+    wave_finalize.add_argument("--state", required=True)
+    wave_finalize.add_argument("--output", required=True)
+    wave_status = subparsers.add_parser(
+        "teacher-wave-status",
+        help="summarize causal teacher production progress and next phases",
+    )
+    wave_status.add_argument("--jobs", required=True)
+    wave_status.add_argument("--state", required=True)
     benchmark = subparsers.add_parser(
         "benchmark",
         help="run a neural CID checkpoint on deterministic replay trajectories",
@@ -908,6 +988,14 @@ def main() -> None:
         _build_public_task_pool(args)
     elif args.command == "prepare-public-distillation":
         _prepare_public_distillation(args)
+    elif args.command == "teacher-wave-export":
+        _teacher_wave_export(args)
+    elif args.command == "teacher-wave-import":
+        _teacher_wave_import(args)
+    elif args.command == "teacher-wave-finalize":
+        _teacher_wave_finalize(args)
+    elif args.command == "teacher-wave-status":
+        _teacher_wave_status(args)
     elif args.command == "benchmark":
         _benchmark(args)
     elif args.command == "train":

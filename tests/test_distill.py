@@ -199,6 +199,32 @@ def test_teacher_compiler_separates_semantics_from_event_timing(tmp_path) -> Non
     assert load_jsonl(path) == (trajectory,)
 
 
+def test_teacher_compiler_expands_counterfactual_schedule_variants() -> None:
+    task, plan = make_teacher_task_and_plan()
+    trajectories = compile_teacher_plans(
+        (task,),
+        (plan,),
+        TeacherScheduleConfig(
+            thought_capacity=6,
+            min_delay_steps=1,
+            max_delay_steps=4,
+            variants_per_task=4,
+            seed=17,
+        ),
+    )
+
+    assert len(trajectories) == 4
+    assert [item.example_id for item in trajectories] == [
+        "teacher-1::schedule-00",
+        "teacher-1::schedule-01",
+        "teacher-1::schedule-02",
+        "teacher-1::schedule-03",
+    ]
+    assert {item.metadata["semantic_task_id"] for item in trajectories} == {"teacher-1"}
+    assert [item.metadata["schedule_variant"] for item in trajectories] == [0, 1, 2, 3]
+    assert len({item.events[0].arrival_step for item in trajectories}) > 1
+
+
 def test_teacher_request_forbids_timing_and_private_cot() -> None:
     task, _ = make_teacher_task_and_plan()
     request = build_teacher_request(task)
@@ -207,6 +233,38 @@ def test_teacher_request_forbids_timing_and_private_cot() -> None:
     assert "Do NOT emit numeric timesteps" in request.prompt
     assert "Do not write private chain-of-thought" in request.prompt
     assert '"evidence_id": "e0"' in request.prompt
+
+
+def test_teacher_review_checks_supported_public_reference_answers() -> None:
+    task, plan = make_teacher_task_and_plan()
+    public_task = replace(
+        task,
+        reference_answer="37 ms",
+        metadata={"task_kind": "multi_hop_qa"},
+    )
+    (accepted,) = review_teacher_plans((public_task,), (plan,))
+    assert accepted.accepted
+
+    wrong_task = replace(public_task, reference_answer="42 ms")
+    (rejected,) = review_teacher_plans((wrong_task,), (plan,))
+    assert not rejected.accepted
+    assert any("public reference answer" in reason for reason in rejected.reasons)
+
+
+def test_teacher_review_accepts_equivalent_gsm8k_numeric_surface_form() -> None:
+    task, plan = make_teacher_task_and_plan()
+    numeric_task = replace(
+        task,
+        reference_answer="1,250",
+        metadata={"task_kind": "math_word_problem"},
+    )
+    numeric_plan = replace(
+        plan,
+        final_answer="$1,250",
+        frames=(*plan.frames[:-1], replace(plan.frames[-1], display="$1,250")),
+    )
+    (review,) = review_teacher_plans((numeric_task,), (numeric_plan,))
+    assert review.accepted
 
 
 def test_teacher_plan_parser_rejects_timing_and_physical_slots() -> None:
