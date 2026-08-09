@@ -161,14 +161,17 @@ authoritative after materialization.
 ## 4. Information need before executable call
 
 A runtime-visible need has a stable `need_id`, source probabilities, partially bound arguments,
-confidence, freshness demand, and typed cell/display targets. Runtime activation has two gates:
-
-1. need confidence must cross the binding threshold;
-2. a source must be selected and its required arguments must be executable.
+confidence, freshness demand, and typed cell/display targets. Need confidence and source selection
+are sufficient to create a binding when the selected source declares that it accepts progressive
+selectors. The binding records whether required arguments are complete; ordinary sources still wait
+for all required arguments before external execution. When a progressive selector is refined, the
+old in-flight work is cancelled or discarded and the persistent binding launches the more specific
+request.
 
 The training model exposes argument presence and one retrieval query for each source-schema argument
-position. An information need may therefore become visible before all required argument slots are
-grounded. That lead time is directly measurable and corresponds to RQ1.
+position. An information need can therefore start useful I/O before all required argument slots are
+grounded, while the trace separately records the first fully executable step. That lead time is
+directly measurable and corresponds to RQ1.
 
 ## 5. One need, persistent binding
 
@@ -177,8 +180,10 @@ means two cognitive needs may keep distinct bindings and target links while shar
 in-flight or cached external observation.
 
 Every denoising step with an available active binding emits a fresh `Percept` object to the model.
-No external call is required for this cognitive refresh. Dynamic refresh is controlled separately
-by binding policy.
+No external call is required for this cognitive refresh. `target_cells` and `target_display` are
+materialized into query-specific cross-attention masks, so an explicitly routed percept conditions
+only the linked TCT cells and display spans; an unscoped percept retains the global fallback. Dynamic
+refresh is controlled separately by binding policy.
 
 ## 6. Async execution
 
@@ -200,5 +205,9 @@ explicit instead of hiding it inside a global remasking schedule so RQ4/RQ5 abla
 ## 8. Source scope
 
 v0 sources are read-only. A source descriptor declares cacheability, dynamism, streaming/version
-properties, and required arguments. Mutation, authorization, rollback, and irreversible actions
-are intentionally excluded until perception/revision works on its own.
+properties, required arguments, and whether partial selectors are executable. Version-aware sources
+can expose a cheap `version()` probe so `ALWAYS`/`MAX_AGE` freshness checks avoid a full read when the
+source is unchanged. Streamable sources expose an async observation stream; the runtime keeps one
+subscription per canonical work key and delivers queued observations one per denoising step so
+incremental chunks are not collapsed before the model can assimilate them. Mutation, authorization,
+rollback, and irreversible actions remain intentionally excluded.

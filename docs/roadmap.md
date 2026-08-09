@@ -13,9 +13,10 @@ Status: implemented in the initial repository scaffold.
 - pressure-aware retired-cell archival, reclamation, and physical compaction;
 - typed anchors, object references, cognitive links, and closed-world oracle grounding;
 - typed latent information needs;
-- persistent bindings with external-I/O deduplication;
+- persistent bindings with external-I/O deduplication and progressive partial-argument execution;
 - asynchronous model/source overlap;
-- static cognitive re-projection and dynamic refresh policies;
+- static cognitive re-projection, version-aware refresh, and incremental source streams;
+- target-aware percept routing into linked thought cells and display spans;
 - trajectory schema and CID-specific runtime metrics;
 - small PyTorch reference core and multi-head training objective.
 

@@ -2,8 +2,11 @@ from cid.runtime.archive import CognitiveArchive, CognitiveTombstone
 from cid.runtime.engine import CIDRuntime, RuntimeConfig, RuntimeResult
 from cid.runtime.sources import (
     ClockSource,
+    ReadOnlySource,
     SourceRegistry,
     StaticMappingSource,
+    StreamingSource,
+    VersionAwareSource,
     VersionedMemorySource,
 )
 
@@ -14,7 +17,10 @@ __all__ = [
     "ClockSource",
     "RuntimeConfig",
     "RuntimeResult",
+    "ReadOnlySource",
     "SourceRegistry",
+    "StreamingSource",
+    "VersionAwareSource",
     "StaticMappingSource",
     "VersionedMemorySource",
 ]

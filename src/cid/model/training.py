@@ -21,7 +21,7 @@ from cid.model.encoding import ILLaDATextEncoder, stable_text
 from cid.model.illada import ILLADA_MASK_TOKEN_ID, ILLaDACIDAdapter
 from cid.model.losses import CIDLoss, CIDTargets, cid_loss
 from cid.model.materialize import RevisionAction
-from cid.model.tensors import CIDTensorBatch, CIDTensorOutput
+from cid.model.tensors import CIDTensorBatch, CIDTensorOutput, build_percept_routing_masks
 from cid.state import CognitiveRole
 
 
@@ -94,6 +94,8 @@ def collate_training_steps(
     percept_memory, percept_padding_mask = _pad_3d(
         tuple(step.batch.percept_memory for step in steps)
     )
+    percept_thought_mask = _collate_percept_masks(steps, "thought")
+    percept_display_mask = _collate_percept_masks(steps, "display")
     source_memory, source_padding_mask = _pad_3d(
         tuple(step.batch.source_memory for step in steps)
     )
@@ -114,6 +116,8 @@ def collate_training_steps(
         fact_memory=fact_memory,
         percept_memory=percept_memory,
         source_memory=source_memory,
+        percept_thought_mask=percept_thought_mask,
+        percept_display_mask=percept_display_mask,
         prompt_padding_mask=prompt_padding_mask,
         display_padding_mask=display_padding_mask,
         fact_padding_mask=fact_padding_mask,
@@ -785,6 +789,9 @@ class ILLaDATrajectoryTensorizer:
                 for key, value in example.protected_facts.items()
             )
         )
+        available_events = tuple(
+            event for event in example.events if event.arrival_step <= target_step
+        )
         percept_memory = self.text_encoder.encode_texts(
             tuple(
                 " | ".join(
@@ -794,9 +801,16 @@ class ILLaDATrajectoryTensorizer:
                         f"version={event.version or ''}",
                     )
                 )
-                for event in example.events
-                if event.arrival_step <= target_step
+                for event in available_events
             )
+        )
+        percept_thought_mask, percept_display_mask = self._percept_target_masks(
+            example,
+            available_events,
+            target_output_slots=target_output_slots,
+            target_step=target_step,
+            display_length=display_input_ids.shape[1],
+            device=device,
         )
         source_memory = self.text_encoder.encode_texts(
             tuple(_source_text(descriptor) for descriptor in example.source_descriptors)
@@ -814,6 +828,8 @@ class ILLaDATrajectoryTensorizer:
             fact_memory=fact_memory,
             percept_memory=percept_memory,
             source_memory=source_memory,
+            percept_thought_mask=percept_thought_mask,
+            percept_display_mask=percept_display_mask,
         )
         targets = self._targets(
             example=example,
@@ -834,6 +850,41 @@ class ILLaDATrajectoryTensorizer:
             target_step=target_step,
             batch=batch,
             targets=targets,
+        )
+
+    def _percept_target_masks(
+        self,
+        example: TrajectoryExample,
+        events: tuple[Any, ...],
+        *,
+        target_output_slots: Mapping[str, int],
+        target_step: int,
+        display_length: int,
+        device: torch.device,
+    ) -> tuple[Tensor, Tensor]:
+        cell_targets: list[tuple[ObjectRef, ...]] = []
+        display_targets: list[tuple[ObjectRef, ...]] = []
+        for event in events:
+            bindings = tuple(
+                binding
+                for binding in example.binding_targets
+                if binding.first_need_step <= target_step
+                and binding.source == event.source
+                and dict(binding.arguments) == dict(event.arguments)
+            )
+            cell_targets.append(
+                tuple(target for binding in bindings for target in binding.target_cells)
+            )
+            display_targets.append(
+                tuple(target for binding in bindings for target in binding.target_display)
+            )
+        return build_percept_routing_masks(
+            tuple(cell_targets),
+            tuple(display_targets),
+            cell_slots=target_output_slots,
+            thought_slots=self.adapter.config.max_thought_slots,
+            display_length=display_length,
+            device=device,
         )
 
     def _validate_rollout_state(self, state: CIDRolloutState) -> None:
@@ -1181,6 +1232,42 @@ def _pad_3d(tensors: tuple[Tensor, ...]) -> tuple[Tensor, Tensor]:
     return output, padding_mask
 
 
+def _collate_percept_masks(
+    steps: tuple[CIDTrainingStep, ...], kind: str
+) -> Tensor | None:
+    if kind not in {"thought", "display"}:
+        raise ValueError("percept mask kind must be thought or display")
+    attribute = f"percept_{kind}_mask"
+    masks = tuple(getattr(step.batch, attribute) for step in steps)
+    if all(mask is None for mask in masks):
+        return None
+    query_lengths = tuple(
+        step.batch.thought_semantic.shape[1]
+        if kind == "thought"
+        else step.batch.display_ids.shape[1]
+        for step in steps
+    )
+    percept_lengths = tuple(step.batch.percept_memory.shape[1] for step in steps)
+    output = torch.zeros(
+        (len(steps), max(query_lengths), max(percept_lengths, default=0)),
+        dtype=torch.bool,
+        device=steps[0].batch.thought_semantic.device,
+    )
+    for row, (_step, mask, query_length, percept_length) in enumerate(
+        zip(steps, masks, query_lengths, percept_lengths, strict=True)
+    ):
+        if mask is None:
+            output[row, :query_length, :percept_length] = True
+            continue
+        expected = (1, query_length, percept_length)
+        if tuple(mask.shape) != expected:
+            raise ValueError(
+                f"{attribute} must have shape {expected}, got {tuple(mask.shape)}"
+            )
+        output[row, :query_length, :percept_length] = mask[0].to(dtype=torch.bool)
+    return output
+
+
 def _source_text(descriptor: Mapping[str, Any]) -> str:
     arguments = ",".join(
         f"{item.get('name', '')}:{item.get('kind', 'any')}"
@@ -1192,6 +1279,9 @@ def _source_text(descriptor: Mapping[str, Any]) -> str:
             f"description={descriptor.get('description', '')}",
             f"arguments={arguments}",
             f"dynamic={bool(descriptor.get('dynamic', False))}",
+            f"streamable={bool(descriptor.get('streamable', False))}",
+            f"versioned={bool(descriptor.get('versioned', False))}",
+            f"accepts_partial_arguments={bool(descriptor.get('accepts_partial_arguments', False))}",
         )
     )
 

@@ -5,8 +5,10 @@ from types import SimpleNamespace
 
 import pytest
 
+from cid.contracts import ModelContext, Observation, Percept
+from cid.grounding import ObjectRef
 from cid.runtime import CIDRuntime, RuntimeConfig, SourceRegistry, StaticMappingSource
-from cid.state import CognitiveField, DisplayCanvas
+from cid.state import CognitiveField, DisplayCanvas, FactStore
 
 torch = pytest.importorskip("torch")
 nn = import_module("torch.nn")
@@ -223,3 +225,44 @@ def test_context_tensorizer_requires_illada_mask_token() -> None:
 
     with pytest.raises(ValueError, match="mask token id 5"):
         tensorizer(context)
+
+
+def test_context_tensorizer_routes_percept_to_target_cell_and_display_span() -> None:
+    adapter = ILLaDACIDAdapter(TinyBackbone(), freeze_backbone=True)
+    tensorizer = ILLaDAContextTensorizer(adapter, TinyTokenizer())
+    thought = CognitiveField.empty(capacity=3, width=TinyConfig.hidden_size)
+    thought, first = thought.allocate(semantic=(0.0,) * TinyConfig.hidden_size)
+    thought, second = thought.allocate(semantic=(0.0,) * TinyConfig.hidden_size)
+    context = ModelContext(
+        facts=FactStore().snapshot(),
+        thought=thought,
+        display=DisplayCanvas.masked(length=4, mask_token_id=5),
+        sources=(),
+        percepts=(
+            Percept(
+                binding_id="b1",
+                source="docs",
+                observation=Observation(value="37", version="v1"),
+                target_cells=(ObjectRef.cell(second),),
+                target_display=(ObjectRef.display_span(1, 3),),
+                projection_index=1,
+            ),
+        ),
+        step=0,
+        prompt="Read the updated value.",
+    )
+
+    batch = tensorizer(context)
+
+    assert batch.percept_thought_mask is not None
+    assert batch.percept_display_mask is not None
+    assert batch.percept_thought_mask.shape == (1, 3, 1)
+    assert not batch.percept_thought_mask[0, thought.slot_of(first), 0]
+    assert batch.percept_thought_mask[0, thought.slot_of(second), 0]
+    assert batch.percept_display_mask[0, :, 0].tolist() == [False, True, True, False]
+
+    query_mask = adapter._percept_query_mask(
+        batch, thought_slots=3, prompt_length=batch.prompt_ids.shape[1], display_length=4
+    )
+    assert query_mask is not None
+    assert not query_mask[0, 3 : 3 + batch.prompt_ids.shape[1], 0].any()

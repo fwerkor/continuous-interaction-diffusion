@@ -6,13 +6,14 @@ import time
 from collections.abc import Iterable
 from copy import deepcopy
 from dataclasses import dataclass
+from typing import Any
 
 from cid.contracts import CIDPolicy, FreshnessDemand, ModelContext, Observation, Percept
 from cid.grounding import STRONG_LINK_RELATIONS, ClosedWorldGrounder, ObjectKind, ObjectRef
 from cid.lifecycle import LifecycleTransitionController, LifecycleTransitionSignals
 from cid.runtime.archive import CognitiveArchive, CognitiveTombstone
 from cid.runtime.bindings import Binding, BindingStatus, BindingTable
-from cid.runtime.sources import SourceRegistry
+from cid.runtime.sources import ReadOnlySource, SourceRegistry, StreamingSource, VersionAwareSource
 from cid.runtime.trace import RuntimeTrace
 from cid.state import CellLifecycle, CognitiveField, DisplayCanvas, FactItem, FactStore
 
@@ -61,6 +62,17 @@ class _ExternalJob:
     owner_binding_id: str
 
 
+@dataclass(slots=True)
+class _VersionJob:
+    task: asyncio.Task[str | None]
+
+
+@dataclass(slots=True)
+class _StreamJob:
+    task: asyncio.Task[None]
+    queue: asyncio.Queue[Observation]
+
+
 class CIDRuntime:
     def __init__(
         self,
@@ -77,6 +89,10 @@ class CIDRuntime:
         self.lifecycle = LifecycleTransitionController()
         self.archive = CognitiveArchive()
         self._jobs: dict[str, _ExternalJob] = {}
+        self._version_jobs: dict[str, _VersionJob] = {}
+        self._streams: dict[str, _StreamJob] = {}
+        self._completed_streams: set[str] = set()
+        self._detached_tasks: set[asyncio.Task[Any]] = set()
         self._cache: dict[str, Observation] = {}
         self._created_at: dict[str, int] = {}
         self._retired_at: dict[str, int] = {}
@@ -90,13 +106,15 @@ class CIDRuntime:
         facts: Iterable[FactItem] = (),
         prompt: str = "",
     ) -> RuntimeResult:
-        if self._jobs:
+        if self._jobs or self._version_jobs or self._streams:
             raise RuntimeError("a CIDRuntime instance cannot run concurrent trajectories")
         self.facts = FactStore()
         self.bindings = BindingTable()
         self.trace = RuntimeTrace()
         self.archive = CognitiveArchive()
         self._cache = {}
+        self._completed_streams = set()
+        self._detached_tasks = set()
         self._created_at = {cell_id: 0 for cell_id in thought.occupied_cell_ids}
         self._retired_at = {
             cell.cell_id: 0
@@ -109,7 +127,7 @@ class CIDRuntime:
         converged = False
         completed_steps = 0
         descriptors = self.sources.descriptors()
-        required_args = {d.name: d.required_arguments for d in descriptors}
+        descriptor_by_name = {descriptor.name: descriptor for descriptor in descriptors}
 
         try:
             for step in range(self.config.max_steps):
@@ -117,7 +135,9 @@ class CIDRuntime:
                     await asyncio.sleep(0)
                 thought = self._maybe_reclaim(thought, step)
                 previous_thought = thought
+                self._drain_completed_version_jobs(step)
                 self._drain_completed_jobs(step)
+                self._drain_stream_updates(step)
                 percepts = self._project_available(step, thought)
                 context = ModelContext(
                     facts=self.facts.snapshot(),
@@ -151,9 +171,9 @@ class CIDRuntime:
                             f"information need {need.need_id!r} targets non-live cells: {missing}"
                         )
                     source = need.selected_source()
-                    required = required_args.get(source or "", ())
-                    executable = source in required_args and all(
-                        name in need.arguments for name in required
+                    descriptor = descriptor_by_name.get(source or "")
+                    executable = descriptor is not None and all(
+                        name in need.arguments for name in descriptor.required_arguments
                     )
                     self.trace.emit(
                         "information_need",
@@ -167,7 +187,7 @@ class CIDRuntime:
                 touched = self.bindings.reconcile(
                     update.needs,
                     binding_threshold=self.config.binding_threshold,
-                    source_descriptors=required_args,
+                    source_descriptors=descriptor_by_name,
                 )
                 for binding in touched:
                     self.trace.emit(
@@ -176,9 +196,13 @@ class CIDRuntime:
                         binding_id=binding.binding_id,
                         need_id=binding.need_id,
                         source=binding.source,
+                        arguments_complete=binding.arguments_complete,
                     )
 
+                self._cancel_orphan_external_work(step)
+                self._drain_completed_version_jobs(step)
                 self._drain_completed_jobs(step)
+                self._drain_stream_updates(step)
                 thought = self.lifecycle.apply(
                     previous_thought,
                     proposed_thought,
@@ -205,18 +229,25 @@ class CIDRuntime:
                     break
                 self._launch_due_jobs(step)
 
-                if self._jobs and self.config.idle_yield_s:
+                if (self._jobs or self._version_jobs or self._streams) and self.config.idle_yield_s:
                     await asyncio.sleep(self.config.idle_yield_s)
                 else:
                     await asyncio.sleep(0)
         finally:
-            for job in self._jobs.values():
-                job.task.cancel()
-            if self._jobs:
-                await asyncio.gather(
-                    *(job.task for job in self._jobs.values()), return_exceptions=True
-                )
+            tasks = [
+                *(job.task for job in self._jobs.values()),
+                *(job.task for job in self._version_jobs.values()),
+                *(job.task for job in self._streams.values()),
+                *self._detached_tasks,
+            ]
+            for task in tasks:
+                task.cancel()
+            if tasks:
+                await asyncio.gather(*tasks, return_exceptions=True)
             self._jobs.clear()
+            self._version_jobs.clear()
+            self._streams.clear()
+            self._detached_tasks.clear()
 
         thought = self._maybe_reclaim(thought, completed_steps, force=True)
 
@@ -277,36 +308,134 @@ class CIDRuntime:
                 and source.descriptor.cacheable
                 and work_key in self._cache
             ):
-                binding.observation = self._cache[work_key]
+                binding.observation = deepcopy(self._cache[work_key])
+                binding.last_refresh_at = now
                 binding.status = BindingStatus.AVAILABLE
                 self.trace.emit("cache_hit", step, binding_id=binding.binding_id)
 
             if not self._refresh_due(binding, now):
                 continue
-            if work_key in self._jobs:
-                job = self._jobs[work_key]
-                binding.status = (
-                    BindingStatus.REFRESHING
-                    if binding.observation is not None
-                    else BindingStatus.WAITING
-                )
-                if binding.binding_id != job.owner_binding_id:
-                    self.trace.emit("job_deduplicated", step, binding_id=binding.binding_id)
+
+            if (
+                source.descriptor.streamable
+                and binding.freshness is not FreshnessDemand.ONCE
+                and isinstance(source, StreamingSource)
+            ):
+                self._ensure_stream(binding, source, step)
                 continue
 
-            task = asyncio.create_task(source.read(binding.arguments))
-            self._jobs[work_key] = _ExternalJob(task=task, owner_binding_id=binding.binding_id)
+            if (
+                binding.observation is not None
+                and source.descriptor.versioned
+                and isinstance(source, VersionAwareSource)
+            ):
+                self._ensure_version_probe(binding, source, step)
+                continue
+
+            self._ensure_read(binding, source, step)
+
+    def _ensure_read(self, binding: Binding, source: ReadOnlySource, step: int) -> None:
+        work_key = binding.work_key
+        if work_key in self._jobs:
+            job = self._jobs[work_key]
             binding.status = (
                 BindingStatus.REFRESHING
                 if binding.observation is not None
                 else BindingStatus.WAITING
             )
-            self.trace.emit(
-                "external_refresh_started",
-                step,
-                binding_id=binding.binding_id,
-                work_key=work_key,
+            if binding.binding_id != job.owner_binding_id:
+                self.trace.emit("job_deduplicated", step, binding_id=binding.binding_id)
+            return
+
+        task = asyncio.create_task(source.read(binding.arguments))
+        self._jobs[work_key] = _ExternalJob(task=task, owner_binding_id=binding.binding_id)
+        binding.status = (
+            BindingStatus.REFRESHING
+            if binding.observation is not None
+            else BindingStatus.WAITING
+        )
+        self.trace.emit(
+            "external_refresh_started",
+            step,
+            binding_id=binding.binding_id,
+            work_key=work_key,
+            arguments_complete=binding.arguments_complete,
+        )
+
+    def _ensure_version_probe(
+        self, binding: Binding, source: VersionAwareSource, step: int
+    ) -> None:
+        work_key = binding.work_key
+        if work_key in self._jobs or work_key in self._version_jobs:
+            return
+        task = asyncio.create_task(source.version(binding.arguments))
+        self._version_jobs[work_key] = _VersionJob(task=task)
+        binding.status = BindingStatus.REFRESHING
+        self.trace.emit(
+            "version_check_started",
+            step,
+            binding_id=binding.binding_id,
+            work_key=work_key,
+        )
+
+    def _ensure_stream(
+        self, binding: Binding, source: StreamingSource, step: int
+    ) -> None:
+        work_key = binding.work_key
+        if work_key in self._streams or work_key in self._completed_streams:
+            return
+        queue: asyncio.Queue[Observation] = asyncio.Queue()
+
+        async def consume() -> None:
+            async for observation in source.stream(binding.arguments):
+                await queue.put(deepcopy(observation))
+
+        task = asyncio.create_task(consume())
+        self._streams[work_key] = _StreamJob(task=task, queue=queue)
+        binding.status = (
+            BindingStatus.REFRESHING
+            if binding.observation is not None
+            else BindingStatus.WAITING
+        )
+        self.trace.emit(
+            "stream_started",
+            step,
+            binding_id=binding.binding_id,
+            work_key=work_key,
+        )
+
+    def _drain_completed_version_jobs(self, step: int) -> None:
+        for work_key, job in tuple(self._version_jobs.items()):
+            if not job.task.done():
+                continue
+            del self._version_jobs[work_key]
+            version = job.task.result()
+            matching = tuple(
+                binding for binding in self.bindings.active() if binding.work_key == work_key
             )
+            if not matching:
+                continue
+            changed = any(
+                binding.observation is None or binding.observation.version != version
+                for binding in matching
+            )
+            self.trace.emit(
+                "version_check_finished",
+                step,
+                work_key=work_key,
+                version=version,
+                changed=changed,
+            )
+            if changed:
+                source = self.sources.get(matching[0].source)
+                self._ensure_read(matching[0], source, step)
+                for binding in matching[1:]:
+                    binding.status = BindingStatus.REFRESHING
+                continue
+            checked_at = time.monotonic()
+            for binding in matching:
+                binding.last_refresh_at = checked_at
+                binding.status = BindingStatus.AVAILABLE
 
     def _drain_completed_jobs(self, step: int) -> None:
         for work_key, job in tuple(self._jobs.items()):
@@ -318,7 +447,7 @@ class CIDRuntime:
                 binding for binding in self.bindings.active() if binding.work_key == work_key
             )
             if matching and self.sources.get(matching[0].source).descriptor.cacheable:
-                self._cache[work_key] = observation
+                self._cache[work_key] = deepcopy(observation)
 
             self.trace.emit(
                 "external_refresh_finished",
@@ -326,20 +455,66 @@ class CIDRuntime:
                 work_key=work_key,
                 version=observation.version,
             )
+            self._apply_observation(matching, observation, step)
 
-            for binding in matching:
-                binding.observation = observation
-                binding.last_refresh_at = time.monotonic()
-                binding.external_refreshes += 1
-                binding.status = BindingStatus.AVAILABLE
+    def _drain_stream_updates(self, step: int) -> None:
+        for work_key, stream in tuple(self._streams.items()):
+            matching = tuple(
+                binding for binding in self.bindings.active() if binding.work_key == work_key
+            )
+            try:
+                observation = stream.queue.get_nowait()
+            except asyncio.QueueEmpty:
+                observation = None
+            if observation is not None:
                 self.trace.emit(
-                    "binding_observation_updated",
+                    "stream_observation",
                     step,
-                    binding_id=binding.binding_id,
+                    work_key=work_key,
                     version=observation.version,
                 )
-                if binding.promote_to_fact:
-                    self._promote_fact(binding, observation)
+                self._apply_observation(matching, observation, step)
+
+            if not stream.task.done() or not stream.queue.empty():
+                continue
+            del self._streams[work_key]
+            self._completed_streams.add(work_key)
+            stream.task.result()
+            self.trace.emit("stream_finished", step, work_key=work_key)
+
+    def _apply_observation(
+        self, matching: tuple[Binding, ...], observation: Observation, step: int
+    ) -> None:
+        observed_at = time.monotonic()
+        for binding in matching:
+            binding.observation = deepcopy(observation)
+            binding.last_refresh_at = observed_at
+            binding.external_refreshes += 1
+            binding.status = BindingStatus.AVAILABLE
+            self.trace.emit(
+                "binding_observation_updated",
+                step,
+                binding_id=binding.binding_id,
+                version=observation.version,
+            )
+            if binding.promote_to_fact:
+                self._promote_fact(binding, observation)
+
+    def _cancel_orphan_external_work(self, step: int) -> None:
+        active_keys = {binding.work_key for binding in self.bindings.active()}
+        for jobs, kind in (
+            (self._jobs, "external_refresh_cancelled"),
+            (self._version_jobs, "version_check_cancelled"),
+            (self._streams, "stream_cancelled"),
+        ):
+            for work_key, job in tuple(jobs.items()):
+                if work_key in active_keys:
+                    continue
+                del jobs[work_key]
+                job.task.cancel()
+                self._detached_tasks.add(job.task)
+                job.task.add_done_callback(self._detached_tasks.discard)
+                self.trace.emit(kind, step, work_key=work_key)
 
     def _promote_fact(self, binding: Binding, observation: Observation) -> None:
         timestamp = observation.observed_at or time.monotonic()

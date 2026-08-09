@@ -219,3 +219,26 @@ def test_from_pretrained_uses_official_model_id_and_remote_code(monkeypatch) -> 
         )
     ]
     assert ILLADA_MASK_TOKEN_ID == 5
+
+
+def test_targeted_percept_attention_uses_null_only_for_unrouted_queries() -> None:
+    adapter = ILLaDACIDAdapter(TinyILLaDABackbone())
+    hidden = torch.zeros(1, 3, TinyILLaDAConfig.hidden_size)
+    routing = torch.tensor([[[True], [False], [True]]])
+
+    mask = adapter.external_fusion._query_attention_mask(
+        hidden=hidden,
+        fact_count=0,
+        percept_count=1,
+        percept_query_mask=routing,
+        fact_padding_mask=None,
+        percept_padding_mask=None,
+    )
+
+    assert mask is not None
+    first_head = mask[0]
+    assert first_head.tolist() == [
+        [False, True],
+        [True, False],
+        [False, True],
+    ]

@@ -12,7 +12,10 @@ CID keeps three coupled channels:
 Tool use is represented as persistent **perceptual bindings**, not one-shot serialized calls.
 The runtime can keep denoising while read-only I/O is in flight, reuse static observations
 without repeating I/O, refresh dynamic sources, and re-project the same observation as
-cognition changes.
+cognition changes. Sources may opt into progressive selectors so a binding can begin external work
+before every required argument converges. Version-aware sources use lightweight freshness probes,
+streamable sources feed incremental observations into successive denoising steps, and percept
+cell/display targets become query-specific neural routing masks rather than metadata only.
 
 TCT uses a fixed physical capacity for efficient tensor execution but dynamic logical occupancy.
 Cognitive objects receive stable `cell_id` values, so they can be allocated, retired, reclaimed,

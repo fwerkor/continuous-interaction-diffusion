@@ -6,7 +6,7 @@ from dataclasses import dataclass
 from enum import StrEnum
 from typing import Any
 
-from cid.contracts import FreshnessDemand, InformationNeed, Observation
+from cid.contracts import FreshnessDemand, InformationNeed, Observation, SourceDescriptor
 from cid.grounding import ObjectRef
 
 
@@ -35,6 +35,7 @@ class Binding:
     target_cells: tuple[ObjectRef, ...]
     target_display: tuple[ObjectRef, ...]
     promote_to_fact: bool
+    arguments_complete: bool = True
     status: BindingStatus = BindingStatus.CANDIDATE
     observation: Observation | None = None
     last_refresh_at: float | None = None
@@ -46,9 +47,10 @@ class Binding:
     def work_key(self) -> str:
         return canonical_work_key(self.source, self.arguments)
 
-    def update_from_need(self, need: InformationNeed) -> None:
+    def update_from_need(self, need: InformationNeed, *, arguments_complete: bool) -> None:
         arguments_changed = self.arguments != dict(need.arguments)
         self.arguments = dict(need.arguments)
+        self.arguments_complete = arguments_complete
         self.freshness = need.freshness
         self.max_age_s = need.max_age_s
         self.target_cells = need.target_cells
@@ -110,7 +112,7 @@ class BindingTable:
         needs: tuple[InformationNeed, ...],
         *,
         binding_threshold: float,
-        source_descriptors: Mapping[str, tuple[str, ...]],
+        source_descriptors: Mapping[str, SourceDescriptor],
     ) -> tuple[Binding, ...]:
         seen: set[str] = set()
         touched: list[Binding] = []
@@ -121,8 +123,11 @@ class BindingTable:
             source = need.selected_source()
             if source is None or source not in source_descriptors:
                 continue
-            required = source_descriptors[source]
-            if any(name not in need.arguments for name in required):
+            descriptor = source_descriptors[source]
+            arguments_complete = all(
+                name in need.arguments for name in descriptor.required_arguments
+            )
+            if not arguments_complete and not descriptor.accepts_partial_arguments:
                 continue
 
             seen.add(need.need_id)
@@ -142,11 +147,12 @@ class BindingTable:
                     target_cells=need.target_cells,
                     target_display=need.target_display,
                     promote_to_fact=need.promote_to_fact,
+                    arguments_complete=arguments_complete,
                     status=BindingStatus.ACTIVE,
                 )
                 self._by_need[need.need_id] = binding
             else:
-                binding.update_from_need(need)
+                binding.update_from_need(need, arguments_complete=arguments_complete)
                 if binding.status is BindingStatus.CANDIDATE:
                     binding.status = BindingStatus.ACTIVE
             touched.append(binding)

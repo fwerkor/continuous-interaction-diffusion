@@ -19,6 +19,7 @@ class CIDExternalFusion(nn.Module):
     ) -> None:
         super().__init__()
         self.external_type_embedding = nn.Embedding(2, d_model)
+        self.num_heads = num_heads
         self.percept_projection = nn.Sequential(
             nn.Linear(d_model * 2, d_model),
             nn.GELU(),
@@ -47,6 +48,7 @@ class CIDExternalFusion(nn.Module):
         percepts: Tensor,
         fact_padding_mask: Tensor | None = None,
         percept_padding_mask: Tensor | None = None,
+        percept_query_mask: Tensor | None = None,
     ) -> Tensor:
         context_summary = (seed_hidden * context_weight).sum(dim=1, keepdim=True)
         context_summary = context_summary / context_weight.sum(dim=1, keepdim=True).clamp_min(1.0)
@@ -54,10 +56,22 @@ class CIDExternalFusion(nn.Module):
         projected_percepts = self.percept_projection(
             torch.cat((percepts, percept_context), dim=-1)
         )
+        include_null = (
+            percept_query_mask is not None or facts.shape[1] + percepts.shape[1] == 0
+        )
         external_memory, external_padding_mask = self._external_memory(
             batch_size=hidden.shape[0],
             facts=facts,
             percepts=projected_percepts,
+            fact_padding_mask=fact_padding_mask,
+            percept_padding_mask=percept_padding_mask,
+            include_null=include_null,
+        )
+        attention_mask = self._query_attention_mask(
+            hidden=hidden,
+            fact_count=facts.shape[1],
+            percept_count=percepts.shape[1],
+            percept_query_mask=percept_query_mask,
             fact_padding_mask=fact_padding_mask,
             percept_padding_mask=percept_padding_mask,
         )
@@ -66,6 +80,7 @@ class CIDExternalFusion(nn.Module):
             external_memory,
             external_memory,
             key_padding_mask=external_padding_mask,
+            attn_mask=attention_mask,
             need_weights=False,
         )
         gate = torch.sigmoid(self.external_gate(torch.cat((hidden, external), dim=-1)))
@@ -79,18 +94,17 @@ class CIDExternalFusion(nn.Module):
         percepts: Tensor,
         fact_padding_mask: Tensor | None,
         percept_padding_mask: Tensor | None,
+        include_null: bool,
     ) -> tuple[Tensor, Tensor | None]:
         fact_count = facts.shape[1]
         percept_count = percepts.shape[1]
-        if fact_count + percept_count == 0:
-            return self.null_external.expand(batch_size, -1, -1), None
-
         fact_type = self.external_type_embedding.weight[0][None, None, :]
         percept_type = self.external_type_embedding.weight[1][None, None, :]
-        memory = torch.cat((facts + fact_type, percepts + percept_type), dim=1)
+        parts = [facts + fact_type, percepts + percept_type]
+        if include_null:
+            parts.append(self.null_external.expand(batch_size, -1, -1))
+        memory = torch.cat(parts, dim=1)
 
-        if fact_padding_mask is None and percept_padding_mask is None:
-            return memory, None
         if fact_padding_mask is None:
             fact_padding_mask = torch.zeros(
                 (batch_size, fact_count), dtype=torch.bool, device=facts.device
@@ -99,14 +113,80 @@ class CIDExternalFusion(nn.Module):
             percept_padding_mask = torch.zeros(
                 (batch_size, percept_count), dtype=torch.bool, device=percepts.device
             )
-        padding_mask = torch.cat((fact_padding_mask, percept_padding_mask), dim=1)
-        empty_rows = padding_mask.all(dim=1)
-        if bool(empty_rows.any()):
-            memory = memory.clone()
-            padding_mask = padding_mask.clone()
-            memory[empty_rows, 0] = self.null_external[0, 0]
-            padding_mask[empty_rows, 0] = False
-        return memory, padding_mask
+        padding_parts = [fact_padding_mask, percept_padding_mask]
+        if include_null:
+            padding_parts.append(
+                torch.zeros((batch_size, 1), dtype=torch.bool, device=memory.device)
+            )
+        padding_mask = torch.cat(padding_parts, dim=1)
+        return memory, padding_mask if bool(padding_mask.any()) else None
+
+    def _query_attention_mask(
+        self,
+        *,
+        hidden: Tensor,
+        fact_count: int,
+        percept_count: int,
+        percept_query_mask: Tensor | None,
+        fact_padding_mask: Tensor | None,
+        percept_padding_mask: Tensor | None,
+    ) -> Tensor | None:
+        if percept_query_mask is None:
+            return None
+        expected = (hidden.shape[0], hidden.shape[1], percept_count)
+        if percept_query_mask.shape != expected:
+            raise ValueError(
+                "percept_query_mask must have shape "
+                f"{expected}, got {tuple(percept_query_mask.shape)}"
+            )
+        fact_allowed = torch.ones(
+            (hidden.shape[0], hidden.shape[1], fact_count),
+            dtype=torch.bool,
+            device=hidden.device,
+        )
+        routed_percepts = percept_query_mask.to(device=hidden.device, dtype=torch.bool)
+        if fact_count == 0:
+            fact_available = torch.zeros(
+                hidden.shape[0], dtype=torch.bool, device=hidden.device
+            )
+        elif fact_padding_mask is None:
+            fact_available = torch.ones(
+                hidden.shape[0], dtype=torch.bool, device=hidden.device
+            )
+        else:
+            fact_available = (~fact_padding_mask.to(hidden.device, dtype=torch.bool)).any(dim=1)
+
+        if percept_count == 0:
+            percept_available = torch.zeros(
+                (hidden.shape[0], hidden.shape[1]),
+                dtype=torch.bool,
+                device=hidden.device,
+            )
+        else:
+            if percept_padding_mask is None:
+                percept_valid = torch.ones(
+                    (hidden.shape[0], percept_count),
+                    dtype=torch.bool,
+                    device=hidden.device,
+                )
+            else:
+                percept_valid = ~percept_padding_mask.to(hidden.device, dtype=torch.bool)
+            percept_available = (
+                routed_percepts & percept_valid[:, None, :]
+            ).any(dim=-1)
+
+        has_external = fact_available[:, None] | percept_available
+        null_allowed = (~has_external).unsqueeze(-1)
+        allowed = torch.cat(
+            (fact_allowed, routed_percepts, null_allowed),
+            dim=-1,
+        )
+        disallowed = ~allowed
+        return (
+            disallowed[:, None, :, :]
+            .expand(-1, self.num_heads, -1, -1)
+            .reshape(hidden.shape[0] * self.num_heads, hidden.shape[1], -1)
+        )
 
 
 class CIDOutputHeads(nn.Module):

@@ -2,7 +2,7 @@ from __future__ import annotations
 
 import asyncio
 import time
-from collections.abc import Mapping
+from collections.abc import AsyncIterator, Mapping
 from dataclasses import dataclass
 from typing import Any, Protocol, runtime_checkable
 
@@ -13,6 +13,18 @@ class ReadOnlySource(Protocol):
     descriptor: SourceDescriptor
 
     async def read(self, arguments: Mapping[str, Any]) -> Observation:
+        ...
+
+
+@runtime_checkable
+class VersionAwareSource(Protocol):
+    async def version(self, arguments: Mapping[str, Any]) -> str | None:
+        ...
+
+
+@runtime_checkable
+class StreamingSource(Protocol):
+    def stream(self, arguments: Mapping[str, Any]) -> AsyncIterator[Observation]:
         ...
 
 
@@ -114,6 +126,10 @@ class VersionedMemorySource:
             provenance=self._name,
             observed_at=time.monotonic(),
         )
+
+    async def version(self, arguments: Mapping[str, Any]) -> str:
+        del arguments
+        return str(self._version)
 
 
 @dataclass(slots=True)

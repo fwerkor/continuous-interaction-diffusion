@@ -218,6 +218,12 @@ class ILLaDACIDAdapter(nn.Module):
             percepts=percept_memory,
             fact_padding_mask=batch.fact_padding_mask,
             percept_padding_mask=batch.percept_padding_mask,
+            percept_query_mask=self._percept_query_mask(
+                batch,
+                thought_slots=thought_slots,
+                prompt_length=prompt_length,
+                display_length=display_length,
+            ),
         )
 
         t_hidden = hidden[:, :thought_slots]
@@ -230,6 +236,56 @@ class ILLaDACIDAdapter(nn.Module):
             source_memory=source_memory,
             source_padding_mask=batch.source_padding_mask,
         )
+
+    def _percept_query_mask(
+        self,
+        batch: CIDTensorBatch,
+        *,
+        thought_slots: int,
+        prompt_length: int,
+        display_length: int,
+    ) -> torch.Tensor | None:
+        if batch.percept_thought_mask is None and batch.percept_display_mask is None:
+            return None
+        batch_size = batch.thought_semantic.shape[0]
+        percept_count = batch.percept_memory.shape[1]
+        if batch.percept_thought_mask is None:
+            thought_mask = torch.ones(
+                (batch_size, thought_slots, percept_count),
+                dtype=torch.bool,
+                device=batch.thought_semantic.device,
+            )
+        else:
+            expected = (batch_size, thought_slots, percept_count)
+            if batch.percept_thought_mask.shape != expected:
+                raise ValueError(
+                    f"percept_thought_mask must have shape {expected}"
+                )
+            thought_mask = batch.percept_thought_mask.to(
+                device=batch.thought_semantic.device, dtype=torch.bool
+            )
+
+        prompt_mask = torch.zeros(
+            (batch_size, prompt_length, percept_count),
+            dtype=torch.bool,
+            device=batch.thought_semantic.device,
+        )
+        if batch.percept_display_mask is None:
+            display_mask = torch.ones(
+                (batch_size, display_length, percept_count),
+                dtype=torch.bool,
+                device=batch.thought_semantic.device,
+            )
+        else:
+            expected = (batch_size, display_length, percept_count)
+            if batch.percept_display_mask.shape != expected:
+                raise ValueError(
+                    f"percept_display_mask must have shape {expected}"
+                )
+            display_mask = batch.percept_display_mask.to(
+                device=batch.thought_semantic.device, dtype=torch.bool
+            )
+        return torch.cat((thought_mask, prompt_mask, display_mask), dim=1)
 
     def _validate_batch(self, batch: CIDTensorBatch) -> tuple[int, int, int, int]:
         thought = batch.thought_semantic

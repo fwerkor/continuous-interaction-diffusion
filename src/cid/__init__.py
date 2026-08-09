@@ -39,8 +39,11 @@ from cid.runtime import (
     CIDRuntime,
     CognitiveArchive,
     CognitiveTombstone,
+    ReadOnlySource,
     RuntimeConfig,
     SourceRegistry,
+    StreamingSource,
+    VersionAwareSource,
 )
 from cid.state import (
     CellLifecycle,
@@ -86,6 +89,7 @@ __all__ = [
     "ObjectKind",
     "ObjectRef",
     "Percept",
+    "ReadOnlySource",
     "RuntimeConfig",
     "RuntimeEvaluationSummary",
     "RuntimeTaskEvaluation",
@@ -93,6 +97,8 @@ __all__ = [
     "ScheduledReplaySource",
     "SourceDescriptor",
     "SourceRegistry",
+    "StreamingSource",
+    "VersionAwareSource",
     "STRONG_LINK_RELATIONS",
     "build_replay_registry",
     "evaluate_runtime_result",

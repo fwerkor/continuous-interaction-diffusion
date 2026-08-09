@@ -15,7 +15,7 @@ from cid.model.illada import (
     ILLaDACIDAdapter,
 )
 from cid.model.materialize import CIDMaterializer, ClosedWorldMaterializationCatalog
-from cid.model.tensors import CIDTensorBatch
+from cid.model.tensors import CIDTensorBatch, build_percept_routing_masks
 from cid.state import CognitiveRole, FactItem
 
 
@@ -108,6 +108,9 @@ class ILLaDAContextTensorizer:
             tuple(self._percept_text(item) for item in context.percepts),
             detach=True,
         )
+        percept_thought_mask, percept_display_mask = self._percept_target_masks(
+            context, device=device
+        )
         source_memory = self.text_encoder.encode_texts(
             tuple(self._source_text(item) for item in context.sources),
             detach=True,
@@ -124,6 +127,8 @@ class ILLaDAContextTensorizer:
             fact_memory=fact_memory,
             percept_memory=percept_memory,
             source_memory=source_memory,
+            percept_thought_mask=percept_thought_mask,
+            percept_display_mask=percept_display_mask,
         )
 
     @staticmethod
@@ -140,6 +145,12 @@ class ILLaDAContextTensorizer:
     @staticmethod
     def _percept_text(item: Percept) -> str:
         anchors = ",".join(anchor.canonical_key for anchor in item.observation.anchors)
+        target_cells = ",".join(target.identifier for target in item.target_cells)
+        target_display = ",".join(
+            f"{target.span[0]}:{target.span[1]}"
+            for target in item.target_display
+            if target.span is not None
+        )
         return " | ".join(
             (
                 f"percept={item.binding_id}",
@@ -147,7 +158,26 @@ class ILLaDAContextTensorizer:
                 f"value={stable_text(item.observation.value)}",
                 f"version={item.observation.version or ''}",
                 f"anchors={anchors}",
+                f"target_cells={target_cells}",
+                f"target_display={target_display}",
             )
+        )
+
+    @staticmethod
+    def _percept_target_masks(
+        context: ModelContext, *, device: torch.device
+    ) -> tuple[torch.Tensor, torch.Tensor]:
+        cell_slots = {
+            cell_id: context.thought.slot_of(cell_id)
+            for cell_id in context.thought.occupied_cell_ids
+        }
+        return build_percept_routing_masks(
+            tuple(percept.target_cells for percept in context.percepts),
+            tuple(percept.target_display for percept in context.percepts),
+            cell_slots=cell_slots,
+            thought_slots=context.thought.capacity,
+            display_length=len(context.display.token_ids),
+            device=device,
         )
 
     @staticmethod
@@ -163,6 +193,7 @@ class ILLaDAContextTensorizer:
                 f"arguments={arguments}",
                 f"dynamic={item.dynamic}",
                 f"versioned={item.versioned}",
+                f"accepts_partial_arguments={item.accepts_partial_arguments}",
             )
         )
 
