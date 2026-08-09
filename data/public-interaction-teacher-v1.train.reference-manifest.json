@@ -1,18 +1,29 @@
 {
   "causal_jobs": "data/generated/public-interaction-teacher-causal-v1.train.jsonl",
-  "causal_jobs_sha256": "8ebcd1e3b2ab670c9a2058281fc4c4da57d95e05c827a6c17993a2d16abee571",
+  "causal_jobs_sha256": "79b2ebf3f4a61b49ef479209e0987bd47cd11fcbc6954df4c767b944209e5d18",
+  "dependency_depth_histogram": {
+    "2": 7911,
+    "3": 968,
+    "4": 146
+  },
   "evidence_count_histogram": {
-    "3": 6812,
-    "4": 1001,
-    "5": 1212
+    "3": 3549,
+    "4": 3238,
+    "5": 966,
+    "6": 1015,
+    "8": 257
   },
   "format_version": 1,
   "input_pool": "data/generated/public-interaction-task-pool-v1.jsonl",
   "input_pool_sha256": "44cc895235a0536a8a75b5ee312f17a0537f7824055009b5ddc74134a985d920",
+  "interaction_pattern_counts": {
+    "decomposition_dag": 4510,
+    "search_then_parallel_reads": 4515
+  },
   "mode_counts": {
     "tool_required": 9025
   },
-  "requests_sha256": "2dce873fe953af0da2867d6113838643610002eb07d1be84cafbdd522c496ece",
+  "requests_sha256": "785d4e25c5c19d4b366e58faa08ca95fd7f9c2cd6498f43284bbffe4911ebf6d",
   "seed": 20260809,
   "source_counts": {
     "2wikimultihopqa-train": 4515,
@@ -20,6 +31,6 @@
   },
   "split": "train",
   "tasks": 9025,
-  "tasks_sha256": "4b0b733de2b9b4ba5dbb8b5c6aa0173a40056c4682b2088502de954cee2a92af",
+  "tasks_sha256": "d1943b8453683c65cd31a1cd775a5b51a81a7de5c34e54d790b8e2c43d3f14dd",
   "unnecessary_tool_fraction": 0.0
 }

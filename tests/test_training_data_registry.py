@@ -19,6 +19,8 @@ def test_training_semantic_mixture_v2_matches_component_reference_manifests() ->
     }
 
     assert mixture["semantic_tasks"] == 28_055
+    assert mixture["sequential_dependency_tasks"] == 4_510
+    assert mixture["dependency_depth_3_plus_tasks"] == 1_114
     assert sum(mixture["mode_counts"].values()) == 28_055
     assert sum(component["tasks"] for component in mixture["components"]) == 28_055
     for component in mixture["components"]:
@@ -27,6 +29,17 @@ def test_training_semantic_mixture_v2_matches_component_reference_manifests() ->
         assert component["tasks"] == task_count
         assert component["tasks_sha256"] == reference["tasks_sha256"]
         assert component["causal_jobs_sha256"] == reference["causal_jobs_sha256"]
+
+    interaction = references["public-interaction-v1"]
+    assert interaction["interaction_pattern_counts"] == {
+        "decomposition_dag": 4_510,
+        "search_then_parallel_reads": 4_515,
+    }
+    assert interaction["dependency_depth_histogram"] == {
+        "2": 7_911,
+        "3": 968,
+        "4": 146,
+    }
 
 
 def test_mechanism_reference_manifest_covers_all_cid_specific_families() -> None:

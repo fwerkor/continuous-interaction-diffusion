@@ -1,6 +1,10 @@
 {
   "causal_jobs": "data/generated/public-teacher-causal-v1.train.jsonl",
-  "causal_jobs_sha256": "0c090a84dc0176353983380d6140ee8c5071571e9609c491cbd0b85a88d2945d",
+  "causal_jobs_sha256": "620e95a00081f52f16ef5f598bde5f7699ce821b15d5653899a4bda3bf530953",
+  "dependency_depth_histogram": {
+    "0": 7664,
+    "2": 1366
+  },
   "evidence_count_histogram": {
     "0": 7664,
     "3": 1366
@@ -8,12 +12,16 @@
   "format_version": 1,
   "input_pool": "data/generated/public-task-pool-v1.jsonl",
   "input_pool_sha256": "bb92a3d6fccad2687cd5805ec5aa3eaff404644dea76cce153a088853d49f17b",
+  "interaction_pattern_counts": {
+    "none": 7664,
+    "search_then_parallel_reads": 1366
+  },
   "mode_counts": {
     "no_tool": 6921,
     "tool_required": 1366,
     "tools_available_unnecessary": 743
   },
-  "requests_sha256": "2ed8d43d72bbf3ec59a69fe85f8a7201c7683c5b162e2cee195c1e7e45851400",
+  "requests_sha256": "723c1774efe92ff99c45902d0fe91a2d3d18e1fcdb4f3488cb1311e82ea8ab96",
   "seed": 20260809,
   "source_counts": {
     "arc-challenge": 542,
@@ -26,6 +34,6 @@
   },
   "split": "train",
   "tasks": 9030,
-  "tasks_sha256": "e5df4695b5cd2caa74035c1ef31cd08b16b01e25aebead73115c037d74d86e5b",
+  "tasks_sha256": "5c38ff9cf2b1455c3ec5bb4dec0fddfe66ce6e81f975ec8c5983f4aa5d3c7005",
   "unnecessary_tool_fraction": 0.1
 }

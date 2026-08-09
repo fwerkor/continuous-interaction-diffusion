@@ -1,18 +1,18 @@
 {
   "components": [
     {
-      "causal_jobs_sha256": "0c090a84dc0176353983380d6140ee8c5071571e9609c491cbd0b85a88d2945d",
+      "causal_jobs_sha256": "620e95a00081f52f16ef5f598bde5f7699ce821b15d5653899a4bda3bf530953",
       "name": "public-base-v1",
       "reference_manifest": "data/public-teacher-v1.train.reference-manifest.json",
       "tasks": 9030,
-      "tasks_sha256": "e5df4695b5cd2caa74035c1ef31cd08b16b01e25aebead73115c037d74d86e5b"
+      "tasks_sha256": "5c38ff9cf2b1455c3ec5bb4dec0fddfe66ce6e81f975ec8c5983f4aa5d3c7005"
     },
     {
-      "causal_jobs_sha256": "8ebcd1e3b2ab670c9a2058281fc4c4da57d95e05c827a6c17993a2d16abee571",
+      "causal_jobs_sha256": "79b2ebf3f4a61b49ef479209e0987bd47cd11fcbc6954df4c767b944209e5d18",
       "name": "public-interaction-v1",
       "reference_manifest": "data/public-interaction-teacher-v1.train.reference-manifest.json",
       "tasks": 9025,
-      "tasks_sha256": "4b0b733de2b9b4ba5dbb8b5c6aa0173a40056c4682b2088502de954cee2a92af"
+      "tasks_sha256": "d1943b8453683c65cd31a1cd775a5b51a81a7de5c34e54d790b8e2c43d3f14dd"
     },
     {
       "causal_jobs_sha256": "90d9e1947e1e59ad18266053905c777ce412cb6b4ca057d9e3ca40d66494ba3b",
@@ -22,6 +22,7 @@
       "tasks_sha256": "86a1b89b068e0289be4d13990d430f9961614df021dd92f938167d0c2e660265"
     }
   ],
+  "dependency_depth_3_plus_tasks": 1114,
   "mode_counts": {
     "no_tool": 6921,
     "tool_required": 20391,
@@ -34,6 +35,7 @@
   },
   "name": "training-semantic-mixture-v2",
   "semantic_tasks": 28055,
+  "sequential_dependency_tasks": 4510,
   "split": "train-plus-generated-mechanisms",
   "version": 2
 }
