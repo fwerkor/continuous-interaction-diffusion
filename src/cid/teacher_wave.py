@@ -18,6 +18,30 @@ from cid.distill import (
 )
 from cid.state import CellLifecycle, CognitiveRole
 
+TEACHER_SOFT_QUALITY_GUIDANCE = """Soft quality targets (guidance, not hard validation):
+- Keep each `semantic_text` compact: target <=160 characters and normally <=240. Summarize only
+  task-relevant state; do not copy whole evidence sentences or paragraphs. If a carried-forward
+  cell is overly verbose, compress it while preserving its meaning and stable `cell_id`.
+- Prefer about 3-6 live cells for an ordinary task. Add a cell only for a distinct cognitive role;
+  merge redundant state when that does not destroy a useful dependency.
+- Ground salient task-relevant entities, numbers, dates, symbols, paths, or URLs with `anchors`.
+  Usually 1-3 anchors are enough for an evidence-bearing cell; do not annotate filler words.
+- Add typed `links` when the relation is meaningful: `requests` from an information need to a
+  source, `observes` from a percept to the source it came from, `supports`/`derived_from` or
+  `depends_on` between related cells, and `conflicts` when evidence disagrees. Do not invent links
+  merely to satisfy a quota.
+- Reuse stable anchor IDs for the same logical object across later stages when practical.
+
+Anchor example:
+`{"anchor_id":"entity:alice-example","kind":"entity","value":"Alice Example","confidence":1.0}`
+Link example:
+`{"relation":"observes","target":{"kind":"source","identifier":"workspace_read"},"confidence":1.0}`
+"""
+
+TEACHER_SEMANTIC_TEXT_TARGET_CHARS = 160
+TEACHER_SEMANTIC_TEXT_PREFERRED_MAX_CHARS = 240
+TEACHER_PREFERRED_LIVE_CELLS = 6
+
 
 @dataclass(frozen=True, slots=True)
 class TeacherWaveRequest:
@@ -469,6 +493,8 @@ arguments are fixed by the contract and therefore are omitted from your output. 
 `freshness_hint`, copy that value into the need's `freshness` field; `always` means the binding must
 remain live for later refreshes or stream chunks.
 
+{TEACHER_SOFT_QUALITY_GUIDANCE}
+
 Output schema:
 {{
   "display":"non-empty current display state",
@@ -554,6 +580,41 @@ def _validate_stage_output(
     }
     if any(need.cell_id in retired for need in output.needs):
         raise ValueError("teacher stage cannot attach a new need to a retired cell")
+
+
+def teacher_stage_soft_warning_codes(
+    stage: Mapping[str, Any],
+    output: TeacherStageOutput,
+) -> tuple[str, ...]:
+    """Return non-blocking quality warnings for teacher supervision.
+
+    These warnings intentionally do not participate in validation. They make compactness and
+    grounding quality observable without turning stylistic preferences into brittle data gates.
+    """
+
+    warnings: list[str] = []
+    lengths = [len(cell.semantic_text) for cell in output.cells]
+    if any(length > TEACHER_SEMANTIC_TEXT_TARGET_CHARS for length in lengths):
+        warnings.append("semantic_text_over_target")
+    if any(length > TEACHER_SEMANTIC_TEXT_PREFERRED_MAX_CHARS for length in lengths):
+        warnings.append("semantic_text_over_preferred_max")
+
+    live_cells = [cell for cell in output.cells if cell.lifecycle is not CellLifecycle.RETIRED]
+    if len(live_cells) > TEACHER_PREFERRED_LIVE_CELLS:
+        warnings.append("live_cells_over_preferred_count")
+
+    if stage.get("arrived_evidence") is not None:
+        evidence_cells = [
+            cell
+            for cell in live_cells
+            if cell.roles.get(CognitiveRole.PERCEPT, 0.0) > 0.0
+            or cell.roles.get(CognitiveRole.CONCLUSION, 0.0) > 0.0
+        ]
+        if evidence_cells and not any(cell.anchors for cell in evidence_cells):
+            warnings.append("arrived_evidence_without_anchor")
+        if evidence_cells and not any(cell.links for cell in evidence_cells):
+            warnings.append("arrived_evidence_without_link")
+    return tuple(warnings)
 
 
 def _request_id(task_id: str, stage_index: int, phase: str) -> str:
