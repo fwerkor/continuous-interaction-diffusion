@@ -53,6 +53,7 @@ def build_causal_teacher_job(task: TeacherTask) -> CausalTeacherJob:
     base = task.teacher_visible_dict()
     base.pop("evidence", None)
     evidence_by_id = {item.evidence_id: item for item in task.evidence}
+    persistent_roots = _persistent_binding_roots(task.evidence)
     unlocked: set[str] = set()
     arrived: set[str] = set()
 
@@ -63,7 +64,13 @@ def build_causal_teacher_job(task: TeacherTask) -> CausalTeacherJob:
                 continue
             if all(dependency in arrived for dependency in item.depends_on):
                 unlocked.add(item.evidence_id)
-                contracts.append(_evidence_contract(item))
+                if item.requires_need:
+                    contracts.append(
+                        _evidence_contract(
+                            item,
+                            persistent=item.evidence_id in persistent_roots,
+                        )
+                    )
         return tuple(contracts)
 
     stages: list[CausalTeacherStage] = [
@@ -113,10 +120,41 @@ def dump_causal_teacher_jobs(tasks: tuple[TeacherTask, ...], path: str | Path) -
             )
 
 
-def _evidence_contract(evidence: TeacherEvidence) -> dict[str, Any]:
-    return {
+def _evidence_contract(
+    evidence: TeacherEvidence,
+    *,
+    persistent: bool = False,
+) -> dict[str, Any]:
+    contract = {
         "evidence_id": evidence.evidence_id,
         "source": evidence.source,
         "arguments": dict(evidence.arguments),
         "depends_on": list(evidence.depends_on),
+        "requires_need": evidence.requires_need,
     }
+    if persistent:
+        contract["freshness_hint"] = "always"
+    return contract
+
+
+def _persistent_binding_roots(
+    evidence: tuple[TeacherEvidence, ...],
+) -> set[str]:
+    by_id = {item.evidence_id: item for item in evidence}
+    roots: set[str] = set()
+    for item in evidence:
+        if item.requires_need:
+            continue
+        current = item
+        visited: set[str] = set()
+        while not current.requires_need and len(current.depends_on) == 1:
+            if current.evidence_id in visited:
+                break
+            visited.add(current.evidence_id)
+            parent = by_id[current.depends_on[0]]
+            if parent.source != item.source or dict(parent.arguments) != dict(item.arguments):
+                break
+            current = parent
+        if current.requires_need:
+            roots.add(current.evidence_id)
+    return roots

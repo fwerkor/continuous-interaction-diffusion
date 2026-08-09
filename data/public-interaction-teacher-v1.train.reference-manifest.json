@@ -1,6 +1,6 @@
 {
   "causal_jobs": "data/generated/public-interaction-teacher-causal-v1.train.jsonl",
-  "causal_jobs_sha256": "42ddb605c1b0e54259553cb031db04f9a59adcab2a747fbda1ed83a64848444c",
+  "causal_jobs_sha256": "8ebcd1e3b2ab670c9a2058281fc4c4da57d95e05c827a6c17993a2d16abee571",
   "evidence_count_histogram": {
     "3": 6812,
     "4": 1001,
@@ -12,7 +12,7 @@
   "mode_counts": {
     "tool_required": 9025
   },
-  "requests_sha256": "02080892c0d5eb27dc06c88bdac7021d086ba96b11d48eb2195b900b1731e08d",
+  "requests_sha256": "2dce873fe953af0da2867d6113838643610002eb07d1be84cafbdd522c496ece",
   "seed": 20260809,
   "source_counts": {
     "2wikimultihopqa-train": 4515,
@@ -20,6 +20,6 @@
   },
   "split": "train",
   "tasks": 9025,
-  "tasks_sha256": "dad498413e0787af9bc10dddcec2bb433c70662743d3faa85f7991081e17a348",
+  "tasks_sha256": "4b0b733de2b9b4ba5dbb8b5c6aa0173a40056c4682b2088502de954cee2a92af",
   "unnecessary_tool_fraction": 0.0
 }

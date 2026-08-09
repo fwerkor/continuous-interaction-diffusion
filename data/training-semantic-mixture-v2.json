@@ -13,21 +13,27 @@
       "reference_manifest": "data/public-interaction-teacher-v1.train.reference-manifest.json",
       "tasks": 9025,
       "tasks_sha256": "4b0b733de2b9b4ba5dbb8b5c6aa0173a40056c4682b2088502de954cee2a92af"
+    },
+    {
+      "causal_jobs_sha256": "90d9e1947e1e59ad18266053905c777ce412cb6b4ca057d9e3ca40d66494ba3b",
+      "name": "mechanism-teacher-v1",
+      "reference_manifest": "data/mechanism-teacher-v1.reference-manifest.json",
+      "tasks": 10000,
+      "tasks_sha256": "86a1b89b068e0289be4d13990d430f9961614df021dd92f938167d0c2e660265"
     }
   ],
-  "cross_pool_semantic_overlap": 0,
   "mode_counts": {
     "no_tool": 6921,
-    "tool_required": 10391,
+    "tool_required": 20391,
     "tools_available_unnecessary": 743
   },
   "mode_fractions": {
-    "no_tool": 0.38333,
-    "tool_required": 0.57552,
-    "tools_available_unnecessary": 0.04115
+    "no_tool": 0.24669,
+    "tool_required": 0.72682,
+    "tools_available_unnecessary": 0.02648
   },
-  "name": "training-semantic-mixture-v1",
-  "semantic_tasks": 18055,
-  "split": "train",
-  "version": 1
+  "name": "training-semantic-mixture-v2",
+  "semantic_tasks": 28055,
+  "split": "train-plus-generated-mechanisms",
+  "version": 2
 }

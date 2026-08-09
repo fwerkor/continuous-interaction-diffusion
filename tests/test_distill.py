@@ -318,6 +318,26 @@ def test_teacher_task_request_files_are_stable_and_drop_event_schedule(tmp_path)
     assert all("arrival_step" not in item for item in task_payload["evidence"])
 
 
+def test_synthetic_teacher_tasks_reuse_persistent_bindings_for_updates() -> None:
+    examples = generate_synthetic(
+        SyntheticConfig(count_per_family=1, seed=9, thought_capacity=8)
+    )
+    tasks = teacher_tasks_from_trajectories(examples)
+    by_family = {str(task.metadata["family"]): task for task in tasks}
+
+    dynamic = by_family["dynamic_state"]
+    assert [item.requires_need for item in dynamic.evidence] == [True, False]
+    assert dynamic.evidence[1].depends_on == ("evidence-0",)
+
+    streaming = by_family["streaming_evidence"]
+    assert [item.requires_need for item in streaming.evidence] == [True, False]
+    assert streaming.evidence[1].depends_on == ("evidence-0",)
+
+    competing = by_family["competing_sources"]
+    assert [item.requires_need for item in competing.evidence] == [True, True]
+    assert all(item.depends_on == () for item in competing.evidence)
+
+
 def test_teacher_quality_review_rejects_future_leaks_and_bad_arguments() -> None:
     task, plan = make_teacher_task_and_plan()
     pre = plan.frames[1]

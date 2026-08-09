@@ -202,6 +202,27 @@ splits of 2WikiMultiHopQA and MuSiQue. After the CID-owned train split, it conta
 tasks: 10,391 tool-required, 6,921 no-tool, and 743 tools-available-but-unnecessary tasks. Every task
 in the interaction component spans at least two distinct supporting documents.
 
+The overall semantic mixture is `data/training-semantic-mixture-v2.json`. It adds 10,000 generated
+mechanism tasks, with 2,000 examples from each of the five deterministic families. These seeds are
+converted back to timing-free `TeacherTask` records and relabeled by the same strong semantic
+teacher; the programmatic TCT text in the seed trajectories is not treated as final high-quality
+supervision. `data/mechanism-seed-v1.reference-manifest.json` pins the seed trajectory build and
+`data/mechanism-teacher-v1.reference-manifest.json` pins the teacher-task/causal-job ABI.
+
+The resulting v2 mixture contains 28,055 semantic tasks: 20,391 tool-required, 6,921 no-tool, and
+743 tools-available-but-unnecessary. The generated mechanism component contributes:
+
+- 2,000 static exact reads;
+- 2,000 delayed reads;
+- 2,000 dynamic-state tasks where one `freshness=always` binding receives a later version;
+- 2,000 streaming tasks where later chunks reuse the original persistent binding;
+- 2,000 competing-source tasks where two independent reads become executable together.
+
+`TeacherEvidence.requires_need` distinguishes explicit model-launched work from later arrivals on
+an existing binding. A causal action contract that must stay live carries
+`freshness_hint="always"`; the teacher-output validator enforces that hint without exposing future
+evidence values.
+
 ### Causal teacher production
 
 Production teacher labeling is a resumable sequence of causal waves. Start from the generated job

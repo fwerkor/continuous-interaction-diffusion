@@ -1,0 +1,25 @@
+{
+  "bytes": 29448758,
+  "examples": 10000,
+  "format_version": 1,
+  "max_trajectory_steps": 5,
+  "schema": "cid.TrajectoryExample.v1",
+  "sha256": "3a05848637e6fb0428a33ec4ad6d16fc144928ed94c895cf10502f76ad15696d",
+  "sources": [
+    "counter",
+    "docs",
+    "primary",
+    "registry",
+    "secondary",
+    "stream"
+  ],
+  "tag_counts": {
+    "family:competing_sources": 2000,
+    "family:delayed_retrieval": 2000,
+    "family:dynamic_state": 2000,
+    "family:static_copy": 2000,
+    "family:streaming_evidence": 2000
+  },
+  "thought_capacity_required": 8,
+  "transitions": 30000
+}

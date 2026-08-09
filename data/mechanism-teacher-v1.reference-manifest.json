@@ -1,0 +1,19 @@
+{
+  "causal_jobs_sha256": "90d9e1947e1e59ad18266053905c777ce412cb6b4ca057d9e3ca40d66494ba3b",
+  "causal_stages": 26000,
+  "debug_requests_sha256": "ee1242aefef80c977d9d5b8552488fa1462ac03ac56fd7d443f2a3953482343f",
+  "family_counts": {
+    "competing_sources": 2000,
+    "delayed_retrieval": 2000,
+    "dynamic_state": 2000,
+    "static_copy": 2000,
+    "streaming_evidence": 2000
+  },
+  "name": "mechanism-teacher-v1",
+  "parallel_root_need_tasks": 2000,
+  "persistent_binding_tasks": 4000,
+  "seed_trajectory_manifest": "data/mechanism-seed-v1.reference-manifest.json",
+  "semantic_tasks": 10000,
+  "tasks_sha256": "86a1b89b068e0289be4d13990d430f9961614df021dd92f938167d0c2e660265",
+  "version": 1
+}

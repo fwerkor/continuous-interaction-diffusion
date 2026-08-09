@@ -30,6 +30,7 @@ class TeacherEvidence:
     value: Any
     arguments: Mapping[str, Any] = field(default_factory=dict)
     depends_on: tuple[str, ...] = ()
+    requires_need: bool = True
     version: str | None = None
     provenance: str | None = None
 
@@ -45,6 +46,7 @@ class TeacherEvidence:
             value=raw.get("value"),
             arguments=dict(raw.get("arguments", {})),
             depends_on=tuple(str(item) for item in raw.get("depends_on", ())),
+            requires_need=bool(raw.get("requires_need", True)),
             version=None if raw.get("version") is None else str(raw["version"]),
             provenance=(
                 None if raw.get("provenance") is None else str(raw["provenance"])
@@ -58,6 +60,7 @@ class TeacherEvidence:
             "value": self.value,
             "arguments": dict(self.arguments),
             "depends_on": list(self.depends_on),
+            "requires_need": self.requires_need,
             "version": self.version,
             "provenance": self.provenance,
         }
@@ -454,24 +457,53 @@ def teacher_tasks_from_trajectories(
             prompt=example.prompt,
             protected_facts=dict(example.protected_facts),
             source_descriptors=example.source_descriptors,
-            evidence=tuple(
-                TeacherEvidence(
-                    evidence_id=f"evidence-{index}",
-                    source=event.source,
-                    value=event.value,
-                    arguments=dict(event.arguments),
-                    version=event.version,
-                    provenance=event.provenance,
-                )
-                for index, event in enumerate(example.events)
-            ),
+            evidence=_teacher_evidence_from_trajectory(example),
             metadata={
                 **dict(example.metadata),
                 "source_example_id": example.example_id,
+                "task_kind": str(
+                    example.metadata.get("task_kind", "synthetic_mechanism")
+                ),
             },
+            reference_answer=example.target_display,
         )
         for example in examples
     )
+
+
+def _teacher_evidence_from_trajectory(
+    example: TrajectoryExample,
+) -> tuple[TeacherEvidence, ...]:
+    binding_keys = {
+        _source_arguments_key(binding.source, binding.arguments)
+        for binding in example.binding_targets
+    }
+    previous_by_binding: dict[str, str] = {}
+    evidence: list[TeacherEvidence] = []
+    for index, event in enumerate(example.events):
+        evidence_id = f"evidence-{index}"
+        binding_key = _source_arguments_key(event.source, event.arguments)
+        previous = previous_by_binding.get(binding_key)
+        requires_need = binding_key in binding_keys and previous is None
+        evidence.append(
+            TeacherEvidence(
+                evidence_id=evidence_id,
+                source=event.source,
+                value=event.value,
+                arguments=dict(event.arguments),
+                depends_on=() if previous is None else (previous,),
+                requires_need=requires_need,
+                version=event.version,
+                provenance=event.provenance,
+            )
+        )
+        previous_by_binding[binding_key] = evidence_id
+    return tuple(evidence)
+
+
+def _source_arguments_key(source: str, arguments: Mapping[str, Any]) -> str:
+    payload = json.dumps(dict(arguments), ensure_ascii=False, sort_keys=True, default=str)
+    return f"{source}\0{payload}"
 
 
 def compile_teacher_plans(
@@ -1025,6 +1057,31 @@ def _teacher_quality_reasons(
     source_by_name = {
         str(item.get("name", "")): item for item in task.source_descriptors
     }
+    needs_by_evidence = {
+        evidence.evidence_id: tuple(
+            need for need in plan.needs if need.evidence_id == evidence.evidence_id
+        )
+        for evidence in task.evidence
+    }
+    for evidence in task.evidence:
+        evidence_needs = needs_by_evidence[evidence.evidence_id]
+        if evidence.requires_need and len(evidence_needs) != 1:
+            reasons.append(
+                f"evidence {evidence.evidence_id} requires exactly one activating need"
+            )
+        if not evidence.requires_need and evidence_needs:
+            reasons.append(
+                f"evidence {evidence.evidence_id} reuses a persistent binding and must not "
+                "create a new need"
+            )
+        if not evidence.requires_need:
+            root_id = _persistent_root_evidence_id(evidence, evidence_by_id)
+            root_needs = needs_by_evidence.get(root_id, ())
+            if len(root_needs) == 1 and root_needs[0].freshness is not FreshnessDemand.ALWAYS:
+                reasons.append(
+                    f"need {root_needs[0].need_id} must use freshness='always' for persistent "
+                    f"updates ending at {evidence.evidence_id}"
+                )
     for need in plan.needs:
         evidence = evidence_by_id.get(need.evidence_id)
         descriptor = source_by_name.get(need.source)
@@ -1062,6 +1119,25 @@ def _teacher_quality_reasons(
     return tuple(dict.fromkeys(reasons))
 
 
+def _persistent_root_evidence_id(
+    evidence: TeacherEvidence,
+    evidence_by_id: Mapping[str, TeacherEvidence],
+) -> str:
+    current = evidence
+    visited: set[str] = set()
+    while not current.requires_need:
+        if current.evidence_id in visited:
+            raise ValueError("teacher evidence dependency graph contains a cycle")
+        visited.add(current.evidence_id)
+        if len(current.depends_on) != 1:
+            return current.evidence_id
+        parent = evidence_by_id[current.depends_on[0]]
+        if parent.source != evidence.source or dict(parent.arguments) != dict(evidence.arguments):
+            return current.evidence_id
+        current = parent
+    return current.evidence_id
+
+
 def _reference_answer_reason(task: TeacherTask, plan: TeacherPlan) -> str | None:
     reference = task.reference_answer
     if reference is None:
@@ -1071,6 +1147,7 @@ def _reference_answer_reason(task: TeacherTask, plan: TeacherPlan) -> str | None
         "multi_hop_qa",
         "multiple_choice_knowledge_reasoning",
         "science_multiple_choice",
+        "synthetic_mechanism",
     }:
         if not _normalized_answer_match(plan.final_answer, reference):
             return "final_answer does not match the public reference answer"

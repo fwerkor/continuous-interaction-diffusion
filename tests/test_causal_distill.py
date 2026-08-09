@@ -104,3 +104,43 @@ def test_no_evidence_task_is_single_terminal_causal_stage() -> None:
     assert job.stages[0].phase == "initial"
     assert job.stages[0].terminal is True
     assert job.stages[0].available_evidence == ()
+
+
+def test_persistent_update_arrives_without_creating_a_second_need() -> None:
+    task = TeacherTask(
+        task_id="dynamic",
+        prompt="Track the newest counter value.",
+        source_descriptors=(
+            {
+                "name": "counter",
+                "description": "read current counter",
+                "arguments": (),
+                "dynamic": True,
+                "versioned": True,
+            },
+        ),
+        evidence=(
+            TeacherEvidence(
+                evidence_id="v1",
+                source="counter",
+                value=7,
+                requires_need=True,
+            ),
+            TeacherEvidence(
+                evidence_id="v2",
+                source="counter",
+                value=9,
+                depends_on=("v1",),
+                requires_need=False,
+            ),
+        ),
+    )
+
+    job = build_causal_teacher_job(task)
+
+    assert [item["evidence_id"] for item in job.stages[0].available_evidence] == ["v1"]
+    assert job.stages[0].available_evidence[0]["freshness_hint"] == "always"
+    assert job.stages[1].phase == "after:v1"
+    assert job.stages[1].available_evidence == ()
+    assert job.stages[2].phase == "after:v2"
+    assert job.stages[2].terminal is True

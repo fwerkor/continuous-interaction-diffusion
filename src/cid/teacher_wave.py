@@ -465,7 +465,9 @@ Allowed roles: hypothesis, information_need, percept, plan, constraint, conclusi
 Every AVAILABLE_EVIDENCE_CONTRACT is a gold external information need that becomes executable at
 this stage. Emit exactly one `needs` entry for each contract, attached to a current cell with a
 positive `information_need` role. Do not invent needs for unavailable evidence. Source name and
-arguments are fixed by the contract and therefore are omitted from your output.
+arguments are fixed by the contract and therefore are omitted from your output. If a contract has
+`freshness_hint`, copy that value into the need's `freshness` field; `always` means the binding must
+remain live for later refreshes or stream chunks.
 
 Output schema:
 {{
@@ -535,6 +537,11 @@ def _validate_stage_output(
             raise ValueError(f"teacher stage need references missing cell {need.cell_id!r}")
         if cell.roles.get(CognitiveRole.INFORMATION_NEED, 0.0) <= 0.0:
             raise ValueError("teacher stage need cell must carry a positive information_need role")
+        freshness_hint = available[need.evidence_id].get("freshness_hint")
+        if freshness_hint is not None and need.freshness.value != str(freshness_hint):
+            raise ValueError(
+                f"teacher stage need {need.evidence_id} must use freshness={freshness_hint!r}"
+            )
     if bool(stage.get("terminal", False)):
         if output.needs:
             raise ValueError("terminal teacher stage cannot emit new needs")

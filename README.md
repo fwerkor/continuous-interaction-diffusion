@@ -175,11 +175,13 @@ Convert a pool into teacher-ready CID tasks and causal evidence-exposure jobs wi
 cid prepare-public-distillation
 ```
 
-The pinned train mixture currently contains 18,055 semantic tasks: 10,391 tool-required examples,
-6,921 no-tool examples, and 743 examples where tools are present but unnecessary. Retrieval tasks
-use a task-local `workspace_search` followed by two to four supporting `workspace_read` operations.
-Supporting reads depend on the search result and become eligible together, while causal teacher jobs
-reveal evidence values only after their corresponding arrival stage.
+The current overall semantic mixture is pinned by `data/training-semantic-mixture-v2.json` and
+contains 28,055 tasks. It combines the 18,055-task public mixture with 10,000 generated mechanism
+tasks covering static reads, delayed reads, dynamic refresh, streaming evidence, and competing
+sources. Retrieval tasks use a task-local `workspace_search` followed by two to four supporting
+`workspace_read` operations. Dynamic and streaming tasks create one persistent binding and reuse it
+for later updates instead of reissuing a new need for every arrival. Causal teacher jobs reveal
+evidence values only after their corresponding arrival stage.
 
 Generated task data lives under `data/generated/` and is not committed. Every record retains exact
 upstream provenance; semantic IDs are deduplicated and assigned to the CID train/validation/test

@@ -1,6 +1,6 @@
 {
   "causal_jobs": "data/generated/public-teacher-causal-v1.train.jsonl",
-  "causal_jobs_sha256": "6ce4ea7c3b40bf4ff94f1864e7d6bd2e761fa9716379ee06ca2a01a3d9f8c1b9",
+  "causal_jobs_sha256": "0c090a84dc0176353983380d6140ee8c5071571e9609c491cbd0b85a88d2945d",
   "evidence_count_histogram": {
     "0": 7664,
     "3": 1366
@@ -13,7 +13,7 @@
     "tool_required": 1366,
     "tools_available_unnecessary": 743
   },
-  "requests_sha256": "41e6cfd0f8bdcd3fe1a06241b49b7fc60a6dd4eae4223a780a32623919373c5b",
+  "requests_sha256": "2ed8d43d72bbf3ec59a69fe85f8a7201c7683c5b162e2cee195c1e7e45851400",
   "seed": 20260809,
   "source_counts": {
     "arc-challenge": 542,
@@ -26,6 +26,6 @@
   },
   "split": "train",
   "tasks": 9030,
-  "tasks_sha256": "6562a4093a07880a698285ec3b8b4707a6e858d6a46b1c734bf2d37d2c68891d",
+  "tasks_sha256": "e5df4695b5cd2caa74035c1ef31cd08b16b01e25aebead73115c037d74d86e5b",
   "unnecessary_tool_fraction": 0.1
 }

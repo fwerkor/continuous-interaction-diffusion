@@ -102,6 +102,8 @@ def _generate_synthetic(args: argparse.Namespace) -> None:
 
 
 def _prepare_distillation(args: argparse.Namespace) -> None:
+    from cid.causal_distill import dump_causal_teacher_jobs
+
     examples = load_jsonl(args.data)
     tasks = teacher_tasks_from_trajectories(examples)
     tasks_output = Path(args.tasks_output)
@@ -110,8 +112,13 @@ def _prepare_distillation(args: argparse.Namespace) -> None:
     requests_output.parent.mkdir(parents=True, exist_ok=True)
     dump_teacher_tasks(tasks, tasks_output)
     dump_teacher_requests(tasks, requests_output)
+    if args.causal_jobs_output:
+        causal_output = Path(args.causal_jobs_output)
+        causal_output.parent.mkdir(parents=True, exist_ok=True)
+        dump_causal_teacher_jobs(tasks, causal_output)
     print(
-        f"tasks={len(tasks)} tasks_path={tasks_output} requests_path={requests_output}"
+        f"tasks={len(tasks)} tasks_path={tasks_output} requests_path={requests_output} "
+        f"causal_jobs={args.causal_jobs_output}"
     )
 
 
@@ -797,6 +804,7 @@ def main() -> None:
     prepare.add_argument("--data", required=True)
     prepare.add_argument("--tasks-output", required=True)
     prepare.add_argument("--requests-output", required=True)
+    prepare.add_argument("--causal-jobs-output")
     compile_distillation = subparsers.add_parser(
         "compile-distillation",
         help="compile semantic teacher plans with independently randomized event schedules",
