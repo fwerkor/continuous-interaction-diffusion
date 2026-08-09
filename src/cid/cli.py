@@ -170,6 +170,16 @@ def _dataset_manifest(args: argparse.Namespace) -> None:
     )
 
 
+def _build_public_task_pool(args: argparse.Namespace) -> None:
+    from cid.public_tasks import build_public_task_pool
+
+    manifest = build_public_task_pool(args.registry, args.output, args.manifest_output)
+    print(
+        f"tasks={manifest['tasks']} sha256={manifest['sha256']} "
+        f"output={args.output} manifest={args.manifest_output}"
+    )
+
+
 def _benchmark(args: argparse.Namespace) -> None:
     import torch
     import torch.distributed as dist
@@ -741,6 +751,16 @@ def main() -> None:
     )
     manifest.add_argument("--data", required=True)
     manifest.add_argument("--output", required=True)
+    public_pool = subparsers.add_parser(
+        "build-public-task-pool",
+        help="build the pinned public semantic-task pool from registered training splits",
+    )
+    public_pool.add_argument("--registry", default="data/public-datasets.json")
+    public_pool.add_argument("--output", default="data/generated/public-task-pool-v1.jsonl")
+    public_pool.add_argument(
+        "--manifest-output",
+        default="data/generated/public-task-pool-v1.manifest.json",
+    )
     benchmark = subparsers.add_parser(
         "benchmark",
         help="run a neural CID checkpoint on deterministic replay trajectories",
@@ -837,6 +857,8 @@ def main() -> None:
         _review_distillation(args)
     elif args.command == "dataset-manifest":
         _dataset_manifest(args)
+    elif args.command == "build-public-task-pool":
+        _build_public_task_pool(args)
     elif args.command == "benchmark":
         _benchmark(args)
     elif args.command == "train":

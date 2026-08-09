@@ -12,3 +12,4 @@ build/
 *.pth
 checkpoints/
 runs/
+data/generated/

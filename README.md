@@ -72,6 +72,7 @@ src/cid/metrics.py          CID-specific interaction metrics
 docs/architecture.md        Concrete v0 architecture decisions
 docs/training.md            Staged training plan
 docs/evaluation.md          Runtime/task evaluation metric contract
+docs/public-datasets.md     Pinned public-task sources, licenses, and quotas
 examples/                   Small executable runtime examples
 tests/                      Runtime invariants and concurrency tests
 ```
@@ -96,6 +97,12 @@ For the neural reference core:
 
 ```bash
 python -m pip install -e '.[train]'
+```
+
+For reproducible public task-pool construction:
+
+```bash
+python -m pip install -e '.[data]'
 ```
 
 ## iLLaDA backbone adapter
@@ -143,6 +150,19 @@ Training data uses typed per-step `ThoughtTarget` and `DisplayTarget` records ra
 dictionaries. `ILLaDATrajectoryTensorizer` constructs adjacent-step supervision and the CID loss
 performs permutation-invariant assignment for multi-anchor and multi-link targets. The test suite
 includes a complete tiny-backbone optimizer step with the pretrained backbone frozen.
+
+The raw semantic-task pool is built separately from CID trajectories. Public sources, exact
+revisions, licenses, upstream splits, and sampling quotas are registered in
+`data/public-datasets.json` and documented in `docs/public-datasets.md`. Build the pinned 10,000-task
+v1 pool with:
+
+```bash
+cid build-public-task-pool
+```
+
+Generated task data lives under `data/generated/` and is not committed. Every record retains exact
+upstream provenance; semantic IDs are deduplicated and assigned to the CID train/validation/test
+split before later toolization or timing augmentation.
 
 For deterministic mechanism-training data before teacher distillation is available:
 

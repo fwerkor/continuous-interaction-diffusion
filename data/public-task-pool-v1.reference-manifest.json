@@ -1,0 +1,37 @@
+{
+  "dropped_invalid_rows": 2,
+  "dropped_semantic_duplicates": 22,
+  "format_version": 1,
+  "license_counts": {
+    "CC-BY-4.0": 374,
+    "CC-BY-SA-4.0": 2626,
+    "MIT": 7000
+  },
+  "pool_name": "public-task-pool-v1",
+  "registry_sha256": "cf97047d118dd8349462162eac7ecaadacb16ba04ab75a197fd56d60b83b15d8",
+  "seed": 20260809,
+  "sha256": "bb92a3d6fccad2687cd5805ec5aa3eaff404644dea76cce153a088853d49f17b",
+  "source_counts": {
+    "arc-challenge": 600,
+    "arc-easy": 526,
+    "gsm8k-main": 2500,
+    "hendrycks-math": 2500,
+    "hotpotqa-distractor": 1500,
+    "mbpp-full-train": 374,
+    "mmlu-auxiliary-train": 2000
+  },
+  "split_counts": {
+    "test": 477,
+    "train": 9030,
+    "validation": 493
+  },
+  "task_kind_counts": {
+    "competition_math": 2500,
+    "math_word_problem": 2500,
+    "multi_hop_qa": 1500,
+    "multiple_choice_knowledge_reasoning": 2000,
+    "python_programming": 374,
+    "science_multiple_choice": 1126
+  },
+  "tasks": 10000
+}

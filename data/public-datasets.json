@@ -1,0 +1,121 @@
+{
+  "version": 1,
+  "pool_name": "public-task-pool-v1",
+  "seed": 20260809,
+  "target_tasks": 10000,
+  "expected_sha256": "bb92a3d6fccad2687cd5805ec5aa3eaff404644dea76cce153a088853d49f17b",
+  "expected_split_counts": {
+    "train": 9030,
+    "validation": 493,
+    "test": 477
+  },
+  "internal_split": {
+    "train": 0.90,
+    "validation": 0.05,
+    "test": 0.05
+  },
+  "sources": [
+    {
+      "id": "gsm8k-main",
+      "repo": "openai/gsm8k",
+      "revision": "740312add88f781978c0658806c59bc2815b9866",
+      "license": "MIT",
+      "upstream_config": "main",
+      "upstream_split": "train",
+      "files": ["main/train-00000-of-00001.parquet"],
+      "adapter": "gsm8k",
+      "task_kind": "math_word_problem",
+      "quota": 2500,
+      "use": "general_reasoning"
+    },
+    {
+      "id": "hendrycks-math",
+      "repo": "EleutherAI/hendrycks_math",
+      "revision": "21a5633873b6a120296cce3e2df9d5550074f4a3",
+      "license": "MIT",
+      "upstream_config": "all-seven-subjects",
+      "upstream_split": "train",
+      "files": [
+        "algebra/train-00000-of-00001.parquet",
+        "counting_and_probability/train-00000-of-00001.parquet",
+        "geometry/train-00000-of-00001.parquet",
+        "intermediate_algebra/train-00000-of-00001.parquet",
+        "number_theory/train-00000-of-00001.parquet",
+        "prealgebra/train-00000-of-00001.parquet",
+        "precalculus/train-00000-of-00001.parquet"
+      ],
+      "adapter": "hendrycks_math",
+      "task_kind": "competition_math",
+      "quota": 2500,
+      "use": "general_reasoning"
+    },
+    {
+      "id": "mmlu-auxiliary-train",
+      "repo": "cais/mmlu",
+      "revision": "c30699e8356da336a370243923dbaf21066bb9fe",
+      "license": "MIT",
+      "upstream_config": "all",
+      "upstream_split": "auxiliary_train",
+      "files": ["all/auxiliary_train-00000-of-00001.parquet"],
+      "adapter": "mmlu",
+      "task_kind": "multiple_choice_knowledge_reasoning",
+      "quota": 2000,
+      "use": "general_reasoning"
+    },
+    {
+      "id": "hotpotqa-distractor",
+      "repo": "hotpotqa/hotpot_qa",
+      "revision": "1908d6afbbead072334abe2965f91bd2709910ab",
+      "license": "CC-BY-SA-4.0",
+      "upstream_config": "distractor",
+      "upstream_split": "train",
+      "files": [
+        "distractor/train-00000-of-00002.parquet",
+        "distractor/train-00001-of-00002.parquet"
+      ],
+      "adapter": "hotpotqa",
+      "task_kind": "multi_hop_qa",
+      "quota": 1500,
+      "use": "toolizable_retrieval"
+    },
+    {
+      "id": "arc-challenge",
+      "repo": "allenai/ai2_arc",
+      "revision": "210d026faf9955653af8916fad021475a3f00453",
+      "license": "CC-BY-SA-4.0",
+      "upstream_config": "ARC-Challenge",
+      "upstream_split": "train",
+      "files": ["ARC-Challenge/train-00000-of-00001.parquet"],
+      "adapter": "arc",
+      "task_kind": "science_multiple_choice",
+      "quota": 600,
+      "use": "general_reasoning"
+    },
+    {
+      "id": "arc-easy",
+      "repo": "allenai/ai2_arc",
+      "revision": "210d026faf9955653af8916fad021475a3f00453",
+      "license": "CC-BY-SA-4.0",
+      "upstream_config": "ARC-Easy",
+      "upstream_split": "train",
+      "files": ["ARC-Easy/train-00000-of-00001.parquet"],
+      "adapter": "arc",
+      "task_kind": "science_multiple_choice",
+      "quota": 526,
+      "use": "general_reasoning"
+    },
+    {
+      "id": "mbpp-full-train",
+      "repo": "google-research-datasets/mbpp",
+      "revision": "4bb6404fdc6cacfda99d4ac4205087b89d32030c",
+      "license": "CC-BY-4.0",
+      "upstream_config": "full",
+      "upstream_split": "train",
+      "files": ["full/train-00000-of-00001.parquet"],
+      "adapter": "mbpp",
+      "task_kind": "python_programming",
+      "quota": 374,
+      "use": "general_reasoning"
+    }
+  ]
+}
