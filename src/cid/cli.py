@@ -180,6 +180,29 @@ def _build_public_task_pool(args: argparse.Namespace) -> None:
     )
 
 
+def _prepare_public_distillation(args: argparse.Namespace) -> None:
+    from cid.public_training import PublicTrainingConfig, prepare_public_distillation
+
+    manifest = prepare_public_distillation(
+        args.data,
+        args.tasks_output,
+        args.requests_output,
+        args.manifest_output,
+        PublicTrainingConfig(
+            split=args.split,
+            seed=args.seed,
+            unnecessary_tool_fraction=args.unnecessary_tool_fraction,
+        ),
+        causal_jobs_output=args.causal_jobs_output,
+    )
+    print(
+        f"tasks={manifest['tasks']} split={manifest['split']} "
+        f"modes={manifest['mode_counts']} tasks_path={args.tasks_output} "
+        f"requests_path={args.requests_output} causal_jobs={args.causal_jobs_output} "
+        f"manifest={args.manifest_output}"
+    )
+
+
 def _benchmark(args: argparse.Namespace) -> None:
     import torch
     import torch.distributed as dist
@@ -761,6 +784,30 @@ def main() -> None:
         "--manifest-output",
         default="data/generated/public-task-pool-v1.manifest.json",
     )
+    public_distill = subparsers.add_parser(
+        "prepare-public-distillation",
+        help="convert the public semantic-task pool into teacher-ready CID tasks",
+    )
+    public_distill.add_argument(
+        "--data", default="data/generated/public-task-pool-v1.jsonl"
+    )
+    public_distill.add_argument(
+        "--tasks-output", default="data/generated/public-teacher-tasks-v1.train.jsonl"
+    )
+    public_distill.add_argument(
+        "--requests-output", default="data/generated/public-teacher-requests-v1.train.jsonl"
+    )
+    public_distill.add_argument(
+        "--manifest-output", default="data/generated/public-teacher-v1.train.manifest.json"
+    )
+    public_distill.add_argument(
+        "--causal-jobs-output", default="data/generated/public-teacher-causal-v1.train.jsonl"
+    )
+    public_distill.add_argument(
+        "--split", choices=("train", "validation", "test"), default="train"
+    )
+    public_distill.add_argument("--seed", type=int, default=20260809)
+    public_distill.add_argument("--unnecessary-tool-fraction", type=float, default=0.10)
     benchmark = subparsers.add_parser(
         "benchmark",
         help="run a neural CID checkpoint on deterministic replay trajectories",
@@ -859,6 +906,8 @@ def main() -> None:
         _dataset_manifest(args)
     elif args.command == "build-public-task-pool":
         _build_public_task_pool(args)
+    elif args.command == "prepare-public-distillation":
+        _prepare_public_distillation(args)
     elif args.command == "benchmark":
         _benchmark(args)
     elif args.command == "train":

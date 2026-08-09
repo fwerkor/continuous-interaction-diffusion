@@ -153,12 +153,33 @@ includes a complete tiny-backbone optimizer step with the pretrained backbone fr
 
 The raw semantic-task pool is built separately from CID trajectories. Public sources, exact
 revisions, licenses, upstream splits, and sampling quotas are registered in
-`data/public-datasets.json` and documented in `docs/public-datasets.md`. Build the pinned 10,000-task
-v1 pool with:
+`data/public-datasets.json` and `data/public-interaction-datasets.json`, with the complete registry
+documented in `docs/public-datasets.md`. Build the pinned 10,000-task general pool with:
 
 ```bash
 cid build-public-task-pool
 ```
+
+Build the separate 10,000-task interaction-heavy pool from 2WikiMultiHopQA and MuSiQue with:
+
+```bash
+cid build-public-task-pool \
+  --registry data/public-interaction-datasets.json \
+  --output data/generated/public-interaction-task-pool-v1.jsonl \
+  --manifest-output data/generated/public-interaction-task-pool-v1.manifest.json
+```
+
+Convert a pool into teacher-ready CID tasks and causal evidence-exposure jobs with:
+
+```bash
+cid prepare-public-distillation
+```
+
+The pinned train mixture currently contains 18,055 semantic tasks: 10,391 tool-required examples,
+6,921 no-tool examples, and 743 examples where tools are present but unnecessary. Retrieval tasks
+use a task-local `workspace_search` followed by two to four supporting `workspace_read` operations.
+Supporting reads depend on the search result and become eligible together, while causal teacher jobs
+reveal evidence values only after their corresponding arrival stage.
 
 Generated task data lives under `data/generated/` and is not committed. Every record retains exact
 upstream provenance; semantic IDs are deduplicated and assigned to the CID train/validation/test

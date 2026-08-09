@@ -1,0 +1,26 @@
+{
+  "dropped_invalid_rows": 308,
+  "dropped_semantic_duplicates": 2,
+  "format_version": 1,
+  "license_counts": {
+    "Apache-2.0": 5000,
+    "CC-BY-4.0": 5000
+  },
+  "pool_name": "public-interaction-task-pool-v1",
+  "registry_sha256": "0cdc83e5602456c443827c1d8b0a51a7c01c2c978188f954c7c4cbf3088bdeb0",
+  "seed": 20260809,
+  "sha256": "44cc895235a0536a8a75b5ee312f17a0537f7824055009b5ddc74134a985d920",
+  "source_counts": {
+    "2wikimultihopqa-train": 5000,
+    "musique-train": 5000
+  },
+  "split_counts": {
+    "test": 493,
+    "train": 9025,
+    "validation": 482
+  },
+  "task_kind_counts": {
+    "multi_hop_qa": 10000
+  },
+  "tasks": 10000
+}

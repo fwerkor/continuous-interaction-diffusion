@@ -1,0 +1,33 @@
+{
+  "version": 1,
+  "name": "training-semantic-mixture-v1",
+  "split": "train",
+  "semantic_tasks": 18055,
+  "cross_pool_semantic_overlap": 0,
+  "mode_counts": {
+    "tool_required": 10391,
+    "no_tool": 6921,
+    "tools_available_unnecessary": 743
+  },
+  "mode_fractions": {
+    "tool_required": 0.57552,
+    "no_tool": 0.38333,
+    "tools_available_unnecessary": 0.04115
+  },
+  "components": [
+    {
+      "name": "public-base-v1",
+      "reference_manifest": "data/public-teacher-v1.train.reference-manifest.json",
+      "tasks": 9030,
+      "tasks_sha256": "6562a4093a07880a698285ec3b8b4707a6e858d6a46b1c734bf2d37d2c68891d",
+      "causal_jobs_sha256": "6ce4ea7c3b40bf4ff94f1864e7d6bd2e761fa9716379ee06ca2a01a3d9f8c1b9"
+    },
+    {
+      "name": "public-interaction-v1",
+      "reference_manifest": "data/public-interaction-teacher-v1.train.reference-manifest.json",
+      "tasks": 9025,
+      "tasks_sha256": "dad498413e0787af9bc10dddcec2bb433c70662743d3faa85f7991081e17a348",
+      "causal_jobs_sha256": "42ddb605c1b0e54259553cb031db04f9a59adcab2a747fbda1ed83a64848444c"
+    }
+  ]
+}

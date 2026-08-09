@@ -27,6 +27,7 @@ class TeacherEvidence:
     source: str
     value: Any
     arguments: Mapping[str, Any] = field(default_factory=dict)
+    depends_on: tuple[str, ...] = ()
     version: str | None = None
     provenance: str | None = None
 
@@ -41,6 +42,7 @@ class TeacherEvidence:
             source=str(raw["source"]),
             value=raw.get("value"),
             arguments=dict(raw.get("arguments", {})),
+            depends_on=tuple(str(item) for item in raw.get("depends_on", ())),
             version=None if raw.get("version") is None else str(raw["version"]),
             provenance=(
                 None if raw.get("provenance") is None else str(raw["provenance"])
@@ -53,6 +55,7 @@ class TeacherEvidence:
             "source": self.source,
             "value": self.value,
             "arguments": dict(self.arguments),
+            "depends_on": list(self.depends_on),
             "version": self.version,
             "provenance": self.provenance,
         }
@@ -66,6 +69,7 @@ class TeacherTask:
     source_descriptors: tuple[Mapping[str, Any], ...] = ()
     evidence: tuple[TeacherEvidence, ...] = ()
     metadata: Mapping[str, Any] = field(default_factory=dict)
+    reference_answer: str | None = None
 
     def __post_init__(self) -> None:
         if not self.task_id or not self.prompt:
@@ -73,6 +77,22 @@ class TeacherTask:
         evidence_ids = tuple(item.evidence_id for item in self.evidence)
         if len(evidence_ids) != len(set(evidence_ids)):
             raise ValueError("teacher task evidence IDs must be unique")
+        evidence_id_set = set(evidence_ids)
+        seen_evidence: set[str] = set()
+        for item in self.evidence:
+            unknown_dependencies = set(item.depends_on) - evidence_id_set
+            if unknown_dependencies:
+                raise ValueError(
+                    "teacher evidence dependencies reference unknown evidence IDs: "
+                    f"{sorted(unknown_dependencies)}"
+                )
+            if item.evidence_id in item.depends_on:
+                raise ValueError("teacher evidence cannot depend on itself")
+            if any(dependency not in seen_evidence for dependency in item.depends_on):
+                raise ValueError(
+                    "teacher evidence must be topologically ordered by dependency"
+                )
+            seen_evidence.add(item.evidence_id)
         source_names = {str(item.get("name", "")) for item in self.source_descriptors}
         unknown = {item.source for item in self.evidence} - source_names
         if unknown:
@@ -91,6 +111,11 @@ class TeacherTask:
                 TeacherEvidence.from_dict(item) for item in raw.get("evidence", ())
             ),
             metadata=dict(raw.get("metadata", {})),
+            reference_answer=(
+                None
+                if raw.get("reference_answer") is None
+                else str(raw["reference_answer"])
+            ),
         )
 
     def to_dict(self) -> dict[str, Any]:
@@ -101,7 +126,20 @@ class TeacherTask:
             "source_descriptors": [dict(item) for item in self.source_descriptors],
             "evidence": [item.to_dict() for item in self.evidence],
             "metadata": dict(self.metadata),
+            "reference_answer": self.reference_answer,
         }
+
+    def teacher_visible_dict(self) -> dict[str, Any]:
+        """Return the task payload visible to a semantic teacher.
+
+        The gold answer remains available to deterministic review/auditing but is deliberately
+        excluded from teacher input so no-tool cognition must solve the task and evidence-backed
+        cognition cannot shortcut the external source path from a leaked label.
+        """
+
+        raw = self.to_dict()
+        raw.pop("reference_answer", None)
+        return raw
 
 
 @dataclass(frozen=True, slots=True)
@@ -343,7 +381,9 @@ class TeacherReview:
 
 
 def build_teacher_request(task: TeacherTask) -> TeacherRequest:
-    task_json = json.dumps(task.to_dict(), ensure_ascii=False, sort_keys=True, indent=2)
+    task_json = json.dumps(
+        task.teacher_visible_dict(), ensure_ascii=False, sort_keys=True, indent=2
+    )
     prompt = f"""You are producing supervision for Continuous Interaction Diffusion (CID).
 Return exactly one JSON object and no prose.
 
@@ -392,6 +432,7 @@ Rules:
 - Pre-evidence frames must not reveal values that have not arrived yet.
 - Needs refer to evidence IDs and source schemas supplied below.
 - Keep cognition compact; create only cells that serve a distinct cognitive role.
+- Solve the task yourself. No gold/reference answer is included in TASK.
 
 TASK:
 {task_json}

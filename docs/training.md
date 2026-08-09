@@ -187,6 +187,21 @@ duplicate an already accepted task/plan payload. The review report carries a sta
 fingerprint for every plan, so filtering decisions can be audited independently of the training
 run.
 
+For public training data, `prepare-public-distillation` additionally writes a causal teacher-job
+specification. Evidence records carry an explicit `depends_on` relation. The orchestrator first
+shows only the immutable task and dependency-ready evidence contracts; each later teacher call sees
+the accepted previous semantic state plus the evidence that has just arrived. Future evidence values
+are never placed in that call's visible payload. In retrieval tasks the search result is the root and
+all supporting-document reads depend on it, allowing multiple reads to become eligible together.
+The older single-request JSONL is retained as an inspection/debug artifact; production teacher
+generation should consume the causal job specification.
+
+The currently pinned public semantic mixture is `data/training-semantic-mixture-v1.json`. It combines
+the general 10k public task pool with a separate 10k interaction-heavy pool derived from the training
+splits of 2WikiMultiHopQA and MuSiQue. After the CID-owned train split, it contains 18,055 semantic
+tasks: 10,391 tool-required, 6,921 no-tool, and 743 tools-available-but-unnecessary tasks. Every task
+in the interaction component spans at least two distinct supporting documents.
+
 After compilation, `dataset-manifest` records the exact JSONL SHA-256 together with example and
 transition counts, scenario/distillation tags, source names, maximum trajectory depth, and required
 TCT capacity. This gives every training run a deterministic dataset identity instead of relying on

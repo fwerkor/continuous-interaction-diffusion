@@ -300,6 +300,65 @@ def _adapt_row(
             },
         )
 
+    if adapter == "2wikimultihopqa":
+        context = _json_field(row["context"], "2Wiki context")
+        supporting = _json_field(row["supporting_facts"], "2Wiki supporting_facts")
+        evidences = _json_field(row.get("evidences", "[]"), "2Wiki evidences")
+        evidence_bank = [
+            {
+                "title": str(item[0]),
+                "sentences": [str(sentence) for sentence in item[1]],
+            }
+            for item in context
+        ]
+        return (
+            str(row["question"]).strip(),
+            str(row["answer"]).strip(),
+            {"evidence_bank": evidence_bank},
+            {
+                "upstream_id": str(row.get("_id", "")),
+                "question_type": str(row.get("type", "")),
+                "supporting_facts": {
+                    "title": [str(item[0]) for item in supporting],
+                    "sent_id": [int(item[1]) for item in supporting],
+                },
+                "reasoning_evidences": evidences,
+            },
+        )
+
+    if adapter == "musique":
+        if not bool(row.get("answerable", True)):
+            raise PublicTaskRowRejected("MuSiQue row is marked unanswerable")
+        paragraphs = list(row.get("paragraphs", ()))
+        evidence_bank = [
+            {
+                "title": str(item["title"]),
+                "sentences": [str(item["paragraph_text"])],
+            }
+            for item in paragraphs
+        ]
+        supporting = [item for item in paragraphs if bool(item.get("is_supporting", False))]
+        if not supporting:
+            raise PublicTaskRowRejected("MuSiQue row has no supporting paragraphs")
+        if len({str(item["title"]) for item in supporting}) < 2:
+            raise PublicTaskRowRejected("MuSiQue row does not span multiple supporting documents")
+        decomposition = [dict(item) for item in row.get("question_decomposition", ())]
+        return (
+            str(row["question"]).strip(),
+            str(row["answer"]).strip(),
+            {"evidence_bank": evidence_bank},
+            {
+                "upstream_id": str(row.get("id", "")),
+                "supporting_facts": {
+                    "title": [str(item["title"]) for item in supporting],
+                    "sent_id": [0 for _ in supporting],
+                },
+                "hop_count": len(decomposition),
+                "question_decomposition": decomposition,
+                "answer_aliases": [str(item) for item in row.get("answer_aliases", ())],
+            },
+        )
+
     raise ValueError(f"unsupported public dataset adapter: {adapter}")
 
 
@@ -312,6 +371,15 @@ def _labeled_choice_prompt(question: str, labels: Sequence[str], choices: Sequen
     lines = [question.strip()]
     lines.extend(f"{label}. {choice}" for label, choice in zip(labels, choices, strict=True))
     return "\n".join(lines)
+
+
+def _json_field(value: Any, label: str) -> Any:
+    if isinstance(value, str):
+        try:
+            return json.loads(value)
+        except json.JSONDecodeError as exc:
+            raise PublicTaskRowRejected(f"invalid {label} JSON") from exc
+    return value
 
 
 def _last_boxed_value(text: str) -> str | None:

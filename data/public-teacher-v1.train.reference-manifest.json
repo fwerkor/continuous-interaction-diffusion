@@ -1,0 +1,31 @@
+{
+  "causal_jobs": "data/generated/public-teacher-causal-v1.train.jsonl",
+  "causal_jobs_sha256": "6ce4ea7c3b40bf4ff94f1864e7d6bd2e761fa9716379ee06ca2a01a3d9f8c1b9",
+  "evidence_count_histogram": {
+    "0": 7664,
+    "3": 1366
+  },
+  "format_version": 1,
+  "input_pool": "data/generated/public-task-pool-v1.jsonl",
+  "input_pool_sha256": "bb92a3d6fccad2687cd5805ec5aa3eaff404644dea76cce153a088853d49f17b",
+  "mode_counts": {
+    "no_tool": 6921,
+    "tool_required": 1366,
+    "tools_available_unnecessary": 743
+  },
+  "requests_sha256": "41e6cfd0f8bdcd3fe1a06241b49b7fc60a6dd4eae4223a780a32623919373c5b",
+  "seed": 20260809,
+  "source_counts": {
+    "arc-challenge": 542,
+    "arc-easy": 481,
+    "gsm8k-main": 2249,
+    "hendrycks-math": 2246,
+    "hotpotqa-distractor": 1366,
+    "mbpp-full-train": 326,
+    "mmlu-auxiliary-train": 1820
+  },
+  "split": "train",
+  "tasks": 9030,
+  "tasks_sha256": "6562a4093a07880a698285ec3b8b4707a6e858d6a46b1c734bf2d37d2c68891d",
+  "unnecessary_tool_fraction": 0.1
+}

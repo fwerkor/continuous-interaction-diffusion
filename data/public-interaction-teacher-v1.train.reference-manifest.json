@@ -1,0 +1,25 @@
+{
+  "causal_jobs": "data/generated/public-interaction-teacher-causal-v1.train.jsonl",
+  "causal_jobs_sha256": "42ddb605c1b0e54259553cb031db04f9a59adcab2a747fbda1ed83a64848444c",
+  "evidence_count_histogram": {
+    "3": 6812,
+    "4": 1001,
+    "5": 1212
+  },
+  "format_version": 1,
+  "input_pool": "data/generated/public-interaction-task-pool-v1.jsonl",
+  "input_pool_sha256": "44cc895235a0536a8a75b5ee312f17a0537f7824055009b5ddc74134a985d920",
+  "mode_counts": {
+    "tool_required": 9025
+  },
+  "requests_sha256": "02080892c0d5eb27dc06c88bdac7021d086ba96b11d48eb2195b900b1731e08d",
+  "seed": 20260809,
+  "source_counts": {
+    "2wikimultihopqa-train": 4515,
+    "musique-train": 4510
+  },
+  "split": "train",
+  "tasks": 9025,
+  "tasks_sha256": "dad498413e0787af9bc10dddcec2bb433c70662743d3faa85f7991081e17a348",
+  "unnecessary_tool_fraction": 0.0
+}

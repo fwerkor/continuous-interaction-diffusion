@@ -89,6 +89,75 @@ def test_hotpot_adapter_keeps_evidence_out_of_prompt() -> None:
     assert metadata["question_type"] == "comparison"
 
 
+def test_2wiki_adapter_normalizes_json_encoded_context() -> None:
+    prompt, answer, resources, metadata = _adapt_row(
+        "2wikimultihopqa",
+        {
+            "_id": "w1",
+            "type": "bridge_comparison",
+            "question": "Are A and B from the same country?",
+            "answer": "no",
+            "context": json.dumps(
+                [["A", ["A is from France."]], ["B", ["B is from Canada."]]]
+            ),
+            "supporting_facts": json.dumps([["A", 0], ["B", 0]]),
+            "evidences": json.dumps([["A", "country", "France"]]),
+        },
+    )
+    assert prompt == "Are A and B from the same country?"
+    assert answer == "no"
+    assert resources["evidence_bank"][1]["title"] == "B"
+    assert metadata["supporting_facts"]["title"] == ["A", "B"]
+    assert metadata["reasoning_evidences"] == [["A", "country", "France"]]
+
+
+def test_musique_adapter_keeps_supporting_paragraphs_hidden() -> None:
+    prompt, answer, resources, metadata = _adapt_row(
+        "musique",
+        {
+            "id": "m1",
+            "question": "Where was the author born?",
+            "answer": "Paris",
+            "answer_aliases": [],
+            "answerable": True,
+            "paragraphs": [
+                {
+                    "idx": 0,
+                    "is_supporting": True,
+                    "paragraph_text": "The author was born in Paris.",
+                    "title": "Author",
+                },
+                {
+                    "idx": 1,
+                    "is_supporting": True,
+                    "paragraph_text": "The author of the work is X.",
+                    "title": "Work",
+                },
+            ],
+            "question_decomposition": [
+                {
+                    "id": 1,
+                    "question": "Who is the author?",
+                    "answer": "X",
+                    "paragraph_support_idx": 0,
+                },
+                {
+                    "id": 2,
+                    "question": "Where was X born?",
+                    "answer": "Paris",
+                    "paragraph_support_idx": 0,
+                },
+            ],
+        },
+    )
+    assert prompt == "Where was the author born?"
+    assert "Paris" not in prompt
+    assert answer == "Paris"
+    assert resources["evidence_bank"][0]["sentences"] == ["The author was born in Paris."]
+    assert metadata["supporting_facts"]["title"] == ["Author", "Work"]
+    assert metadata["hop_count"] == 2
+
+
 def test_arc_adapter_resolves_labeled_answer() -> None:
     prompt, answer, _, metadata = _adapt_row(
         "arc",
@@ -114,4 +183,18 @@ def test_public_dataset_registry_uses_only_training_sources() -> None:
     assert all(source["upstream_split"] != "test" for source in registry["sources"])
     assert registry["expected_sha256"] == (
         "bb92a3d6fccad2687cd5805ec5aa3eaff404644dea76cce153a088853d49f17b"
+    )
+
+
+def test_public_interaction_registry_uses_only_training_sources() -> None:
+    registry = json.loads(
+        (Path(__file__).resolve().parents[1] / "data/public-interaction-datasets.json").read_text(
+            encoding="utf-8"
+        )
+    )
+    assert sum(source["quota"] for source in registry["sources"]) == 10_000
+    assert all(source["upstream_split"] == "train" for source in registry["sources"])
+    assert all(source["use"] == "toolizable_retrieval" for source in registry["sources"])
+    assert registry["expected_sha256"] == (
+        "44cc895235a0536a8a75b5ee312f17a0537f7824055009b5ddc74134a985d920"
     )

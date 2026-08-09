@@ -1,0 +1,45 @@
+{
+  "version": 1,
+  "pool_name": "public-interaction-task-pool-v1",
+  "seed": 20260809,
+  "target_tasks": 10000,
+  "expected_sha256": "44cc895235a0536a8a75b5ee312f17a0537f7824055009b5ddc74134a985d920",
+  "expected_split_counts": {
+    "train": 9025,
+    "validation": 482,
+    "test": 493
+  },
+  "internal_split": {
+    "train": 0.90,
+    "validation": 0.05,
+    "test": 0.05
+  },
+  "sources": [
+    {
+      "id": "2wikimultihopqa-train",
+      "repo": "xanhho/2WikiMultihopQA",
+      "revision": "612bc5039a457880d9e7d84c3b0a4cf154b70e4f",
+      "license": "Apache-2.0",
+      "upstream_config": "default",
+      "upstream_split": "train",
+      "files": ["train.parquet"],
+      "adapter": "2wikimultihopqa",
+      "task_kind": "multi_hop_qa",
+      "quota": 5000,
+      "use": "toolizable_retrieval"
+    },
+    {
+      "id": "musique-train",
+      "repo": "awinml/musique",
+      "revision": "3ac762478df3609852f18dd33652a16820660a5e",
+      "license": "CC-BY-4.0",
+      "upstream_config": "default",
+      "upstream_split": "train",
+      "files": ["data/train-00000-of-00001.parquet"],
+      "adapter": "musique",
+      "task_kind": "multi_hop_qa",
+      "quota": 5000,
+      "use": "toolizable_retrieval"
+    }
+  ]
+}
