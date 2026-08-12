@@ -267,9 +267,9 @@ zero rejects, missing responses, or soft warnings, and all 10,000 plans pass bot
 the local-correction audit. Exact hashes are pinned by
 `data/correction-teacher-v1.reference-manifest.json`.
 
-The latest semantic mixture is `data/training-semantic-mixture-v7.json`. Relative to v6, it adds
-720 deterministic no-tool self-identity tasks generated from the canonical
-`data/cid-self-identity-v1.contract.json`. The model name is fixed as `CID-v1`, while
+The latest semantic mixture is `data/training-semantic-mixture-v8.json`. It contains the corrected
+720-task no-tool self-identity component from v7 plus the later 1,200-task multilingual cross-lingual
+component. The self-identity contract fixes the model name as `CID-v1`, while
 `Continuous Interaction Diffusion (CID)` is explicitly the method/architecture name. Nine internal
 families supervise model identity, CID acronym expansion, a basic CID method overview,
 diffusion-native model class, architecture summary, Facts/TCT/Display separation, TCT structure,
@@ -284,8 +284,8 @@ Build it with:
 cid build-self-identity-training
 ```
 
-The current compiled mixture is `data/training-trajectory-mixture-v7.json`: **205,048 trajectories
-and 1,076,988 adjacent supervised transitions** across eight components.
+The current compiled mixture is `data/training-trajectory-mixture-v8.json`: **207,448 trajectories
+and 1,096,147 adjacent supervised transitions** across nine components.
 
 The historical v5 six-component training input is pinned separately by
 `data/training-trajectory-mixture-v5.json`. It preserves every reviewed schedule variant from

@@ -78,14 +78,14 @@ def test_v8_training_registry_adds_only_a_small_multilingual_slice() -> None:
         "ja": 225,
         "zh": 450,
     }
-    assert semantic["semantic_tasks"] == 79_495
+    assert semantic["semantic_tasks"] == 79_575
     assert semantic["multilingual_cross_lingual_tasks"] == 1_200
     assert (
         sum(component["tasks"] for component in semantic["components"])
         == semantic["semantic_tasks"]
     )
-    assert trajectories["examples"] == 207_288
-    assert trajectories["transitions"] == 1_095_987
+    assert trajectories["examples"] == 207_448
+    assert trajectories["transitions"] == 1_096_147
     assert (
         sum(component["examples"] for component in trajectories["components"])
         == trajectories["examples"]

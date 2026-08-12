@@ -54,8 +54,8 @@
     {
       "name": "cid-self-identity-v1",
       "reference_manifest": "data/self-identity-teacher-v1.reference-manifest.json",
-      "tasks": 640,
-      "tasks_sha256": "40bb8e944b7672fd43757bf7a7e5dad79264b3512a3b5c2757b0de695ec889d7",
+      "tasks": 720,
+      "tasks_sha256": "1cb98605e9bf53b2f0bc85c17357f51ea45a283e0b3ca50da5a80b4df10c3f47",
       "teacher_protocol": "deterministic-no-tool-self-model"
     },
     {
@@ -71,14 +71,14 @@
   "correction_dependency_depth_2_tasks": 10000,
   "dependency_depth_3_plus_tasks": 13114,
   "mode_counts": {
-    "no_tool": 19561,
+    "no_tool": 19641,
     "tool_required": 56791,
     "tools_available_unnecessary": 3143
   },
   "mode_fractions": {
-    "no_tool": 0.24607,
-    "tool_required": 0.7144,
-    "tools_available_unnecessary": 0.03954
+    "no_tool": 0.24682,
+    "tool_required": 0.71368,
+    "tools_available_unnecessary": 0.0395
   },
   "multilingual_cross_lingual_tasks": 1200,
   "multilingual_prompt_language_counts": {
@@ -95,11 +95,11 @@
   },
   "name": "training-semantic-mixture-v8",
   "self_identity_language_counts": {
-    "en": 480,
-    "zh": 160
+    "en": 540,
+    "zh": 180
   },
-  "self_identity_tasks": 640,
-  "semantic_tasks": 79495,
+  "self_identity_tasks": 720,
+  "semantic_tasks": 79575,
   "sequential_dependency_tasks": 21710,
   "speculative_local_correction_tasks": 10000,
   "split": "train-plus-generated-mechanisms-computation-symbolic-local-correction-complex-logic-and-self-identity-plus-multilingual-crosslingual",

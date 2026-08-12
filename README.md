@@ -179,27 +179,27 @@ Convert a pool into teacher-ready CID tasks and causal evidence-exposure jobs wi
 cid prepare-public-distillation
 ```
 
-The current overall semantic mixture is pinned by `data/training-semantic-mixture-v7.json` and
-contains 78,375 tasks. In addition to the public, mechanism, computational, symbolic, local-correction,
-and complex-logic components, v7 adds 720 no-tool CID self-identity tasks. The component fixes the
-model name as `CID-v1` while reserving `Continuous Interaction Diffusion (CID)` for the method and
-architecture. Its nine internal families cover model identity, the CID acronym and method overview,
-diffusion-native generation, Facts/TCT/Display state separation, TCT logical-vs-physical identity,
-the model/runtime responsibility boundary, and asynchronous external interaction. It contains 540
-English and 180 Chinese semantic tasks and is generated from `data/cid-self-identity-v1.contract.json`
-so model/method identity and architecture wording cannot drift across samples.
+The current overall semantic mixture is pinned by `data/training-semantic-mixture-v8.json` and
+contains 79,575 tasks. It includes the 720-task no-tool CID self-identity component plus the 1,200-task
+multilingual cross-lingual component added after v7. The self-identity component fixes the model name
+as `CID-v1` while reserving `Continuous Interaction Diffusion (CID)` for the method and architecture.
+Its nine internal families cover model identity, the CID acronym and method overview, diffusion-native
+generation, Facts/TCT/Display state separation, TCT logical-vs-physical identity, the model/runtime
+responsibility boundary, and asynchronous external interaction. It contains 540 English and 180
+Chinese semantic tasks and is generated from `data/cid-self-identity-v1.contract.json` so model/method
+identity and architecture wording cannot drift across samples.
 
 The corresponding compiled training mixture is pinned by
-`data/training-trajectory-mixture-v7.json`: **205,048 runtime trajectories and 1,076,988 adjacent
+`data/training-trajectory-mixture-v8.json`: **207,448 runtime trajectories and 1,096,147 adjacent
 supervised transitions**. The self-identity component contributes two independently randomized TCT
 slot variants per semantic task (1,440 trajectories / 1,440 transitions) and contains no external
 source calls. Materialize the component-order training file with:
 
 ```bash
 cid materialize-trajectory-mixture \
-  --spec data/training-trajectory-mixture-v7.json \
-  --output data/generated/training-trajectories-v7.jsonl \
-  --manifest-output data/generated/training-trajectories-v7.manifest.json
+  --spec data/training-trajectory-mixture-v8.json \
+  --output data/generated/training-trajectories-v8.jsonl \
+  --manifest-output data/generated/training-trajectories-v8.manifest.json
 ```
 
 The materializer verifies every component SHA/count and global `example_id` uniqueness before
