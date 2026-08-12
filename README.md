@@ -395,6 +395,21 @@ cid demo
 The demo runs a delayed read-only source. CID starts another denoising step while the source
 request is outstanding, then assimilates the observation through the existing binding.
 
+## Citation
+
+Preprint: [arXiv:2608.10438](https://arxiv.org/abs/2608.10438) · DOI: [10.48550/arXiv.2608.10438](https://doi.org/10.48550/arXiv.2608.10438)
+
+```bibtex
+@article{cao2026continuous,
+  title   = {Continuous Interaction Diffusion: A Diffusion-Native Runtime for Asynchronous Tool-Augmented Reasoning},
+  author  = {Cao, Yuhang},
+  journal = {arXiv preprint arXiv:2608.10438},
+  year    = {2026},
+  doi     = {10.48550/arXiv.2608.10438},
+  url     = {https://arxiv.org/abs/2608.10438}
+}
+```
+
 ## Current implementation boundary
 
 The v0 runtime intentionally accepts only read-only sources. Side-effecting tools need a
