@@ -1012,7 +1012,7 @@ def main() -> None:
         help="build a small multilingual and cross-lingual CID trajectory component",
     )
     multilingual.add_argument(
-        "--output-dir", default="data/generated/multilingual-crosslingual-v1"
+        "--output-dir", default="data/generated/multilingual-v1"
     )
     multilingual.add_argument("--zh-tasks", type=int, default=450)
     multilingual.add_argument("--en-zh-tasks", type=int, default=300)

@@ -26,7 +26,7 @@
   "mode_counts": {
     "tool_required": 1200
   },
-  "name": "multilingual-crosslingual-v1",
+  "name": "multilingual-v1",
   "plans_sha256": "31fc03c10b38d5b2c529a4f253fd83c06a4ff1b47d2a1c345162f79df0eca85b",
   "prompt_language_counts": {
     "en": 300,

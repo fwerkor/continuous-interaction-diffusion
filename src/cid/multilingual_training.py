@@ -105,7 +105,7 @@ def build_multilingual_training(
     )
     manifest = {
         "format_version": 1,
-        "name": "multilingual-crosslingual-v1",
+        "name": "multilingual-v1",
         "seed": config.seed,
         "semantic_tasks": len(tasks),
         "accepted_teacher_plans": len(plans),

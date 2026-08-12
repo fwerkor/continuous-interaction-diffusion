@@ -58,7 +58,7 @@ ROOT = Path(__file__).resolve().parents[1]
 
 def test_v8_training_registry_adds_only_a_small_multilingual_slice() -> None:
     reference = json.loads(
-        (ROOT / "data/multilingual-crosslingual-v1.reference-manifest.json").read_text(
+        (ROOT / "data/multilingual-v1.reference-manifest.json").read_text(
             encoding="utf-8"
         )
     )
@@ -79,7 +79,7 @@ def test_v8_training_registry_adds_only_a_small_multilingual_slice() -> None:
         "zh": 450,
     }
     assert semantic["semantic_tasks"] == 79_575
-    assert semantic["multilingual_cross_lingual_tasks"] == 1_200
+    assert semantic["multilingual_tasks"] == 1_200
     assert (
         sum(component["tasks"] for component in semantic["components"])
         == semantic["semantic_tasks"]
@@ -91,7 +91,7 @@ def test_v8_training_registry_adds_only_a_small_multilingual_slice() -> None:
         == trajectories["examples"]
     )
     multilingual = trajectories["components"][-1]
-    assert multilingual["name"] == "multilingual-crosslingual"
+    assert multilingual["name"] == "multilingual"
     assert multilingual["sha256"] == reference["compiled_sha256"]
     assert multilingual["examples"] / trajectories["examples"] < 0.012
 

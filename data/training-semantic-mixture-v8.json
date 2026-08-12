@@ -59,8 +59,8 @@
       "teacher_protocol": "deterministic-no-tool-self-model"
     },
     {
-      "name": "multilingual-crosslingual-v1",
-      "reference_manifest": "data/multilingual-crosslingual-v1.reference-manifest.json",
+      "name": "multilingual-v1",
+      "reference_manifest": "data/multilingual-v1.reference-manifest.json",
       "tasks": 1200,
       "tasks_sha256": "156b9d84bd9625a9253b2b74f2f072a3df3d73365c63f1f0b66f4533d3f040f9",
       "teacher_protocol": "deterministic-crosslingual-semantic-plan-v1"
@@ -80,7 +80,7 @@
     "tool_required": 0.71368,
     "tools_available_unnecessary": 0.0395
   },
-  "multilingual_cross_lingual_tasks": 1200,
+  "multilingual_tasks": 1200,
   "multilingual_prompt_language_counts": {
     "en": 300,
     "es": 225,
@@ -102,7 +102,7 @@
   "semantic_tasks": 79575,
   "sequential_dependency_tasks": 21710,
   "speculative_local_correction_tasks": 10000,
-  "split": "train-plus-generated-mechanisms-computation-symbolic-local-correction-complex-logic-and-self-identity-plus-multilingual-crosslingual",
+  "split": "train-plus-generated-mechanisms-computation-symbolic-local-correction-complex-logic-and-self-identity-plus-multilingual",
   "symbolic_dependency_depth_2_tasks": 3600,
   "symbolic_parallel_then_merge_tasks": 1200,
   "version": 8
