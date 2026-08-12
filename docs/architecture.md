@@ -154,9 +154,10 @@ sufficient probability advantage, which is the display-side path for post-arriva
 Materialization turns allocation/lifecycle logits into TCT proposals, retrieves typed anchors and
 link targets from a trajectory-local catalog, decodes schema-positioned argument slots, emits
 persistent `InformationNeed` objects, and converts revision predictions into typed reopen
-references. A separate convergence head predicts whether the trajectory is actually terminal; a
-fully unmasked Y alone is not treated as convergence. Runtime lifecycle/binding gates remain
-authoritative after materialization.
+references. A separate convergence head predicts current-information equilibrium. Materialization
+exposes that signal separately from terminal convergence: a fully resolved display plus equilibrium
+forms a terminal candidate, while equilibrium with an unresolved required binding allows the runtime
+to quiesce. Runtime lifecycle/binding and freshness gates remain authoritative after materialization.
 
 ## 4. Information need before executable call
 
@@ -191,8 +192,18 @@ Model steps run in a worker thread from the asyncio runtime. Read-only source jo
 tasks. Therefore source latency can overlap actual model compute rather than merely alternating
 between `model.step()` and `await tool()`.
 
-The runtime does not seal a model-declared converged display while an active required binding is
-still unresolved. A hard step/wall-clock budget can still terminate the trajectory.
+When the model reaches current-information equilibrium while a required observation is outstanding,
+the runtime quiesces: no forward pass is issued and no model-step budget is consumed until external
+progress occurs. `max_steps` bounds one refinement epoch between external observations; an arriving
+observation reopens a new epoch, while the wall-clock budget remains trajectory-wide. This prevents
+a faster accelerator from losing post-observation reasoning budget merely because it exhausted more
+forwards during the same tool latency.
+
+A model-declared terminal candidate is also subject to a final freshness barrier. `ONCE` bindings
+are accepted once resolved; due `MAX_AGE` bindings and `ALWAYS` bindings must be refreshed or version
+checked at the candidate boundary. If the source changed, the new percept is assimilated before the
+model may declare convergence again. Streaming bindings use the latest delivered observation after
+queued updates have been drained.
 
 ## 7. Local reopening
 

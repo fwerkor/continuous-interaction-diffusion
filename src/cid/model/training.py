@@ -1,9 +1,10 @@
 from __future__ import annotations
 
 import json
+import math
 import random
 from collections.abc import Callable, Mapping
-from dataclasses import asdict, dataclass
+from dataclasses import asdict, dataclass, replace
 from functools import partial
 from inspect import signature
 from pathlib import Path
@@ -22,7 +23,7 @@ from cid.model.illada import ILLADA_MASK_TOKEN_ID, ILLaDACIDAdapter
 from cid.model.losses import CIDLoss, CIDTargets, cid_loss
 from cid.model.materialize import RevisionAction
 from cid.model.tensors import CIDTensorBatch, CIDTensorOutput, build_percept_routing_masks
-from cid.state import CognitiveRole
+from cid.state import CellLifecycle, CognitiveRole
 
 
 @dataclass(slots=True)
@@ -58,10 +59,13 @@ class CIDRolloutState:
 class CIDRolloutWindow:
     example: TrajectoryExample
     source_steps: tuple[int, ...]
+    loss_weight: float = 1.0
 
     def __post_init__(self) -> None:
         if not self.source_steps:
             raise ValueError("rollout window requires at least one transition")
+        if not math.isfinite(self.loss_weight) or self.loss_weight <= 0.0:
+            raise ValueError("rollout window loss_weight must be finite and positive")
         if any(
             right != left + 1
             for left, right in zip(self.source_steps, self.source_steps[1:], strict=False)
@@ -307,6 +311,10 @@ class CIDTrainer:
         lengths = {len(window.source_steps) for window in windows}
         if len(lengths) != 1:
             raise ValueError("rollout micro-batch windows must have the same length")
+        loss_weights = {window.loss_weight for window in windows}
+        if len(loss_weights) != 1:
+            raise ValueError("rollout micro-batch windows must have the same loss_weight")
+        loss_weight = next(iter(loss_weights))
 
         rollout_states: list[CIDRolloutState | None] = [None] * len(windows)
         loss_sum = 0.0
@@ -328,9 +336,11 @@ class CIDTrainer:
                         rollout_state=rollout_states[index] if use_rollout else None,
                     )
                 )
-            losses, output, training_batch = self._forward_backward(tuple(samples))
+            losses, output, training_batch = self._forward_backward(
+                tuple(samples), loss_scale=loss_weight
+            )
             batch_size = len(samples)
-            loss_sum += float(losses.total.detach().float()) * batch_size
+            loss_sum += float(losses.total.detach().float()) * batch_size * loss_weight
             transition_count += batch_size
             rollout_states = [
                 self._rollout_state_from_prediction(
@@ -346,9 +356,13 @@ class CIDTrainer:
     def _forward_backward(
         self,
         samples: tuple[CIDTrainingStep, ...],
+        *,
+        loss_scale: float = 1.0,
     ) -> tuple[CIDLoss, CIDTensorOutput, CIDTrainingBatch]:
         if not samples:
             raise ValueError("training samples cannot be empty")
+        if not math.isfinite(loss_scale) or loss_scale <= 0.0:
+            raise ValueError("loss_scale must be finite and positive")
         training_batch = collate_training_steps(
             samples,
             pad_token_id=int(self.pad_token_id),
@@ -361,7 +375,7 @@ class CIDTrainer:
                 f"non-finite CID loss for training micro-batch: {names}"
             )
         batch_size = len(samples)
-        (losses.total * batch_size).backward()
+        (losses.total * batch_size * loss_scale).backward()
         self._pending_accumulation += 1
         self._pending_examples += batch_size
         self.state = CIDTrainerState(
@@ -437,11 +451,12 @@ class CIDTrainer:
         start_optimizer_steps = self.state.optimizer_steps
         for _ in range(epochs):
             rollout_probability = self.rollout_probability()
-            buckets: dict[int, list[CIDRolloutWindow]] = {}
+            buckets: dict[tuple[int, float], list[CIDRolloutWindow]] = {}
             for window in windows:
-                buckets.setdefault(len(window.source_steps), []).append(window)
-            for length in sorted(buckets):
-                bucket = buckets[length]
+                key = (len(window.source_steps), window.loss_weight)
+                buckets.setdefault(key, []).append(window)
+            for key in sorted(buckets):
+                bucket = buckets[key]
                 if shuffle:
                     self.shuffle_rng.shuffle(bucket)
                 for start in range(0, len(bucket), self.config.micro_batch_size):
@@ -952,11 +967,14 @@ class ILLaDATrajectoryTensorizer:
         object_order = tuple(ObjectKind)
         freshness_order = tuple(FreshnessDemand)
         final_step = max(target.step for target in example.thought_targets)
+        waiting_equilibrium = any(
+            target.lifecycle is CellLifecycle.WAITING for target in target_by_id.values()
+        )
 
         thought_target = torch.zeros((1, n, self.adapter.d_model), device=device, dtype=dtype)
         thought_mask = torch.zeros((1, n), device=device, dtype=torch.bool)
         convergence_targets = torch.tensor(
-            [float(target_step == final_step)],
+            [float(target_step == final_step or waiting_equilibrium)],
             device=device,
             dtype=dtype,
         )
@@ -1340,6 +1358,42 @@ def trajectory_rollout_windows(
     return tuple(windows)
 
 
+def balance_rollout_windows_by_semantic_task(
+    windows: tuple[CIDRolloutWindow, ...],
+) -> tuple[CIDRolloutWindow, ...]:
+    """Importance-weight rollout transitions so every semantic task has equal total mass.
+
+    Schedule variants and long trajectories remain fully present, but the sum of transition weights
+    for each semantic task is identical.  The global transition-weight mean is exactly one, so this
+    does not silently change the optimizer's overall loss scale.
+    """
+
+    if not windows:
+        return ()
+    transition_counts: dict[str, int] = {}
+    task_ids: list[str] = []
+    total_transitions = 0
+    for window in windows:
+        task_id = str(
+            window.example.metadata.get("semantic_task_id") or window.example.example_id
+        )
+        count = len(window.source_steps)
+        transition_counts[task_id] = transition_counts.get(task_id, 0) + count
+        task_ids.append(task_id)
+        total_transitions += count
+    task_count = len(transition_counts)
+    if task_count == 0 or total_transitions == 0:
+        return windows
+    weights = {
+        task_id: total_transitions / (task_count * transition_count)
+        for task_id, transition_count in transition_counts.items()
+    }
+    return tuple(
+        replace(window, loss_weight=weights[task_id])
+        for window, task_id in zip(windows, task_ids, strict=True)
+    )
+
+
 def shard_transitions(
     transitions: tuple[tuple[TrajectoryExample, int], ...],
     *,
@@ -1380,11 +1434,16 @@ def shard_rollout_windows(
     if not windows:
         return ()
     local: list[CIDRolloutWindow] = []
-    lengths = sorted({len(window.source_steps) for window in windows})
-    for length in lengths:
-        bucket = [window for window in windows if len(window.source_steps) == length]
+    keys = sorted({(len(window.source_steps), window.loss_weight) for window in windows})
+    for bucket_index, key in enumerate(keys):
+        length, loss_weight = key
+        bucket = [
+            window
+            for window in windows
+            if len(window.source_steps) == length and window.loss_weight == loss_weight
+        ]
         if shuffle:
-            random.Random(seed + epoch * 1009 + length).shuffle(bucket)
+            random.Random(seed + epoch * 1009 + length * 100_003 + bucket_index).shuffle(bucket)
         padding = (-len(bucket)) % world_size
         if padding:
             bucket.extend(bucket[:padding])

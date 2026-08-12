@@ -300,6 +300,36 @@ def test_trajectory_tensorizer_supervises_convergence_only_on_final_step() -> No
     assert final.targets.convergence_targets.item() == 1.0
 
 
+def test_trajectory_tensorizer_marks_waiting_snapshot_as_current_information_equilibrium() -> None:
+    adapter = make_adapter()
+    tensorizer = ILLaDATrajectoryTensorizer(adapter, TinyTokenizer())
+    base = make_trajectory()
+    step_one = tuple(target for target in base.thought_targets if target.step == 1)
+    waiting_step = tuple(
+        replace(
+            target,
+            lifecycle=(
+                CellLifecycle.WAITING if target.cell_id == "c1" else target.lifecycle
+            ),
+        )
+        for target in step_one
+    )
+    extended = replace(
+        base,
+        thought_targets=(
+            *(target for target in base.thought_targets if target.step == 0),
+            *waiting_step,
+            *(replace(target, step=2, lifecycle=CellLifecycle.STABLE) for target in step_one),
+        ),
+    )
+
+    waiting = tensorizer.tensorize(extended, source_step=0, timestep=1.0)
+    final = tensorizer.tensorize(extended, source_step=1, timestep=1.0)
+
+    assert waiting.targets.convergence_targets.item() == 1.0
+    assert final.targets.convergence_targets.item() == 1.0
+
+
 def test_training_collator_pads_variable_sequences_and_external_memory() -> None:
     adapter = make_adapter()
     tensorizer = ILLaDATrajectoryTensorizer(adapter, TinyTokenizer())

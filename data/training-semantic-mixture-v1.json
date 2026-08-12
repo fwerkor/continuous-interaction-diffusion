@@ -1,11 +1,11 @@
 {
   "components": [
     {
-      "causal_jobs_sha256": "620e95a00081f52f16ef5f598bde5f7699ce821b15d5653899a4bda3bf530953",
+      "causal_jobs_sha256": "7f101139ac44647480ced1b1ffc0dfb5d50aa52b148425c4f636a52d8dff3a96",
       "name": "public-base-v1",
       "reference_manifest": "data/public-teacher-v1.train.reference-manifest.json",
       "tasks": 9030,
-      "tasks_sha256": "5c38ff9cf2b1455c3ec5bb4dec0fddfe66ce6e81f975ec8c5983f4aa5d3c7005"
+      "tasks_sha256": "b6746a3335e6de0d3a57eb798ef9c168baf7452c2ff258a2a626d37176d91623"
     },
     {
       "causal_jobs_sha256": "79b2ebf3f4a61b49ef479209e0987bd47cd11fcbc6954df4c767b944209e5d18",

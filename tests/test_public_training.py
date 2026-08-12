@@ -61,6 +61,63 @@ def test_teacher_reference_answer_is_persisted_but_hidden_from_request(tmp_path)
     assert "2 + 3 = 5" not in request
 
 
+def test_mbpp_teacher_prompt_exposes_public_tests_but_not_hidden_code(tmp_path) -> None:
+    pool = tmp_path / "pool.jsonl"
+    record = _base_record(
+        task_id="mbpp-1",
+        semantic_id="mbpp-semantic",
+        task_kind="python_programming",
+        prompt="Write a function to increment a number.",
+        reference_answer="def inc(x):\n    return x + 1",
+        source={
+            "dataset_id": "mbpp-full-train",
+            "repo": "google-research-datasets/mbpp",
+            "revision": "rev",
+            "license": "CC-BY-4.0",
+            "upstream_config": "full",
+            "upstream_split": "train",
+            "row_key": "train.parquet:1",
+            "use": "general_reasoning",
+        },
+        metadata={
+            "upstream_task_id": 1,
+            "tests": ["assert inc(1) == 2", "assert inc(-1) == 0"],
+            "challenge_tests": ["assert inc(100) == 101"],
+            "test_setup_code": "import math",
+        },
+    )
+    _write_pool(pool, [record])
+    tasks_path = tmp_path / "tasks.jsonl"
+    requests_path = tmp_path / "requests.jsonl"
+    manifest_path = tmp_path / "manifest.json"
+
+    prepare_public_distillation(
+        pool,
+        tasks_path,
+        requests_path,
+        manifest_path,
+        PublicTrainingConfig(unnecessary_tool_fraction=0.0),
+    )
+
+    (task,) = load_teacher_tasks(tasks_path)
+    assert task.task_id == "mbpp-1"
+    assert "Public evaluation contract:" in task.prompt
+    assert "import math" in task.prompt
+    assert "assert inc(1) == 2" in task.prompt
+    assert "assert inc(-1) == 0" in task.prompt
+    assert "assert inc(100) == 101" not in task.prompt
+    assert "def inc(x):" not in task.prompt
+    assert task.reference_answer.startswith("def inc(x):")
+    assert json.loads(manifest_path.read_text())["python_public_test_tasks"] == 1
+    assert task.metadata["public_tests"] == ["assert inc(1) == 2", "assert inc(-1) == 0"]
+    assert task.metadata["public_test_setup_code"] == "import math"
+    assert "challenge_tests" not in task.metadata
+    request = build_teacher_request(task).prompt
+    assert "assert inc(1) == 2" in request
+    assert "assert inc(100) == 101" not in request
+    assert "def inc(x):" not in request
+
+
 def test_public_distillation_respects_owned_split_and_deterministic_modes(tmp_path) -> None:
     pool = tmp_path / "pool.jsonl"
     records = [

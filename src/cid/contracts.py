@@ -119,6 +119,7 @@ class ModelUpdate:
     display: DisplayCanvas
     needs: tuple[InformationNeed, ...] = ()
     reopen_cells: tuple[ObjectRef, ...] = ()
+    equilibrium: bool = False
     converged: bool = False
 
     def __post_init__(self) -> None:

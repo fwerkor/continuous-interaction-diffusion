@@ -152,6 +152,7 @@ class CIDMaterializer:
             display=display,
             needs=needs,
             reopen_cells=reopen_cells,
+            equilibrium=convergence >= self.config.convergence_threshold,
             converged=(
                 display.unresolved == 0
                 and convergence >= self.config.convergence_threshold

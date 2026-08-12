@@ -68,6 +68,7 @@ src/cid/model/policy.py     iLLaDA context tensorizer and runtime neural policy
 src/cid/model/training.py   Distilled trajectory to training tensors/targets
 src/cid/synthetic.py        Reproducible five-family mechanism trajectory factory
 src/cid/data.py             Trajectory JSONL schema and validation
+src/cid/teacher_agent.py    Resumable interactive/LSM teacher workspace adapter
 src/cid/metrics.py          CID-specific interaction metrics
 docs/architecture.md        Concrete v0 architecture decisions
 docs/training.md            Staged training plan
@@ -142,8 +143,11 @@ correct stale text after new evidence arrives instead of treating every revealed
 The neural path is executable end to end: `ILLaDAContextTensorizer` converts a runtime
 `ModelContext`, `ILLaDANeuralPolicy` performs a denoising step, and `CIDMaterializer` converts
 allocation/lifecycle/need/source/argument/grounding/revision/refresh predictions back into the
-typed runtime contract. A separate learned convergence logit decides when a fully denoised display
-is actually terminal; filling the last MASK no longer ends a neural trajectory by itself.
+typed runtime contract. A separate learned convergence logit estimates whether cognition has reached
+equilibrium under the information currently available. If required external work is still pending,
+the runtime enters quiescence without consuming additional model steps and resumes when an event
+arrives. A fully denoised display can terminate only after required bindings are resolved and the
+final freshness barrier is satisfied; filling the last MASK alone is insufficient.
 Closed-world candidate retrieval is used for the first training stage.
 
 Training data uses typed per-step `ThoughtTarget` and `DisplayTarget` records rather than free-form
@@ -175,13 +179,69 @@ Convert a pool into teacher-ready CID tasks and causal evidence-exposure jobs wi
 cid prepare-public-distillation
 ```
 
-The current overall semantic mixture is pinned by `data/training-semantic-mixture-v2.json` and
-contains 28,055 tasks. It combines the 18,055-task public mixture with 10,000 generated mechanism
-tasks covering static reads, delayed reads, dynamic refresh, streaming evidence, and competing
-sources. Retrieval tasks use a task-local `workspace_search` followed by two to four supporting
-`workspace_read` operations. Dynamic and streaming tasks create one persistent binding and reuse it
-for later updates instead of reissuing a new need for every arrival. Causal teacher jobs reveal
-evidence values only after their corresponding arrival stage.
+The current overall semantic mixture is pinned by `data/training-semantic-mixture-v5.json` and
+contains 65,655 tasks. It combines the 18,055-task public mixture, 10,000 generated mechanism tasks,
+12,000 computational-tool tasks, 15,600 symbolic-tool tasks, and 10,000 speculative local-correction
+tasks. The computational component covers
+calculator use, deterministic Python execution, immutable record lookup followed by calculation,
+serial dependencies, parallel fan-out/merge, and negative examples where tools are deliberately
+unnecessary. The symbolic component adds exact equation solving, systems, expansion, factorization,
+rational simplification, differentiation, integration, identity checking, symbolic-to-numeric
+chains, record-to-symbolic chains, parallel symbolic merge, and another 1,200 no-tool calibration
+cases. The local-correction component explicitly supervises a plausible but wrong hypothesis,
+contradictory evidence that reopens only that hypothesis and its dependent answer, and independent
+confirmation that stabilizes the corrected state while unrelated cells remain unchanged. Retrieval
+tasks still use task-local `workspace_search`/`workspace_read`; dynamic and streaming mechanism tasks
+reuse persistent bindings. Causal teacher jobs reveal evidence values only after their corresponding
+arrival stage.
+
+The corresponding compiled training mixture is pinned by
+`data/training-trajectory-mixture-v5.json`: **179,608 runtime trajectories and 1,027,548 adjacent
+supervised transitions** across the same six semantic components. Materialize the single JSONL
+expected by Stage A/B with:
+
+```bash
+cid materialize-trajectory-mixture \
+  --spec data/training-trajectory-mixture-v5.json \
+  --output data/generated/training-trajectories-v5.jsonl \
+  --manifest-output data/generated/training-trajectories-v5.manifest.json
+```
+
+The materializer verifies every component SHA/count and global `example_id` uniqueness before
+writing the combined file. Its output is deterministic; training shuffles rollout windows per epoch
+unless `--no-shuffle` is requested. The verified materialized identity is pinned by
+`data/training-trajectories-v5.reference-manifest.json` (179,608 examples, 1,027,548 transitions,
+SHA-256 `d771d5ddcf94c1b8b7ae9a1b7df38944fc3c5974d34867ec4c0ae392b7c9120b`).
+
+Build the deterministic computational teacher jobs with:
+
+```bash
+cid build-computational-training
+```
+
+The pinned build and self-distillation hashes are recorded in
+`data/computational-teacher-v1.reference-manifest.json`.
+
+Build the deterministic symbolic teacher jobs with:
+
+```bash
+cid build-symbolic-training
+```
+
+The symbolic component contains 34,800 causal teacher stages; all 15,600 semantic plans pass the
+quality gate and compile to 31,200 independently randomized runtime trajectories. Its exact build,
+review, tool-replay, and compilation hashes are pinned by
+`data/symbolic-teacher-v1.reference-manifest.json`.
+
+Build the deterministic speculative local-correction teacher jobs with:
+
+```bash
+cid build-correction-training
+```
+
+The released component contains 30,000 validated causal stages and 20,000 compiled trajectories;
+its exact generation, review, correction-audit, and compilation hashes are pinned by
+`data/correction-teacher-v1.reference-manifest.json`.
 
 Generated task data lives under `data/generated/` and is not committed. Every record retains exact
 upstream provenance; semantic IDs are deduplicated and assigned to the CID train/validation/test

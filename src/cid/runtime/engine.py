@@ -13,7 +13,13 @@ from cid.grounding import STRONG_LINK_RELATIONS, ClosedWorldGrounder, ObjectKind
 from cid.lifecycle import LifecycleTransitionController, LifecycleTransitionSignals
 from cid.runtime.archive import CognitiveArchive, CognitiveTombstone
 from cid.runtime.bindings import Binding, BindingStatus, BindingTable
-from cid.runtime.sources import ReadOnlySource, SourceRegistry, StreamingSource, VersionAwareSource
+from cid.runtime.sources import (
+    ReadOnlySource,
+    RuntimeSnapshotSource,
+    SourceRegistry,
+    StreamingSource,
+    VersionAwareSource,
+)
 from cid.runtime.trace import RuntimeTrace
 from cid.state import CellLifecycle, CognitiveField, DisplayCanvas, FactItem, FactStore
 
@@ -21,6 +27,7 @@ from cid.state import CellLifecycle, CognitiveField, DisplayCanvas, FactItem, Fa
 @dataclass(frozen=True, slots=True)
 class RuntimeConfig:
     max_steps: int = 64
+    max_wall_time_s: float | None = 300.0
     binding_threshold: float = 0.55
     idle_yield_s: float = 0.001
     reclamation_grace_steps: int = 2
@@ -30,6 +37,8 @@ class RuntimeConfig:
     def __post_init__(self) -> None:
         if self.max_steps <= 0:
             raise ValueError("max_steps must be positive")
+        if self.max_wall_time_s is not None and self.max_wall_time_s <= 0:
+            raise ValueError("max_wall_time_s must be positive when set")
         if not 0.0 <= self.binding_threshold <= 1.0:
             raise ValueError("binding_threshold must be in [0, 1]")
         if self.idle_yield_s < 0:
@@ -60,11 +69,13 @@ class RuntimeResult:
 class _ExternalJob:
     task: asyncio.Task[Observation]
     owner_binding_id: str
+    terminal_validation: bool = False
 
 
 @dataclass(slots=True)
 class _VersionJob:
     task: asyncio.Task[str | None]
+    terminal_validation: bool = False
 
 
 @dataclass(slots=True)
@@ -93,6 +104,9 @@ class CIDRuntime:
         self._streams: dict[str, _StreamJob] = {}
         self._completed_streams: set[str] = set()
         self._detached_tasks: set[asyncio.Task[Any]] = set()
+        self._external_progress = asyncio.Event()
+        self._terminal_validated: dict[str, tuple[str, str | None, float | None]] = {}
+        self._runtime_step = 0
         self._cache: dict[str, Observation] = {}
         self._created_at: dict[str, int] = {}
         self._retired_at: dict[str, int] = {}
@@ -115,6 +129,9 @@ class CIDRuntime:
         self._cache = {}
         self._completed_streams = set()
         self._detached_tasks = set()
+        self._external_progress = asyncio.Event()
+        self._terminal_validated = {}
+        self._runtime_step = 0
         self._created_at = {cell_id: 0 for cell_id in thought.occupied_cell_ids}
         self._retired_at = {
             cell.cell_id: 0
@@ -126,18 +143,61 @@ class CIDRuntime:
 
         converged = False
         completed_steps = 0
+        epoch_steps = 0
+        started_at = time.monotonic()
+        deadline = (
+            None
+            if self.config.max_wall_time_s is None
+            else started_at + self.config.max_wall_time_s
+        )
         descriptors = self.sources.descriptors()
         descriptor_by_name = {descriptor.name: descriptor for descriptor in descriptors}
 
         try:
-            for step in range(self.config.max_steps):
-                if self.sources.advance_runtime_step(step):
+            while True:
+                if self._deadline_expired(deadline):
+                    self.trace.emit("wall_clock_budget_exhausted", completed_steps)
+                    break
+
+                if epoch_steps >= self.config.max_steps:
+                    if self._has_pending_required_external_work():
+                        self._launch_due_jobs(completed_steps)
+                        self.trace.emit(
+                            "quiescence_started",
+                            completed_steps,
+                            reason="compute_budget_waiting_for_evidence",
+                            runtime_step=self._runtime_step,
+                        )
+                        advanced = await self._wait_for_external_progress(deadline)
+                        if not advanced:
+                            self.trace.emit("wall_clock_budget_exhausted", completed_steps)
+                            break
+                        epoch_steps = 0
+                        self.trace.emit(
+                            "quiescence_resumed",
+                            completed_steps,
+                            reason="external_progress",
+                            runtime_step=self._runtime_step,
+                        )
+                        continue
+                    self.trace.emit(
+                        "compute_budget_exhausted",
+                        completed_steps,
+                        runtime_step=self._runtime_step,
+                    )
+                    break
+
+                step = completed_steps
+                if self.sources.advance_runtime_step(self._runtime_step):
                     await asyncio.sleep(0)
                 thought = self._maybe_reclaim(thought, step)
                 previous_thought = thought
+                observations_before = self._observation_count()
                 self._drain_completed_version_jobs(step)
                 self._drain_completed_jobs(step)
                 self._drain_stream_updates(step)
+                if self._observation_count() > observations_before:
+                    epoch_steps = 0
                 percepts = self._project_available(step, thought)
                 context = ModelContext(
                     facts=self.facts.snapshot(),
@@ -149,10 +209,23 @@ class CIDRuntime:
                     prompt=prompt,
                 )
 
-                self.trace.emit("model_step_started", step, percepts=len(percepts))
+                self.trace.emit(
+                    "model_step_started",
+                    step,
+                    percepts=len(percepts),
+                    runtime_step=self._runtime_step,
+                )
                 update = await asyncio.to_thread(policy.step, context)
-                self.trace.emit("model_step_finished", step, needs=len(update.needs))
-                completed_steps = step + 1
+                self.trace.emit(
+                    "model_step_finished",
+                    step,
+                    needs=len(update.needs),
+                    equilibrium=update.equilibrium,
+                    converged=update.converged,
+                    runtime_step=self._runtime_step,
+                )
+                completed_steps += 1
+                epoch_steps += 1
                 proposed_thought = update.thought
                 display = update.display
                 live_cell_ids = set(proposed_thought.live_cell_ids)
@@ -200,9 +273,12 @@ class CIDRuntime:
                     )
 
                 self._cancel_orphan_external_work(step)
+                observations_before = self._observation_count()
                 self._drain_completed_version_jobs(step)
                 self._drain_completed_jobs(step)
                 self._drain_stream_updates(step)
+                if self._observation_count() > observations_before:
+                    epoch_steps = 0
                 thought = self.lifecycle.apply(
                     previous_thought,
                     proposed_thought,
@@ -224,15 +300,61 @@ class CIDRuntime:
                 self._trace_lifecycle_changes(previous_thought, thought, step)
                 self._record_lifecycle_steps(previous_thought, thought, step)
                 unresolved = self._has_unresolved_active_binding()
+                settled = update.equilibrium or update.converged
                 if update.converged and not unresolved:
-                    converged = True
-                    break
+                    if self._terminal_freshness_satisfied(step):
+                        converged = True
+                        self.trace.emit(
+                            "trajectory_finalized",
+                            step,
+                            runtime_step=self._runtime_step,
+                        )
+                        break
+                    self.trace.emit(
+                        "quiescence_started",
+                        step,
+                        reason="final_freshness_barrier",
+                        runtime_step=self._runtime_step,
+                    )
+                    advanced = await self._wait_for_external_progress(deadline)
+                    if not advanced:
+                        self.trace.emit("wall_clock_budget_exhausted", completed_steps)
+                        break
+                    epoch_steps = 0
+                    self.trace.emit(
+                        "quiescence_resumed",
+                        step,
+                        reason="final_freshness_checked",
+                        runtime_step=self._runtime_step,
+                    )
+                    continue
+
                 self._launch_due_jobs(step)
+                if settled and unresolved:
+                    self.trace.emit(
+                        "quiescence_started",
+                        step,
+                        reason="current_information_equilibrium",
+                        runtime_step=self._runtime_step,
+                    )
+                    advanced = await self._wait_for_external_progress(deadline)
+                    if not advanced:
+                        self.trace.emit("wall_clock_budget_exhausted", completed_steps)
+                        break
+                    epoch_steps = 0
+                    self.trace.emit(
+                        "quiescence_resumed",
+                        step,
+                        reason="external_progress",
+                        runtime_step=self._runtime_step,
+                    )
+                    continue
 
                 if (self._jobs or self._version_jobs or self._streams) and self.config.idle_yield_s:
                     await asyncio.sleep(self.config.idle_yield_s)
                 else:
                     await asyncio.sleep(0)
+                self._runtime_step += 1
         finally:
             tasks = [
                 *(job.task for job in self._jobs.values()),
@@ -334,10 +456,19 @@ class CIDRuntime:
 
             self._ensure_read(binding, source, step)
 
-    def _ensure_read(self, binding: Binding, source: ReadOnlySource, step: int) -> None:
+    def _ensure_read(
+        self,
+        binding: Binding,
+        source: ReadOnlySource,
+        step: int,
+        *,
+        terminal_validation: bool = False,
+    ) -> None:
         work_key = binding.work_key
         if work_key in self._jobs:
             job = self._jobs[work_key]
+            if terminal_validation:
+                job.terminal_validation = True
             binding.status = (
                 BindingStatus.REFRESHING
                 if binding.observation is not None
@@ -348,7 +479,12 @@ class CIDRuntime:
             return
 
         task = asyncio.create_task(source.read(binding.arguments))
-        self._jobs[work_key] = _ExternalJob(task=task, owner_binding_id=binding.binding_id)
+        task.add_done_callback(lambda _: self._external_progress.set())
+        self._jobs[work_key] = _ExternalJob(
+            task=task,
+            owner_binding_id=binding.binding_id,
+            terminal_validation=terminal_validation,
+        )
         binding.status = (
             BindingStatus.REFRESHING
             if binding.observation is not None
@@ -363,13 +499,28 @@ class CIDRuntime:
         )
 
     def _ensure_version_probe(
-        self, binding: Binding, source: VersionAwareSource, step: int
+        self,
+        binding: Binding,
+        source: VersionAwareSource,
+        step: int,
+        *,
+        terminal_validation: bool = False,
     ) -> None:
         work_key = binding.work_key
-        if work_key in self._jobs or work_key in self._version_jobs:
+        if work_key in self._jobs:
+            if terminal_validation:
+                self._jobs[work_key].terminal_validation = True
+            return
+        if work_key in self._version_jobs:
+            if terminal_validation:
+                self._version_jobs[work_key].terminal_validation = True
             return
         task = asyncio.create_task(source.version(binding.arguments))
-        self._version_jobs[work_key] = _VersionJob(task=task)
+        task.add_done_callback(lambda _: self._external_progress.set())
+        self._version_jobs[work_key] = _VersionJob(
+            task=task,
+            terminal_validation=terminal_validation,
+        )
         binding.status = BindingStatus.REFRESHING
         self.trace.emit(
             "version_check_started",
@@ -389,8 +540,10 @@ class CIDRuntime:
         async def consume() -> None:
             async for observation in source.stream(binding.arguments):
                 await queue.put(deepcopy(observation))
+                self._external_progress.set()
 
         task = asyncio.create_task(consume())
+        task.add_done_callback(lambda _: self._external_progress.set())
         self._streams[work_key] = _StreamJob(task=task, queue=queue)
         binding.status = (
             BindingStatus.REFRESHING
@@ -428,7 +581,12 @@ class CIDRuntime:
             )
             if changed:
                 source = self.sources.get(matching[0].source)
-                self._ensure_read(matching[0], source, step)
+                self._ensure_read(
+                    matching[0],
+                    source,
+                    step,
+                    terminal_validation=job.terminal_validation,
+                )
                 for binding in matching[1:]:
                     binding.status = BindingStatus.REFRESHING
                 continue
@@ -436,6 +594,8 @@ class CIDRuntime:
             for binding in matching:
                 binding.last_refresh_at = checked_at
                 binding.status = BindingStatus.AVAILABLE
+                if job.terminal_validation:
+                    self._mark_terminal_validated(binding, step)
 
     def _drain_completed_jobs(self, step: int) -> None:
         for work_key, job in tuple(self._jobs.items()):
@@ -456,6 +616,9 @@ class CIDRuntime:
                 version=observation.version,
             )
             self._apply_observation(matching, observation, step)
+            if job.terminal_validation:
+                for binding in matching:
+                    self._mark_terminal_validated(binding, step)
 
     def _drain_stream_updates(self, step: int) -> None:
         for work_key, stream in tuple(self._streams.items()):
@@ -496,6 +659,7 @@ class CIDRuntime:
                 step,
                 binding_id=binding.binding_id,
                 version=observation.version,
+                runtime_step=self._runtime_step,
             )
             if binding.promote_to_fact:
                 self._promote_fact(binding, observation)
@@ -543,12 +707,152 @@ class CIDRuntime:
             return True
         return now - binding.last_refresh_at >= binding.max_age_s
 
+    def _terminal_freshness_satisfied(self, step: int) -> bool:
+        now = time.monotonic()
+        pending = False
+        for binding in self.bindings.active():
+            if binding.observation is None:
+                self._launch_due_jobs(step)
+                pending = True
+                continue
+
+            source = self.sources.get(binding.source)
+            work_key = binding.work_key
+            if (
+                source.descriptor.streamable
+                and binding.freshness is not FreshnessDemand.ONCE
+                and isinstance(source, StreamingSource)
+            ):
+                stream = self._streams.get(work_key)
+                if stream is not None and not stream.queue.empty():
+                    pending = True
+                continue
+
+            if binding.freshness is FreshnessDemand.ONCE:
+                continue
+            if binding.freshness is FreshnessDemand.MAX_AGE and not self._refresh_due(binding, now):
+                continue
+
+            marker = self._observation_marker(binding)
+            if (
+                binding.freshness is FreshnessDemand.ALWAYS
+                and self._terminal_validated.get(binding.binding_id) == marker
+            ):
+                continue
+
+            if (
+                isinstance(source, RuntimeSnapshotSource)
+                and source.current_runtime_version(binding.arguments) == binding.observation.version
+            ):
+                self._mark_terminal_validated(binding, step)
+                continue
+
+            self.trace.emit(
+                "terminal_freshness_validation_started",
+                step,
+                binding_id=binding.binding_id,
+                work_key=work_key,
+                runtime_step=self._runtime_step,
+            )
+            if source.descriptor.versioned and isinstance(source, VersionAwareSource):
+                self._ensure_version_probe(
+                    binding,
+                    source,
+                    step,
+                    terminal_validation=True,
+                )
+            else:
+                self._ensure_read(
+                    binding,
+                    source,
+                    step,
+                    terminal_validation=True,
+                )
+            pending = True
+        return not pending
+
+    def _mark_terminal_validated(self, binding: Binding, step: int) -> None:
+        if binding.observation is None:
+            return
+        self._terminal_validated[binding.binding_id] = self._observation_marker(binding)
+        self.trace.emit(
+            "terminal_freshness_validated",
+            step,
+            binding_id=binding.binding_id,
+            work_key=binding.work_key,
+            version=binding.observation.version,
+            runtime_step=self._runtime_step,
+        )
+
+    @staticmethod
+    def _observation_marker(binding: Binding) -> tuple[str, str | None, float | None]:
+        observation = binding.observation
+        return (
+            binding.work_key,
+            None if observation is None else observation.version,
+            binding.last_refresh_at,
+        )
+
+    def _observation_count(self) -> int:
+        return sum(binding.external_refreshes for binding in self.bindings.all())
+
+    @staticmethod
+    def _deadline_expired(deadline: float | None) -> bool:
+        return deadline is not None and time.monotonic() >= deadline
+
+    def _external_progress_ready(self) -> bool:
+        return (
+            any(job.task.done() for job in self._jobs.values())
+            or any(job.task.done() for job in self._version_jobs.values())
+            or any(
+                not stream.queue.empty() or stream.task.done()
+                for stream in self._streams.values()
+            )
+        )
+
+    async def _wait_for_external_progress(self, deadline: float | None) -> bool:
+        while True:
+            if self._deadline_expired(deadline):
+                return False
+            self._external_progress.clear()
+            if self._external_progress_ready():
+                return True
+
+            next_runtime_step = self.sources.next_runtime_step()
+            if next_runtime_step is not None and next_runtime_step > self._runtime_step:
+                self._runtime_step = next_runtime_step
+                if self.sources.advance_runtime_step(self._runtime_step):
+                    await asyncio.sleep(0)
+                if self._external_progress_ready() or self._external_progress.is_set():
+                    return True
+                continue
+
+            timeout = None if deadline is None else max(0.0, deadline - time.monotonic())
+            if timeout == 0.0:
+                return False
+            try:
+                if timeout is None:
+                    await self._external_progress.wait()
+                else:
+                    await asyncio.wait_for(self._external_progress.wait(), timeout=timeout)
+            except TimeoutError:
+                return False
+            return True
+
     def _has_unresolved_active_binding(self) -> bool:
         return any(
             binding.observation is None
             for binding in self.bindings.active()
             if binding.status is not BindingStatus.RETIRED
         )
+
+    def _has_pending_required_external_work(self) -> bool:
+        if any(
+            binding.status in {BindingStatus.WAITING, BindingStatus.REFRESHING}
+            for binding in self.bindings.active()
+        ):
+            return True
+        return any(not stream.queue.empty() for stream in self._streams.values())
 
     def _maybe_reclaim(
         self,

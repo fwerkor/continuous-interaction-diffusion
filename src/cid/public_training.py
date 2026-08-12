@@ -77,6 +77,12 @@ def prepare_public_distillation(
         "tasks": len(tasks),
         "tasks_sha256": _file_sha256(task_path),
         "requests_sha256": _file_sha256(request_path),
+        "python_public_test_tasks": sum(
+            1
+            for task in tasks
+            if str(task.metadata.get("task_kind", "")) == "python_programming"
+            and bool(task.metadata.get("public_tests"))
+        ),
         "mode_counts": dict(sorted(mode_counts.items())),
         "source_counts": dict(sorted(source_counts.items())),
         "interaction_pattern_counts": dict(sorted(interaction_patterns.items())),
@@ -117,7 +123,19 @@ def _teacher_task_from_public(
         "upstream_row_key": str(source["row_key"]),
         "license": str(source["license"]),
     }
+    if str(record.get("task_kind", "")) == "python_programming":
+        task_metadata = record.get("metadata", {})
+        metadata["public_tests"] = [
+            str(item).strip()
+            for item in task_metadata.get("tests", ())
+            if str(item).strip()
+        ]
+        metadata["public_test_setup_code"] = str(
+            task_metadata.get("test_setup_code", "")
+        ).strip()
+
     expected_answer = str(record["reference_answer"])
+    prompt = _teacher_visible_prompt(record)
 
     if str(source.get("use", "")) == "toolizable_retrieval":
         if dataset_id == "musique-train":
@@ -131,7 +149,7 @@ def _teacher_task_from_public(
         return (
             TeacherTask(
                 task_id=str(record["task_id"]),
-                prompt=str(record["prompt"]),
+                prompt=prompt,
                 source_descriptors=descriptors,
                 evidence=evidence,
                 metadata={
@@ -148,7 +166,7 @@ def _teacher_task_from_public(
         return (
             TeacherTask(
                 task_id=str(record["task_id"]),
-                prompt=str(record["prompt"]),
+                prompt=prompt,
                 source_descriptors=_workspace_descriptors(),
                 metadata={**metadata, "training_mode": "tools_available_unnecessary"},
                 reference_answer=expected_answer,
@@ -159,12 +177,38 @@ def _teacher_task_from_public(
     return (
         TeacherTask(
             task_id=str(record["task_id"]),
-            prompt=str(record["prompt"]),
+            prompt=prompt,
             metadata={**metadata, "training_mode": "no_tool"},
             reference_answer=expected_answer,
         ),
         "no_tool",
     )
+
+
+def _teacher_visible_prompt(record: Mapping[str, Any]) -> str:
+    """Add public interface tests to programming prompts without leaking hidden answers."""
+
+    prompt = str(record["prompt"]).strip()
+    if str(record.get("task_kind", "")) != "python_programming":
+        return prompt
+
+    task_metadata = record.get("metadata", {})
+    tests = [
+        str(item).strip()
+        for item in task_metadata.get("tests", ())
+        if str(item).strip()
+    ]
+    setup = str(task_metadata.get("test_setup_code", "")).strip()
+    if not tests and not setup:
+        return prompt
+
+    sections = [prompt, "Public evaluation contract:"]
+    if setup:
+        sections.extend(("Setup:", setup))
+    if tests:
+        sections.append("Tests:")
+        sections.extend(tests)
+    return "\n".join(sections)
 
 
 def _retrieval_tool_environment(

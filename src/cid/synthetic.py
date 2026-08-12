@@ -63,7 +63,11 @@ def _static_copy(
     index: int,
 ) -> TrajectoryExample:
     plan_slot, need_slot = rng.sample(range(config.thought_capacity), 2)
-    key = f"latency_{rng.randrange(1000)}"
+    # Keep the semantic task identity unique at large generation scales.  The
+    # value remains randomized, but reusing one of only 1,000 keys caused
+    # otherwise identical generated tasks to be removed by the distillation
+    # review gate when count_per_family exceeded that range.
+    key = f"latency_{index}"
     value = rng.randrange(10, 200)
     key_anchor = _text_anchor(f"{family}-{index}-key", key)
     value_anchor = _number_anchor(f"{family}-{index}-value", value, unit="ms")
@@ -167,7 +171,7 @@ def _delayed_retrieval(
     index: int,
 ) -> TrajectoryExample:
     plan_slot, need_slot = rng.sample(range(config.thought_capacity), 2)
-    key = f"release_{rng.randrange(1000)}"
+    key = f"release_{index}"
     value = f"r{rng.randrange(10, 99)}"
     key_anchor = _text_anchor(f"{family}-{index}-key", key)
     value_anchor = _text_anchor(f"{family}-{index}-value", value)
@@ -268,7 +272,11 @@ def _dynamic_state(
     index: int,
 ) -> TrajectoryExample:
     plan_slot, state_slot = rng.sample(range(config.thought_capacity), 2)
-    first = rng.randrange(1, 50)
+    # The old 49 x 19 (first value, delta) state space contains fewer than
+    # 2,000 combinations, so a 2k-family build necessarily produced many
+    # semantic duplicates.  Give every generated instance a distinct first
+    # observation while retaining a randomized positive refresh delta.
+    first = index + 1
     second = first + rng.randrange(1, 20)
     first_anchor = _number_anchor(f"{family}-{index}-first", first)
     second_anchor = _number_anchor(f"{family}-{index}-second", second)
@@ -388,7 +396,7 @@ def _streaming_evidence(
     index: int,
 ) -> TrajectoryExample:
     plan_slot, evidence_slot = rng.sample(range(config.thought_capacity), 2)
-    topic = f"topic-{rng.randrange(1000)}"
+    topic = f"topic-{index}"
     first = f"evidence-{rng.randrange(100, 999)}"
     second = f"evidence-{rng.randrange(100, 999)}"
     return TrajectoryExample(
@@ -477,7 +485,7 @@ def _competing_sources(
     plan_slot, primary_slot, secondary_slot, conclusion_slot = rng.sample(
         range(config.thought_capacity), 4
     )
-    key = f"score_{rng.randrange(1000)}"
+    key = f"score_{index}"
     primary_value = rng.randrange(50, 100)
     secondary_value = primary_value + rng.choice((-7, -5, 5, 7))
     return TrajectoryExample(

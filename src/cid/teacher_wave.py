@@ -1,6 +1,8 @@
 from __future__ import annotations
 
 import json
+import os
+import tempfile
 from collections.abc import Iterable, Mapping
 from dataclasses import dataclass
 from hashlib import sha256
@@ -16,30 +18,38 @@ from cid.distill import (
     TeacherTask,
     dump_teacher_plans,
 )
+from cid.grounding import LinkRelation, ObjectKind
 from cid.state import CellLifecycle, CognitiveRole
+from cid.teacher_semantics import (
+    TEACHER_SEMANTIC_TEXT_MAX_CHARS,
+    TEACHER_SEMANTIC_TEXT_TARGET_CHARS,
+)
 
-TEACHER_SOFT_QUALITY_GUIDANCE = """Soft quality targets (guidance, not hard validation):
-- Keep each `semantic_text` compact: target <=160 characters and normally <=240. Summarize only
-  task-relevant state; do not copy whole evidence sentences or paragraphs. If a carried-forward
-  cell is overly verbose, compress it while preserving its meaning and stable `cell_id`.
-- Prefer about 3-6 live cells for an ordinary task. Add a cell only for a distinct cognitive role;
-  merge redundant state when that does not destroy a useful dependency.
-- Ground salient task-relevant entities, numbers, dates, symbols, paths, or URLs with `anchors`.
-  Usually 1-3 anchors are enough for an evidence-bearing cell; do not annotate filler words.
-- Add typed `links` when the relation is meaningful: `requests` from an information need to a
-  source, `observes` from a percept to the source it came from, `supports`/`derived_from` or
-  `depends_on` between related cells, and `conflicts` when evidence disagrees. Do not invent links
-  merely to satisfy a quota.
-- Reuse stable anchor IDs for the same logical object across later stages when practical.
+TEACHER_SOFT_QUALITY_GUIDANCE = """TCT supervision quality rules:
+- `semantic_text` represents compressed cognitive state, not evidence storage.
+  Target <=144 characters; interactive teacher stages are rejected above 192 characters.
+  Never paste a whole source sentence or paragraph into a cell. Rewrite evidence as
+  task-relevant facts, e.g. `Ada — born: 1815; country: UK.`
+- Prefer about 3-6 live cells for an ordinary task. Add a cell only for a distinct
+  cognitive role.
+- Evidence-bearing percept cells must ground salient objects with `anchors` and carry
+  an `observes` link to the source that produced the arrived evidence. Reuse stable
+  anchor IDs for the same object.
+- A cell that requests external evidence must carry a typed `requests` link to the
+  contracted source. Use `depends_on` for prerequisite cells when useful.
+- Terminal conclusion cells should link back to supporting percept cells with
+  `derived_from`. Use `conflicts` when visible evidence disagrees. Links encode the
+  cognitive graph; empty `links` on all cells are not acceptable supervision.
 
 Anchor example:
-`{"anchor_id":"entity:alice-example","kind":"entity","value":"Alice Example","confidence":1.0}`
+`{\"anchor_id\":\"entity:alice-example\",\"kind\":\"entity\",`
+`\"value\":\"Alice Example\",\"confidence\":1.0}`
 Link example:
-`{"relation":"observes","target":{"kind":"source","identifier":"workspace_read"},"confidence":1.0}`
+`{\"relation\":\"observes\",\"target\":{\"kind\":\"source\",`
+`\"identifier\":\"workspace_read\"},\"confidence\":1.0}`
 """
 
-TEACHER_SEMANTIC_TEXT_TARGET_CHARS = 160
-TEACHER_SEMANTIC_TEXT_PREFERRED_MAX_CHARS = 240
+TEACHER_SEMANTIC_TEXT_PREFERRED_MAX_CHARS = TEACHER_SEMANTIC_TEXT_MAX_CHARS
 TEACHER_PREFERRED_LIVE_CELLS = 6
 
 
@@ -251,9 +261,7 @@ def import_teacher_wave(
         reject_output.parent.mkdir(parents=True, exist_ok=True)
         with reject_output.open("w", encoding="utf-8") as handle:
             for item in rejected:
-                handle.write(
-                    json.dumps(item, ensure_ascii=False, separators=(",", ":")) + "\n"
-                )
+                handle.write(json.dumps(item, ensure_ascii=False, separators=(",", ":")) + "\n")
     return {
         "imported": imported,
         "unchanged": unchanged,
@@ -442,11 +450,28 @@ def dump_teacher_wave_state(records: Iterable[TeacherStageState], path: str | Pa
     output = Path(path)
     output.parent.mkdir(parents=True, exist_ok=True)
     ordered = sorted(records, key=lambda item: (item.task_id, item.stage_index))
-    with output.open("w", encoding="utf-8") as handle:
-        for record in ordered:
-            handle.write(
-                json.dumps(record.to_dict(), ensure_ascii=False, separators=(",", ":")) + "\n"
-            )
+    temporary: Path | None = None
+    try:
+        with tempfile.NamedTemporaryFile(
+            "w",
+            encoding="utf-8",
+            dir=output.parent,
+            prefix=f".{output.name}.",
+            suffix=".tmp",
+            delete=False,
+        ) as handle:
+            temporary = Path(handle.name)
+            for record in ordered:
+                handle.write(
+                    json.dumps(record.to_dict(), ensure_ascii=False, separators=(",", ":"))
+                    + "\n"
+                )
+            handle.flush()
+            os.fsync(handle.fileno())
+        temporary.replace(output)
+    finally:
+        if temporary is not None and temporary.exists():
+            temporary.unlink()
 
 
 def _build_stage_prompt(
@@ -520,7 +545,7 @@ Output schema:
 TASK:
 {task_json}
 
-PHASE: {stage['phase']}
+PHASE: {stage["phase"]}
 
 PREVIOUS_STATE:
 {previous_json}
@@ -544,13 +569,10 @@ def _validate_stage_output(
         missing = sorted(previous_ids - current_ids)
         if missing:
             raise ValueError(
-                "teacher stage dropped existing cells instead of retiring them: "
-                f"{missing}"
+                f"teacher stage dropped existing cells instead of retiring them: {missing}"
             )
     cell_by_id = {cell.cell_id: cell for cell in output.cells}
-    available = {
-        str(item["evidence_id"]): item for item in stage.get("available_evidence", ())
-    }
+    available = {str(item["evidence_id"]): item for item in stage.get("available_evidence", ())}
     requested = {need.evidence_id for need in output.needs}
     if requested != set(available):
         raise ValueError(
@@ -571,15 +593,106 @@ def _validate_stage_output(
     if bool(stage.get("terminal", False)):
         if output.needs:
             raise ValueError("terminal teacher stage cannot emit new needs")
-        if not any(
-            cell.roles.get(CognitiveRole.CONCLUSION, 0.0) > 0.0 for cell in output.cells
-        ):
+        if not any(cell.roles.get(CognitiveRole.CONCLUSION, 0.0) > 0.0 for cell in output.cells):
             raise ValueError("terminal teacher stage requires a conclusion-role cell")
-    retired = {
-        cell.cell_id for cell in output.cells if cell.lifecycle is CellLifecycle.RETIRED
-    }
+    retired = {cell.cell_id for cell in output.cells if cell.lifecycle is CellLifecycle.RETIRED}
     if any(need.cell_id in retired for need in output.needs):
         raise ValueError("teacher stage cannot attach a new need to a retired cell")
+
+
+def validate_teacher_stage_tct_quality(
+    stage: Mapping[str, Any],
+    output: TeacherStageOutput,
+) -> None:
+    """Hard TCT quality guard used by the interactive teacher adapter."""
+
+    for cell in output.cells:
+        if len(cell.semantic_text) > TEACHER_SEMANTIC_TEXT_MAX_CHARS:
+            raise ValueError(
+                "teacher cell semantic_text exceeds interactive TCT limit "
+                f"({len(cell.semantic_text)} > {TEACHER_SEMANTIC_TEXT_MAX_CHARS})"
+            )
+
+    live_cells = [cell for cell in output.cells if cell.lifecycle is not CellLifecycle.RETIRED]
+    cell_by_id = {cell.cell_id: cell for cell in live_cells}
+    available = {str(item["evidence_id"]): item for item in stage.get("available_evidence", ())}
+    for need in output.needs:
+        contract = available.get(need.evidence_id)
+        if contract is None:
+            continue
+        source = str(contract["source"])
+        cell = cell_by_id.get(need.cell_id)
+        if cell is None or not _has_source_link(cell, LinkRelation.REQUESTS, source):
+            raise ValueError(
+                f"teacher need cell {need.cell_id!r} must carry requests link to source {source!r}"
+            )
+
+    arrived = stage.get("arrived_evidence")
+    if arrived is not None:
+        source = str(arrived.get("source", ""))
+        percepts = [cell for cell in live_cells if cell.roles.get(CognitiveRole.PERCEPT, 0.0) > 0.0]
+        if not percepts:
+            raise ValueError("arrived evidence must be represented by a percept cell")
+        if not any(cell.anchors for cell in percepts):
+            raise ValueError("arrived evidence percept must carry at least one grounding anchor")
+        if source and not any(
+            _has_source_link(cell, LinkRelation.OBSERVES, source) for cell in percepts
+        ):
+            raise ValueError(
+                f"arrived evidence percept must carry observes link to source {source!r}"
+            )
+        raw_text = _arrived_evidence_text(arrived.get("value"))
+        if raw_text:
+            normalized_raw = " ".join(raw_text.casefold().split())
+            for cell in percepts:
+                normalized_cell = " ".join(cell.semantic_text.casefold().split())
+                if len(normalized_cell) >= 96 and normalized_cell in normalized_raw:
+                    raise ValueError(
+                        "percept semantic_text appears to copy arrived evidence verbatim; "
+                        "rewrite it as compact task-relevant state"
+                    )
+
+    if bool(stage.get("terminal", False)):
+        percept_ids = {
+            cell.cell_id for cell in live_cells if cell.roles.get(CognitiveRole.PERCEPT, 0.0) > 0.0
+        }
+        conclusions = [
+            cell for cell in live_cells if cell.roles.get(CognitiveRole.CONCLUSION, 0.0) > 0.0
+        ]
+        if percept_ids and not any(
+            link.relation is LinkRelation.DERIVED_FROM
+            and link.target.kind is ObjectKind.CELL
+            and link.target.identifier in percept_ids
+            for cell in conclusions
+            for link in cell.links
+        ):
+            raise ValueError(
+                "terminal conclusion must carry a derived_from link to visible percept evidence"
+            )
+
+
+def _has_source_link(cell: TeacherCellPlan, relation: LinkRelation, source: str) -> bool:
+    return any(
+        link.relation is relation
+        and link.target.kind is ObjectKind.SOURCE
+        and link.target.identifier == source
+        for link in cell.links
+    )
+
+
+def _arrived_evidence_text(value: Any) -> str:
+    if isinstance(value, dict):
+        sentences = value.get("sentences")
+        if isinstance(sentences, list):
+            return " ".join(str(item) for item in sentences)
+        return str(value.get("text") or value.get("value") or "")
+    if isinstance(value, list):
+        return " ".join(
+            str(item.get("title") or item.get("resource_id") or "")
+            for item in value
+            if isinstance(item, dict)
+        )
+    return str(value or "")
 
 
 def teacher_stage_soft_warning_codes(

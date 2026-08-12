@@ -8,7 +8,12 @@ import time
 from dataclasses import asdict
 from pathlib import Path
 
+from cid.computational_training import (
+    ComputationalTrainingConfig,
+    build_computational_training,
+)
 from cid.contracts import FreshnessDemand, InformationNeed, ModelContext, ModelUpdate
+from cid.correction_training import CorrectionTrainingConfig, build_correction_training
 from cid.data import dump_jsonl, load_jsonl
 from cid.dataset import dump_dataset_manifest, inspect_dataset
 from cid.distill import (
@@ -101,6 +106,59 @@ def _generate_synthetic(args: argparse.Namespace) -> None:
     print(f"wrote={len(examples)} path={output}")
 
 
+def _build_computational_training(args: argparse.Namespace) -> None:
+    manifest = build_computational_training(
+        tasks_output=args.tasks_output,
+        requests_output=args.requests_output,
+        causal_jobs_output=args.causal_jobs_output,
+        manifest_output=args.manifest_output,
+        config=ComputationalTrainingConfig(
+            count_per_family=args.count_per_family,
+            seed=args.seed,
+        ),
+    )
+    print(
+        f"tasks={manifest['tasks']} families={len(manifest['family_counts'])} "
+        f"tasks_path={manifest['tasks_path']} causal_jobs={manifest['causal_jobs']}"
+    )
+
+
+def _build_correction_training(args: argparse.Namespace) -> None:
+    manifest = build_correction_training(
+        tasks_output=args.tasks_output,
+        requests_output=args.requests_output,
+        causal_jobs_output=args.causal_jobs_output,
+        manifest_output=args.manifest_output,
+        config=CorrectionTrainingConfig(
+            count_per_family=args.count_per_family,
+            seed=args.seed,
+        ),
+    )
+    print(
+        f"tasks={manifest['tasks']} families={len(manifest['family_counts'])} "
+        f"tasks_path={manifest['tasks_path']} causal_jobs={manifest['causal_jobs']}"
+    )
+
+
+def _build_symbolic_training(args: argparse.Namespace) -> None:
+    from cid.symbolic_training import SymbolicTrainingConfig, build_symbolic_training
+
+    manifest = build_symbolic_training(
+        tasks_output=args.tasks_output,
+        requests_output=args.requests_output,
+        causal_jobs_output=args.causal_jobs_output,
+        manifest_output=args.manifest_output,
+        config=SymbolicTrainingConfig(
+            count_per_family=args.count_per_family,
+            seed=args.seed,
+        ),
+    )
+    print(
+        f"tasks={manifest['tasks']} families={len(manifest['family_counts'])} "
+        f"tasks_path={manifest['tasks_path']} causal_jobs={manifest['causal_jobs']}"
+    )
+
+
 def _prepare_distillation(args: argparse.Namespace) -> None:
     from cid.causal_distill import dump_causal_teacher_jobs
 
@@ -140,12 +198,9 @@ def _compile_distillation(args: argparse.Namespace) -> None:
     output.parent.mkdir(parents=True, exist_ok=True)
     dump_jsonl(examples, output)
     transition_count = sum(
-        max(0, len({target.step for target in example.thought_targets}) - 1)
-        for example in examples
+        max(0, len({target.step for target in example.thought_targets}) - 1) for example in examples
     )
-    print(
-        f"compiled={len(examples)} transitions={transition_count} path={output}"
-    )
+    print(f"compiled={len(examples)} transitions={transition_count} path={output}")
 
 
 def _review_distillation(args: argparse.Namespace) -> None:
@@ -175,6 +230,16 @@ def _dataset_manifest(args: argparse.Namespace) -> None:
     print(
         f"examples={manifest.examples} transitions={manifest.transitions} "
         f"sha256={manifest.sha256} path={output}"
+    )
+
+
+def _materialize_trajectory_mixture(args: argparse.Namespace) -> None:
+    from cid.trajectory_mixture import materialize_trajectory_mixture
+
+    manifest = materialize_trajectory_mixture(args.spec, args.output, args.manifest_output)
+    print(
+        f"examples={manifest['examples']} transitions={manifest['transitions']} "
+        f"sha256={manifest['sha256']} path={args.output} manifest={args.manifest_output}"
     )
 
 
@@ -258,6 +323,25 @@ def _teacher_wave_status(args: argparse.Namespace) -> None:
     print(json.dumps(report, ensure_ascii=False, sort_keys=True))
 
 
+def _teacher_agent_checkout(args: argparse.Namespace) -> None:
+    from cid.teacher_agent import checkout_teacher_agent_batch
+
+    report = checkout_teacher_agent_batch(
+        args.jobs,
+        args.state,
+        args.workspace,
+        max_requests=args.max_requests,
+    )
+    print(json.dumps(report, ensure_ascii=False, sort_keys=True))
+
+
+def _teacher_agent_commit(args: argparse.Namespace) -> None:
+    from cid.teacher_agent import commit_teacher_agent_batch
+
+    report = commit_teacher_agent_batch(args.workspace)
+    print(json.dumps(report, ensure_ascii=False, sort_keys=True))
+
+
 def _benchmark(args: argparse.Namespace) -> None:
     import torch
     import torch.distributed as dist
@@ -314,6 +398,7 @@ def _benchmark(args: argparse.Namespace) -> None:
     tokenizer = AutoTokenizer.from_pretrained(args.model, **tokenizer_kwargs)
 
     try:
+
         def load_adapter() -> ILLaDACIDAdapter:
             return ILLaDACIDAdapter.from_pretrained(
                 args.model,
@@ -538,9 +623,7 @@ def _train_stage_a(args: argparse.Namespace) -> None:
             parameter.numel() for parameter in adapter.parameters() if parameter.requires_grad
         )
         if rank == 0:
-            effective_batch = (
-                args.micro_batch_size * args.gradient_accumulation_steps * world_size
-            )
+            effective_batch = args.micro_batch_size * args.gradient_accumulation_steps * world_size
             print(
                 f"device={device} world_size={world_size} dtype={args.dtype} "
                 f"examples={len(examples)} transitions={transition_count_total} "
@@ -735,9 +818,7 @@ def _train_stage_b(args: argparse.Namespace) -> None:
         output_dir = Path(args.output_dir)
         if rank == 0:
             output_dir.mkdir(parents=True, exist_ok=True)
-            effective_batch = (
-                args.micro_batch_size * args.gradient_accumulation_steps * world_size
-            )
+            effective_batch = args.micro_batch_size * args.gradient_accumulation_steps * world_size
             print(
                 f"stage=B device={device} world_size={world_size} dtype={args.dtype} "
                 f"examples={len(examples)} transitions={transition_count_total} "
@@ -797,6 +878,60 @@ def main() -> None:
     synthetic.add_argument("--count-per-family", type=int, default=32)
     synthetic.add_argument("--seed", type=int, default=0)
     synthetic.add_argument("--thought-capacity", type=int, default=8)
+    computational = subparsers.add_parser(
+        "build-computational-training",
+        help="build generated calculator/Python/lookup semantic teacher tasks",
+    )
+    computational.add_argument(
+        "--tasks-output", default="data/generated/computational-teacher-tasks-v1.jsonl"
+    )
+    computational.add_argument(
+        "--requests-output", default="data/generated/computational-teacher-requests-v1.jsonl"
+    )
+    computational.add_argument(
+        "--causal-jobs-output", default="data/generated/computational-teacher-causal-v1.jsonl"
+    )
+    computational.add_argument(
+        "--manifest-output", default="data/generated/computational-teacher-v1.manifest.json"
+    )
+    computational.add_argument("--count-per-family", type=int, default=1200)
+    computational.add_argument("--seed", type=int, default=20260812)
+    correction = subparsers.add_parser(
+        "build-correction-training",
+        help="build speculative-error/local-correction semantic teacher tasks",
+    )
+    correction.add_argument(
+        "--tasks-output", default="data/generated/correction-teacher-tasks-v1.jsonl"
+    )
+    correction.add_argument(
+        "--requests-output", default="data/generated/correction-teacher-requests-v1.jsonl"
+    )
+    correction.add_argument(
+        "--causal-jobs-output", default="data/generated/correction-teacher-causal-v1.jsonl"
+    )
+    correction.add_argument(
+        "--manifest-output", default="data/generated/correction-teacher-v1.manifest.json"
+    )
+    correction.add_argument("--count-per-family", type=int, default=1000)
+    correction.add_argument("--seed", type=int, default=20260812)
+    symbolic = subparsers.add_parser(
+        "build-symbolic-training",
+        help="build generated symbolic algebra/calculus semantic teacher tasks",
+    )
+    symbolic.add_argument(
+        "--tasks-output", default="data/generated/symbolic-teacher-tasks-v1.jsonl"
+    )
+    symbolic.add_argument(
+        "--requests-output", default="data/generated/symbolic-teacher-requests-v1.jsonl"
+    )
+    symbolic.add_argument(
+        "--causal-jobs-output", default="data/generated/symbolic-teacher-causal-v1.jsonl"
+    )
+    symbolic.add_argument(
+        "--manifest-output", default="data/generated/symbolic-teacher-v1.manifest.json"
+    )
+    symbolic.add_argument("--count-per-family", type=int, default=1200)
+    symbolic.add_argument("--seed", type=int, default=20260812)
     prepare = subparsers.add_parser(
         "prepare-distillation",
         help="convert CID trajectories into timing-free teacher task/request JSONL",
@@ -831,6 +966,13 @@ def main() -> None:
     )
     manifest.add_argument("--data", required=True)
     manifest.add_argument("--output", required=True)
+    trajectory_mixture = subparsers.add_parser(
+        "materialize-trajectory-mixture",
+        help="verify and concatenate pinned CID trajectory components into one training JSONL",
+    )
+    trajectory_mixture.add_argument("--spec", required=True)
+    trajectory_mixture.add_argument("--output", required=True)
+    trajectory_mixture.add_argument("--manifest-output", required=True)
     public_pool = subparsers.add_parser(
         "build-public-task-pool",
         help="build the pinned public semantic-task pool from registered training splits",
@@ -845,9 +987,7 @@ def main() -> None:
         "prepare-public-distillation",
         help="convert the public semantic-task pool into teacher-ready CID tasks",
     )
-    public_distill.add_argument(
-        "--data", default="data/generated/public-task-pool-v1.jsonl"
-    )
+    public_distill.add_argument("--data", default="data/generated/public-task-pool-v1.jsonl")
     public_distill.add_argument(
         "--tasks-output", default="data/generated/public-teacher-tasks-v1.train.jsonl"
     )
@@ -860,9 +1000,7 @@ def main() -> None:
     public_distill.add_argument(
         "--causal-jobs-output", default="data/generated/public-teacher-causal-v1.train.jsonl"
     )
-    public_distill.add_argument(
-        "--split", choices=("train", "validation", "test"), default="train"
-    )
+    public_distill.add_argument("--split", choices=("train", "validation", "test"), default="train")
     public_distill.add_argument("--seed", type=int, default=20260809)
     public_distill.add_argument("--unnecessary-tool-fraction", type=float, default=0.10)
     wave_export = subparsers.add_parser(
@@ -896,6 +1034,19 @@ def main() -> None:
     )
     wave_status.add_argument("--jobs", required=True)
     wave_status.add_argument("--state", required=True)
+    agent_checkout = subparsers.add_parser(
+        "teacher-agent-checkout",
+        help="stage a compact resumable causal-teacher batch for an interactive LSM agent",
+    )
+    agent_checkout.add_argument("--jobs", required=True)
+    agent_checkout.add_argument("--state", required=True)
+    agent_checkout.add_argument("--workspace", default=".cid/teacher-agent")
+    agent_checkout.add_argument("--max-requests", type=int, default=8)
+    agent_commit = subparsers.add_parser(
+        "teacher-agent-commit",
+        help="validate and persist responses from the current interactive teacher batch",
+    )
+    agent_commit.add_argument("--workspace", default=".cid/teacher-agent")
     benchmark = subparsers.add_parser(
         "benchmark",
         help="run a neural CID checkpoint on deterministic replay trajectories",
@@ -984,6 +1135,12 @@ def main() -> None:
         asyncio.run(_run_demo())
     elif args.command == "generate-synthetic":
         _generate_synthetic(args)
+    elif args.command == "build-computational-training":
+        _build_computational_training(args)
+    elif args.command == "build-correction-training":
+        _build_correction_training(args)
+    elif args.command == "build-symbolic-training":
+        _build_symbolic_training(args)
     elif args.command == "prepare-distillation":
         _prepare_distillation(args)
     elif args.command == "compile-distillation":
@@ -992,6 +1149,8 @@ def main() -> None:
         _review_distillation(args)
     elif args.command == "dataset-manifest":
         _dataset_manifest(args)
+    elif args.command == "materialize-trajectory-mixture":
+        _materialize_trajectory_mixture(args)
     elif args.command == "build-public-task-pool":
         _build_public_task_pool(args)
     elif args.command == "prepare-public-distillation":
@@ -1004,6 +1163,10 @@ def main() -> None:
         _teacher_wave_finalize(args)
     elif args.command == "teacher-wave-status":
         _teacher_wave_status(args)
+    elif args.command == "teacher-agent-checkout":
+        _teacher_agent_checkout(args)
+    elif args.command == "teacher-agent-commit":
+        _teacher_agent_commit(args)
     elif args.command == "benchmark":
         _benchmark(args)
     elif args.command == "train":

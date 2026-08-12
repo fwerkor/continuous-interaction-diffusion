@@ -1,0 +1,60 @@
+{
+  "accepted_plans": 12000,
+  "accepted_plans_sha256": "08dbc9ebcbad34977108b7ad4f117e2536dc3c5ad3adeda6606b6717f51ebb2f",
+  "causal_jobs_sha256": "f63562d1f8df1e558a30037bf6e0bf5d283f16325cb523d5afe7f8865b4bc430",
+  "causal_stage_histogram": {
+    "1": 1200,
+    "2": 4800,
+    "3": 3600,
+    "4": 2400
+  },
+  "causal_stages": 31200,
+  "compiled_sha256": "5fdce1d9469c0ecf78aa237e428a40b0c36e9e10e93873fc25989e26a92a1afe",
+  "compiled_trajectories": 24000,
+  "compiled_transitions": 111609,
+  "dependency_depth_histogram": {
+    "0": 1200,
+    "1": 4800,
+    "2": 6000
+  },
+  "family_counts": {
+    "applied_formula": 1200,
+    "calculator_then_python": 1200,
+    "calculator_unnecessary": 1200,
+    "direct_calculator": 1200,
+    "lookup_then_calculator": 1200,
+    "parallel_calculator": 1200,
+    "parallel_lookup_merge": 1200,
+    "python_enumeration": 1200,
+    "python_statistics": 1200,
+    "sequential_calculator": 1200
+  },
+  "format_version": 1,
+  "max_teacher_semantic_text_chars": 88,
+  "mode_counts": {
+    "tool_required": 10800,
+    "tools_available_unnecessary": 1200
+  },
+  "name": "computational-teacher-v1",
+  "parallel_then_merge_tasks": 2400,
+  "plans_sha256": "08dbc9ebcbad34977108b7ad4f117e2536dc3c5ad3adeda6606b6717f51ebb2f",
+  "review_rejected": 0,
+  "review_sha256": "dc35b34520b2df8014173f5bb9ae65db351216e380b294a05fed17252a0416a0",
+  "seed": 20260812,
+  "self_distilled_teacher": "GPT-5.6 Sol",
+  "semantic_tasks": 12000,
+  "sequential_chain_tasks": 3600,
+  "tasks_sha256": "be066237eb26bd2ba9fda60cb93d3c57c1ee2e0d98d74b684abb0b019ebb4a88",
+  "teacher_state_sha256": "b123e704d54f1ac06610e5e7c939e7f23a96a7251d1d5423cf16137b3ca2a0f3",
+  "tool_call_target_counts": {
+    "calculator": 12000,
+    "python": 3600,
+    "record_lookup": 3600
+  },
+  "tool_schema_task_counts": {
+    "calculator": 12000,
+    "python": 4800,
+    "record_lookup": 2400
+  },
+  "variants_per_task": 2
+}

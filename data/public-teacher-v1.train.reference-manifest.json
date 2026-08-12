@@ -1,6 +1,9 @@
 {
+  "accepted_plans_sha256": "4b321b7b79c94448495f861a72065706157f995d22427237fb8f8fae7918ed61",
   "causal_jobs": "data/generated/public-teacher-causal-v1.train.jsonl",
-  "causal_jobs_sha256": "620e95a00081f52f16ef5f598bde5f7699ce821b15d5653899a4bda3bf530953",
+  "causal_jobs_sha256": "7f101139ac44647480ced1b1ffc0dfb5d50aa52b148425c4f636a52d8dff3a96",
+  "compiled_trajectories": 34048,
+  "compiled_transitions": 41548,
   "dependency_depth_histogram": {
     "0": 7664,
     "2": 1366
@@ -21,7 +24,12 @@
     "tool_required": 1366,
     "tools_available_unnecessary": 743
   },
-  "requests_sha256": "723c1774efe92ff99c45902d0fe91a2d3d18e1fcdb4f3488cb1311e82ea8ab96",
+  "python_public_test_tasks": 326,
+  "quarantined": 518,
+  "requests_sha256": "143a1f9e5c7a235418fbf5318d6b106978055329591365ff21b9d33462e49bf0",
+  "review_accepted": 8512,
+  "review_rejected": 518,
+  "review_sha256": "3bc86dd4378b64c7602d20d738ab87e5e5edd6969f3fcd245b04f4db7fdc5d00",
   "seed": 20260809,
   "source_counts": {
     "arc-challenge": 542,
@@ -34,6 +42,8 @@
   },
   "split": "train",
   "tasks": 9030,
-  "tasks_sha256": "5c38ff9cf2b1455c3ec5bb4dec0fddfe66ce6e81f975ec8c5983f4aa5d3c7005",
+  "tasks_sha256": "b6746a3335e6de0d3a57eb798ef9c168baf7452c2ff258a2a626d37176d91623",
+  "trajectory_manifest_sha256": "bfe2dd92f47f092b69a833a84fb18b3a5cc7e260d1bb65b27872c6bbde88695b",
+  "trajectory_sha256": "5a1c41253fb3275670aaeba15a770ae2379e308413158841874937ea4faf71a4",
   "unnecessary_tool_fraction": 0.1
 }

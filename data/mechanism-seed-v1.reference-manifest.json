@@ -1,10 +1,10 @@
 {
-  "bytes": 29448758,
+  "bytes": 29518098,
   "examples": 10000,
   "format_version": 1,
   "max_trajectory_steps": 5,
   "schema": "cid.TrajectoryExample.v1",
-  "sha256": "3a05848637e6fb0428a33ec4ad6d16fc144928ed94c895cf10502f76ad15696d",
+  "sha256": "27c2797c7671f27e8280530a934ad191116c8fe95a22702f9dfd73c8e3c4250e",
   "sources": [
     "counter",
     "docs",

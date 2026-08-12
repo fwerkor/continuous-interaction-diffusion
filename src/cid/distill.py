@@ -20,6 +20,7 @@ from cid.data import (
     TrajectoryExample,
 )
 from cid.grounding import Anchor, CognitiveLink, GroundingEntry, ObjectRef
+from cid.python_review import python_public_test_reason
 from cid.state import CellLifecycle, CognitiveRole
 
 
@@ -48,9 +49,7 @@ class TeacherEvidence:
             depends_on=tuple(str(item) for item in raw.get("depends_on", ())),
             requires_need=bool(raw.get("requires_need", True)),
             version=None if raw.get("version") is None else str(raw["version"]),
-            provenance=(
-                None if raw.get("provenance") is None else str(raw["provenance"])
-            ),
+            provenance=(None if raw.get("provenance") is None else str(raw["provenance"])),
         )
 
     def to_dict(self) -> dict[str, Any]:
@@ -94,9 +93,7 @@ class TeacherTask:
             if item.evidence_id in item.depends_on:
                 raise ValueError("teacher evidence cannot depend on itself")
             if any(dependency not in seen_evidence for dependency in item.depends_on):
-                raise ValueError(
-                    "teacher evidence must be topologically ordered by dependency"
-                )
+                raise ValueError("teacher evidence must be topologically ordered by dependency")
             seen_evidence.add(item.evidence_id)
         source_names = {str(item.get("name", "")) for item in self.source_descriptors}
         unknown = {item.source for item in self.evidence} - source_names
@@ -112,14 +109,10 @@ class TeacherTask:
             source_descriptors=tuple(
                 _source_descriptor(item) for item in raw.get("source_descriptors", ())
             ),
-            evidence=tuple(
-                TeacherEvidence.from_dict(item) for item in raw.get("evidence", ())
-            ),
+            evidence=tuple(TeacherEvidence.from_dict(item) for item in raw.get("evidence", ())),
             metadata=dict(raw.get("metadata", {})),
             reference_answer=(
-                None
-                if raw.get("reference_answer") is None
-                else str(raw["reference_answer"])
+                None if raw.get("reference_answer") is None else str(raw["reference_answer"])
             ),
         )
 
@@ -461,9 +454,7 @@ def teacher_tasks_from_trajectories(
             metadata={
                 **dict(example.metadata),
                 "source_example_id": example.example_id,
-                "task_kind": str(
-                    example.metadata.get("task_kind", "synthetic_mechanism")
-                ),
+                "task_kind": str(example.metadata.get("task_kind", "synthetic_mechanism")),
             },
             reference_answer=example.target_display,
         )
@@ -512,26 +503,31 @@ def compile_teacher_plans(
     config: TeacherScheduleConfig | None = None,
 ) -> tuple[TrajectoryExample, ...]:
     config = config or TeacherScheduleConfig()
-    reviews = review_teacher_plans(tasks, plans)
-    rejected = tuple(review for review in reviews if not review.accepted)
-    if rejected:
-        detail = "; ".join(
-            f"{review.task_id}: {', '.join(review.reasons)}" for review in rejected
-        )
-        raise ValueError(f"teacher plans failed quality review: {detail}")
     plan_by_id = {plan.task_id: plan for plan in plans}
     if len(plan_by_id) != len(plans):
         raise ValueError("teacher plan task IDs must be unique")
-    missing = [task.task_id for task in tasks if task.task_id not in plan_by_id]
-    if missing:
-        raise ValueError(f"missing teacher plans for tasks: {missing}")
-    extra = sorted(set(plan_by_id) - {task.task_id for task in tasks})
+    task_by_id = {task.task_id: task for task in tasks}
+    if len(task_by_id) != len(tasks):
+        raise ValueError("teacher task IDs must be unique")
+    extra = sorted(set(plan_by_id) - set(task_by_id))
     if extra:
         raise ValueError(f"teacher plans contain unknown task IDs: {extra}")
 
+    # `review-distillation` intentionally emits only accepted plans.  The
+    # compiler therefore treats the supplied plan IDs as the selected task
+    # subset while still validating every supplied plan against its task.
+    # This keeps the documented full-tasks + accepted-plans workflow usable
+    # without weakening review completeness at the review stage itself.
+    selected_tasks = tuple(task for task in tasks if task.task_id in plan_by_id)
+    reviews = review_teacher_plans(selected_tasks, plans)
+    rejected = tuple(review for review in reviews if not review.accepted)
+    if rejected:
+        detail = "; ".join(f"{review.task_id}: {', '.join(review.reasons)}" for review in rejected)
+        raise ValueError(f"teacher plans failed quality review: {detail}")
+
     rng = random.Random(config.seed)
     compiled: list[TrajectoryExample] = []
-    for task in tasks:
+    for task in selected_tasks:
         for variant_index in range(config.variants_per_task):
             example = _compile_one(task, plan_by_id[task.task_id], config, rng)
             if config.variants_per_task > 1:
@@ -639,15 +635,11 @@ def dump_teacher_reviews(reviews: Iterable[TeacherReview], path: str | Path) -> 
 
 
 def load_teacher_tasks(path: str | Path) -> tuple[TeacherTask, ...]:
-    return tuple(
-        TeacherTask.from_dict(item) for item in _load_json_objects(path, "teacher task")
-    )
+    return tuple(TeacherTask.from_dict(item) for item in _load_json_objects(path, "teacher task"))
 
 
 def load_teacher_plans(path: str | Path) -> tuple[TeacherPlan, ...]:
-    return tuple(
-        TeacherPlan.from_dict(item) for item in _load_json_objects(path, "teacher plan")
-    )
+    return tuple(TeacherPlan.from_dict(item) for item in _load_json_objects(path, "teacher plan"))
 
 
 def _compile_one(
@@ -676,20 +668,10 @@ def _compile_one(
     if "final" in frame_by_phase:
         semantic_frames.append(frame_by_phase["final"])
     _validate_monotonic_cells(semantic_frames)
-
-    ordered_cell_ids: list[str] = []
-    for frame in semantic_frames:
-        for cell in frame.cells:
-            if cell.cell_id not in ordered_cell_ids:
-                ordered_cell_ids.append(cell.cell_id)
-    if len(ordered_cell_ids) > config.thought_capacity:
-        raise ValueError("teacher plan exceeds configured TCT capacity")
-    slots = dict(
-        zip(
-            ordered_cell_ids,
-            rng.sample(range(config.thought_capacity), len(ordered_cell_ids)),
-            strict=True,
-        )
+    slots_by_phase, visible_cells_by_phase = _allocate_teacher_slots(
+        semantic_frames,
+        config.thought_capacity,
+        rng,
     )
 
     needs_by_evidence = {
@@ -717,9 +699,7 @@ def _compile_one(
     for step, frame in scheduled:
         phase_first_step.setdefault(frame.phase, step)
 
-    binding_targets = tuple(
-        _binding_target(need, task, phase_first_step) for need in plan.needs
-    )
+    binding_targets = tuple(_binding_target(need, task, phase_first_step) for need in plan.needs)
     events = tuple(
         ExternalEvent(
             source=item.source,
@@ -734,7 +714,7 @@ def _compile_one(
     thought_targets = tuple(
         ThoughtTarget(
             step=step,
-            slot=slots[cell.cell_id],
+            slot=slots_by_phase[frame.phase][cell.cell_id],
             cell_id=cell.cell_id,
             semantic_text=cell.semantic_text,
             roles=cell.roles,
@@ -744,6 +724,7 @@ def _compile_one(
         )
         for step, frame in scheduled
         for cell in frame.cells
+        if cell.cell_id in visible_cells_by_phase[frame.phase]
     )
     display_targets = tuple(
         DisplayTarget(step=step, text=frame.display) for step, frame in scheduled
@@ -757,6 +738,7 @@ def _compile_one(
         )
         for step, frame in scheduled
         for cell in frame.cells
+        if cell.cell_id in visible_cells_by_phase[frame.phase]
         if cell.anchors or cell.links
     )
     grounding_catalog = _grounding_catalog(semantic_frames)
@@ -813,9 +795,7 @@ def _event_schedule(
         dependency_steps = [arrival_steps[item] for item in evidence.depends_on]
         launch_step = max((*activation_steps, *dependency_steps, 0))
         launch_steps[evidence.evidence_id] = launch_step
-        proposed_arrival = launch_step + rng.randint(
-            config.min_delay_steps, config.max_delay_steps
-        )
+        proposed_arrival = launch_step + rng.randint(config.min_delay_steps, config.max_delay_steps)
         # Teacher semantic frames are generated in evidence-list order. Sibling calls may launch
         # together, but their sampled arrivals remain strictly ordered so the same semantic plan is
         # valid while I/O still overlaps in flight.
@@ -857,9 +837,7 @@ def _schedule_frames(
         arriving_ids = (
             set()
             if arriving_evidence_id is None
-            else {
-                need.cell_id for need in needs_by_evidence[arriving_evidence_id]
-            }
+            else {need.cell_id for need in needs_by_evidence[arriving_evidence_id]}
         )
         runtime_frame = _runtime_frame(current_semantic, waiting_ids, arriving_ids)
         scheduled.append((step, runtime_frame))
@@ -927,6 +905,7 @@ def _validate_need_contract(
 
 def _validate_monotonic_cells(frames: list[TeacherFrame]) -> None:
     previous: set[str] = set()
+    retired: set[str] = set()
     for frame in frames:
         current = {cell.cell_id for cell in frame.cells}
         missing = previous - current
@@ -934,7 +913,87 @@ def _validate_monotonic_cells(frames: list[TeacherFrame]) -> None:
             raise ValueError(
                 f"teacher frame {frame.phase!r} removed cells without retirement: {sorted(missing)}"
             )
+        reactivated = {
+            cell.cell_id
+            for cell in frame.cells
+            if cell.cell_id in retired and cell.lifecycle is not CellLifecycle.RETIRED
+        }
+        if reactivated:
+            raise ValueError(
+                f"teacher frame {frame.phase!r} reactivated retired cells: {sorted(reactivated)}"
+            )
+        retired.update(
+            cell.cell_id for cell in frame.cells if cell.lifecycle is CellLifecycle.RETIRED
+        )
         previous = current
+
+
+def _allocate_teacher_slots(
+    frames: list[TeacherFrame],
+    capacity: int,
+    rng: random.Random,
+) -> tuple[dict[str, dict[str, int]], dict[str, frozenset[str]]]:
+    """Allocate physical TCT slots while recycling retired semantic cells.
+
+    A retirement transition remains supervised for one semantic frame.  Once a
+    cell was already retired in the previous frame, it no longer occupies a
+    physical slot and its slot may be reused by a later cell.  This mirrors the
+    runtime RETIRED -> EMPTY reclamation contract while preserving an explicit
+    retirement target for the model.
+    """
+
+    if capacity <= 0:
+        raise ValueError("thought capacity must be positive")
+
+    free_slots = list(rng.sample(range(capacity), capacity))
+    active_slots: dict[str, int] = {}
+    previous_lifecycle: dict[str, CellLifecycle] = {}
+    slots_by_phase: dict[str, dict[str, int]] = {}
+    visible_by_phase: dict[str, frozenset[str]] = {}
+
+    for frame in frames:
+        live_ids = [
+            cell.cell_id for cell in frame.cells if cell.lifecycle is not CellLifecycle.RETIRED
+        ]
+        retiring_ids = [
+            cell.cell_id
+            for cell in frame.cells
+            if cell.lifecycle is CellLifecycle.RETIRED
+            and previous_lifecycle.get(cell.cell_id) is not None
+            and previous_lifecycle[cell.cell_id] is not CellLifecycle.RETIRED
+        ]
+        visible_ids = [*live_ids, *retiring_ids]
+        if len(visible_ids) > capacity:
+            raise ValueError(
+                "teacher plan exceeds configured TCT capacity after retired-cell reclamation"
+            )
+
+        for cell_id in live_ids:
+            if cell_id in active_slots:
+                continue
+            if not free_slots:
+                raise ValueError(
+                    "teacher plan exceeds configured TCT capacity after retired-cell reclamation"
+                )
+            active_slots[cell_id] = free_slots.pop()
+
+        # Retiring cells must still own their old slot for this frame so the
+        # retirement transition has a target. They are released immediately
+        # after the phase and can be reused by subsequent semantic frames.
+        for cell_id in retiring_ids:
+            if cell_id not in active_slots:
+                raise ValueError(f"retiring teacher cell has no physical slot: {cell_id}")
+
+        slots_by_phase[frame.phase] = {
+            cell_id: active_slots[cell_id] for cell_id in visible_ids
+        }
+        visible_by_phase[frame.phase] = frozenset(visible_ids)
+
+        for cell_id in retiring_ids:
+            free_slots.append(active_slots.pop(cell_id))
+        previous_lifecycle = {cell.cell_id: cell.lifecycle for cell in frame.cells}
+
+    return slots_by_phase, visible_by_phase
 
 
 def _runtime_frame(
@@ -964,18 +1023,28 @@ def _grounding_catalog(frames: list[TeacherFrame]) -> tuple[GroundingEntry, ...]
             for anchor in cell.anchors:
                 existing = anchors.get(anchor.anchor_id)
                 if existing is not None and existing != anchor:
-                    raise ValueError(
-                        f"anchor ID changes meaning across teacher frames: {anchor.anchor_id}"
+                    # Entity anchors are keyed from a case-insensitive canonical
+                    # value, while evidence titles can legitimately vary only in
+                    # capitalization across frames (`De Martino`/`de Martino`).
+                    # An identical object ID therefore denotes the same grounding;
+                    # retain the first display spelling for catalog stability.
+                    same_object = (
+                        existing.kind is anchor.kind
+                        and existing.object_id is not None
+                        and existing.object_id == anchor.object_id
                     )
+                    if not same_object:
+                        raise ValueError(
+                            f"anchor ID changes meaning across teacher frames: {anchor.anchor_id}"
+                        )
+                    continue
                 anchors[anchor.anchor_id] = anchor
     return tuple(GroundingEntry(anchor=anchor) for anchor in anchors.values())
 
 
 def _source_descriptor(raw: Mapping[str, Any]) -> dict[str, Any]:
     descriptor = dict(raw)
-    descriptor["arguments"] = tuple(
-        dict(argument) for argument in descriptor.get("arguments", ())
-    )
+    descriptor["arguments"] = tuple(dict(argument) for argument in descriptor.get("arguments", ()))
     return descriptor
 
 
@@ -1054,9 +1123,7 @@ def _teacher_quality_reasons(
         reasons.append(str(exc) or "invalid teacher need contract")
 
     evidence_by_id = {item.evidence_id: item for item in task.evidence}
-    source_by_name = {
-        str(item.get("name", "")): item for item in task.source_descriptors
-    }
+    source_by_name = {str(item.get("name", "")): item for item in task.source_descriptors}
     needs_by_evidence = {
         evidence.evidence_id: tuple(
             need for need in plan.needs if need.evidence_id == evidence.evidence_id
@@ -1066,9 +1133,7 @@ def _teacher_quality_reasons(
     for evidence in task.evidence:
         evidence_needs = needs_by_evidence[evidence.evidence_id]
         if evidence.requires_need and len(evidence_needs) != 1:
-            reasons.append(
-                f"evidence {evidence.evidence_id} requires exactly one activating need"
-            )
+            reasons.append(f"evidence {evidence.evidence_id} requires exactly one activating need")
         if not evidence.requires_need and evidence_needs:
             reasons.append(
                 f"evidence {evidence.evidence_id} reuses a persistent binding and must not "
@@ -1107,14 +1172,17 @@ def _teacher_quality_reasons(
     final_frame = semantic_frames[-1]
     if final_frame.display.strip() != plan.final_answer.strip():
         reasons.append("final frame display does not match final_answer")
-    if not any(
-        cell.roles.get(CognitiveRole.CONCLUSION, 0.0) > 0.0
-        for cell in final_frame.cells
-    ):
+    if not any(cell.roles.get(CognitiveRole.CONCLUSION, 0.0) > 0.0 for cell in final_frame.cells):
         reasons.append("final frame has no conclusion-role cell")
     reference_reason = _reference_answer_reason(task, plan)
     if reference_reason is not None:
         reasons.append(reference_reason)
+    if str(task.metadata.get("task_kind", "")) == "python_programming":
+        public_tests = tuple(str(item) for item in task.metadata.get("public_tests", ()))
+        setup = str(task.metadata.get("public_test_setup_code", ""))
+        python_reason = python_public_test_reason(plan.final_answer, public_tests, setup)
+        if python_reason is not None:
+            reasons.append(python_reason)
     reasons.extend(_future_evidence_leaks(task, semantic_frames))
     return tuple(dict.fromkeys(reasons))
 
@@ -1149,6 +1217,11 @@ def _reference_answer_reason(task: TeacherTask, plan: TeacherPlan) -> str | None
         "science_multiple_choice",
         "synthetic_mechanism",
     }:
+        insufficiency = _evidence_insufficiency_match(plan.final_answer)
+        if insufficiency is not None:
+            supported_prefix = plan.final_answer[: insufficiency.start()].strip(" ,.;:-")
+            if not supported_prefix or not _normalized_answer_match(supported_prefix, reference):
+                return "final_answer does not match the public reference answer"
         if not _normalized_answer_match(plan.final_answer, reference):
             return "final_answer does not match the public reference answer"
         return None
@@ -1156,7 +1229,216 @@ def _reference_answer_reason(task: TeacherTask, plan: TeacherPlan) -> str | None
         plan.final_answer, reference
     ):
         return "final_answer does not match the public numerical reference answer"
+    if kind == "competition_math":
+        if _competition_math_answer_match(plan.final_answer, reference):
+            return None
+        if _competition_math_choice_match(task.prompt, plan.final_answer, reference):
+            return None
+        return "final_answer does not match the public competition-math reference answer"
     return None
+
+
+_QA_INSUFFICIENCY_PATTERN = re.compile(
+    r"\b(?:visible|support) evidence\b[^.]{0,160}\b"
+    r"(?:does not|cannot|not stated|not establish|gives no)\b|"
+    r"\bdid not\b[^.;]{0,120}\bin the visible (?:account|evidence)\b|"
+    r"\bno minimum age\b|"
+    r"\b(?:cannot be resolved|not established|not reliably established|not explicitly stated|"
+    r"does not establish|does not state|does not give)\b",
+    re.IGNORECASE,
+)
+
+
+def _evidence_insufficiency_match(value: str) -> re.Match[str] | None:
+    return _QA_INSUFFICIENCY_PATTERN.search(value)
+
+
+def _looks_like_evidence_insufficient_answer(value: str) -> bool:
+    return _evidence_insufficiency_match(value) is not None
+
+
+_QA_COUNTRY_ALIASES = {
+    "american": "united states",
+    "america": "united states",
+    "united states": "united states",
+    "united states american": "united states",
+    "united states of america": "united states",
+    "usa": "united states",
+    "u s": "united states",
+    "british": "united kingdom",
+    "english": "united kingdom",
+    "england": "united kingdom",
+    "scottish": "united kingdom",
+    "welsh": "united kingdom",
+    "northern irish": "united kingdom",
+    "united kingdom": "united kingdom",
+    "uk": "united kingdom",
+    "indian": "india",
+    "india": "india",
+    "canadian": "canada",
+    "canada": "canada",
+    "australian": "australia",
+    "australia": "australia",
+    "german": "germany",
+    "germany": "germany",
+    "french": "france",
+    "france": "france",
+    "italian": "italy",
+    "italy": "italy",
+    "spanish": "spain",
+    "spain": "spain",
+    "norwegian": "norway",
+    "norway": "norway",
+    "dutch": "netherlands",
+    "netherlands": "netherlands",
+    "swiss": "switzerland",
+    "switzerland": "switzerland",
+    "swedish": "sweden",
+    "sweden": "sweden",
+    "finnish": "finland",
+    "finland": "finland",
+    "polish": "poland",
+    "poland": "poland",
+    "irish": "ireland",
+    "ireland": "ireland",
+    "danish": "denmark",
+    "denmark": "denmark",
+    "icelandic": "iceland",
+    "iceland": "iceland",
+    "austrian": "austria",
+    "austria": "austria",
+    "belgian": "belgium",
+    "belgium": "belgium",
+    "portuguese": "portugal",
+    "portugal": "portugal",
+    "greek": "greece",
+    "greece": "greece",
+    "turkish": "turkey",
+    "turkey": "turkey",
+    "russian": "russia",
+    "russia": "russia",
+    "ukrainian": "ukraine",
+    "ukraine": "ukraine",
+    "iranian": "iran",
+    "iran": "iran",
+    "syrian": "syria",
+    "syria": "syria",
+    "israeli": "israel",
+    "israel": "israel",
+    "egyptian": "egypt",
+    "egypt": "egypt",
+    "south african": "south africa",
+    "south africa": "south africa",
+    "argentine": "argentina",
+    "argentinian": "argentina",
+    "argentina": "argentina",
+    "brazilian": "brazil",
+    "brazil": "brazil",
+    "mexican": "mexico",
+    "mexico": "mexico",
+    "colombian": "colombia",
+    "colombia": "colombia",
+    "chilean": "chile",
+    "chile": "chile",
+    "peruvian": "peru",
+    "peru": "peru",
+    "japanese": "japan",
+    "japan": "japan",
+    "chinese": "china",
+    "china": "china",
+    "south korean": "south korea",
+    "south korea": "south korea",
+    "pakistani": "pakistan",
+    "pakistan": "pakistan",
+    "bangladeshi": "bangladesh",
+    "bangladesh": "bangladesh",
+    "sri lankan": "sri lanka",
+    "sri lanka": "sri lanka",
+    "indonesian": "indonesia",
+    "indonesia": "indonesia",
+    "malaysian": "malaysia",
+    "malaysia": "malaysia",
+    "singaporean": "singapore",
+    "singapore": "singapore",
+    "thai": "thailand",
+    "thailand": "thailand",
+    "vietnamese": "vietnam",
+    "vietnam": "vietnam",
+    "filipino": "philippines",
+    "philippine": "philippines",
+    "philippines": "philippines",
+    "hungarian": "hungary",
+    "hungary": "hungary",
+    "czech": "czechia",
+    "czech republic": "czechia",
+    "czechia": "czechia",
+    "slovak": "slovakia",
+    "slovakia": "slovakia",
+    "romanian": "romania",
+    "romania": "romania",
+    "bulgarian": "bulgaria",
+    "bulgaria": "bulgaria",
+    "croatian": "croatia",
+    "croatia": "croatia",
+    "serbian": "serbia",
+    "serbia": "serbia",
+    "slovenian": "slovenia",
+    "slovenia": "slovenia",
+    "cypriot": "cyprus",
+    "cyprus": "cyprus",
+    "cambodian": "cambodia",
+    "cambodia": "cambodia",
+    "armenian": "armenia",
+    "armenia": "armenia",
+}
+
+
+_QA_SURFACE_ALIASES = {
+    "abc": "american broadcasting company",
+    "american broadcasting company": "american broadcasting company",
+    "bombay": "mumbai",
+    "mumbai": "mumbai",
+    "mumbai india": "mumbai",
+    "bombay india": "mumbai",
+    "parisian": "paris",
+    "paris": "paris",
+    "malbork": "malbork",
+    "marienburg": "malbork",
+    "marienburg german empire": "malbork",
+    "wallachia": "wallachia",
+    "principality of wallachia": "wallachia",
+    "oscar for best picture": "academy award best picture",
+    "academy award for best picture": "academy award best picture",
+    "jaz": "jazz",
+    "jazz": "jazz",
+    "north west": "northwest",
+    "northwest": "northwest",
+}
+
+
+_QA_NUMBER_WORDS = {
+    "zero": "0",
+    "one": "1",
+    "two": "2",
+    "three": "3",
+    "four": "4",
+    "five": "5",
+    "six": "6",
+    "seven": "7",
+    "eight": "8",
+    "nine": "9",
+    "ten": "10",
+    "eleven": "11",
+    "twelve": "12",
+    "thirteen": "13",
+    "fourteen": "14",
+    "fifteen": "15",
+    "sixteen": "16",
+    "seventeen": "17",
+    "eighteen": "18",
+    "nineteen": "19",
+    "twenty": "20",
+}
 
 
 def _normalized_answer_match(prediction: str, reference: str) -> bool:
@@ -1166,7 +1448,59 @@ def _normalized_answer_match(prediction: str, reference: str) -> bool:
         return True
     if not predicted or not expected:
         return False
+    if expected in {"yes", "no"} and predicted.startswith(expected):
+        suffix = predicted[len(expected) :]
+        if (
+            not suffix
+            or suffix[:1].isspace()
+            or prediction.lstrip().casefold().startswith(expected + "—")
+        ):
+            return True
+    predicted_country = _QA_COUNTRY_ALIASES.get(predicted)
+    expected_country = _QA_COUNTRY_ALIASES.get(expected)
+    if predicted_country is not None and predicted_country == expected_country:
+        return True
+    predicted_surface = _QA_SURFACE_ALIASES.get(predicted)
+    expected_surface = _QA_SURFACE_ALIASES.get(expected)
+    if predicted_surface is not None and predicted_surface == expected_surface:
+        return True
+    predicted_number_word = _QA_NUMBER_WORDS.get(predicted, predicted)
+    expected_number_word = _QA_NUMBER_WORDS.get(expected, expected)
+    if predicted_number_word == expected_number_word:
+        return True
+    predicted_date = _canonical_calendar_date(predicted)
+    expected_date = _canonical_calendar_date(expected)
+    if predicted_date is not None and predicted_date == expected_date:
+        return True
+    predicted_partial_date = _canonical_partial_calendar_date(predicted)
+    expected_partial_date = _canonical_partial_calendar_date(expected)
+    if (
+        predicted_date is not None
+        and expected_partial_date is not None
+        and predicted_date[1:] == expected_partial_date
+    ):
+        return True
+    if (
+        expected_date is not None
+        and predicted_partial_date is not None
+        and expected_date[1:] == predicted_partial_date
+    ):
+        return True
+    if (
+        predicted_partial_date is not None
+        and predicted_partial_date == expected_partial_date
+    ):
+        return True
+    if _numeric_surface_match(prediction, reference):
+        return True
+    numeric_reference_match = _numeric_reference_leading_match(prediction, reference)
+    if numeric_reference_match is not None:
+        return numeric_reference_match
     predicted_tokens = predicted.split()
+    if expected_date is not None and len(predicted_tokens) >= 3:
+        leading_date = _canonical_calendar_date(" ".join(predicted_tokens[:3]))
+        if leading_date == expected_date:
+            return True
     expected_tokens = expected.split()
     if len(predicted_tokens) <= len(expected_tokens):
         return False
@@ -1175,6 +1509,109 @@ def _normalized_answer_match(prediction: str, reference: str) -> bool:
         predicted_tokens[index : index + width] == expected_tokens
         for index in range(len(predicted_tokens) - width + 1)
     )
+
+
+_QA_MONTH_NUMBERS = {
+    "january": 1,
+    "february": 2,
+    "march": 3,
+    "april": 4,
+    "may": 5,
+    "june": 6,
+    "july": 7,
+    "august": 8,
+    "september": 9,
+    "october": 10,
+    "november": 11,
+    "december": 12,
+}
+
+
+def _canonical_calendar_date(normalized: str) -> tuple[int, int, int] | None:
+    tokens = normalized.split()
+    if len(tokens) != 3:
+        return None
+    if tokens[0] in _QA_MONTH_NUMBERS:
+        month_token, day_token, year_token = tokens
+    elif tokens[1] in _QA_MONTH_NUMBERS:
+        day_token, month_token, year_token = tokens
+    else:
+        return None
+    day_token = re.sub(r"(?:st|nd|rd|th)$", "", day_token)
+    if not day_token.isdigit() or not year_token.isdigit():
+        return None
+    day = int(day_token)
+    year = int(year_token)
+    month = _QA_MONTH_NUMBERS[month_token]
+    if not 1 <= day <= 31 or year <= 0:
+        return None
+    return year, month, day
+
+
+def _canonical_partial_calendar_date(normalized: str) -> tuple[int, int] | None:
+    tokens = normalized.split()
+    if len(tokens) != 2:
+        return None
+    if tokens[0] in _QA_MONTH_NUMBERS:
+        month_token, day_token = tokens
+    elif tokens[1] in _QA_MONTH_NUMBERS:
+        day_token, month_token = tokens
+    else:
+        return None
+    day_token = re.sub(r"(?:st|nd|rd|th)$", "", day_token)
+    if not day_token.isdigit():
+        return None
+    day = int(day_token)
+    month = _QA_MONTH_NUMBERS[month_token]
+    if not 1 <= day <= 31:
+        return None
+    return month, day
+
+
+def _numeric_surface_match(prediction: str, reference: str) -> bool:
+    def surface_numbers(value: str) -> tuple[str, ...]:
+        normalized = re.sub(r"(?<=\d)[-–—−](?=\d)", " ", value)
+        return _number_tokens(normalized)
+
+    predicted_numbers = surface_numbers(prediction)
+    reference_numbers = surface_numbers(reference)
+    if not predicted_numbers or predicted_numbers != reference_numbers:
+        return False
+
+    def residue(value: str) -> set[str]:
+        normalized = re.sub(r"(?<=\d),(?=\d)", "", value.casefold())
+        normalized = re.sub(r"[-+]?\d+(?:\.\d+)?", " ", normalized)
+        normalized = re.sub(r"[^a-z]+", " ", normalized)
+        return set(normalized.split())
+
+    harmless = {"about", "approximately", "around", "to", "and", "in", "on", "ce", "ad"}
+    return residue(prediction) <= harmless and residue(reference) <= harmless
+
+
+def _numeric_reference_leading_match(prediction: str, reference: str) -> bool | None:
+    if not _number_tokens(reference):
+        return None
+    normalized = re.sub(r"(?<=\d),(?=\d)", "", reference.casefold())
+    normalized = re.sub(r"(?<=\d)[-–—−](?=\d)", " ", normalized)
+    normalized = re.sub(r"[-+]?\d+(?:\.\d+)?", " ", normalized)
+    normalized = re.sub(r"[^a-z]+", " ", normalized)
+    if not set(normalized.split()) <= {"to", "and", "in", "on", "ce", "ad"}:
+        return None
+
+    reference_numbers = _number_tokens(re.sub(r"(?<=\d)[-–—−](?=\d)", " ", reference))
+    prediction_numbers = _number_tokens(re.sub(r"(?<=\d)[-–—−](?=\d)", " ", prediction))
+    if not prediction_numbers:
+        return False
+    if len(reference_numbers) == 1:
+        expected = reference_numbers[0]
+        if expected.isdigit() and len(expected) == 4 and 1000 <= int(expected) <= 2999:
+            prediction_years = tuple(
+                number
+                for number in prediction_numbers
+                if number.isdigit() and len(number) == 4 and 1000 <= int(number) <= 2999
+            )
+            return bool(prediction_years) and prediction_years[0] == expected
+    return prediction_numbers[: len(reference_numbers)] == reference_numbers
 
 
 def _numeric_or_normalized_answer_match(prediction: str, reference: str) -> bool:
@@ -1187,11 +1624,436 @@ def _numeric_or_normalized_answer_match(prediction: str, reference: str) -> bool
     return predicted_numbers[-1] == reference_numbers[-1]
 
 
-def _qa_normalize(value: str) -> str:
-    lowered = value.casefold().replace("_", " ")
-    no_punctuation = "".join(
-        " " if char in string.punctuation else char for char in lowered
+def _competition_math_answer_match(prediction: str, reference: str) -> bool:
+    predicted = _math_answer_surface(prediction)
+    expected = _math_answer_surface(reference)
+    if predicted == expected:
+        return True
+    if _normalized_answer_match(prediction, reference):
+        return True
+    predicted_parts = _top_level_math_parts(predicted)
+    expected_parts = _top_level_math_parts(expected)
+    if len(predicted_parts) != len(expected_parts):
+        return False
+    if len(predicted_parts) == 1:
+        return _symbolic_math_part_match(predicted_parts[0], expected_parts[0])
+    return _unordered_math_parts_match(predicted_parts, expected_parts)
+
+
+def _competition_math_choice_match(
+    prompt: str, prediction: str, reference: str
+) -> bool:
+    choice = prediction.strip().upper()
+    if not re.fullmatch(r"[A-E]", choice):
+        return False
+    markers = list(
+        re.finditer(
+            r"(?:\\(?:textbf|text)\{\(([A-E])\)\s*\}|\(([A-E])\))",
+            prompt,
+        )
     )
+    for index, marker in enumerate(markers):
+        marker_choice = marker.group(1) or marker.group(2)
+        if marker_choice != choice:
+            continue
+        end = markers[index + 1].start() if index + 1 < len(markers) else len(prompt)
+        option = prompt[marker.end() : end]
+        option = option.replace("$", "")
+        option = option.replace("\\ ", "")
+        option = re.sub(r"\\(?:qquad|quad)\b", "", option)
+        option = option.replace("\\\\", "")
+        option = option.strip(" \n\t.;")
+        return _competition_math_answer_match(option, reference)
+    return False
+
+
+def _unordered_math_parts_match(
+    predicted_parts: tuple[str, ...], expected_parts: tuple[str, ...]
+) -> bool:
+    candidates = [
+        [
+            index
+            for index, expected in enumerate(expected_parts)
+            if _symbolic_math_part_match(predicted, expected)
+        ]
+        for predicted in predicted_parts
+    ]
+    order = sorted(range(len(candidates)), key=lambda index: len(candidates[index]))
+    used: set[int] = set()
+
+    def assign(position: int) -> bool:
+        if position == len(order):
+            return True
+        predicted_index = order[position]
+        for expected_index in candidates[predicted_index]:
+            if expected_index in used:
+                continue
+            used.add(expected_index)
+            if assign(position + 1):
+                return True
+            used.remove(expected_index)
+        return False
+
+    return assign(0)
+
+
+def _math_answer_surface(value: str) -> str:
+    normalized = value.strip().strip("$")
+    normalized = normalized.replace("\\left", "").replace("\\right", "")
+    normalized = normalized.replace("\\$", "")
+    normalized = normalized.replace("\\dfrac", "\\frac").replace("\\tfrac", "\\frac")
+    normalized = re.sub(r"\\phantom(?:\{[^{}]*\}|.)", "", normalized)
+    normalized = normalized.rstrip(" .;")
+    normalized = re.sub(
+        r"\\(?:text|mathrm)\{\s*,?\s*and\s*\}",
+        ",",
+        normalized,
+        flags=re.IGNORECASE,
+    )
+    normalized = re.sub(r",{2,}", ",", normalized)
+    text_only = re.fullmatch(r"\\(?:text|mathrm)\{([^{}]+)\}", normalized)
+    if text_only is not None:
+        normalized = text_only.group(1)
+    normalized = re.sub(
+        r"(?<=.)\\(?:mbox|text|mathrm)\{[^{}]*[A-Za-z][^{}]*\}(?:\^\{?\d+\}?)?$",
+        "",
+        normalized,
+    )
+    normalized = normalized.replace("{,}", "")
+    normalized = normalized.replace(",\\!", "")
+    normalized = re.sub(
+        r"\\text\{\s*degrees?\s*\}",
+        "",
+        normalized,
+        flags=re.IGNORECASE,
+    )
+    normalized = normalized.replace("\\,", "").replace("\\!", "")
+    normalized = normalized.replace("\\;", "").replace("\\:", "")
+    normalized = normalized.replace("\\%", "%")
+    base_literal = re.fullmatch(r"([0-9A-Z]+)_\{?(\d+)\}?", normalized, flags=re.IGNORECASE)
+    if base_literal is not None:
+        normalized = base_literal.group(1)
+    normalized = re.sub(r"\^\{?\\circ\}?", "", normalized)
+    normalized = re.sub(r"\s+", "", normalized)
+    return normalized
+
+
+def _top_level_math_parts(value: str) -> tuple[str, ...]:
+    parts: list[str] = []
+    start = 0
+    depth = 0
+    for index, char in enumerate(value):
+        if char in "{([":
+            depth += 1
+        elif char in "})]":
+            depth = max(0, depth - 1)
+        elif char == "," and depth == 0:
+            parts.append(value[start:index])
+            start = index + 1
+    parts.append(value[start:])
+    return tuple(part for part in parts if part)
+
+
+def _symbolic_math_part_match(prediction: str, reference: str) -> bool:
+    if prediction == reference:
+        return True
+    predicted_union = _top_level_union_parts(prediction)
+    reference_union = _top_level_union_parts(reference)
+    if predicted_union is not None or reference_union is not None:
+        if predicted_union is None or reference_union is None:
+            return False
+        if len(predicted_union) != len(reference_union):
+            return False
+        return _unordered_math_parts_match(predicted_union, reference_union)
+    predicted_matrix = _latex_matrix_entries(prediction)
+    reference_matrix = _latex_matrix_entries(reference)
+    if predicted_matrix is not None or reference_matrix is not None:
+        predicted_vector = predicted_matrix or _coordinate_tuple_entries(prediction)
+        reference_vector = reference_matrix or _coordinate_tuple_entries(reference)
+        if predicted_vector is None or reference_vector is None:
+            return False
+        if len(predicted_vector) != len(reference_vector):
+            return False
+        return all(
+            _symbolic_math_part_match(left, right)
+            for left, right in zip(predicted_vector, reference_vector, strict=True)
+        )
+    predicted_coordinates = _coordinate_tuple_entries(prediction)
+    reference_coordinates = _coordinate_tuple_entries(reference)
+    if predicted_coordinates is not None or reference_coordinates is not None:
+        if predicted_coordinates is None or reference_coordinates is None:
+            return False
+        if len(predicted_coordinates) != len(reference_coordinates):
+            return False
+        return all(
+            _symbolic_math_part_match(left, right)
+            for left, right in zip(
+                predicted_coordinates, reference_coordinates, strict=True
+            )
+        )
+    predicted_interval = _interval_answer_parts(prediction)
+    reference_interval = _interval_answer_parts(reference)
+    if predicted_interval is not None or reference_interval is not None:
+        if predicted_interval is None or reference_interval is None:
+            return False
+        predicted_left, predicted_right, predicted_endpoints = predicted_interval
+        reference_left, reference_right, reference_endpoints = reference_interval
+        if predicted_left != reference_left or predicted_right != reference_right:
+            return False
+        return all(
+            _symbolic_math_part_match(left, right)
+            for left, right in zip(predicted_endpoints, reference_endpoints, strict=True)
+        )
+    predicted_assignment = _scalar_assignment_value(prediction)
+    reference_assignment = _scalar_assignment_value(reference)
+    if predicted_assignment is not None and "=" not in reference:
+        return _symbolic_math_part_match(predicted_assignment, reference)
+    if reference_assignment is not None and "=" not in prediction:
+        return _symbolic_math_part_match(prediction, reference_assignment)
+    relation_match = _symbolic_equation_match(prediction, reference)
+    if relation_match is not None:
+        return relation_match
+    predicted_expr = _parse_simple_latex_expression(prediction)
+    reference_expr = _parse_simple_latex_expression(reference)
+    if predicted_expr is None or reference_expr is None:
+        return False
+    try:
+        from sympy import simplify
+
+        return simplify(predicted_expr - reference_expr) == 0
+    except (ArithmeticError, TypeError, ValueError):
+        return False
+
+
+def _scalar_assignment_value(value: str) -> str | None:
+    if value.count("=") != 1:
+        return None
+    left, right = value.split("=", maxsplit=1)
+    if re.fullmatch(r"[A-Za-z][A-Za-z0-9_]*", left) and right:
+        return right
+    if re.fullmatch(r"[A-Za-z][A-Za-z0-9_]*", right) and left:
+        return left
+    return None
+
+
+def _interval_answer_parts(
+    value: str,
+) -> tuple[str, str, tuple[str, str]] | None:
+    if len(value) < 5 or value[0] not in "([" or value[-1] not in ")]":
+        return None
+    parts = _top_level_math_parts(value[1:-1])
+    if len(parts) != 2:
+        return None
+    return value[0], value[-1], (parts[0], parts[1])
+
+
+def _top_level_union_parts(value: str) -> tuple[str, ...] | None:
+    parts: list[str] = []
+    start = 0
+    depth = 0
+    index = 0
+    found = False
+    while index < len(value):
+        char = value[index]
+        if char in "{([":
+            depth += 1
+            index += 1
+            continue
+        if char in "})]":
+            depth = max(0, depth - 1)
+            index += 1
+            continue
+        token_width = 0
+        if depth == 0 and value.startswith("\\cup", index):
+            token_width = 4
+        elif depth == 0 and char == "∪":
+            token_width = 1
+        if token_width:
+            part = value[start:index]
+            if not part:
+                return None
+            parts.append(part)
+            index += token_width
+            start = index
+            found = True
+            continue
+        index += 1
+    if not found:
+        return None
+    tail = value[start:]
+    if not tail:
+        return None
+    parts.append(tail)
+    return tuple(parts)
+
+
+def _coordinate_tuple_entries(value: str) -> tuple[str, ...] | None:
+    if len(value) < 3 or value[0] != "(" or value[-1] != ")":
+        return None
+    parts = _top_level_math_parts(value[1:-1])
+    return parts if len(parts) > 1 else None
+
+
+def _latex_matrix_entries(value: str) -> tuple[str, ...] | None:
+    match = re.fullmatch(
+        r"(?P<scale>.*?)\\begin\{(?P<env>p?matrix|bmatrix|matrix)\}"
+        r"(?P<body>.*)\\end\{(?P=env)\}",
+        value,
+        flags=re.DOTALL,
+    )
+    if match is None:
+        return None
+    scale = match.group("scale")
+    body = match.group("body")
+    rows = re.split(r"\\\\", body)
+    entries: list[str] = []
+    for row in rows:
+        for part in row.split("&"):
+            if not part:
+                continue
+            entries.append(f"({scale})*({part})" if scale else part)
+    return tuple(entries)
+
+
+def _symbolic_equation_match(prediction: str, reference: str) -> bool | None:
+    if prediction.count("=") != 1 or reference.count("=") != 1:
+        return None
+    predicted_left, predicted_right = prediction.split("=", maxsplit=1)
+    reference_left, reference_right = reference.split("=", maxsplit=1)
+    predicted_left_expr = _parse_simple_latex_expression(predicted_left)
+    predicted_right_expr = _parse_simple_latex_expression(predicted_right)
+    reference_left_expr = _parse_simple_latex_expression(reference_left)
+    reference_right_expr = _parse_simple_latex_expression(reference_right)
+    if any(
+        expr is None
+        for expr in (
+            predicted_left_expr,
+            predicted_right_expr,
+            reference_left_expr,
+            reference_right_expr,
+        )
+    ):
+        return False
+    try:
+        from sympy import simplify
+
+        predicted_zero = simplify(predicted_left_expr - predicted_right_expr)
+        reference_zero = simplify(reference_left_expr - reference_right_expr)
+        if simplify(predicted_zero - reference_zero) == 0:
+            return True
+        if predicted_zero == 0 or reference_zero == 0:
+            return False
+        ratio = simplify(predicted_zero / reference_zero)
+        return bool(ratio.is_number and ratio != 0)
+    except (ArithmeticError, TypeError, ValueError):
+        return False
+
+
+def _parse_simple_latex_expression(value: str) -> Any | None:
+    if not value or len(value) > 512:
+        return None
+    if any(token in value for token in ("\\begin", "\\end", "\\text", "=", "<", ">")):
+        return None
+    try:
+        from sympy.parsing.sympy_parser import (
+            convert_xor,
+            implicit_multiplication_application,
+            parse_expr,
+            standard_transformations,
+        )
+    except ImportError:
+        return None
+
+    expression = value
+    expression = _replace_latex_group_command(expression, "\\sqrt", "sqrt")
+    expression = re.sub(r"\\sqrt([A-Za-z0-9]+)", r"sqrt(\1)", expression)
+    expression = _replace_latex_fractions(expression)
+    if expression is None:
+        return None
+    expression = expression.replace("\\pi", "pi")
+    expression = expression.replace("\\cdot", "*").replace("\\times", "*")
+    expression = re.sub(r"\^\{([^{}]+)\}", r"^(\1)", expression)
+    expression = expression.replace("{", "(").replace("}", ")")
+    expression = expression.replace("\\", "")
+    if not re.fullmatch(r"[A-Za-z0-9_+\-*/^().]+", expression):
+        return None
+    transformations = standard_transformations + (
+        implicit_multiplication_application,
+        convert_xor,
+    )
+    try:
+        return parse_expr(expression, transformations=transformations, evaluate=True)
+    except (SyntaxError, TypeError, ValueError):
+        return None
+
+
+def _replace_latex_group_command(value: str, command: str, replacement: str) -> str:
+    output = value
+    while command in output:
+        index = output.rfind(command)
+        group_start = index + len(command)
+        group = _latex_braced_group(output, group_start)
+        if group is None:
+            return output
+        content, end = group
+        output = output[:index] + f"{replacement}({content})" + output[end:]
+    return output
+
+
+def _replace_latex_fractions(value: str) -> str | None:
+    output = value
+    while "\\frac" in output:
+        index = output.rfind("\\frac")
+        numerator = _latex_argument(output, index + len("\\frac"))
+        if numerator is None:
+            return None
+        numerator_text, numerator_end = numerator
+        denominator = _latex_argument(output, numerator_end)
+        if denominator is None:
+            return None
+        denominator_text, denominator_end = denominator
+        replacement = f"(({numerator_text})/({denominator_text}))"
+        output = output[:index] + replacement + output[denominator_end:]
+    return output
+
+
+def _latex_argument(value: str, start: int) -> tuple[str, int] | None:
+    grouped = _latex_braced_group(value, start)
+    if grouped is not None:
+        return grouped
+    if start >= len(value):
+        return None
+    return value[start], start + 1
+
+
+def _latex_braced_group(value: str, start: int) -> tuple[str, int] | None:
+    if start >= len(value) or value[start] != "{":
+        return None
+    depth = 0
+    for index in range(start, len(value)):
+        char = value[index]
+        if char == "{":
+            depth += 1
+        elif char == "}":
+            depth -= 1
+            if depth == 0:
+                return value[start + 1 : index], index + 1
+    return None
+
+
+def _qa_normalize(value: str) -> str:
+    lowered = (
+        value.casefold()
+        .replace("_", " ")
+        .replace("’", "'")
+        .replace("‘", "'")
+        .replace("ʼ", "'")
+        .replace("–", "-")
+        .replace("—", "-")
+        .replace("−", "-")
+    )
+    lowered = re.sub(r"(?<=\d),(?=\d)", "", lowered)
+    no_punctuation = "".join(" " if char in string.punctuation else char for char in lowered)
     tokens = [token for token in no_punctuation.split() if token not in {"a", "an", "the"}]
     return " ".join(tokens)
 
@@ -1199,8 +2061,7 @@ def _qa_normalize(value: str) -> str:
 def _number_tokens(value: str) -> tuple[str, ...]:
     normalized = value.replace(",", "")
     return tuple(
-        match.group(0).lstrip("+")
-        for match in re.finditer(r"[-+]?\d+(?:\.\d+)?", normalized)
+        match.group(0).lstrip("+") for match in re.finditer(r"[-+]?\d+(?:\.\d+)?", normalized)
     )
 
 
@@ -1235,6 +2096,16 @@ def _future_evidence_leaks(
             available.update(evidence_order)
 
         frame_text = _frame_visibility_text(frame)
+        # If a later observation has exactly the same visible value as one
+        # that has already arrived, mentioning that value cannot establish a
+        # causal leak.  This occurs naturally for refreshes and streams whose
+        # next version repeats the previous payload.
+        available_markers = {
+            _normalized_text(marker)
+            for available_id in available
+            for marker in _evidence_markers(evidence_by_id[available_id].value)
+            if _normalized_text(marker)
+        }
         for evidence_id in evidence_order:
             if evidence_id in available:
                 continue
@@ -1243,12 +2114,27 @@ def _future_evidence_leaks(
                 normalized_marker = _normalized_text(marker)
                 if normalized_marker in baseline:
                     continue
-                if normalized_marker and normalized_marker in frame_text:
-                    reasons.append(
-                        f"phase {frame.phase!r} leaks future evidence {evidence_id!r}"
-                    )
+                if normalized_marker in available_markers:
+                    continue
+                if any(
+                    _visibility_contains_marker(available_marker, normalized_marker)
+                    for available_marker in available_markers
+                ):
+                    continue
+                if normalized_marker and _visibility_contains_marker(
+                    frame_text, normalized_marker
+                ):
+                    reasons.append(f"phase {frame.phase!r} leaks future evidence {evidence_id!r}")
                     break
     return tuple(reasons)
+
+
+def _visibility_contains_marker(frame_text: str, marker: str) -> bool:
+    """Match numeric evidence as a token, not as a substring of another number."""
+    numeric = marker.replace(",", "")
+    if re.fullmatch(r"[-+]?\d+(?:\.\d+)?", numeric):
+        return numeric.lstrip("+") in _number_tokens(frame_text)
+    return marker in frame_text
 
 
 def _frame_visibility_text(frame: TeacherFrame) -> str:
@@ -1267,6 +2153,18 @@ def _evidence_markers(value: Any) -> tuple[str, ...]:
     if isinstance(value, str):
         marker = value.strip()
         return (marker,) if len(marker) >= 3 else ()
+    if isinstance(value, dict):
+        marker = json.dumps(value, ensure_ascii=False, sort_keys=True, default=str)
+        nested = tuple(
+            child
+            for item in value.values()
+            for child in _evidence_markers(item)
+        )
+        return ((marker,) if len(marker) >= 4 else ()) + nested
+    if isinstance(value, (list, tuple)):
+        marker = json.dumps(value, ensure_ascii=False, sort_keys=True, default=str)
+        nested = tuple(child for item in value for child in _evidence_markers(item))
+        return ((marker,) if len(marker) >= 4 else ()) + nested
     marker = json.dumps(value, ensure_ascii=False, sort_keys=True, default=str)
     return (marker,) if len(marker) >= 4 else ()
 

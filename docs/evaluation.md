@@ -50,11 +50,12 @@ computed only over tasks for which expected display token IDs were supplied.
 ## Deterministic dataset replay
 
 `ScheduledReplaySource` and `run_replay_case()` provide a step-exact replay layer for
-`TrajectoryExample.events`. Replay sources implement the optional runtime-step hook, so an event
-with `arrival_step=4` becomes visible on CID step 4 regardless of CPU/GPU speed. Dynamic sources
-return the newest not-yet-observed version available at that step; later refreshes block until a
-new dataset version becomes visible. No wall-clock sleep multiplier is used to approximate dataset
-time.
+`TrajectoryExample.events`. Replay uses a logical runtime clock that is distinct from the count of
+model forward passes, so an event with `arrival_step=4` becomes visible on logical runtime step 4
+regardless of CPU/GPU speed. During quiescence the replay clock may advance to the next scheduled
+event without consuming a model step. Dynamic sources return the newest not-yet-observed version
+available at that logical step; later refreshes block until a new dataset version becomes visible.
+No wall-clock sleep multiplier is used to approximate dataset time.
 
 The replay runner constructs source descriptors and protected facts from the trajectory, executes
 the supplied `CIDPolicy`, then immediately evaluates the resulting runtime trace/final state with

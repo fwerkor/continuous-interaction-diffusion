@@ -185,12 +185,12 @@ async def test_replay_runner_delivers_dataset_events_on_exact_runtime_steps() ->
         runtime_config=RuntimeConfig(max_steps=8),
     )
 
-    observation_steps = [
-        event.step
+    observation_runtime_steps = [
+        event.payload["runtime_step"]
         for event in replay.runtime.trace.events
         if event.kind == "binding_observation_updated"
     ]
-    assert observation_steps == [2, 4]
+    assert observation_runtime_steps == [2, 4]
     assert replay.evaluation.converged
     assert replay.evaluation.exact_display is True
     assert replay.evaluation.fresh_observations == 1

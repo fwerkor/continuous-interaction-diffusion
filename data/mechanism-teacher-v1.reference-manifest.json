@@ -1,7 +1,10 @@
 {
-  "causal_jobs_sha256": "90d9e1947e1e59ad18266053905c777ce412cb6b4ca057d9e3ca40d66494ba3b",
+  "accepted_plans_sha256": "04dc3a23208cc3adf518ea468b54c3ba58f75a397047f881b8e570026ab3e438",
+  "causal_jobs_sha256": "f0b3b904e0e83dddc3669595b65fe91d86982539b4c59a108e07e1e769c7ccc7",
   "causal_stages": 26000,
-  "debug_requests_sha256": "ee1242aefef80c977d9d5b8552488fa1462ac03ac56fd7d443f2a3953482343f",
+  "compiled_trajectories": 40000,
+  "compiled_transitions": 232148,
+  "debug_requests_sha256": "08fb12a8af9434e590ca1feafcc4973d4e5545c5d74378aff91154ccd0b6aeb6",
   "family_counts": {
     "competing_sources": 2000,
     "delayed_retrieval": 2000,
@@ -12,8 +15,14 @@
   "name": "mechanism-teacher-v1",
   "parallel_root_need_tasks": 2000,
   "persistent_binding_tasks": 4000,
+  "review_accepted": 10000,
+  "review_rejected": 0,
+  "review_sha256": "99e6793e659bb4527fe336697a743e30a2562a25691b475a0281a075c2734be5",
   "seed_trajectory_manifest": "data/mechanism-seed-v1.reference-manifest.json",
+  "seed_trajectory_sha256": "27c2797c7671f27e8280530a934ad191116c8fe95a22702f9dfd73c8e3c4250e",
   "semantic_tasks": 10000,
-  "tasks_sha256": "86a1b89b068e0289be4d13990d430f9961614df021dd92f938167d0c2e660265",
+  "tasks_sha256": "29d8ba7e53d8e25c35fbbe4cb26fa41b65ae57b64b7506a1db410c9a2e3972be",
+  "trajectory_manifest_sha256": "9b2118772fc1d4fb2cef5b6b9a40389410682377c20adb24d43f91a9bbc9e6a0",
+  "trajectory_sha256": "6b22dbc55af1f44911998c34a8dbe81c42ceeb3bbd9d0199d1501825b287d403",
   "version": 1
 }

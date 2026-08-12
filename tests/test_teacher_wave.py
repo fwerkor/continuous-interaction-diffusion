@@ -13,13 +13,37 @@ from cid.distill import (
     review_teacher_plans,
 )
 from cid.state import CellLifecycle
+from cid.teacher_agent import checkout_teacher_agent_batch, commit_teacher_agent_batch
 from cid.teacher_wave import (
+    dump_teacher_wave_state,
     export_teacher_wave,
     finalize_teacher_wave,
     import_teacher_wave,
     load_teacher_wave_state,
     teacher_wave_status,
 )
+
+
+def test_dump_teacher_wave_state_is_atomic_on_write_failure(tmp_path) -> None:
+    state_path = tmp_path / "state.jsonl"
+    state_path.write_text("sentinel\n", encoding="utf-8")
+
+    class Record:
+        def __init__(self, task_id: str, *, fail: bool = False) -> None:
+            self.task_id = task_id
+            self.stage_index = 0
+            self.fail = fail
+
+        def to_dict(self):
+            if self.fail:
+                raise RuntimeError("synthetic serialization failure")
+            return {"task_id": self.task_id, "stage_index": self.stage_index}
+
+    with pytest.raises(RuntimeError, match="synthetic serialization failure"):
+        dump_teacher_wave_state((Record("a"), Record("b", fail=True)), state_path)
+
+    assert state_path.read_text(encoding="utf-8") == "sentinel\n"
+    assert list(tmp_path.glob(".state.jsonl.*.tmp")) == []
 
 
 def _task() -> TeacherTask:
@@ -32,9 +56,7 @@ def _task() -> TeacherTask:
         {
             "name": "workspace_read",
             "description": "Read a document.",
-            "arguments": (
-                {"name": "resource_id", "kind": "string", "required": True},
-            ),
+            "arguments": ({"name": "resource_id", "kind": "string", "required": True},),
         },
     )
     return TeacherTask(
@@ -370,3 +392,85 @@ def test_teacher_wave_rejects_missing_or_extra_evidence_needs(tmp_path) -> None:
     rejected = json.loads(rejects_path.read_text())
     assert rejected["request_id"] == request["request_id"]
     assert "every and only" in rejected["error"]
+
+
+def test_teacher_agent_workspace_resumes_commits_and_advances(tmp_path) -> None:
+    task = _task()
+    jobs_path = tmp_path / "jobs.jsonl"
+    state_path = tmp_path / "state.jsonl"
+    workspace = tmp_path / "agent"
+    dump_causal_teacher_jobs((task,), jobs_path)
+
+    first = checkout_teacher_agent_batch(jobs_path, state_path, workspace, max_requests=4)
+    assert first["status"] == "checked_out"
+    assert first["requests"] == 1
+    resumed = checkout_teacher_agent_batch(jobs_path, state_path, workspace, max_requests=4)
+    assert resumed["status"] == "resumed"
+    assert resumed["pending"] == 1
+
+    manifest = json.loads((workspace / "current" / "manifest.json").read_text())
+    request_entry = manifest["requests"][0]
+    request = json.loads((workspace / "current" / request_entry["request_file"]).read_text())
+    assert request["phase"] == "initial"
+    assert request["previous_state"] is None
+    assert request["arrived_evidence"] is None
+    assert "reference_answer" not in request["task"]
+    assert [item["evidence_id"] for item in request["available_evidence_contracts"]] == [
+        "search-results"
+    ]
+
+    bad_response = {
+        "display": "pending",
+        "cells": [_cell("plan", "No need yet.", {"plan": 1.0})],
+        "needs": [],
+    }
+    response_path = workspace / "current" / request_entry["response_file"]
+    response_path.write_text(json.dumps(bad_response))
+    rejected = commit_teacher_agent_batch(workspace)
+    assert rejected["rejected"] == 1
+    assert not rejected["complete"]
+    error_path = workspace / "current" / "errors" / f"{request['request_id']}.json"
+    assert "every and only" in json.loads(error_path.read_text())["error"]
+
+    response_path.write_text(
+        json.dumps(
+            {
+                "display": "pending",
+                "cells": [
+                    {
+                        **_cell(
+                            "search",
+                            "Need workspace evidence for the comparison.",
+                            {"information_need": 1.0},
+                        ),
+                        "links": [
+                            {
+                                "relation": "requests",
+                                "target": {
+                                    "kind": "source",
+                                    "identifier": "workspace_search",
+                                },
+                                "confidence": 1.0,
+                            }
+                        ],
+                    }
+                ],
+                "needs": [{"evidence_id": "search-results", "cell_id": "search"}],
+            }
+        )
+    )
+    committed = commit_teacher_agent_batch(workspace)
+    assert committed["imported"] == 1
+    assert committed["complete"]
+    assert not error_path.exists()
+
+    second = checkout_teacher_agent_batch(jobs_path, state_path, workspace, max_requests=4)
+    assert second["status"] == "checked_out"
+    second_manifest = json.loads((workspace / "current" / "manifest.json").read_text())
+    second_entry = second_manifest["requests"][0]
+    second_request = json.loads((workspace / "current" / second_entry["request_file"]).read_text())
+    assert second_request["phase"] == "after:search-results"
+    assert second_request["previous_state"]["cells"][0]["cell_id"] == "search"
+    assert second_request["arrived_evidence"]["evidence_id"] == "search-results"
+    assert "A was released in 2001." not in json.dumps(second_request)
+    assert "B was released in 2005." not in json.dumps(second_request)

@@ -225,6 +225,32 @@ class WaitingLifecyclePolicy:
         )
 
 
+class QuiescentEvidencePolicy:
+    def step(self, context: ModelContext) -> ModelUpdate:
+        cell_id = context.thought.live_cell_ids[0]
+        need = InformationNeed(
+            need_id="quiescent-evidence",
+            source_scores={"source": 1.0},
+            arguments={"key": "evidence"},
+            confidence=1.0,
+            target_cells=(ObjectRef.cell(cell_id),),
+        )
+        if context.percepts:
+            return ModelUpdate(
+                thought=context.thought.advance(context.thought.cells),
+                display=context.display.advance((7,)),
+                needs=(need,),
+                equilibrium=True,
+                converged=True,
+            )
+        return ModelUpdate(
+            thought=context.thought.advance(context.thought.cells),
+            display=context.display.advance(context.display.token_ids),
+            needs=(need,),
+            equilibrium=True,
+        )
+
+
 class GroundedRoutingPolicy:
     def __init__(self, request_cell: str, related_cell: str) -> None:
         self.request_cell = request_cell
@@ -315,8 +341,9 @@ async def test_dynamic_source_refreshes_without_cache_reuse() -> None:
     )
 
     assert result.converged
-    assert source.reads == 3
+    assert source.reads == 4
     assert result.trace.count("cache_hit") == 0
+    assert result.trace.count("terminal_freshness_validated") == 1
 
 
 async def test_changed_arguments_invalidate_old_observation() -> None:
@@ -383,6 +410,29 @@ async def test_runtime_keeps_waiting_cell_blocked_until_observation_is_available
         event.payload["previous"] == "waiting" and event.payload["current"] == "active"
         for event in transitions
     )
+
+
+async def test_quiescence_waits_without_consuming_the_refinement_epoch_budget() -> None:
+    source = CountingSource(delay_s=0.02)
+    registry = SourceRegistry()
+    registry.register(source)
+    runtime = CIDRuntime(
+        registry,
+        RuntimeConfig(max_steps=1, max_wall_time_s=1.0),
+    )
+
+    result = await runtime.run(
+        QuiescentEvidencePolicy(),
+        thought=seeded_thought(1),
+        display=DisplayCanvas.masked(1, -1),
+    )
+
+    assert result.converged
+    assert result.steps == 2
+    assert source.reads == 1
+    starts = tuple(event for event in result.trace.events if event.kind == "quiescence_started")
+    assert any(event.payload["reason"] == "current_information_equilibrium" for event in starts)
+    assert result.trace.count("compute_budget_exhausted") == 0
 
 
 async def test_observation_anchor_routes_percept_to_related_cognitive_cell() -> None:

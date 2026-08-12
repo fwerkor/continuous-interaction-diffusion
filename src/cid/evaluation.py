@@ -81,6 +81,22 @@ class ScheduledReplaySource:
         self._wake = asyncio.Event()
         wake.set()
 
+    def next_runtime_step(self) -> int | None:
+        candidates = tuple(
+            event.arrival_step
+            for events in self._events.values()
+            for event in events
+            if event.arrival_step > self._step
+        )
+        return min(candidates) if candidates else None
+
+    def current_runtime_version(self, arguments: Mapping[str, Any]) -> str | None:
+        work_key = canonical_work_key(self.descriptor.name, arguments)
+        due = tuple(
+            event for event in self._events.get(work_key, ()) if event.arrival_step <= self._step
+        )
+        return due[-1].version if due else None
+
     async def read(self, arguments: Mapping[str, Any]) -> Observation:
         work_key = canonical_work_key(self.descriptor.name, arguments)
         events = self._events.get(work_key, ())

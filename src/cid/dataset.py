@@ -7,7 +7,7 @@ from dataclasses import dataclass
 from pathlib import Path
 from typing import Any
 
-from cid.data import TrajectoryExample, load_jsonl
+from cid.data import TrajectoryExample
 
 
 @dataclass(frozen=True, slots=True)
@@ -40,34 +40,55 @@ class DatasetManifest:
 
 def inspect_dataset(path: str | Path) -> DatasetManifest:
     source = Path(path)
-    payload = source.read_bytes()
-    examples = load_jsonl(source)
-    tags = Counter(_dataset_tag(example) for example in examples)
-    sources = sorted(
-        {
-            str(descriptor.get("name", ""))
-            for example in examples
-            for descriptor in example.source_descriptors
-            if str(descriptor.get("name", ""))
-        }
-    )
+    digest = hashlib.sha256()
+    byte_count = 0
+    example_count = 0
+    transition_count = 0
+    tags: Counter[str] = Counter()
+    sources: set[str] = set()
+    thought_capacity_required = 0
+    max_trajectory_steps = 0
+
+    with source.open("rb") as handle:
+        for line_number, raw_line in enumerate(handle, start=1):
+            digest.update(raw_line)
+            byte_count += len(raw_line)
+            stripped = raw_line.strip()
+            if not stripped:
+                continue
+            try:
+                raw = json.loads(stripped)
+                example = TrajectoryExample.from_dict(raw)
+            except (json.JSONDecodeError, KeyError, TypeError, ValueError) as exc:
+                raise ValueError(f"invalid CID trajectory at line {line_number}: {exc}") from exc
+            example_count += 1
+            tags[_dataset_tag(example)] += 1
+            sources.update(
+                str(descriptor.get("name", ""))
+                for descriptor in example.source_descriptors
+                if str(descriptor.get("name", ""))
+            )
+            transition_count += _transition_count(example)
+            thought_capacity_required = max(
+                thought_capacity_required,
+                max((target.slot + 1 for target in example.thought_targets), default=0),
+            )
+            max_trajectory_steps = max(
+                max_trajectory_steps,
+                len({target.step for target in example.thought_targets}),
+            )
+
     return DatasetManifest(
         format_version=1,
         schema="cid.TrajectoryExample.v1",
-        sha256=hashlib.sha256(payload).hexdigest(),
-        bytes=len(payload),
-        examples=len(examples),
-        transitions=sum(_transition_count(example) for example in examples),
+        sha256=digest.hexdigest(),
+        bytes=byte_count,
+        examples=example_count,
+        transitions=transition_count,
         tag_counts=dict(sorted(tags.items())),
-        sources=tuple(sources),
-        thought_capacity_required=max(
-            (target.slot + 1 for example in examples for target in example.thought_targets),
-            default=0,
-        ),
-        max_trajectory_steps=max(
-            (len({target.step for target in example.thought_targets}) for example in examples),
-            default=0,
-        ),
+        sources=tuple(sorted(sources)),
+        thought_capacity_required=thought_capacity_required,
+        max_trajectory_steps=max_trajectory_steps,
     )
 
 

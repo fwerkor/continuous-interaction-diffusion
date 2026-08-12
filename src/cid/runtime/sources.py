@@ -34,6 +34,18 @@ class RuntimeStepAwareSource(Protocol):
         ...
 
 
+@runtime_checkable
+class RuntimeScheduledSource(Protocol):
+    def next_runtime_step(self) -> int | None:
+        ...
+
+
+@runtime_checkable
+class RuntimeSnapshotSource(Protocol):
+    def current_runtime_version(self, arguments: Mapping[str, Any]) -> str | None:
+        ...
+
+
 class SourceRegistry:
     def __init__(self) -> None:
         self._sources: dict[str, ReadOnlySource] = {}
@@ -60,6 +72,16 @@ class SourceRegistry:
                 source.on_runtime_step(step)
                 advanced = True
         return advanced
+
+    def next_runtime_step(self) -> int | None:
+        candidates = tuple(
+            step
+            for source in self._sources.values()
+            if isinstance(source, RuntimeScheduledSource)
+            for step in (source.next_runtime_step(),)
+            if step is not None
+        )
+        return min(candidates) if candidates else None
 
 
 @dataclass(slots=True)

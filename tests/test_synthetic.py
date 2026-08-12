@@ -55,3 +55,21 @@ def test_synthetic_seed_changes_physical_slot_placement() -> None:
         }
 
     assert placements(left) != placements(right)
+
+
+def test_large_synthetic_build_keeps_semantic_instances_unique() -> None:
+    examples = generate_synthetic(
+        SyntheticConfig(count_per_family=1001, seed=0, thought_capacity=8)
+    )
+    by_family: dict[str, list] = {}
+    for example in examples:
+        by_family.setdefault(str(example.metadata["family"]), []).append(example)
+
+    for family, family_examples in by_family.items():
+        if family == SyntheticFamily.DYNAMIC_STATE.value:
+            signatures = tuple(
+                tuple(event.value for event in item.events) for item in family_examples
+            )
+        else:
+            signatures = tuple(item.prompt for item in family_examples)
+        assert len(signatures) == len(set(signatures)), family

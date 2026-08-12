@@ -47,9 +47,13 @@ physical slot placement are randomized so a model cannot assign permanent semant
 Allocation loss is masked to slots that are `EMPTY` at the current step. Lifecycle cross-entropy is
 masked to existing cells and has four classes: `ACTIVE`, `WAITING`, `STABLE`, and `RETIRED`.
 Runtime-gated transitions remain hard constraints during both training rollouts and inference.
-Every transition also has a trajectory-level convergence target. Intermediate steps supervise
-`converged=0`; only the final supervised state is positive. The neural runtime therefore does not
-treat "no MASK tokens remain" as sufficient evidence that the task is finished.
+Every transition also has a trajectory-level equilibrium target for the learned convergence head.
+Ordinary intermediate states supervise zero; the final supervised state and snapshots containing
+required `WAITING` cognition supervise one. At inference this signal means that no further useful
+refinement is expected from the currently available information. The runtime interprets it as
+quiescence when required evidence is pending and as a terminal candidate only when the display is
+resolved. It therefore does not treat "no MASK tokens remain" as sufficient evidence that the task
+is finished.
 Training rollouts should also randomize slot pressure. Retired cells are archived and reclaimed by
 runtime policy rather than model logits; supervision should not teach the model to encode garbage
 collection decisions in TCT. Reclamation traces can be used to measure whether a trained model
@@ -218,6 +222,80 @@ The resulting v2 mixture contains 28,055 semantic tasks: 20,391 tool-required, 6
 - 2,000 streaming tasks where later chunks reuse the original persistent binding;
 - 2,000 competing-source tasks where two independent reads become executable together.
 
+The current overall mixture is `data/training-semantic-mixture-v3.json`. It adds 12,000
+computational-tool semantic tasks, bringing the total to 40,055: 31,191 tool-required, 6,921
+no-tool, and 1,943 tools-available-but-unnecessary. The computational component contains 1,200
+examples from each of ten balanced families: direct calculator use, applied formula evaluation,
+sequential calculator calls, parallel calculator fan-out/merge, calculator-available negative
+examples, Python statistics, Python enumeration, record lookup followed by calculation, calculator
+followed by Python, and parallel record lookup followed by a merged calculation. Six thousand of
+these tasks have dependency depth two.
+
+`cid build-computational-training` deterministically produces the teacher tasks and causal jobs.
+The pinned self-distillation contains 31,200 causal teacher stages. All 12,000 semantic plans pass
+`review-distillation`; compilation uses two independently sampled timing/slot schedules per semantic
+task, yielding 24,000 `TrajectoryExample` records and 111,609 adjacent supervised transitions.
+`data/computational-teacher-v1.reference-manifest.json` records the exact hashes. Teacher TCT text is
+kept as short semantic state rather than a reasoning transcript; arrived calculator/Python/lookup
+percepts carry anchors and `observes` links, executable needs carry `requests` links, and terminal
+conclusions carry `derived_from` links.
+
+The current overall mixture is `data/training-semantic-mixture-v4.json`. It adds 15,600 generated
+symbolic-tool semantic tasks and brings the total to 55,655: 45,591 tool-required, 6,921 no-tool,
+and 3,143 tools-available-but-unnecessary. Thirteen balanced symbolic families cover exact linear
+and quadratic solving, polynomial expansion and factorization, rational simplification, two-variable
+linear systems, differentiation, definite integration, identity checking, symbolic-to-calculator
+chains, record-to-symbolic chains, parallel symbolic fan-out/merge, and trivial manipulations where
+the symbolic tool should not be called. The component contributes 3,600 dependency-depth-two tasks.
+
+`cid build-symbolic-training` deterministically materializes the timing-free teacher tasks and causal
+jobs. The final self-distillation contains 34,800 causal teacher stages and 15,600/15,600 plans pass
+`review-distillation`. Every serialized symbolic/calculator call was independently re-executed before
+release (18,000 calls, zero mismatches). Two timing/slot schedules per semantic task compile to
+31,200 `TrajectoryExample` records and 121,748 adjacent supervised transitions. Exact hashes and
+compiler parameters are pinned by `data/symbolic-teacher-v1.reference-manifest.json`.
+
+The current overall mixture is `data/training-semantic-mixture-v5.json`. It adds 10,000
+speculative local-correction semantic tasks, bringing the total to 65,655. Each correction task
+starts with a plausible but explicitly uncertain wrong hypothesis, exposes contradictory
+authoritative evidence, then exposes an independent confirmation. The correction stage increases
+noise only for the hypothesis and its dependent answer so training emits local `REOPEN` targets;
+unrelated context/scope cells are copied unchanged. Confirmation lowers those cells' noise and emits
+`STABILIZE` targets. Two timing/slot schedules per semantic task yield 20,000 compiled trajectories
+and 120,021 adjacent supervised transitions. All 30,000 causal teacher stages pass validation with
+zero rejects, missing responses, or soft warnings, and all 10,000 plans pass both general review and
+the local-correction audit. Exact hashes are pinned by
+`data/correction-teacher-v1.reference-manifest.json`.
+
+The compiled six-component training input is pinned separately by
+`data/training-trajectory-mixture-v5.json`. It preserves every reviewed schedule variant from
+`public-base`, `public-interaction`, `mechanism`, `computational`, `symbolic`, and
+`local-correction`: **179,608 trajectories and 1,027,548 adjacent supervised transitions** in total.
+The materializer verifies every component SHA-256 and example count, rejects duplicate
+`example_id`s across components, and concatenates the original JSONL bytes deterministically. Epoch
+shuffling still happens at the rollout-window layer in the trainer, so file concatenation order is
+not a learned curriculum unless `--no-shuffle` is explicitly requested.
+
+```bash
+cid materialize-trajectory-mixture \
+  --spec data/training-trajectory-mixture-v5.json \
+  --output data/generated/training-trajectories-v5.jsonl \
+  --manifest-output data/generated/training-trajectories-v5.manifest.json
+
+cid train \
+  --data data/generated/training-trajectories-v5.jsonl \
+  --output-dir runs/cid-stage-a
+```
+
+The verified materialized dataset identity is pinned by
+`data/training-trajectories-v5.reference-manifest.json`: 179,608 examples, 1,027,548 transitions,
+2,391,099,272 bytes, SHA-256
+`d771d5ddcf94c1b8b7ae9a1b7df38944fc3c5974d34867ec4c0ae392b7c9120b`.
+
+`inspect_dataset` is streaming, so Stage B can verify the multi-gigabyte dataset identity and TCT
+capacity without first duplicating the whole input in memory. The actual trainer still loads the
+trajectory examples for rollout-window construction after that verification step.
+
 `TeacherEvidence.requires_need` distinguishes explicit model-launched work from later arrivals on
 an existing binding. A causal action contract that must stay live carries
 `freshness_hint="always"`; the teacher-output validator enforces that hint without exposing future
@@ -267,6 +345,45 @@ cid teacher-wave-status \
   --jobs data/generated/public-interaction-teacher-causal-v1.train.jsonl \
   --state data/generated/public-interaction-teacher-wave.state.jsonl
 ```
+
+For an interactive strong teacher operating through local-shell-mcp, the equivalent agent adapter
+avoids materializing a large request/response JSONL pair on every wave. It checks out a small batch
+as separate pretty-printed request files and writes the stable protocol instructions only once:
+
+```bash
+cid teacher-agent-checkout \
+  --jobs data/generated/public-interaction-teacher-causal-v1.train.jsonl \
+  --state data/generated/public-interaction-teacher-wave.state.jsonl \
+  --workspace .cid/teacher-agent \
+  --max-requests 8
+```
+
+The agent reads `.cid/teacher-agent/INSTRUCTIONS.md` and `current/requests/*.json`, then writes the
+stage output directly to `current/responses/<request_id>.json`. Request files contain structured
+`task`, `previous_state`, `arrived_evidence`, and `available_evidence_contracts` fields instead of
+repeating the long worker prompt for every item. They still exclude the reference answer and all
+future evidence values.
+
+The interactive adapter treats TCT structure as supervised data, not optional metadata. Its
+`semantic_text` is a compact fact/state representation (target <=144 characters, hard limit 192),
+and full source sentences or paragraphs are rejected when they appear to be copied into percept
+cells. Evidence-bearing percepts carry grounding `anchors` plus an `observes` link to the source;
+information-need cells carry `requests` links to their contracted source; terminal conclusions link
+back to supporting percept cells with `derived_from`. This keeps TCT semantics separate from document
+storage while preserving the typed cognitive graph required by the model heads.
+
+Commit whatever has been completed:
+
+```bash
+cid teacher-agent-commit --workspace .cid/teacher-agent
+```
+
+Valid records are persisted immediately while malformed or missing files remain in the current
+batch. Validation errors are written to `current/errors/`, so an agent can correct only those
+responses and commit again. Checkout is interruption-safe: before the current batch is fully
+committed it simply resumes the same files; afterward the next checkout advances those tasks to
+their next causally visible stages. The state and final `TeacherPlan` format are identical to the
+normal teacher-wave pipeline, so this adapter does not create a second training-data ABI.
 
 Repeat export/worker/import until `complete_tasks == jobs`, then assemble normal `TeacherPlan`
 records and run the deterministic review gate:
