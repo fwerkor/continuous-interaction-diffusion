@@ -255,7 +255,7 @@ release (18,000 calls, zero mismatches). Two timing/slot schedules per semantic 
 31,200 `TrajectoryExample` records and 121,748 adjacent supervised transitions. Exact hashes and
 compiler parameters are pinned by `data/symbolic-teacher-v1.reference-manifest.json`.
 
-The current overall mixture is `data/training-semantic-mixture-v5.json`. It adds 10,000
+The v5 semantic mixture is `data/training-semantic-mixture-v5.json`. It adds 10,000
 speculative local-correction semantic tasks, bringing the total to 65,655. Each correction task
 starts with a plausible but explicitly uncertain wrong hypothesis, exposes contradictory
 authoritative evidence, then exposes an independent confirmation. The correction stage increases
@@ -267,7 +267,25 @@ zero rejects, missing responses, or soft warnings, and all 10,000 plans pass bot
 the local-correction audit. Exact hashes are pinned by
 `data/correction-teacher-v1.reference-manifest.json`.
 
-The compiled six-component training input is pinned separately by
+The latest semantic mixture is `data/training-semantic-mixture-v7.json`. Relative to v6, it adds
+640 deterministic no-tool self-identity tasks generated from the canonical
+`data/cid-self-identity-v1.contract.json`. Eight balanced families supervise the model name and CID
+acronym, diffusion-native model class, architecture summary, Facts/TCT/Display separation, TCT
+structure, runtime/model responsibility boundary, and asynchronous interaction. The component uses
+480 English and 160 Chinese prompts; all 640 plans pass the normal CID semantic review with zero
+duplicates or rejects. Two physical-slot variants per task produce 1,280 trajectories. Exact hashes
+are pinned by `data/self-identity-teacher-v1.reference-manifest.json`.
+
+Build it with:
+
+```bash
+cid build-self-identity-training
+```
+
+The current compiled mixture is `data/training-trajectory-mixture-v7.json`: **204,888 trajectories
+and 1,076,828 adjacent supervised transitions** across eight components.
+
+The historical v5 six-component training input is pinned separately by
 `data/training-trajectory-mixture-v5.json`. It preserves every reviewed schedule variant from
 `public-base`, `public-interaction`, `mechanism`, `computational`, `symbolic`, and
 `local-correction`: **179,608 trajectories and 1,027,548 adjacent supervised transitions** in total.

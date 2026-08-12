@@ -1,0 +1,17 @@
+{
+  "architecture": {
+    "channels": {
+      "display": "A revisable user-visible output canvas denoised by the model.",
+      "facts": "Runtime-owned protected facts are read-only to the model.",
+      "tct": "The Typed Cognitive Tensor is fixed-capacity physical storage with dynamic logical occupancy for continuous cognitive state."
+    },
+    "generation": "CID is diffusion-native: visible output and cognitive state are iteratively refined instead of being committed only by a conventional left-to-right autoregressive loop.",
+    "grounding": "TCT cells have stable logical cell IDs independent of physical slots and may carry typed roles, lifecycle state, anchors, and cognitive links.",
+    "interaction": "External source I/O can remain in flight while model denoising steps continue; arriving observations are projected back as percepts and can revise TCT state and display output.",
+    "model_responsibility": "The model predicts cognitive/display updates, information needs, learned lifecycle/allocation proposals, and convergence-related signals subject to runtime gates.",
+    "runtime_responsibility": "The CID runtime owns protected facts, source schemas, bindings, external jobs, cache/provenance/freshness state, asynchronous scheduling, and hard safety/lifecycle invariants."
+  },
+  "full_name": "Continuous Interaction Diffusion",
+  "name": "CID",
+  "version": 1
+}

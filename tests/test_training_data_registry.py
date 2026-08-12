@@ -244,3 +244,52 @@ def test_training_trajectory_mixture_v5_matches_compiled_components() -> None:
         materialized["sha256"] == "d771d5ddcf94c1b8b7ae9a1b7df38944fc3c5974d34867ec4c0ae392b7c9120b"
     )
     assert materialized["bytes"] == 2_391_099_272
+
+
+def test_training_semantic_mixture_v7_adds_cid_self_identity() -> None:
+    mixture = _load("data/training-semantic-mixture-v7.json")
+    identity = _load("data/self-identity-teacher-v1.reference-manifest.json")
+    component = next(
+        item for item in mixture["components"] if item["name"] == "cid-self-identity-v1"
+    )
+
+    assert mixture["version"] == 7
+    assert mixture["semantic_tasks"] == 78_295
+    assert mixture["self_identity_tasks"] == 640
+    assert mixture["self_identity_language_counts"] == {"en": 480, "zh": 160}
+    assert mixture["mode_counts"] == {
+        "no_tool": 19_561,
+        "tool_required": 55_591,
+        "tools_available_unnecessary": 3_143,
+    }
+    assert component["tasks"] == identity["semantic_tasks"] == 640
+    assert component["tasks_sha256"] == identity["tasks_sha256"]
+    assert component["teacher_protocol"] == "deterministic-no-tool-self-model"
+    assert identity["accepted_plans"] == 640
+    assert identity["review_rejected"] == 0
+    assert identity["compiled_trajectories"] == 1_280
+    assert identity["compiled_transitions"] == 1_280
+    assert identity["family_counts"] == {
+        "acronym": 80,
+        "architecture_summary": 80,
+        "async_interaction": 80,
+        "channels": 80,
+        "model_class": 80,
+        "name": 80,
+        "runtime_boundary": 80,
+        "tct": 80,
+    }
+
+
+def test_training_trajectory_mixture_v7_appends_self_identity() -> None:
+    mixture = _load("data/training-trajectory-mixture-v7.json")
+    identity = _load("data/self-identity-teacher-v1.reference-manifest.json")
+    component = next(item for item in mixture["components"] if item["name"] == "self-identity")
+
+    assert mixture["version"] == 7
+    assert mixture["examples"] == 204_888
+    assert mixture["transitions"] == 1_076_828
+    assert mixture["thought_capacity_required"] == 8
+    assert component["examples"] == identity["compiled_trajectories"]
+    assert component["transitions"] == identity["compiled_transitions"]
+    assert component["sha256"] == identity["compiled_sha256"]

@@ -1,0 +1,46 @@
+{
+  "accepted_plans": 640,
+  "capabilities": [
+    "canonical_model_name",
+    "cid_acronym_expansion",
+    "diffusion_native_model_class",
+    "facts_tct_display_architecture",
+    "typed_cognitive_tensor_contract",
+    "runtime_model_responsibility_boundary",
+    "asynchronous_external_interaction",
+    "autoregressive_misconception_correction"
+  ],
+  "compiled_sha256": "6871059a86d4dbb21d37a3e9abb0da58d27105e56ec92d6bca5ab999f36890fb",
+  "compiled_trajectories": 1280,
+  "compiled_transitions": 1280,
+  "compiler": {
+    "seed": 20260813,
+    "variants_per_task": 2
+  },
+  "contract_sha256": "13a9bb963821a04594871765f44e4458ea648e792a1d8748a076381af3c0abd6",
+  "family_counts": {
+    "acronym": 80,
+    "architecture_summary": 80,
+    "async_interaction": 80,
+    "channels": 80,
+    "model_class": 80,
+    "name": 80,
+    "runtime_boundary": 80,
+    "tct": 80
+  },
+  "format_version": 1,
+  "generator": "cid.self_identity_training.v1",
+  "language_counts": {
+    "en": 480,
+    "zh": 160
+  },
+  "name": "cid-self-identity-v1",
+  "plans_sha256": "46a19b270cf2358a699ab3f9d89ba899a31f2283255369e40715604593499763",
+  "review_rejected": 0,
+  "review_sha256": "eba28a96a544993e300b9c44a852fc5166ba47188ad1a6fe25d1d3900daa86cc",
+  "seed": 20260813,
+  "semantic_tasks": 640,
+  "tasks_sha256": "40bb8e944b7672fd43757bf7a7e5dad79264b3512a3b5c2757b0de695ec889d7",
+  "thought_capacity_required": 8,
+  "version": 1
+}

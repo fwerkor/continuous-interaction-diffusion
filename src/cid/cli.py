@@ -32,6 +32,10 @@ from cid.evaluation import summarize_evaluations
 from cid.grounding import ObjectRef
 from cid.metrics import summarize_runtime
 from cid.runtime import CIDRuntime, RuntimeConfig, SourceRegistry, StaticMappingSource
+from cid.self_identity_training import (
+    SelfIdentityTrainingConfig,
+    build_self_identity_training,
+)
 from cid.state import CognitiveField, CognitiveRole, DisplayCanvas
 from cid.synthetic import SyntheticConfig, generate_synthetic
 
@@ -156,6 +160,29 @@ def _build_symbolic_training(args: argparse.Namespace) -> None:
     print(
         f"tasks={manifest['tasks']} families={len(manifest['family_counts'])} "
         f"tasks_path={manifest['tasks_path']} causal_jobs={manifest['causal_jobs']}"
+    )
+
+
+def _build_self_identity_training(args: argparse.Namespace) -> None:
+    manifest = build_self_identity_training(
+        contract_path=args.contract,
+        tasks_output=args.tasks_output,
+        plans_output=args.plans_output,
+        reviews_output=args.reviews_output,
+        trajectories_output=args.trajectories_output,
+        trajectory_manifest_output=args.trajectory_manifest_output,
+        reference_manifest_output=args.reference_manifest_output,
+        config=SelfIdentityTrainingConfig(
+            count_per_family=args.count_per_family,
+            seed=args.seed,
+            variants_per_task=args.variants_per_task,
+            thought_capacity=args.thought_capacity,
+        ),
+    )
+    print(
+        f"tasks={manifest['semantic_tasks']} accepted={manifest['accepted_plans']} "
+        f"trajectories={manifest['compiled_trajectories']} "
+        f"transitions={manifest['compiled_transitions']}"
     )
 
 
@@ -932,6 +959,35 @@ def main() -> None:
     )
     symbolic.add_argument("--count-per-family", type=int, default=1200)
     symbolic.add_argument("--seed", type=int, default=20260812)
+    self_identity = subparsers.add_parser(
+        "build-self-identity-training",
+        help="build deterministic CID model-identity and architecture self-knowledge training data",
+    )
+    self_identity.add_argument("--contract", default="data/cid-self-identity-v1.contract.json")
+    self_identity.add_argument(
+        "--tasks-output", default="data/generated/self-identity-teacher-tasks-v1.jsonl"
+    )
+    self_identity.add_argument(
+        "--plans-output", default="data/generated/self-identity-teacher-plans-v1.accepted.jsonl"
+    )
+    self_identity.add_argument(
+        "--reviews-output", default="data/generated/self-identity-review-v1.jsonl"
+    )
+    self_identity.add_argument(
+        "--trajectories-output", default="data/generated/self-identity-trajectories-v1.jsonl"
+    )
+    self_identity.add_argument(
+        "--trajectory-manifest-output",
+        default="data/generated/self-identity-trajectories-v1.manifest.json",
+    )
+    self_identity.add_argument(
+        "--reference-manifest-output",
+        default="data/generated/self-identity-reference-manifest-v1.json",
+    )
+    self_identity.add_argument("--count-per-family", type=int, default=80)
+    self_identity.add_argument("--variants-per-task", type=int, default=2)
+    self_identity.add_argument("--thought-capacity", type=int, default=8)
+    self_identity.add_argument("--seed", type=int, default=20260813)
     prepare = subparsers.add_parser(
         "prepare-distillation",
         help="convert CID trajectories into timing-free teacher task/request JSONL",
@@ -1141,6 +1197,8 @@ def main() -> None:
         _build_correction_training(args)
     elif args.command == "build-symbolic-training":
         _build_symbolic_training(args)
+    elif args.command == "build-self-identity-training":
+        _build_self_identity_training(args)
     elif args.command == "prepare-distillation":
         _prepare_distillation(args)
     elif args.command == "compile-distillation":

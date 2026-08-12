@@ -179,39 +179,37 @@ Convert a pool into teacher-ready CID tasks and causal evidence-exposure jobs wi
 cid prepare-public-distillation
 ```
 
-The current overall semantic mixture is pinned by `data/training-semantic-mixture-v5.json` and
-contains 65,655 tasks. It combines the 18,055-task public mixture, 10,000 generated mechanism tasks,
-12,000 computational-tool tasks, 15,600 symbolic-tool tasks, and 10,000 speculative local-correction
-tasks. The computational component covers
-calculator use, deterministic Python execution, immutable record lookup followed by calculation,
-serial dependencies, parallel fan-out/merge, and negative examples where tools are deliberately
-unnecessary. The symbolic component adds exact equation solving, systems, expansion, factorization,
-rational simplification, differentiation, integration, identity checking, symbolic-to-numeric
-chains, record-to-symbolic chains, parallel symbolic merge, and another 1,200 no-tool calibration
-cases. The local-correction component explicitly supervises a plausible but wrong hypothesis,
-contradictory evidence that reopens only that hypothesis and its dependent answer, and independent
-confirmation that stabilizes the corrected state while unrelated cells remain unchanged. Retrieval
-tasks still use task-local `workspace_search`/`workspace_read`; dynamic and streaming mechanism tasks
-reuse persistent bindings. Causal teacher jobs reveal evidence values only after their corresponding
-arrival stage.
+The current overall semantic mixture is pinned by `data/training-semantic-mixture-v7.json` and
+contains 78,295 tasks. In addition to the public, mechanism, computational, symbolic, local-correction,
+and complex-logic components, v7 adds 640 no-tool CID self-identity tasks. The identity component
+covers the canonical name `Continuous Interaction Diffusion (CID)`, the diffusion-native generation
+paradigm, Facts/TCT/Display state separation, TCT logical-vs-physical identity, the model/runtime
+responsibility boundary, and asynchronous external interaction. It contains 480 English and 160
+Chinese semantic tasks and is generated from `data/cid-self-identity-v1.contract.json` so architecture
+wording cannot drift across teacher samples.
 
 The corresponding compiled training mixture is pinned by
-`data/training-trajectory-mixture-v5.json`: **179,608 runtime trajectories and 1,027,548 adjacent
-supervised transitions** across the same six semantic components. Materialize the single JSONL
-expected by Stage A/B with:
+`data/training-trajectory-mixture-v7.json`: **204,888 runtime trajectories and 1,076,828 adjacent
+supervised transitions**. The self-identity component contributes two independently randomized TCT
+slot variants per semantic task (1,280 trajectories / 1,280 transitions) and contains no external
+source calls. Materialize the component-order training file with:
 
 ```bash
 cid materialize-trajectory-mixture \
-  --spec data/training-trajectory-mixture-v5.json \
-  --output data/generated/training-trajectories-v5.jsonl \
-  --manifest-output data/generated/training-trajectories-v5.manifest.json
+  --spec data/training-trajectory-mixture-v7.json \
+  --output data/generated/training-trajectories-v7.jsonl \
+  --manifest-output data/generated/training-trajectories-v7.manifest.json
 ```
 
 The materializer verifies every component SHA/count and global `example_id` uniqueness before
-writing the combined file. Its output is deterministic; training shuffles rollout windows per epoch
-unless `--no-shuffle` is requested. The verified materialized identity is pinned by
-`data/training-trajectories-v5.reference-manifest.json` (179,608 examples, 1,027,548 transitions,
-SHA-256 `d771d5ddcf94c1b8b7ae9a1b7df38944fc3c5974d34867ec4c0ae392b7c9120b`).
+writing the combined file. Training shuffles rollout windows per epoch unless `--no-shuffle` is
+requested.
+
+Build the self-identity component reproducibly with:
+
+```bash
+cid build-self-identity-training
+```
 
 Build the deterministic computational teacher jobs with:
 
