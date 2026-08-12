@@ -1,10 +1,10 @@
 {
   "accepted_plans": 12000,
-  "accepted_plans_sha256": "11f3ebc81b78b735824a4ef94236a8e12c28ac940a9b1e2f4c1a2fba793b4125",
+  "accepted_plans_sha256": "dff2aa4b770a3b12262741c8d5c6045b56c5ab76afdea126ac9166be64343ddd",
   "anchor_instances": 12000,
-  "compiled_sha256": "09c7824fd5a065be6581b673fc3aa41279d542cf20d23693eff54169fb5d3683",
+  "compiled_sha256": "24f5125de86f56ca10e9c900412b65522a54752e7dd5a2a045dc1a6562c351ae",
   "compiled_trajectories": 24000,
-  "compiled_transitions": 48000,
+  "compiled_transitions": 120000,
   "compiler": {
     "seed": 20260812,
     "variants_per_task": 2
@@ -27,16 +27,16 @@
   },
   "format_version": 1,
   "generator": "GPT-5.6-Sol-authored deterministic self-distill",
-  "link_instances": 108000,
-  "name": "complex-logic-reasoning-v1",
-  "plans_sha256": "11f3ebc81b78b735824a4ef94236a8e12c28ac940a9b1e2f4c1a2fba793b4125",
+  "link_instances": 216000,
+  "name": "complex-logic-reasoning-v2",
+  "plans_sha256": "dff2aa4b770a3b12262741c8d5c6045b56c5ab76afdea126ac9166be64343ddd",
   "review_rejected": 0,
-  "review_sha256": "16658d56fe17481239e786b01401b226491a13ca87df7759660296b7b12b0bbf",
+  "review_sha256": "bf6e2f50be6bb3661580421eeac3f2764709619ac041fb4836abc9506c515891",
   "seed": 20260812,
   "self_distilled_teacher": "GPT-5.6 Sol",
   "semantic_tasks": 12000,
   "semantic_text_cap": 144,
-  "tasks_sha256": "d7e67ed0ccba5798d48cb7df3ec736b8c742cf9fbb06898b1c56aba365ddc7f0",
+  "tasks_sha256": "b97aa553ce37e295f766f9a19bbefaf1a5458e8c9f7121901bfdf637c47e2b45",
   "thought_capacity_required": 8,
-  "version": 1
+  "version": 2
 }
