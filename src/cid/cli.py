@@ -8,6 +8,7 @@ import time
 from dataclasses import asdict
 from pathlib import Path
 
+from cid.composed_training import ComposedTrainingConfig, build_composed_distillation
 from cid.computational_training import (
     ComputationalTrainingConfig,
     build_computational_training,
@@ -39,6 +40,10 @@ from cid.self_identity_training import (
 )
 from cid.state import CognitiveField, CognitiveRole, DisplayCanvas
 from cid.synthetic import SyntheticConfig, generate_synthetic
+from cid.tool_restraint_training import (
+    ToolRestraintTrainingConfig,
+    build_tool_restraint_distillation,
+)
 
 
 class DemoPolicy:
@@ -202,6 +207,43 @@ def _build_multilingual_training(args: argparse.Namespace) -> None:
     print(
         f"tasks={manifest['semantic_tasks']} trajectories={manifest['compiled_trajectories']} "
         f"cross_lingual={manifest['cross_lingual_tasks']} output={args.output_dir}"
+    )
+
+
+def _build_composed_training(args: argparse.Namespace) -> None:
+    manifest = build_composed_distillation(
+        output_dir=args.output_dir,
+        reference_manifest_output=args.reference_manifest_output,
+        config=ComposedTrainingConfig(
+            count_per_family=args.count_per_family,
+            seed=args.seed,
+            variants_per_task=args.variants_per_task,
+            thought_capacity=args.thought_capacity,
+            min_delay_steps=args.min_delay_steps,
+            max_delay_steps=args.max_delay_steps,
+        ),
+    )
+    print(
+        f"tasks={manifest['semantic_tasks']} trajectories={manifest['compiled_trajectories']} "
+        f"transitions={manifest['compiled_transitions']}"
+    )
+
+
+def _build_tool_restraint_training(args: argparse.Namespace) -> None:
+    manifest = build_tool_restraint_distillation(
+        source_tasks_path=args.source_tasks,
+        source_plans_path=args.source_plans,
+        output_dir=args.output_dir,
+        reference_manifest_output=args.reference_manifest_output,
+        config=ToolRestraintTrainingConfig(
+            count=args.count,
+            seed=args.seed,
+            thought_capacity=args.thought_capacity,
+        ),
+    )
+    print(
+        f"tasks={manifest['semantic_tasks']} trajectories={manifest['compiled_trajectories']} "
+        f"mode=tools_available_unnecessary"
     )
 
 
@@ -1011,15 +1053,47 @@ def main() -> None:
         "build-multilingual-training",
         help="build a small multilingual and cross-lingual CID trajectory component",
     )
-    multilingual.add_argument(
-        "--output-dir", default="data/generated/multilingual-v1"
-    )
+    multilingual.add_argument("--output-dir", default="data/generated/multilingual-v1")
     multilingual.add_argument("--zh-tasks", type=int, default=450)
     multilingual.add_argument("--en-zh-tasks", type=int, default=300)
     multilingual.add_argument("--ja-tasks", type=int, default=225)
     multilingual.add_argument("--es-tasks", type=int, default=225)
     multilingual.add_argument("--schedule-variants", type=int, default=2)
     multilingual.add_argument("--seed", type=int, default=20260813)
+    composed = subparsers.add_parser(
+        "build-composed-training",
+        help="build mixed lookup/reasoning/calculator/symbolic CID trajectories",
+    )
+    composed.add_argument("--output-dir", default="data/generated")
+    composed.add_argument(
+        "--reference-manifest-output",
+        default="data/composed-teacher-v1.reference-manifest.json",
+    )
+    composed.add_argument("--count-per-family", type=int, default=2000)
+    composed.add_argument("--variants-per-task", type=int, default=2)
+    composed.add_argument("--thought-capacity", type=int, default=8)
+    composed.add_argument("--min-delay-steps", type=int, default=1)
+    composed.add_argument("--max-delay-steps", type=int, default=4)
+    composed.add_argument("--seed", type=int, default=20260813)
+    restraint = subparsers.add_parser(
+        "build-tool-restraint-training",
+        help="derive natural tasks where tools are available but unnecessary",
+    )
+    restraint.add_argument(
+        "--source-tasks", default="data/generated/public-teacher-tasks-v1.train.jsonl"
+    )
+    restraint.add_argument(
+        "--source-plans", default="data/generated/public-teacher-plans-v1.accepted.jsonl"
+    )
+    restraint.add_argument("--output-dir", default="data/generated")
+    restraint.add_argument(
+        "--reference-manifest-output",
+        default="data/tool-restraint-teacher-v1.reference-manifest.json",
+    )
+    restraint.add_argument("--count", type=int, default=6500)
+    restraint.add_argument("--thought-capacity", type=int, default=8)
+    restraint.add_argument("--seed", type=int, default=20260813)
+
     prepare = subparsers.add_parser(
         "prepare-distillation",
         help="convert CID trajectories into timing-free teacher task/request JSONL",
@@ -1233,6 +1307,11 @@ def main() -> None:
         _build_self_identity_training(args)
     elif args.command == "build-multilingual-training":
         _build_multilingual_training(args)
+    elif args.command == "build-composed-training":
+        _build_composed_training(args)
+    elif args.command == "build-tool-restraint-training":
+        _build_tool_restraint_training(args)
+
     elif args.command == "prepare-distillation":
         _prepare_distillation(args)
     elif args.command == "compile-distillation":

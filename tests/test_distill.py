@@ -239,6 +239,92 @@ def test_teacher_compiler_accepts_review_filtered_plan_subset() -> None:
     assert trajectories[0].example_id == task.task_id
 
 
+def test_teacher_compiler_supports_no_tool_refinement_phases() -> None:
+    task = TeacherTask(
+        task_id="no-tool-refine",
+        prompt="Determine whether the stated implication chain reaches z.",
+        metadata={"task_kind": "complex_logic_reasoning", "training_mode": "no_tool"},
+        reference_answer="entailed",
+    )
+    frames = (
+        TeacherFrame(
+            phase="initial",
+            display="Reasoning.",
+            cells=(
+                TeacherCellPlan(
+                    cell_id="state",
+                    semantic_text="Start from the stated seed and preserve implication direction.",
+                    roles={CognitiveRole.PLAN: 1.0},
+                    uncertainty=0.7,
+                ),
+            ),
+        ),
+        TeacherFrame(
+            phase="refine:0",
+            display="Reasoning.",
+            cells=(
+                TeacherCellPlan(
+                    cell_id="state",
+                    semantic_text="The reachable frontier advances through the first two rules.",
+                    roles={CognitiveRole.HYPOTHESIS: 0.7, CognitiveRole.PLAN: 0.4},
+                    uncertainty=0.4,
+                ),
+            ),
+        ),
+        TeacherFrame(
+            phase="refine:1",
+            display="Reasoning.",
+            cells=(
+                TeacherCellPlan(
+                    cell_id="state",
+                    semantic_text=(
+                        "The final directed edge reaches z; disconnected rules are irrelevant."
+                    ),
+                    roles={CognitiveRole.PERCEPT: 0.7, CognitiveRole.HYPOTHESIS: 0.4},
+                    uncertainty=0.12,
+                ),
+            ),
+        ),
+        TeacherFrame(
+            phase="final",
+            display="entailed",
+            cells=(
+                TeacherCellPlan(
+                    cell_id="state",
+                    semantic_text="The complete directed chain reaches z.",
+                    roles={CognitiveRole.CONCLUSION: 1.0},
+                    uncertainty=0.02,
+                    lifecycle=CellLifecycle.STABLE,
+                ),
+            ),
+        ),
+    )
+    plan = TeacherPlan(task_id=task.task_id, final_answer="entailed", frames=frames)
+
+    (trajectory,) = compile_teacher_plans((task,), (plan,))
+
+    assert [target.step for target in trajectory.display_targets] == [0, 1, 2, 3]
+    assert [target.text for target in trajectory.display_targets] == [
+        "Reasoning.",
+        "Reasoning.",
+        "Reasoning.",
+        "entailed",
+    ]
+    assert review_teacher_plans((task,), (plan,))[0].accepted
+
+
+def test_teacher_compiler_rejects_refinement_phases_with_external_evidence() -> None:
+    task, plan = make_teacher_task_and_plan()
+    refine = replace(plan.frames[0], phase="refine:0")
+    invalid = replace(plan, frames=(plan.frames[0], refine, *plan.frames[1:]))
+
+    review = review_teacher_plans((task,), (invalid,))[0]
+    assert not review.accepted
+    assert any("only supported for no-evidence" in reason for reason in review.reasons)
+    with pytest.raises(ValueError, match="only supported for no-evidence"):
+        compile_teacher_plans((task,), (invalid,))
+
+
 def test_teacher_compiler_tolerates_entity_anchor_case_variants() -> None:
     task, plan = make_teacher_task_and_plan()
     final = plan.frames[-1]
@@ -568,9 +654,7 @@ def test_teacher_quality_review_rejects_future_leaks_and_bad_arguments() -> None
 
 
 def test_teacher_quality_review_allows_repeated_future_evidence_value() -> None:
-    examples = generate_synthetic(
-        SyntheticConfig(count_per_family=1, seed=31, thought_capacity=8)
-    )
+    examples = generate_synthetic(SyntheticConfig(count_per_family=1, seed=31, thought_capacity=8))
     streaming_example = next(
         example for example in examples if example.metadata["family"] == "streaming_evidence"
     )
@@ -657,9 +741,7 @@ def test_future_leak_check_allows_future_value_already_visible_inside_record() -
             {
                 "name": "symbolic_math",
                 "description": "solve an equation",
-                "arguments": (
-                    {"name": "expression", "kind": "string", "required": True},
-                ),
+                "arguments": ({"name": "expression", "kind": "string", "required": True},),
                 "cacheable": True,
                 "dynamic": False,
                 "versioned": False,
@@ -714,9 +796,7 @@ def test_future_leak_check_allows_future_text_already_visible_inside_search_titl
             {
                 "name": "workspace_read",
                 "description": "read one local record",
-                "arguments": (
-                    {"name": "resource_id", "kind": "string", "required": True},
-                ),
+                "arguments": ({"name": "resource_id", "kind": "string", "required": True},),
                 "cacheable": True,
                 "dynamic": False,
                 "versioned": False,

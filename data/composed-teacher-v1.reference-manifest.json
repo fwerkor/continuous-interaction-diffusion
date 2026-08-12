@@ -1,0 +1,64 @@
+{
+  "accepted_plans": 12000,
+  "accepted_plans_sha256": "982e24f2a876a1c6c12725b89fec2e5ff2c9711c1934ac092807b54fce8a7643",
+  "causal_jobs_sha256": "9527524db80fe6abd97da49746b151cc35eadc5daf3845473590dee47b023104",
+  "causal_stage_histogram": {
+    "3": 2000,
+    "4": 8000,
+    "5": 2000
+  },
+  "compiled_sha256": "9e85b6b1ecd3db15716511045de3523d60d2fd88d58e6e43f3ddfce15a223556",
+  "compiled_trajectories": 24000,
+  "compiled_transitions": 237058,
+  "compiler": {
+    "max_delay_steps": 4,
+    "min_delay_steps": 1,
+    "seed": 20260813,
+    "variants_per_task": 2
+  },
+  "dependency_depth_histogram": {
+    "2": 6000,
+    "3": 6000
+  },
+  "exact_verifier_failures": 0,
+  "family_counts": {
+    "alias_disambiguate_calculate": 2000,
+    "lookup_then_symbolic": 2000,
+    "parallel_branch_symbolic": 2000,
+    "parallel_lookup_system": 2000,
+    "policy_filter_calculate": 2000,
+    "stale_correct_calculate": 2000
+  },
+  "format_version": 1,
+  "generator": "GPT-5.6-Sol-authored deterministic mixed-capability self-distill",
+  "interaction_pattern_counts": {
+    "entity_disambiguation_then_lookup_then_calculate": 2000,
+    "lookup_then_parallel_filter_then_calculate": 2000,
+    "lookup_then_symbolic": 2000,
+    "parallel_lookup_then_logic_branch_then_symbolic": 2000,
+    "parallel_lookup_then_symbolic_merge": 2000,
+    "stale_hypothesis_then_authoritative_correction_then_calculate": 2000
+  },
+  "max_semantic_text_chars": 94,
+  "mode_counts": {
+    "tool_required": 12000
+  },
+  "name": "composed-tool-reasoning-v1",
+  "plans_sha256": "982e24f2a876a1c6c12725b89fec2e5ff2c9711c1934ac092807b54fce8a7643",
+  "review_rejected": 0,
+  "review_sha256": "9101b400cd7ba943a0e3b3ef9b29040eb5ac9887f805fe0ddf68f3139d1b4e36",
+  "seed": 20260813,
+  "self_distilled_teacher": "GPT-5.6 Sol",
+  "semantic_tasks": 12000,
+  "semantic_text_cap": 112,
+  "tasks_sha256": "baea71c0ef222ceaf99a6ffccfc0b6b55646efe7ece694ad656f40f51954c505",
+  "tasks_with_anchor": 12000,
+  "tasks_with_link": 12000,
+  "thought_capacity_required": 8,
+  "tool_call_target_counts": {
+    "calculator": 6000,
+    "record_lookup": 24000,
+    "symbolic_math": 6000
+  },
+  "version": 1
+}

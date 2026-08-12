@@ -401,6 +401,7 @@ Output schema:
   "final_answer": "...",
   "frames": [
     {{"phase":"initial","display":"...","cells":[CELL,...]}},
+    {{"phase":"refine:0","display":"...","cells":[CELL,...]}},
     {{"phase":"pre","display":"...","cells":[CELL,...]}},
     {{"phase":"after:EVIDENCE_ID","display":"...","cells":[CELL,...]}},
     {{"phase":"final","display":"...","cells":[CELL,...]}}
@@ -428,6 +429,8 @@ CELL schema:
 Rules:
 - Preserve every previously introduced cell in later frames; retire it explicitly if obsolete.
 - `initial` must be first. Use `pre` before external evidence if the task needs tools.
+- No-tool tasks may use contiguous `refine:0`, `refine:1`, ... frames for internal semantic
+  refinement. Refinement frames are not allowed on tasks with external evidence.
 - For every supplied evidence item E, emit exactly one `after:E` frame in evidence-list order.
 - A final frame is optional; if present it comes after all evidence frames.
 - Pre-evidence frames must not reveal values that have not arrived yet.
@@ -642,6 +645,32 @@ def load_teacher_plans(path: str | Path) -> tuple[TeacherPlan, ...]:
     return tuple(TeacherPlan.from_dict(item) for item in _load_json_objects(path, "teacher plan"))
 
 
+def _refinement_phases(
+    frame_by_phase: Mapping[str, TeacherFrame],
+    *,
+    has_evidence: bool,
+) -> tuple[str, ...]:
+    raw = tuple(phase for phase in frame_by_phase if phase.startswith("refine:"))
+    if not raw:
+        return ()
+    if has_evidence:
+        raise ValueError("refinement phases are only supported for no-evidence teacher plans")
+
+    indexed: list[tuple[int, str]] = []
+    for phase in raw:
+        suffix = phase.removeprefix("refine:")
+        if not suffix.isdigit():
+            raise ValueError(f"invalid refinement phase {phase!r}")
+        indexed.append((int(suffix), phase))
+    indexed.sort()
+    indexes = tuple(index for index, _ in indexed)
+    if indexes != tuple(range(len(indexed))):
+        raise ValueError(
+            f"refinement phases must be contiguous and zero-based: found {list(indexes)}"
+        )
+    return tuple(phase for _, phase in indexed)
+
+
 def _compile_one(
     task: TeacherTask,
     plan: TeacherPlan,
@@ -652,16 +681,18 @@ def _compile_one(
         raise ValueError("teacher task and plan IDs do not match")
     frame_by_phase = {frame.phase: frame for frame in plan.frames}
     expected_after = tuple(f"after:{item.evidence_id}" for item in task.evidence)
+    refinement_phases = _refinement_phases(frame_by_phase, has_evidence=bool(task.evidence))
     for phase in expected_after:
         if phase not in frame_by_phase:
             raise ValueError(f"teacher plan is missing required evidence frame {phase!r}")
-    allowed = {"initial", "pre", "final", *expected_after}
+    allowed = {"initial", "pre", "final", *expected_after, *refinement_phases}
     unknown = set(frame_by_phase) - allowed
     if unknown:
         raise ValueError(f"teacher plan contains unsupported phases: {sorted(unknown)}")
     _validate_need_contract(task, plan, frame_by_phase)
 
     semantic_frames = [frame_by_phase["initial"]]
+    semantic_frames.extend(frame_by_phase[phase] for phase in refinement_phases)
     if "pre" in frame_by_phase:
         semantic_frames.append(frame_by_phase["pre"])
     semantic_frames.extend(frame_by_phase[phase] for phase in expected_after)
@@ -813,6 +844,23 @@ def _schedule_frames(
     launch_steps: Mapping[str, int],
     arrival_steps: Mapping[str, int],
 ) -> list[tuple[int, TeacherFrame]]:
+    refinement_phases = _refinement_phases(
+        frame_by_phase,
+        has_evidence=bool(task.evidence),
+    )
+    if refinement_phases:
+        if "pre" in frame_by_phase:
+            raise ValueError("no-tool refinement plans must not also use the pre phase")
+        scheduled = [(0, frame_by_phase["initial"])]
+        current_step = 0
+        for phase in refinement_phases:
+            current_step += 1
+            scheduled.append((current_step, frame_by_phase[phase]))
+        if "final" in frame_by_phase:
+            current_step += 1
+            scheduled.append((current_step, frame_by_phase["final"]))
+        return scheduled
+
     arrival_by_step = {step: evidence_id for evidence_id, step in arrival_steps.items()}
     if len(arrival_by_step) != len(arrival_steps):
         raise ValueError("compiled evidence arrivals must be unique by runtime step")
@@ -984,9 +1032,7 @@ def _allocate_teacher_slots(
             if cell_id not in active_slots:
                 raise ValueError(f"retiring teacher cell has no physical slot: {cell_id}")
 
-        slots_by_phase[frame.phase] = {
-            cell_id: active_slots[cell_id] for cell_id in visible_ids
-        }
+        slots_by_phase[frame.phase] = {cell_id: active_slots[cell_id] for cell_id in visible_ids}
         visible_by_phase[frame.phase] = frozenset(visible_ids)
 
         for cell_id in retiring_ids:
@@ -1097,15 +1143,24 @@ def _teacher_quality_reasons(
 
     frame_by_phase = {frame.phase: frame for frame in plan.frames}
     expected_after = tuple(f"after:{item.evidence_id}" for item in task.evidence)
+    try:
+        refinement_phases = _refinement_phases(
+            frame_by_phase,
+            has_evidence=bool(task.evidence),
+        )
+    except ValueError as exc:
+        refinement_phases = ()
+        reasons.append(str(exc))
     missing_phases = tuple(phase for phase in expected_after if phase not in frame_by_phase)
     if missing_phases:
         reasons.append(f"missing evidence frames: {list(missing_phases)}")
-    allowed = {"initial", "pre", "final", *expected_after}
+    allowed = {"initial", "pre", "final", *expected_after, *refinement_phases}
     unknown_phases = sorted(set(frame_by_phase) - allowed)
     if unknown_phases:
         reasons.append(f"unsupported phases: {unknown_phases}")
 
     semantic_frames = [frame_by_phase["initial"]]
+    semantic_frames.extend(frame_by_phase[phase] for phase in refinement_phases)
     if "pre" in frame_by_phase:
         semantic_frames.append(frame_by_phase["pre"])
     semantic_frames.extend(
@@ -1486,10 +1541,7 @@ def _normalized_answer_match(prediction: str, reference: str) -> bool:
         and expected_date[1:] == predicted_partial_date
     ):
         return True
-    if (
-        predicted_partial_date is not None
-        and predicted_partial_date == expected_partial_date
-    ):
+    if predicted_partial_date is not None and predicted_partial_date == expected_partial_date:
         return True
     if _numeric_surface_match(prediction, reference):
         return True
@@ -1640,9 +1692,7 @@ def _competition_math_answer_match(prediction: str, reference: str) -> bool:
     return _unordered_math_parts_match(predicted_parts, expected_parts)
 
 
-def _competition_math_choice_match(
-    prompt: str, prediction: str, reference: str
-) -> bool:
+def _competition_math_choice_match(prompt: str, prediction: str, reference: str) -> bool:
     choice = prediction.strip().upper()
     if not re.fullmatch(r"[A-E]", choice):
         return False
@@ -1787,9 +1837,7 @@ def _symbolic_math_part_match(prediction: str, reference: str) -> bool:
             return False
         return all(
             _symbolic_math_part_match(left, right)
-            for left, right in zip(
-                predicted_coordinates, reference_coordinates, strict=True
-            )
+            for left, right in zip(predicted_coordinates, reference_coordinates, strict=True)
         )
     predicted_interval = _interval_answer_parts(prediction)
     reference_interval = _interval_answer_parts(reference)
@@ -2121,9 +2169,7 @@ def _future_evidence_leaks(
                     for available_marker in available_markers
                 ):
                     continue
-                if normalized_marker and _visibility_contains_marker(
-                    frame_text, normalized_marker
-                ):
+                if normalized_marker and _visibility_contains_marker(frame_text, normalized_marker):
                     reasons.append(f"phase {frame.phase!r} leaks future evidence {evidence_id!r}")
                     break
     return tuple(reasons)
@@ -2155,11 +2201,7 @@ def _evidence_markers(value: Any) -> tuple[str, ...]:
         return (marker,) if len(marker) >= 3 else ()
     if isinstance(value, dict):
         marker = json.dumps(value, ensure_ascii=False, sort_keys=True, default=str)
-        nested = tuple(
-            child
-            for item in value.values()
-            for child in _evidence_markers(item)
-        )
+        nested = tuple(child for item in value.values() for child in _evidence_markers(item))
         return ((marker,) if len(marker) >= 4 else ()) + nested
     if isinstance(value, (list, tuple)):
         marker = json.dumps(value, ensure_ascii=False, sort_keys=True, default=str)
