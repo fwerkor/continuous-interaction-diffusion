@@ -218,12 +218,6 @@ def test_training_trajectory_mixture_v5_matches_compiled_components() -> None:
         "local-correction",
     ]
 
-    for component in mixture["components"]:
-        manifest = _load(component["manifest"])
-        assert component["sha256"] == manifest["sha256"]
-        assert component["examples"] == manifest["examples"]
-        assert component["transitions"] == manifest["transitions"]
-
     assert sum(component["examples"] for component in mixture["components"]) == mixture["examples"]
     assert (
         sum(component["transitions"] for component in mixture["components"])
@@ -231,6 +225,16 @@ def test_training_trajectory_mixture_v5_matches_compiled_components() -> None:
     )
 
     materialized = _load("data/training-trajectories-v5.reference-manifest.json")
+    materialized_components = {
+        component["name"]: component for component in materialized["components"]
+    }
+    for component in mixture["components"]:
+        reference = materialized_components[component["name"]]
+        assert component["path"] == reference["path"]
+        assert component["sha256"] == reference["sha256"]
+        assert component["examples"] == reference["examples"]
+        assert component["transitions"] == reference["transitions"]
+
     assert materialized["mixture"] == mixture["name"]
     assert materialized["mixture_version"] == mixture["version"]
     assert materialized["examples"] == mixture["examples"]
