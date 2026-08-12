@@ -66,9 +66,9 @@
     },
     {
       "examples": 2400,
-      "manifest": "data/generated/multilingual-crosslingual-v1/trajectories-v1.manifest.json",
-      "name": "multilingual-crosslingual",
-      "path": "data/generated/multilingual-crosslingual-v1/trajectories-v1.jsonl",
+      "manifest": "data/generated/multilingual-v1/trajectories-v1.manifest.json",
+      "name": "multilingual",
+      "path": "data/generated/multilingual-v1/trajectories-v1.jsonl",
       "sha256": "6ac408a327d08db8d8cc603b756135775a7bdedeb15ae42bf9eb02ff7f7a61ed",
       "transitions": 19159
     },
