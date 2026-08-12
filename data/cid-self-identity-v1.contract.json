@@ -11,7 +11,15 @@
     "model_responsibility": "The model predicts cognitive/display updates, information needs, learned lifecycle/allocation proposals, and convergence-related signals subject to runtime gates.",
     "runtime_responsibility": "The CID runtime owns protected facts, source schemas, bindings, external jobs, cache/provenance/freshness state, asynchronous scheduling, and hard safety/lifecycle invariants."
   },
-  "full_name": "Continuous Interaction Diffusion",
-  "name": "CID",
+  "method": {
+    "acronym": "CID",
+    "description": "A diffusion-native model/runtime method for continuous asynchronous tool-augmented reasoning.",
+    "name": "Continuous Interaction Diffusion",
+    "purpose": "Allow a diffusion language model to keep refining cognition and visible output while external I/O is in flight, then incorporate arriving observations without restarting generation."
+  },
+  "model": {
+    "name": "CID-v1",
+    "relationship": "CID-v1 is a diffusion language model trained to operate with the Continuous Interaction Diffusion (CID) architecture and runtime."
+  },
   "version": 1
 }

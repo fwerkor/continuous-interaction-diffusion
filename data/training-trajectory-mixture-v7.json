@@ -57,18 +57,18 @@
       "transitions": 48000
     },
     {
-      "examples": 1280,
+      "examples": 1440,
       "manifest": "data/generated/self-identity-trajectories-v1.manifest.json",
       "name": "self-identity",
       "path": "data/generated/self-identity-trajectories-v1.jsonl",
-      "sha256": "6871059a86d4dbb21d37a3e9abb0da58d27105e56ec92d6bca5ab999f36890fb",
-      "transitions": 1280
+      "sha256": "98ba8f417ff2da12ff44d9620c980b3c7f3dd1f6263f4c7302250d542b7e0853",
+      "transitions": 1440
     }
   ],
-  "examples": 204888,
+  "examples": 205048,
   "name": "training-trajectory-mixture-v7",
   "semantic_mixture": "data/training-semantic-mixture-v7.json",
   "thought_capacity_required": 8,
-  "transitions": 1076828,
+  "transitions": 1076988,
   "version": 7
 }

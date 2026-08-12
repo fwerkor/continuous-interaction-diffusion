@@ -180,18 +180,19 @@ cid prepare-public-distillation
 ```
 
 The current overall semantic mixture is pinned by `data/training-semantic-mixture-v7.json` and
-contains 78,295 tasks. In addition to the public, mechanism, computational, symbolic, local-correction,
-and complex-logic components, v7 adds 640 no-tool CID self-identity tasks. The identity component
-covers the canonical name `Continuous Interaction Diffusion (CID)`, the diffusion-native generation
-paradigm, Facts/TCT/Display state separation, TCT logical-vs-physical identity, the model/runtime
-responsibility boundary, and asynchronous external interaction. It contains 480 English and 160
-Chinese semantic tasks and is generated from `data/cid-self-identity-v1.contract.json` so architecture
-wording cannot drift across teacher samples.
+contains 78,375 tasks. In addition to the public, mechanism, computational, symbolic, local-correction,
+and complex-logic components, v7 adds 720 no-tool CID self-identity tasks. The component fixes the
+model name as `CID-v1` while reserving `Continuous Interaction Diffusion (CID)` for the method and
+architecture. Its nine internal families cover model identity, the CID acronym and method overview,
+diffusion-native generation, Facts/TCT/Display state separation, TCT logical-vs-physical identity,
+the model/runtime responsibility boundary, and asynchronous external interaction. It contains 540
+English and 180 Chinese semantic tasks and is generated from `data/cid-self-identity-v1.contract.json`
+so model/method identity and architecture wording cannot drift across samples.
 
 The corresponding compiled training mixture is pinned by
-`data/training-trajectory-mixture-v7.json`: **204,888 runtime trajectories and 1,076,828 adjacent
+`data/training-trajectory-mixture-v7.json`: **205,048 runtime trajectories and 1,076,988 adjacent
 supervised transitions**. The self-identity component contributes two independently randomized TCT
-slot variants per semantic task (1,280 trajectories / 1,280 transitions) and contains no external
+slot variants per semantic task (1,440 trajectories / 1,440 transitions) and contains no external
 source calls. Materialize the component-order training file with:
 
 ```bash

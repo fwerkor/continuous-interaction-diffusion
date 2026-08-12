@@ -268,13 +268,15 @@ the local-correction audit. Exact hashes are pinned by
 `data/correction-teacher-v1.reference-manifest.json`.
 
 The latest semantic mixture is `data/training-semantic-mixture-v7.json`. Relative to v6, it adds
-640 deterministic no-tool self-identity tasks generated from the canonical
-`data/cid-self-identity-v1.contract.json`. Eight balanced families supervise the model name and CID
-acronym, diffusion-native model class, architecture summary, Facts/TCT/Display separation, TCT
-structure, runtime/model responsibility boundary, and asynchronous interaction. The component uses
-480 English and 160 Chinese prompts; all 640 plans pass the normal CID semantic review with zero
-duplicates or rejects. Two physical-slot variants per task produce 1,280 trajectories. Exact hashes
-are pinned by `data/self-identity-teacher-v1.reference-manifest.json`.
+720 deterministic no-tool self-identity tasks generated from the canonical
+`data/cid-self-identity-v1.contract.json`. The model name is fixed as `CID-v1`, while
+`Continuous Interaction Diffusion (CID)` is explicitly the method/architecture name. Nine internal
+families supervise model identity, CID acronym expansion, a basic CID method overview,
+diffusion-native model class, architecture summary, Facts/TCT/Display separation, TCT structure,
+runtime/model responsibility boundary, and asynchronous interaction. The component uses 540 English
+and 180 Chinese prompts; all 720 plans pass the normal CID semantic review with zero duplicates or
+rejects. Two physical-slot variants per task produce 1,440 trajectories. Exact hashes are pinned by
+`data/self-identity-teacher-v1.reference-manifest.json`.
 
 Build it with:
 
@@ -282,8 +284,8 @@ Build it with:
 cid build-self-identity-training
 ```
 
-The current compiled mixture is `data/training-trajectory-mixture-v7.json`: **204,888 trajectories
-and 1,076,828 adjacent supervised transitions** across eight components.
+The current compiled mixture is `data/training-trajectory-mixture-v7.json`: **205,048 trajectories
+and 1,076,988 adjacent supervised transitions** across eight components.
 
 The historical v5 six-component training input is pinned separately by
 `data/training-trajectory-mixture-v5.json`. It preserves every reviewed schedule variant from

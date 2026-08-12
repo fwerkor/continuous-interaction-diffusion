@@ -26,10 +26,7 @@ def test_self_identity_generation_is_balanced_unique_and_bilingual() -> None:
     assert {task.metadata["family"] for task in tasks} == set(FAMILIES)
     assert sum(task.metadata["language"] == "zh" for task in tasks) == len(FAMILIES) * 2
     assert all(not task.evidence and not task.source_descriptors for task in tasks)
-    assert all(
-        "Continuous Interaction Diffusion" in plan.frames[0].cells[0].semantic_text
-        for plan in plans
-    )
+    assert all("CID-v1" in plan.frames[0].cells[0].semantic_text for plan in plans)
     assert all(review.accepted for review in review_teacher_plans(tasks, plans))
 
 
@@ -48,10 +45,30 @@ def test_self_identity_plans_ground_identity_and_architecture() -> None:
             cell for cell in initial.cells if cell.cell_id == "architecture_contract"
         )
         conclusion = next(cell for cell in final.cells if cell.cell_id == "answer")
-        assert identity.anchors and identity.anchors[0].object_id == "cid:self"
+        assert identity.anchors and identity.anchors[0].object_id == "model:cid-v1"
+        assert architecture.anchors and architecture.anchors[0].object_id == "method:cid"
         assert architecture.links
         assert conclusion.links
-        assert "CID" in initial.display
+        assert "CID-v1" in initial.display
+
+
+def test_self_identity_distinguishes_model_name_from_method_name() -> None:
+    contract = load_self_identity_contract(CONTRACT)
+    tasks, plans = generate_self_identity_tasks_and_plans(
+        contract,
+        SelfIdentityTrainingConfig(count_per_family=4, seed=9, variants_per_task=1),
+    )
+    by_family = {}
+    for task, plan in zip(tasks, plans, strict=True):
+        by_family.setdefault(task.metadata["family"], []).append(plan.final_answer)
+
+    assert all("CID-v1" in answer for answer in by_family["name"])
+    assert all("Continuous Interaction Diffusion" in answer for answer in by_family["acronym"])
+    assert all("CID" in answer for answer in by_family["method_overview"])
+    assert all(
+        "diffusion" in answer.casefold() or "扩散" in answer
+        for answer in by_family["method_overview"]
+    )
 
 
 def test_build_self_identity_training_writes_reviewed_trajectories(tmp_path: Path) -> None:

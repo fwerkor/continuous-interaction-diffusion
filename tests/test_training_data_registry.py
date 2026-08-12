@@ -254,26 +254,29 @@ def test_training_semantic_mixture_v7_adds_cid_self_identity() -> None:
     )
 
     assert mixture["version"] == 7
-    assert mixture["semantic_tasks"] == 78_295
-    assert mixture["self_identity_tasks"] == 640
-    assert mixture["self_identity_language_counts"] == {"en": 480, "zh": 160}
+    assert mixture["semantic_tasks"] == 78_375
+    assert mixture["self_identity_tasks"] == 720
+    assert mixture["self_identity_language_counts"] == {"en": 540, "zh": 180}
     assert mixture["mode_counts"] == {
-        "no_tool": 19_561,
+        "no_tool": 19_641,
         "tool_required": 55_591,
         "tools_available_unnecessary": 3_143,
     }
-    assert component["tasks"] == identity["semantic_tasks"] == 640
+    assert component["tasks"] == identity["semantic_tasks"] == 720
     assert component["tasks_sha256"] == identity["tasks_sha256"]
     assert component["teacher_protocol"] == "deterministic-no-tool-self-model"
-    assert identity["accepted_plans"] == 640
+    assert identity["accepted_plans"] == 720
     assert identity["review_rejected"] == 0
-    assert identity["compiled_trajectories"] == 1_280
-    assert identity["compiled_transitions"] == 1_280
+    assert identity["compiled_trajectories"] == 1_440
+    assert identity["compiled_transitions"] == 1_440
+    assert identity["model_name"] == "CID-v1"
+    assert identity["method_name"] == "Continuous Interaction Diffusion"
     assert identity["family_counts"] == {
         "acronym": 80,
         "architecture_summary": 80,
         "async_interaction": 80,
         "channels": 80,
+        "method_overview": 80,
         "model_class": 80,
         "name": 80,
         "runtime_boundary": 80,
@@ -287,8 +290,8 @@ def test_training_trajectory_mixture_v7_appends_self_identity() -> None:
     component = next(item for item in mixture["components"] if item["name"] == "self-identity")
 
     assert mixture["version"] == 7
-    assert mixture["examples"] == 204_888
-    assert mixture["transitions"] == 1_076_828
+    assert mixture["examples"] == 205_048
+    assert mixture["transitions"] == 1_076_988
     assert mixture["thought_capacity_required"] == 8
     assert component["examples"] == identity["compiled_trajectories"]
     assert component["transitions"] == identity["compiled_transitions"]
