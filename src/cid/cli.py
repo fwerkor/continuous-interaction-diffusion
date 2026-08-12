@@ -31,6 +31,7 @@ from cid.distill import (
 from cid.evaluation import summarize_evaluations
 from cid.grounding import ObjectRef
 from cid.metrics import summarize_runtime
+from cid.multilingual_training import MultilingualTrainingConfig, build_multilingual_training
 from cid.runtime import CIDRuntime, RuntimeConfig, SourceRegistry, StaticMappingSource
 from cid.self_identity_training import (
     SelfIdentityTrainingConfig,
@@ -183,6 +184,24 @@ def _build_self_identity_training(args: argparse.Namespace) -> None:
         f"tasks={manifest['semantic_tasks']} accepted={manifest['accepted_plans']} "
         f"trajectories={manifest['compiled_trajectories']} "
         f"transitions={manifest['compiled_transitions']}"
+    )
+
+
+def _build_multilingual_training(args: argparse.Namespace) -> None:
+    manifest = build_multilingual_training(
+        args.output_dir,
+        config=MultilingualTrainingConfig(
+            zh_tasks=args.zh_tasks,
+            en_zh_tasks=args.en_zh_tasks,
+            ja_tasks=args.ja_tasks,
+            es_tasks=args.es_tasks,
+            schedule_variants=args.schedule_variants,
+            seed=args.seed,
+        ),
+    )
+    print(
+        f"tasks={manifest['semantic_tasks']} trajectories={manifest['compiled_trajectories']} "
+        f"cross_lingual={manifest['cross_lingual_tasks']} output={args.output_dir}"
     )
 
 
@@ -988,6 +1007,19 @@ def main() -> None:
     self_identity.add_argument("--variants-per-task", type=int, default=2)
     self_identity.add_argument("--thought-capacity", type=int, default=8)
     self_identity.add_argument("--seed", type=int, default=20260813)
+    multilingual = subparsers.add_parser(
+        "build-multilingual-training",
+        help="build a small multilingual and cross-lingual CID trajectory component",
+    )
+    multilingual.add_argument(
+        "--output-dir", default="data/generated/multilingual-crosslingual-v1"
+    )
+    multilingual.add_argument("--zh-tasks", type=int, default=450)
+    multilingual.add_argument("--en-zh-tasks", type=int, default=300)
+    multilingual.add_argument("--ja-tasks", type=int, default=225)
+    multilingual.add_argument("--es-tasks", type=int, default=225)
+    multilingual.add_argument("--schedule-variants", type=int, default=2)
+    multilingual.add_argument("--seed", type=int, default=20260813)
     prepare = subparsers.add_parser(
         "prepare-distillation",
         help="convert CID trajectories into timing-free teacher task/request JSONL",
@@ -1199,6 +1231,8 @@ def main() -> None:
         _build_symbolic_training(args)
     elif args.command == "build-self-identity-training":
         _build_self_identity_training(args)
+    elif args.command == "build-multilingual-training":
+        _build_multilingual_training(args)
     elif args.command == "prepare-distillation":
         _prepare_distillation(args)
     elif args.command == "compile-distillation":

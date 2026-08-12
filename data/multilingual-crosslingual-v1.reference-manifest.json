@@ -1,0 +1,49 @@
+{
+  "accepted_plans": 1200,
+  "accepted_plans_sha256": "31fc03c10b38d5b2c529a4f253fd83c06a4ff1b47d2a1c345162f79df0eca85b",
+  "answer_language_counts": {
+    "en": 300,
+    "es": 225,
+    "ja": 225,
+    "zh": 450
+  },
+  "canonical_tct_language": "en",
+  "compiled_sha256": "6ac408a327d08db8d8cc603b756135775a7bdedeb15ae42bf9eb02ff7f7a61ed",
+  "compiled_trajectories": 2400,
+  "compiled_transitions": 19159,
+  "cross_lingual_tasks": 1200,
+  "dependency_depth_histogram": {
+    "2": 1200
+  },
+  "family_counts": {
+    "en_prompt_zh_index_en_dispatch": 300,
+    "es_prompt_fr_directory_es_roster": 225,
+    "ja_prompt_en_registry_ja_support": 225,
+    "zh_prompt_en_catalog_zh_roster": 450
+  },
+  "format_version": 1,
+  "max_teacher_semantic_text_chars": 81,
+  "mode_counts": {
+    "tool_required": 1200
+  },
+  "name": "multilingual-crosslingual-v1",
+  "plans_sha256": "31fc03c10b38d5b2c529a4f253fd83c06a4ff1b47d2a1c345162f79df0eca85b",
+  "prompt_language_counts": {
+    "en": 300,
+    "es": 225,
+    "ja": 225,
+    "zh": 450
+  },
+  "review_rejected": 0,
+  "seed": 20260813,
+  "semantic_tasks": 1200,
+  "source_language_pair_counts": {
+    "en->ja": 225,
+    "en->zh": 450,
+    "fr->es": 225,
+    "zh->en": 300
+  },
+  "tasks_sha256": "156b9d84bd9625a9253b2b74f2f072a3df3d73365c63f1f0b66f4533d3f040f9",
+  "teacher_protocol": "deterministic-crosslingual-semantic-plan-v1",
+  "variants_per_task": 2
+}
