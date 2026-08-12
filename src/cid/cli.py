@@ -247,6 +247,29 @@ def _build_tool_restraint_training(args: argparse.Namespace) -> None:
     )
 
 
+def _build_compositional_training(args: argparse.Namespace) -> None:
+    from cid.compositional_training import (
+        CompositionalTrainingConfig,
+        build_compositional_training_streaming,
+    )
+
+    result = build_compositional_training_streaming(
+        args.output_dir,
+        CompositionalTrainingConfig(
+            seed=args.seed,
+            variants_per_task=args.variants_per_task,
+            probe_variants_per_task=args.probe_variants_per_task,
+        ),
+    )
+    print(
+        f"train_tasks={result['train_tasks']} "
+        f"train_trajectories={result['train_trajectories']} "
+        f"probe_tasks={result['probe_tasks']} "
+        f"max_live_cells={result['train_manifest']['audit']['max_live_cells']} "
+        f"output_dir={args.output_dir}"
+    )
+
+
 def _prepare_distillation(args: argparse.Namespace) -> None:
     from cid.causal_distill import dump_causal_teacher_jobs
 
@@ -1093,6 +1116,14 @@ def main() -> None:
     restraint.add_argument("--count", type=int, default=6500)
     restraint.add_argument("--thought-capacity", type=int, default=8)
     restraint.add_argument("--seed", type=int, default=20260813)
+    compositional = subparsers.add_parser(
+        "build-compositional-training",
+        help="build 8/16/32/64/128-slot compositional long-tail reasoning data and OOD probes",
+    )
+    compositional.add_argument("--output-dir", default="data/generated")
+    compositional.add_argument("--seed", type=int, default=20260813)
+    compositional.add_argument("--variants-per-task", type=int, default=2)
+    compositional.add_argument("--probe-variants-per-task", type=int, default=1)
 
     prepare = subparsers.add_parser(
         "prepare-distillation",
@@ -1251,7 +1282,7 @@ def main() -> None:
     train.add_argument("--rollout-horizon", type=int, default=3)
     train.add_argument("--teacher-forcing-epochs", type=int, default=1)
     train.add_argument("--rollout-ramp-epochs", type=int, default=2)
-    train.add_argument("--thought-capacity", type=int, default=8)
+    train.add_argument("--thought-capacity", type=int, default=128)
     train.add_argument("--max-display-tokens", type=int, default=1024)
     train.add_argument("--seed", type=int, default=0)
     train.add_argument("--max-examples", type=int)
@@ -1282,7 +1313,7 @@ def main() -> None:
     train_full.add_argument("--rollout-horizon", type=int, default=3)
     train_full.add_argument("--teacher-forcing-epochs", type=int, default=1)
     train_full.add_argument("--rollout-ramp-epochs", type=int, default=2)
-    train_full.add_argument("--thought-capacity", type=int, default=8)
+    train_full.add_argument("--thought-capacity", type=int, default=128)
     train_full.add_argument("--max-display-tokens", type=int, default=1024)
     train_full.add_argument("--seed", type=int, default=0)
     train_full.add_argument("--max-examples", type=int)
@@ -1311,6 +1342,8 @@ def main() -> None:
         _build_composed_training(args)
     elif args.command == "build-tool-restraint-training":
         _build_tool_restraint_training(args)
+    elif args.command == "build-compositional-training":
+        _build_compositional_training(args)
 
     elif args.command == "prepare-distillation":
         _prepare_distillation(args)

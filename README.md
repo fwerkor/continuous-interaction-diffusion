@@ -321,7 +321,7 @@ fusion, and prediction heads. A single A6000 can run the launcher directly:
 cid train \
   --data data/synthetic.jsonl \
   --output-dir runs/stage-a \
-  --thought-capacity 8 \
+  --thought-capacity 128 \
   --micro-batch-size 2 \
   --gradient-accumulation-steps 8 \
   --dtype bf16
@@ -333,7 +333,7 @@ With six GPUs, use `torchrun`; the command detects the distributed environment a
 torchrun --standalone --nproc-per-node=6 -m cid.cli train \
   --data data/synthetic.jsonl \
   --output-dir runs/stage-a-6gpu \
-  --thought-capacity 8 \
+  --thought-capacity 128 \
   --micro-batch-size 2 \
   --gradient-accumulation-steps 8 \
   --dtype bf16
@@ -353,7 +353,11 @@ continue to provide the next-step supervision and event schedule; predicted T/Y 
 input state, preventing incorrect rollouts from becoming self-generated labels.
 
 The trainer pads variable-length prompt/display/external-memory sequences inside each micro-batch.
-Gradient checkpointing is enabled by default for the native iLLaDA stack and can be disabled with
+`--thought-capacity` is an upper bound: trajectory tensorization uses only the slot footprint required
+by that example (with an eight-slot minimum), and mixed micro-batches pad thought tensors only to the
+largest local footprint. Setting the model ceiling to 128 therefore enables the long-tail curriculum
+without making every ordinary 8-slot example allocate 128 slots. Gradient checkpointing is enabled
+by default for the native iLLaDA stack and can be disabled with
 `--no-gradient-checkpointing`. With the six-GPU example above, the effective transition batch is
 `2 × 8 × 6 = 96`; start at micro-batch 1 if the real trajectory lengths are substantially larger.
 Per-sample RoPE position IDs are computed from valid token counts, so padding a short prompt beside
@@ -376,7 +380,7 @@ torchrun --standalone --nproc-per-node=6 -m cid.cli train-full \
   --data data/distilled.jsonl \
   --output-dir runs/stage-b-6gpu \
   --init-cid-checkpoint runs/stage-a/stage-a-step-00001000.pt \
-  --thought-capacity 8 \
+  --thought-capacity 128 \
   --micro-batch-size 1 \
   --gradient-accumulation-steps 8 \
   --learning-rate 1e-5 \
@@ -398,7 +402,7 @@ torchrun --standalone --nproc-per-node=6 -m cid.cli train-full \
   --data data/distilled.jsonl \
   --output-dir runs/stage-b-6gpu \
   --resume runs/stage-b-6gpu/stage-b-step-00002000 \
-  --thought-capacity 8 \
+  --thought-capacity 128 \
   --micro-batch-size 1 \
   --gradient-accumulation-steps 8 \
   --dtype bf16

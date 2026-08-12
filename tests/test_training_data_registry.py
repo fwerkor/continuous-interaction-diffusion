@@ -296,3 +296,55 @@ def test_training_trajectory_mixture_v7_appends_self_identity() -> None:
     assert component["examples"] == identity["compiled_trajectories"]
     assert component["transitions"] == identity["compiled_transitions"]
     assert component["sha256"] == identity["compiled_sha256"]
+
+
+def test_training_semantic_mixture_v10_adds_longtail_without_probe_leakage() -> None:
+    mixture = _load("data/training-semantic-mixture-v10.json")
+    reference = _load("data/compositional-teacher-v1.reference-manifest.json")
+    probe = _load("data/generalization-probe-v1.reference-manifest.json")
+    by_name = {component["name"]: component for component in mixture["components"]}
+
+    assert mixture["name"] == "training-semantic-mixture-v10"
+    assert mixture["version"] == 10
+    assert mixture["semantic_tasks"] == 118_075
+    assert mixture["thought_capacity_required"] == 128
+    assert mixture["mode_counts"] == {
+        "no_tool": 39_641,
+        "tool_required": 68_791,
+        "tools_available_unnecessary": 9_643,
+    }
+    assert mixture["compositional_capacity_bucket_counts"] == {
+        "8": 6_000,
+        "16": 5_000,
+        "32": 4_000,
+        "64": 3_000,
+        "128": 2_000,
+    }
+    assert mixture["super_complex_64_plus_tasks"] == 5_000
+    assert mixture["ultra_complex_128_tasks"] == 2_000
+    assert mixture["generalization_probe_tasks_excluded"] == 4_000
+
+    component = by_name["compositional-longtail-reasoning-v1"]
+    assert component["tasks"] == reference["semantic_tasks"] == 20_000
+    assert component["tasks_sha256"] == reference["tasks_sha256"]
+    assert probe["semantic_tasks"] == 4_000
+    assert probe["training_eligible"] is False
+    assert probe["strict_holdout_axes"] == ["domain"]
+    assert all(component["name"] != probe["name"] for component in mixture["components"])
+
+
+def test_training_trajectory_mixture_v10_raises_capacity_ceiling_to_128() -> None:
+    mixture = _load("data/training-trajectory-mixture-v10.json")
+    component = next(
+        item for item in mixture["components"] if item["name"] == "compositional-longtail"
+    )
+    reference = _load("data/compositional-teacher-v1.reference-manifest.json")
+
+    assert mixture["name"] == "training-trajectory-mixture-v10"
+    assert mixture["version"] == 10
+    assert mixture["examples"] == 277_948
+    assert mixture["transitions"] == 1_585_205
+    assert mixture["thought_capacity_required"] == 128
+    assert component["examples"] == reference["compiled_trajectories"] == 40_000
+    assert component["transitions"] == reference["compiled_transitions"] == 180_000
+    assert component["sha256"] == reference["compiled_sha256"]

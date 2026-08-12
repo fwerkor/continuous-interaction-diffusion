@@ -92,28 +92,26 @@ def collate_training_steps(
         pad_value=pad_token_id,
     )
     display_noise, _ = _pad_3d(tuple(step.batch.display_noise for step in steps))
-    fact_memory, fact_padding_mask = _pad_3d(
-        tuple(step.batch.fact_memory for step in steps)
-    )
+    fact_memory, fact_padding_mask = _pad_3d(tuple(step.batch.fact_memory for step in steps))
     percept_memory, percept_padding_mask = _pad_3d(
         tuple(step.batch.percept_memory for step in steps)
     )
     percept_thought_mask = _collate_percept_masks(steps, "thought")
     percept_display_mask = _collate_percept_masks(steps, "display")
-    source_memory, source_padding_mask = _pad_3d(
-        tuple(step.batch.source_memory for step in steps)
-    )
+    source_memory, source_padding_mask = _pad_3d(tuple(step.batch.source_memory for step in steps))
     display_labels, _ = _pad_2d(
         tuple(step.targets.display_ids for step in steps),
         pad_value=-100,
     )
 
     batch = CIDTensorBatch(
-        thought_semantic=torch.cat(tuple(step.batch.thought_semantic for step in steps)),
-        role_features=torch.cat(tuple(step.batch.role_features for step in steps)),
-        uncertainty=torch.cat(tuple(step.batch.uncertainty for step in steps)),
-        local_noise=torch.cat(tuple(step.batch.local_noise for step in steps)),
-        slot_occupancy=torch.cat(tuple(step.batch.slot_occupancy for step in steps)),
+        thought_semantic=_pad_slot_tensors(tuple(step.batch.thought_semantic for step in steps)),
+        role_features=_pad_slot_tensors(tuple(step.batch.role_features for step in steps)),
+        uncertainty=_pad_slot_tensors(
+            tuple(step.batch.uncertainty for step in steps), pad_value=1.0
+        ),
+        local_noise=_pad_slot_tensors(tuple(step.batch.local_noise for step in steps)),
+        slot_occupancy=_pad_slot_tensors(tuple(step.batch.slot_occupancy for step in steps)),
         prompt_ids=prompt_ids,
         display_ids=display_ids,
         display_noise=display_noise,
@@ -129,35 +127,37 @@ def collate_training_steps(
         source_padding_mask=source_padding_mask,
     )
     targets = CIDTargets(
-        thought_semantic=_cat_targets(steps, "thought_semantic"),
-        thought_mask=_cat_targets(steps, "thought_mask"),
+        thought_semantic=_pad_slot_targets(steps, "thought_semantic"),
+        thought_mask=_pad_slot_targets(steps, "thought_mask"),
         convergence_targets=_cat_targets(steps, "convergence_targets"),
-        allocation_targets=_cat_targets(steps, "allocation_targets"),
-        allocation_mask=_cat_targets(steps, "allocation_mask"),
+        allocation_targets=_pad_slot_targets(steps, "allocation_targets"),
+        allocation_mask=_pad_slot_targets(steps, "allocation_mask"),
         display_ids=display_labels,
-        role_targets=_cat_targets(steps, "role_targets"),
-        uncertainty=_cat_targets(steps, "uncertainty"),
-        noise_delta=_cat_targets(steps, "noise_delta"),
-        lifecycle=_cat_targets(steps, "lifecycle"),
-        need_targets=_cat_targets(steps, "need_targets"),
-        source_targets=_cat_targets(steps, "source_targets"),
-        argument_presence_targets=_cat_targets(steps, "argument_presence_targets"),
-        argument_presence_mask=_cat_targets(steps, "argument_presence_mask"),
-        argument_embeddings=_cat_targets(steps, "argument_embeddings"),
-        argument_mask=_cat_targets(steps, "argument_mask"),
-        revision_targets=_cat_targets(steps, "revision_targets"),
-        refresh_targets=_cat_targets(steps, "refresh_targets"),
-        anchor_presence_targets=_cat_targets(steps, "anchor_presence_targets"),
-        anchor_presence_mask=_cat_targets(steps, "anchor_presence_mask"),
-        anchor_kind_targets=_cat_targets(steps, "anchor_kind_targets"),
-        anchor_embeddings=_cat_targets(steps, "anchor_embeddings"),
-        anchor_mask=_cat_targets(steps, "anchor_mask"),
-        link_presence_targets=_cat_targets(steps, "link_presence_targets"),
-        link_presence_mask=_cat_targets(steps, "link_presence_mask"),
-        link_relation_targets=_cat_targets(steps, "link_relation_targets"),
-        link_target_kind_targets=_cat_targets(steps, "link_target_kind_targets"),
-        link_target_embeddings=_cat_targets(steps, "link_target_embeddings"),
-        link_mask=_cat_targets(steps, "link_mask"),
+        role_targets=_pad_slot_targets(steps, "role_targets"),
+        uncertainty=_pad_slot_targets(steps, "uncertainty", pad_value=1.0),
+        noise_delta=_pad_slot_targets(steps, "noise_delta"),
+        lifecycle=_pad_slot_targets(steps, "lifecycle", pad_value=-100),
+        need_targets=_pad_slot_targets(steps, "need_targets"),
+        source_targets=_pad_slot_targets(steps, "source_targets", pad_value=-100),
+        argument_presence_targets=_pad_slot_targets(steps, "argument_presence_targets"),
+        argument_presence_mask=_pad_slot_targets(steps, "argument_presence_mask"),
+        argument_embeddings=_pad_slot_targets(steps, "argument_embeddings"),
+        argument_mask=_pad_slot_targets(steps, "argument_mask"),
+        revision_targets=_pad_slot_targets(steps, "revision_targets", pad_value=-100),
+        refresh_targets=_pad_slot_targets(steps, "refresh_targets", pad_value=-100),
+        anchor_presence_targets=_pad_slot_targets(steps, "anchor_presence_targets"),
+        anchor_presence_mask=_pad_slot_targets(steps, "anchor_presence_mask"),
+        anchor_kind_targets=_pad_slot_targets(steps, "anchor_kind_targets", pad_value=-100),
+        anchor_embeddings=_pad_slot_targets(steps, "anchor_embeddings"),
+        anchor_mask=_pad_slot_targets(steps, "anchor_mask"),
+        link_presence_targets=_pad_slot_targets(steps, "link_presence_targets"),
+        link_presence_mask=_pad_slot_targets(steps, "link_presence_mask"),
+        link_relation_targets=_pad_slot_targets(steps, "link_relation_targets", pad_value=-100),
+        link_target_kind_targets=_pad_slot_targets(
+            steps, "link_target_kind_targets", pad_value=-100
+        ),
+        link_target_embeddings=_pad_slot_targets(steps, "link_target_embeddings"),
+        link_mask=_pad_slot_targets(steps, "link_mask"),
     )
     return CIDTrainingBatch(
         example_ids=tuple(step.example_id for step in steps),
@@ -371,9 +371,7 @@ class CIDTrainer:
         losses = cid_loss(output, training_batch.targets)
         if not bool(torch.isfinite(losses.total)):
             names = ", ".join(training_batch.example_ids)
-            raise FloatingPointError(
-                f"non-finite CID loss for training micro-batch: {names}"
-            )
+            raise FloatingPointError(f"non-finite CID loss for training micro-batch: {names}")
         batch_size = len(samples)
         (losses.total * batch_size * loss_scale).backward()
         self._pending_accumulation += 1
@@ -413,9 +411,7 @@ class CIDTrainer:
         )
         return CIDRolloutState(
             thought_semantic=output.thought_semantic[batch_index : batch_index + 1].detach(),
-            role_features=torch.sigmoid(
-                output.role_logits[batch_index : batch_index + 1]
-            ).detach(),
+            role_features=torch.sigmoid(output.role_logits[batch_index : batch_index + 1]).detach(),
             uncertainty=output.uncertainty[batch_index : batch_index + 1].detach(),
             slot_occupancy=occupancy.to(dtype=sample.batch.slot_occupancy.dtype).detach(),
             display_ids=display_ids.detach(),
@@ -699,6 +695,7 @@ class ILLaDATrajectoryTensorizer:
         *,
         text_encoder: ILLaDATextEncoder | None = None,
         display_replacement_fraction: float = 0.25,
+        minimum_thought_slots: int = 8,
     ) -> None:
         self.adapter = adapter
         self.tokenizer = tokenizer
@@ -707,7 +704,13 @@ class ILLaDATrajectoryTensorizer:
             raise ValueError("training text encoder width must match the iLLaDA adapter")
         if not 0.0 <= display_replacement_fraction <= 1.0:
             raise ValueError("display_replacement_fraction must be in [0, 1]")
+        if minimum_thought_slots <= 0:
+            raise ValueError("minimum_thought_slots must be positive")
         self.display_replacement_fraction = display_replacement_fraction
+        self.minimum_thought_slots = min(
+            minimum_thought_slots,
+            adapter.config.max_thought_slots,
+        )
         self.scheduler = scheduler or CIDDiffusionScheduler(ILLADA_MASK_TOKEN_ID)
 
     def tensorize(
@@ -729,7 +732,7 @@ class ILLaDATrajectoryTensorizer:
 
         device = self.text_encoder.device
         dtype = self.text_encoder.dtype
-        capacity = self.adapter.config.max_thought_slots
+        capacity = self._trajectory_thought_capacity(example)
         current_by_id = {cell.cell_id: cell for cell in current}
         target_by_id = {cell.cell_id: cell for cell in target}
         target_output_slots = self._target_output_slots(current, target, capacity)
@@ -754,10 +757,8 @@ class ILLaDATrajectoryTensorizer:
                 for role_index, role in enumerate(role_order):
                     role_features[0, cell.slot, role_index] = cell.roles.get(role, 0.0)
         else:
-            self._validate_rollout_state(rollout_state)
-            thought_semantic.copy_(
-                rollout_state.thought_semantic.to(device=device, dtype=dtype)
-            )
+            self._validate_rollout_state(rollout_state, capacity)
+            thought_semantic.copy_(rollout_state.thought_semantic.to(device=device, dtype=dtype))
             role_features.copy_(rollout_state.role_features.to(device=device, dtype=dtype))
             uncertainty.copy_(rollout_state.uncertainty.to(device=device, dtype=dtype))
             occupancy.copy_(rollout_state.slot_occupancy.to(device=device, dtype=dtype))
@@ -771,9 +772,7 @@ class ILLaDATrajectoryTensorizer:
         )
 
         target_display = self._display_text(example, target_step)
-        target_display_ids = self.text_encoder.tokenize(
-            target_display, add_special_tokens=False
-        )
+        target_display_ids = self.text_encoder.tokenize(target_display, add_special_tokens=False)
         if rollout_state is None:
             display_corruption = self.scheduler.corrupt_display(
                 target_display_ids,
@@ -794,8 +793,8 @@ class ILLaDATrajectoryTensorizer:
             display_labels = target_display_ids.clone()
             display_labels[display_input_ids == target_display_ids] = -100
             display_noise = (
-                display_input_ids == ILLADA_MASK_TOKEN_ID
-            ).to(dtype=dtype).unsqueeze(-1)
+                (display_input_ids == ILLADA_MASK_TOKEN_ID).to(dtype=dtype).unsqueeze(-1)
+            )
 
         prompt_ids = self.text_encoder.tokenize(example.prompt, add_special_tokens=True)
         fact_memory = self.text_encoder.encode_texts(
@@ -825,6 +824,7 @@ class ILLaDATrajectoryTensorizer:
             target_output_slots=target_output_slots,
             target_step=target_step,
             display_length=display_input_ids.shape[1],
+            thought_slots=capacity,
             device=device,
         )
         source_memory = self.text_encoder.encode_texts(
@@ -856,6 +856,7 @@ class ILLaDATrajectoryTensorizer:
             target_vectors=target_vectors,
             display_labels=display_labels,
             input_occupancy=occupancy,
+            thought_slots=capacity,
             dtype=dtype,
             device=device,
         )
@@ -875,6 +876,7 @@ class ILLaDATrajectoryTensorizer:
         target_output_slots: Mapping[str, int],
         target_step: int,
         display_length: int,
+        thought_slots: int,
         device: torch.device,
     ) -> tuple[Tensor, Tensor]:
         cell_targets: list[tuple[ObjectRef, ...]] = []
@@ -897,23 +899,23 @@ class ILLaDATrajectoryTensorizer:
             tuple(cell_targets),
             tuple(display_targets),
             cell_slots=target_output_slots,
-            thought_slots=self.adapter.config.max_thought_slots,
+            thought_slots=thought_slots,
             display_length=display_length,
             device=device,
         )
 
-    def _validate_rollout_state(self, state: CIDRolloutState) -> None:
-        expected_thought = (1, self.adapter.config.max_thought_slots, self.adapter.d_model)
+    def _validate_rollout_state(self, state: CIDRolloutState, thought_slots: int) -> None:
+        expected_thought = (1, thought_slots, self.adapter.d_model)
         if tuple(state.thought_semantic.shape) != expected_thought:
             raise ValueError("rollout thought semantic shape does not match adapter geometry")
         expected_roles = (
             1,
-            self.adapter.config.max_thought_slots,
+            thought_slots,
             self.adapter.config.num_roles,
         )
         if tuple(state.role_features.shape) != expected_roles:
             raise ValueError("rollout role feature shape does not match adapter geometry")
-        expected_scalar = (1, self.adapter.config.max_thought_slots, 1)
+        expected_scalar = (1, thought_slots, 1)
         if tuple(state.uncertainty.shape) != expected_scalar:
             raise ValueError("rollout uncertainty shape does not match adapter geometry")
         if tuple(state.slot_occupancy.shape) != expected_scalar:
@@ -954,12 +956,13 @@ class ILLaDATrajectoryTensorizer:
         target_vectors: Mapping[str, Tensor],
         display_labels: Tensor,
         input_occupancy: Tensor,
+        thought_slots: int,
         dtype: torch.dtype,
         device: torch.device,
     ) -> CIDTargets:
         del source_step
         c = self.adapter.config
-        n = c.max_thought_slots
+        n = thought_slots
         role_order = tuple(CognitiveRole)
         lifecycle_order = MODELED_LIFECYCLES
         anchor_order = tuple(AnchorKind)
@@ -998,9 +1001,7 @@ class ILLaDATrajectoryTensorizer:
         argument_embeddings = torch.zeros(
             (1, n, c.max_argument_slots, self.adapter.d_model), device=device, dtype=dtype
         )
-        argument_mask = torch.zeros(
-            (1, n, c.max_argument_slots), device=device, dtype=torch.bool
-        )
+        argument_mask = torch.zeros((1, n, c.max_argument_slots), device=device, dtype=torch.bool)
         anchor_presence_targets = torch.zeros(
             (1, n, c.max_anchor_slots), device=device, dtype=dtype
         )
@@ -1014,12 +1015,8 @@ class ILLaDATrajectoryTensorizer:
             (1, n, c.max_anchor_slots, self.adapter.d_model), device=device, dtype=dtype
         )
         anchor_mask = torch.zeros((1, n, c.max_anchor_slots), device=device, dtype=torch.bool)
-        link_presence_targets = torch.zeros(
-            (1, n, c.max_link_slots), device=device, dtype=dtype
-        )
-        link_presence_mask = torch.zeros(
-            (1, n, c.max_link_slots), device=device, dtype=torch.bool
-        )
+        link_presence_targets = torch.zeros((1, n, c.max_link_slots), device=device, dtype=dtype)
+        link_presence_mask = torch.zeros((1, n, c.max_link_slots), device=device, dtype=torch.bool)
         link_relation_targets = torch.full(
             (1, n, c.max_link_slots), -100, device=device, dtype=torch.long
         )
@@ -1161,6 +1158,18 @@ class ILLaDATrajectoryTensorizer:
             raise ValueError("thought target slot exceeds adapter TCT capacity")
         return snapshot
 
+    def _trajectory_thought_capacity(self, example: TrajectoryExample) -> int:
+        required = max(
+            (target.slot + 1 for target in example.thought_targets),
+            default=1,
+        )
+        maximum = self.adapter.config.max_thought_slots
+        if required > maximum:
+            raise ValueError(
+                f"trajectory requires {required} thought slots but adapter supports {maximum}"
+            )
+        return max(self.minimum_thought_slots, required)
+
     def _semantic_vectors(self, snapshot: tuple[ThoughtTarget, ...]) -> dict[str, Tensor]:
         return {
             target.cell_id: self.text_encoder.encode_one(target.semantic_text, detach=True)
@@ -1209,6 +1218,37 @@ def _cat_targets(steps: tuple[CIDTrainingStep, ...], name: str) -> Tensor:
     return torch.cat(tuple(getattr(step.targets, name) for step in steps), dim=0)
 
 
+def _pad_slot_tensors(
+    tensors: tuple[Tensor, ...],
+    *,
+    pad_value: int | float = 0,
+) -> Tensor:
+    if not tensors:
+        raise ValueError("cannot pad an empty slot tensor collection")
+    if any(tensor.ndim < 2 or tensor.shape[0] != 1 for tensor in tensors):
+        raise ValueError("slot tensors must have shape [1, slots, ...]")
+    trailing = tensors[0].shape[2:]
+    if any(tensor.shape[2:] != trailing for tensor in tensors):
+        raise ValueError("slot tensors in one batch must share trailing dimensions")
+    max_slots = max(tensor.shape[1] for tensor in tensors)
+    output = tensors[0].new_full((len(tensors), max_slots, *trailing), pad_value)
+    for row, tensor in enumerate(tensors):
+        output[row, : tensor.shape[1]] = tensor[0]
+    return output
+
+
+def _pad_slot_targets(
+    steps: tuple[CIDTrainingStep, ...],
+    name: str,
+    *,
+    pad_value: int | float = 0,
+) -> Tensor:
+    return _pad_slot_tensors(
+        tuple(getattr(step.targets, name) for step in steps),
+        pad_value=pad_value,
+    )
+
+
 def _pad_2d(
     tensors: tuple[Tensor, ...],
     *,
@@ -1250,9 +1290,7 @@ def _pad_3d(tensors: tuple[Tensor, ...]) -> tuple[Tensor, Tensor]:
     return output, padding_mask
 
 
-def _collate_percept_masks(
-    steps: tuple[CIDTrainingStep, ...], kind: str
-) -> Tensor | None:
+def _collate_percept_masks(steps: tuple[CIDTrainingStep, ...], kind: str) -> Tensor | None:
     if kind not in {"thought", "display"}:
         raise ValueError("percept mask kind must be thought or display")
     attribute = f"percept_{kind}_mask"
@@ -1279,9 +1317,7 @@ def _collate_percept_masks(
             continue
         expected = (1, query_length, percept_length)
         if tuple(mask.shape) != expected:
-            raise ValueError(
-                f"{attribute} must have shape {expected}, got {tuple(mask.shape)}"
-            )
+            raise ValueError(f"{attribute} must have shape {expected}, got {tuple(mask.shape)}")
         output[row, :query_length, :percept_length] = mask[0].to(dtype=torch.bool)
     return output
 
@@ -1316,9 +1352,7 @@ def trajectory_transitions(
     transitions: list[tuple[TrajectoryExample, int]] = []
     for example in examples:
         steps = {target.step for target in example.thought_targets}
-        transitions.extend(
-            (example, step) for step in sorted(steps) if step + 1 in steps
-        )
+        transitions.extend((example, step) for step in sorted(steps) if step + 1 in steps)
     return tuple(transitions)
 
 
@@ -1374,9 +1408,7 @@ def balance_rollout_windows_by_semantic_task(
     task_ids: list[str] = []
     total_transitions = 0
     for window in windows:
-        task_id = str(
-            window.example.metadata.get("semantic_task_id") or window.example.example_id
-        )
+        task_id = str(window.example.metadata.get("semantic_task_id") or window.example.example_id)
         count = len(window.source_steps)
         transition_counts[task_id] = transition_counts.get(task_id, 0) + count
         task_ids.append(task_id)

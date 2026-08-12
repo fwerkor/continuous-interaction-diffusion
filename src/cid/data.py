@@ -177,9 +177,7 @@ class TrajectoryExample:
                 },
                 confidence=float(target.get("confidence", 1.0)),
                 freshness=FreshnessDemand(str(target.get("freshness", FreshnessDemand.ONCE))),
-                max_age_s=(
-                    None if target.get("max_age_s") is None else float(target["max_age_s"])
-                ),
+                max_age_s=(None if target.get("max_age_s") is None else float(target["max_age_s"])),
                 target_cells=tuple(
                     ObjectRef.from_dict(item) for item in target.get("target_cells", ())
                 ),
@@ -227,8 +225,7 @@ class TrajectoryExample:
             target_display=str(raw["target_display"]),
             protected_facts=dict(raw.get("protected_facts", {})),
             source_descriptors=tuple(
-                _source_descriptor_from_dict(item)
-                for item in raw.get("source_descriptors", ())
+                _source_descriptor_from_dict(item) for item in raw.get("source_descriptors", ())
             ),
             events=events,
             binding_targets=bindings,
@@ -255,77 +252,78 @@ def load_jsonl(path: str | Path) -> tuple[TrajectoryExample, ...]:
     return tuple(examples)
 
 
+def trajectory_to_dict(example: TrajectoryExample) -> dict[str, Any]:
+    return {
+        "example_id": example.example_id,
+        "prompt": example.prompt,
+        "target_display": example.target_display,
+        "protected_facts": dict(example.protected_facts),
+        "source_descriptors": [dict(item) for item in example.source_descriptors],
+        "events": [
+            {
+                "source": event.source,
+                "value": event.value,
+                "arrival_step": event.arrival_step,
+                "version": event.version,
+                "provenance": event.provenance,
+                "arguments": dict(event.arguments),
+            }
+            for event in example.events
+        ],
+        "binding_targets": [
+            {
+                "need_id": target.need_id,
+                "source": target.source,
+                "first_need_step": target.first_need_step,
+                "executable_step": target.executable_step,
+                "arguments": dict(target.arguments),
+                "argument_steps": dict(target.argument_steps),
+                "confidence": target.confidence,
+                "freshness": target.freshness.value,
+                "max_age_s": target.max_age_s,
+                "target_cells": [item.to_dict() for item in target.target_cells],
+                "target_display": [item.to_dict() for item in target.target_display],
+            }
+            for target in example.binding_targets
+        ],
+        "grounding_catalog": [entry.to_dict() for entry in example.grounding_catalog],
+        "grounding_targets": [
+            {
+                "step": target.step,
+                "cell_id": target.cell_id,
+                "anchors": [anchor.to_dict() for anchor in target.anchors],
+                "links": [link.to_dict() for link in target.links],
+            }
+            for target in example.grounding_targets
+        ],
+        "thought_targets": [
+            {
+                "step": target.step,
+                "slot": target.slot,
+                "cell_id": target.cell_id,
+                "semantic_text": target.semantic_text,
+                "roles": {role.value: weight for role, weight in target.roles.items()},
+                "uncertainty": target.uncertainty,
+                "noise": target.noise,
+                "lifecycle": target.lifecycle.value,
+            }
+            for target in example.thought_targets
+        ],
+        "display_targets": [
+            {"step": target.step, "text": target.text} for target in example.display_targets
+        ],
+        "metadata": dict(example.metadata),
+    }
+
+
 def dump_jsonl(examples: Iterable[TrajectoryExample], path: str | Path) -> None:
     with Path(path).open("w", encoding="utf-8") as handle:
         for example in examples:
-            raw = {
-                "example_id": example.example_id,
-                "prompt": example.prompt,
-                "target_display": example.target_display,
-                "protected_facts": dict(example.protected_facts),
-                "source_descriptors": [dict(item) for item in example.source_descriptors],
-                "events": [
-                    {
-                        "source": event.source,
-                        "value": event.value,
-                        "arrival_step": event.arrival_step,
-                        "version": event.version,
-                        "provenance": event.provenance,
-                        "arguments": dict(event.arguments),
-                    }
-                    for event in example.events
-                ],
-                "binding_targets": [
-                    {
-                        "need_id": target.need_id,
-                        "source": target.source,
-                        "first_need_step": target.first_need_step,
-                        "executable_step": target.executable_step,
-                        "arguments": dict(target.arguments),
-                        "argument_steps": dict(target.argument_steps),
-                        "confidence": target.confidence,
-                        "freshness": target.freshness.value,
-                        "max_age_s": target.max_age_s,
-                        "target_cells": [item.to_dict() for item in target.target_cells],
-                        "target_display": [item.to_dict() for item in target.target_display],
-                    }
-                    for target in example.binding_targets
-                ],
-                "grounding_catalog": [entry.to_dict() for entry in example.grounding_catalog],
-                "grounding_targets": [
-                    {
-                        "step": target.step,
-                        "cell_id": target.cell_id,
-                        "anchors": [anchor.to_dict() for anchor in target.anchors],
-                        "links": [link.to_dict() for link in target.links],
-                    }
-                    for target in example.grounding_targets
-                ],
-                "thought_targets": [
-                    {
-                        "step": target.step,
-                        "slot": target.slot,
-                        "cell_id": target.cell_id,
-                        "semantic_text": target.semantic_text,
-                        "roles": {role.value: weight for role, weight in target.roles.items()},
-                        "uncertainty": target.uncertainty,
-                        "noise": target.noise,
-                        "lifecycle": target.lifecycle.value,
-                    }
-                    for target in example.thought_targets
-                ],
-                "display_targets": [
-                    {"step": target.step, "text": target.text}
-                    for target in example.display_targets
-                ],
-                "metadata": dict(example.metadata),
-            }
+            raw = trajectory_to_dict(example)
             handle.write(json.dumps(raw, ensure_ascii=False, separators=(",", ":")) + "\n")
 
 
 def _source_descriptor_from_dict(raw: Mapping[str, Any]) -> dict[str, Any]:
     descriptor = dict(raw)
-    descriptor["arguments"] = tuple(
-        dict(argument) for argument in descriptor.get("arguments", ())
-    )
+    descriptor["arguments"] = tuple(dict(argument) for argument in descriptor.get("arguments", ()))
     return descriptor

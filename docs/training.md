@@ -287,6 +287,45 @@ cid build-self-identity-training
 The current compiled mixture is `data/training-trajectory-mixture-v8.json`: **207,448 trajectories
 and 1,096,147 adjacent supervised transitions** across nine components.
 
+### Compositional long-tail curriculum
+
+The long-tail curriculum extends no-tool reasoning beyond the original eight-slot training
+distribution. The CID adapter supports up to 128 physical thought slots, so this curriculum samples
+five capacity buckets: **8, 16, 32, 64, and 128**. The 128-slot bucket is not padding-only: its tasks
+require roughly 76--120 simultaneously represented cognitive objects, including multi-branch DAGs,
+competing candidates, interventions, constraint meshes, and local hypothesis repair. Smaller buckets
+remain the majority so ordinary reasoning does not become unnecessarily expensive.
+
+`cid build-compositional-training` deterministically generates 20,000 training tasks and a separate
+4,000-task generalization probe. The training capacity mixture is 6,000/5,000/4,000/3,000/2,000 for
+8/16/32/64/128 slots respectively. Ten balanced families cover boolean DAG composition, blocked
+reachability, spatial and causal interventions, ordering meshes, open-world quantifier DAGs,
+candidate elimination, numeric DAGs, iterative conditional policies, and internal hypothesis
+repair. Every final answer is independently recomputed from a compact machine-readable logic spec;
+the normal teacher-plan review remains enabled, including duplicate rejection, semantic-text limits,
+anchors, and typed cognitive links.
+
+No-tool plans may contain `refine:0`, `refine:1`, ... semantic frames. These frames supervise compact
+TCT state refinement rather than hidden chain-of-thought text, and they are forbidden on plans with
+external evidence. The generalization probe is excluded from training and uses a strictly disjoint
+domain vocabulary plus a heavier depth/capacity tail and denser long-range dependencies. Surface
+rephrasings are measured as a generalization axis rather than claimed as a strict lexical holdout.
+
+The trainer treats 128 as a **maximum capacity**, not a mandatory tensor width for every example.
+Each trajectory is tensorized at its actual slot footprint (with an eight-slot minimum), and mixed
+micro-batches pad only to the largest footprint in that batch. This keeps ordinary 8/16-slot examples
+close to their previous memory cost while preserving a real 128-slot ability ceiling.
+
+```bash
+cid build-compositional-training \
+  --output-dir data/generated \
+  --variants-per-task 2 \
+  --probe-variants-per-task 1
+```
+
+The resulting component is included in `data/training-semantic-mixture-v10.json` and
+`data/training-trajectory-mixture-v10.json`; the 4,000-task probe is explicitly excluded from both.
+
 The historical v5 six-component training input is pinned separately by
 `data/training-trajectory-mixture-v5.json`. It preserves every reviewed schedule variant from
 `public-base`, `public-interaction`, `mechanism`, `computational`, `symbolic`, and
