@@ -1,0 +1,66 @@
+{
+  "audit": {
+    "anchor_instances": 4000,
+    "capacity_bucket_counts": {
+      "128": 1000,
+      "16": 1000,
+      "32": 1000,
+      "64": 1000
+    },
+    "compiled_transitions": 22000,
+    "dependency_depth_buckets": {
+      "1-8": 236,
+      "17-32": 945,
+      "33-64": 803,
+      "65+": 800,
+      "9-16": 1216
+    },
+    "domain_count": 8,
+    "exact_verifier_failures": 0,
+    "family_counts": {
+      "blocked_reachability": 400,
+      "boolean_dag": 400,
+      "candidate_elimination": 400,
+      "causal_intervention": 400,
+      "internal_hypothesis_repair": 400,
+      "iterative_policy": 400,
+      "numeric_dag": 400,
+      "ordering_mesh": 400,
+      "quantifier_dag": 400,
+      "spatial_intervention": 400
+    },
+    "link_instances": 1146872,
+    "max_live_cells": 120,
+    "max_physical_slot_index_plus_one": 128,
+    "max_semantic_text_chars": 106,
+    "surface_style_counts": {
+      "compact": 2014,
+      "ledger": 1329,
+      "narrative": 657
+    }
+  },
+  "compiled_sha256": "3df644356220f67f5d988d350b21fad5a67a5e67b5620b58f77d534d4ad06f23",
+  "compiled_trajectories": 4000,
+  "compiled_transitions": 22000,
+  "format_version": 1,
+  "generalization_axes": [
+    "unseen_domain",
+    "higher_dependency_depth",
+    "capacity_tail",
+    "long_range_dependency_density",
+    "surface_rephrasing",
+    "graph_topology_shift"
+  ],
+  "name": "compositional-generalization-probe-v1",
+  "plans_sha256": "6167587d3468ceeaeff493dab9c1cf7ef938c100a88e24192a86fbe3d8980221",
+  "review_sha256": "15e91763601d95444d4be3da255ad00038ce3de809f6e63599a813d606b9965d",
+  "seed": 20360816,
+  "semantic_tasks": 4000,
+  "strict_holdout_axes": [
+    "domain"
+  ],
+  "tasks_sha256": "e78421ff06d13b5671eb59de846883a362a2c633ac11de6a994d9f70f3a36855",
+  "thought_capacity_required": 128,
+  "training_eligible": false,
+  "version": 1
+}

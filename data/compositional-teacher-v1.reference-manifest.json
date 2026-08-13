@@ -1,0 +1,68 @@
+{
+  "accepted_plans": 20000,
+  "accepted_plans_sha256": "10b16b0efaa5bd6fbc496580f97939fc506b98d67d62c0976f38f78dac91c2b4",
+  "audit": {
+    "anchor_instances": 20000,
+    "capacity_bucket_counts": {
+      "128": 2000,
+      "16": 5000,
+      "32": 4000,
+      "64": 3000,
+      "8": 6000
+    },
+    "compiled_transitions": 180000,
+    "dependency_depth_buckets": {
+      "1-8": 8466,
+      "17-32": 3531,
+      "33-64": 2473,
+      "65+": 1600,
+      "9-16": 3930
+    },
+    "domain_count": 16,
+    "exact_verifier_failures": 0,
+    "family_counts": {
+      "blocked_reachability": 2000,
+      "boolean_dag": 2000,
+      "candidate_elimination": 2000,
+      "causal_intervention": 2000,
+      "internal_hypothesis_repair": 2000,
+      "iterative_policy": 2000,
+      "numeric_dag": 2000,
+      "ordering_mesh": 2000,
+      "quantifier_dag": 2000,
+      "spatial_intervention": 2000
+    },
+    "link_instances": 2767580,
+    "max_live_cells": 120,
+    "max_physical_slot_index_plus_one": 128,
+    "max_semantic_text_chars": 106,
+    "surface_style_counts": {
+      "compact": 7147,
+      "ledger": 5444,
+      "narrative": 7409
+    }
+  },
+  "compiled_sha256": "2d17c953b16c7038f68ac685db0fb5bc9dfa73cfc5d427895a35c1eee3d0af83",
+  "compiled_trajectories": 40000,
+  "compiled_transitions": 180000,
+  "format_version": 1,
+  "generator": "GPT-5.6-Sol-authored deterministic compositional curriculum",
+  "name": "compositional-longtail-reasoning-v1",
+  "ood_probe_excluded_from_training": true,
+  "plans_sha256": "10b16b0efaa5bd6fbc496580f97939fc506b98d67d62c0976f38f78dac91c2b4",
+  "review_rejected": 0,
+  "review_sha256": "4f029684ad8b9daa5f116c2dc6421c25c7a6c566b37a4373c1adc8ff0972f29b",
+  "seed": 20260813,
+  "semantic_tasks": 20000,
+  "semantic_text_cap": 144,
+  "tasks_sha256": "fe1723c51f931a464051ed32319556c6a27cb0d4741460611512d7d9c8cf6937",
+  "thought_capacity_curriculum": [
+    8,
+    16,
+    32,
+    64,
+    128
+  ],
+  "thought_capacity_required": 128,
+  "version": 1
+}

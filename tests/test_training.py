@@ -308,9 +308,7 @@ def test_trajectory_tensorizer_marks_waiting_snapshot_as_current_information_equ
     waiting_step = tuple(
         replace(
             target,
-            lifecycle=(
-                CellLifecycle.WAITING if target.cell_id == "c1" else target.lifecycle
-            ),
+            lifecycle=(CellLifecycle.WAITING if target.cell_id == "c1" else target.lifecycle),
         )
         for target in step_one
     )
@@ -365,6 +363,44 @@ def test_training_collator_pads_variable_sequences_and_external_memory() -> None
     assert output.display_logits.shape[:2] == training_batch.batch.display_ids.shape
     assert torch.isfinite(losses.total)
     losses.total.backward()
+
+
+def test_trajectory_tensorizer_pads_mixed_thought_capacities_per_batch() -> None:
+    adapter = ILLaDACIDAdapter(
+        TinyBackbone(),
+        ILLaDACIDConfig(max_thought_slots=128, max_display_tokens=16),
+        freeze_backbone=True,
+    )
+    tensorizer = ILLaDATrajectoryTensorizer(
+        adapter,
+        TinyTokenizer(),
+        minimum_thought_slots=8,
+    )
+    small_example = replace(make_trajectory(), prompt="x")
+    small = tensorizer.tensorize(small_example, source_step=0, timestep=1.0)
+    base = replace(make_trajectory(), prompt="y")
+    expanded = replace(
+        base,
+        example_id="train-cap32",
+        thought_targets=tuple(
+            replace(target, slot=31 if target.cell_id == "c1" else target.slot)
+            for target in base.thought_targets
+        ),
+    )
+    large = tensorizer.tensorize(expanded, source_step=0, timestep=1.0)
+
+    assert small.batch.thought_semantic.shape[1] == 8
+    assert large.batch.thought_semantic.shape[1] == 32
+
+    batch = collate_training_steps((small, large), pad_token_id=1)
+    assert batch.batch.thought_semantic.shape[:2] == (2, 32)
+    assert not batch.batch.slot_occupancy[0, 8:].any()
+    assert not batch.targets.allocation_mask[0, 8:].any()
+    assert (batch.targets.lifecycle[0, 8:] == -100).all()
+
+    output = adapter(batch.batch)
+    losses = cid_loss(output, batch.targets)
+    assert torch.isfinite(losses.total)
 
 
 def test_trainer_uses_configured_micro_batches() -> None:
@@ -451,9 +487,7 @@ def test_trainer_checkpoint_restores_trainable_state_optimizer_and_progress(tmp_
 
 
 def test_transition_sharding_is_balanced_deterministic_and_complete() -> None:
-    examples = tuple(
-        replace(make_trajectory(), example_id=f"train-{index}") for index in range(5)
-    )
+    examples = tuple(replace(make_trajectory(), example_id=f"train-{index}") for index in range(5))
     transitions = trajectory_transitions(examples)
 
     shards = tuple(
@@ -579,9 +613,7 @@ def test_stage_b_fsdp_runs_full_parameter_optimizer_step_on_cpu(tmp_path) -> Non
         assert all(parameter.requires_grad for parameter in adapter.backbone.parameters())
 
         checkpoint = tmp_path / "stage-b-checkpoint"
-        saved_weight = (
-            adapter.backbone.get_decoder().layers[0].projection.weight.detach().clone()
-        )
+        saved_weight = adapter.backbone.get_decoder().layers[0].projection.weight.detach().clone()
         save_stage_b_checkpoint(
             fsdp,
             optimizer,
@@ -794,8 +826,7 @@ def test_rollout_curriculum_and_window_sharding_are_deterministic() -> None:
     assert trainer.rollout_probability() == 1.0
 
     examples = tuple(
-        replace(make_rollout_trajectory(), example_id=f"rollout-{index}")
-        for index in range(5)
+        replace(make_rollout_trajectory(), example_id=f"rollout-{index}") for index in range(5)
     )
     windows = trajectory_rollout_windows(examples, max_horizon=3)
     shards = tuple(

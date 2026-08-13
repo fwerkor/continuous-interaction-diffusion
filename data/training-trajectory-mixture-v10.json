@@ -1,0 +1,106 @@
+{
+  "components": [
+    {
+      "examples": 34048,
+      "manifest": "data/generated/public-trajectories-v1.manifest.json",
+      "name": "public-base",
+      "path": "data/generated/public-trajectories-v1.jsonl",
+      "sha256": "5a1c41253fb3275670aaeba15a770ae2379e308413158841874937ea4faf71a4",
+      "transitions": 41548
+    },
+    {
+      "examples": 30360,
+      "manifest": "data/generated/public-interaction-trajectories-v1.manifest.json",
+      "name": "public-interaction",
+      "path": "data/generated/public-interaction-trajectories-v1.jsonl",
+      "sha256": "f9b475d65ffaad4e063ed4e0b0b23fc60075afdf6f741c8f9ef0890f884c3904",
+      "transitions": 400474
+    },
+    {
+      "examples": 40000,
+      "manifest": "data/generated/mechanism-trajectories-v1.manifest.json",
+      "name": "mechanism",
+      "path": "data/generated/mechanism-trajectories-v1.jsonl",
+      "sha256": "6b22dbc55af1f44911998c34a8dbe81c42ceeb3bbd9d0199d1501825b287d403",
+      "transitions": 232148
+    },
+    {
+      "examples": 24000,
+      "manifest": "data/generated/computational-distilled-v1.manifest.json",
+      "name": "computational",
+      "path": "data/generated/computational-distilled-v1.jsonl",
+      "sha256": "5fdce1d9469c0ecf78aa237e428a40b0c36e9e10e93873fc25989e26a92a1afe",
+      "transitions": 111609
+    },
+    {
+      "examples": 31200,
+      "manifest": "data/generated/symbolic-distilled-v1.manifest.json",
+      "name": "symbolic",
+      "path": "data/generated/symbolic-distilled-v1.jsonl",
+      "sha256": "fdc67bfdb1f4890342a34e991475fbff73f7eca769473bb04ca948adc5d35251",
+      "transitions": 121748
+    },
+    {
+      "examples": 20000,
+      "manifest": "data/generated/correction-trajectories-v1.manifest.json",
+      "name": "local-correction",
+      "path": "data/generated/correction-trajectories-v1.jsonl",
+      "sha256": "0e9a0714946dad9eeb19649e2d1e855b75453c61c7781244fbe5d25fc4943d22",
+      "transitions": 120021
+    },
+    {
+      "examples": 24000,
+      "manifest": "data/generated/logic-trajectories-v1.manifest.json",
+      "name": "complex-logic",
+      "path": "data/generated/logic-trajectories-v1.jsonl",
+      "sha256": "24f5125de86f56ca10e9c900412b65522a54752e7dd5a2a045dc1a6562c351ae",
+      "transitions": 120000
+    },
+    {
+      "examples": 1440,
+      "manifest": "data/generated/self-identity-trajectories-v1.manifest.json",
+      "name": "self-identity",
+      "path": "data/generated/self-identity-trajectories-v1.jsonl",
+      "sha256": "98ba8f417ff2da12ff44d9620c980b3c7f3dd1f6263f4c7302250d542b7e0853",
+      "transitions": 1440
+    },
+    {
+      "examples": 2400,
+      "manifest": "data/generated/multilingual-v1/trajectories-v1.manifest.json",
+      "name": "multilingual",
+      "path": "data/generated/multilingual-v1/trajectories-v1.jsonl",
+      "sha256": "6ac408a327d08db8d8cc603b756135775a7bdedeb15ae42bf9eb02ff7f7a61ed",
+      "transitions": 19159
+    },
+    {
+      "examples": 24000,
+      "manifest": "data/generated/composed-trajectories-v1.manifest.json",
+      "name": "composed",
+      "path": "data/generated/composed-trajectories-v1.jsonl",
+      "sha256": "9e85b6b1ecd3db15716511045de3523d60d2fd88d58e6e43f3ddfce15a223556",
+      "transitions": 237058
+    },
+    {
+      "examples": 6500,
+      "manifest": "data/generated/tool-restraint-trajectories-v1.manifest.json",
+      "name": "tool-restraint",
+      "path": "data/generated/tool-restraint-trajectories-v1.jsonl",
+      "sha256": "0e5839f998db41bf9b48e8aa168618cc40fd9f68a38215e1faa21ef00cb59a04",
+      "transitions": 0
+    },
+    {
+      "examples": 40000,
+      "manifest": "data/generated/compositional-trajectories-v1.manifest.json",
+      "name": "compositional-longtail",
+      "path": "data/generated/compositional-trajectories-v1.jsonl",
+      "sha256": "2d17c953b16c7038f68ac685db0fb5bc9dfa73cfc5d427895a35c1eee3d0af83",
+      "transitions": 180000
+    }
+  ],
+  "examples": 277948,
+  "name": "training-trajectory-mixture-v10",
+  "semantic_mixture": "data/training-semantic-mixture-v10.json",
+  "thought_capacity_required": 128,
+  "transitions": 1585205,
+  "version": 10
+}

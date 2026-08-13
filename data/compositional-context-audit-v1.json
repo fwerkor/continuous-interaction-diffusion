@@ -1,0 +1,102 @@
+{
+  "backbone": "GSAI-ML/iLLaDA-8B-Base",
+  "combined_position_formula": "prompt_tokens + thought_capacity_bucket + 8 conservative display positions",
+  "format_version": 1,
+  "max_position_embeddings": 8192,
+  "name": "compositional-context-audit-v1",
+  "probe": {
+    "capacity_buckets": {
+      "128": {
+        "examples": 1000,
+        "max_conservative_positions": 3205,
+        "max_prompt_tokens": 3069,
+        "mean_prompt_tokens": 1540.406,
+        "p95_prompt_tokens": 2495,
+        "p99_prompt_tokens": 2991
+      },
+      "16": {
+        "examples": 1000,
+        "max_conservative_positions": 378,
+        "max_prompt_tokens": 354,
+        "mean_prompt_tokens": 186.612,
+        "p95_prompt_tokens": 302,
+        "p99_prompt_tokens": 339
+      },
+      "32": {
+        "examples": 1000,
+        "max_conservative_positions": 818,
+        "max_prompt_tokens": 778,
+        "mean_prompt_tokens": 426.246,
+        "p95_prompt_tokens": 691,
+        "p99_prompt_tokens": 736
+      },
+      "64": {
+        "examples": 1000,
+        "max_conservative_positions": 1444,
+        "max_prompt_tokens": 1372,
+        "mean_prompt_tokens": 772.016,
+        "p95_prompt_tokens": 1176,
+        "p99_prompt_tokens": 1310
+      }
+    },
+    "examples": 4000,
+    "global_max": {
+      "capacity": 128,
+      "combined_positions": 3205,
+      "family": "candidate_elimination",
+      "prompt_tokens": 3069
+    }
+  },
+  "revision": "a1b5b5f8a31a3854a46205ee584178c04b45ec9a",
+  "train": {
+    "capacity_buckets": {
+      "128": {
+        "examples": 2000,
+        "max_conservative_positions": 3178,
+        "max_prompt_tokens": 3042,
+        "mean_prompt_tokens": 1315.149,
+        "p95_prompt_tokens": 2252,
+        "p99_prompt_tokens": 2703
+      },
+      "16": {
+        "examples": 5000,
+        "max_conservative_positions": 380,
+        "max_prompt_tokens": 356,
+        "mean_prompt_tokens": 171.129,
+        "p95_prompt_tokens": 283,
+        "p99_prompt_tokens": 330
+      },
+      "32": {
+        "examples": 4000,
+        "max_conservative_positions": 804,
+        "max_prompt_tokens": 764,
+        "mean_prompt_tokens": 392.637,
+        "p95_prompt_tokens": 648,
+        "p99_prompt_tokens": 726
+      },
+      "64": {
+        "examples": 3000,
+        "max_conservative_positions": 1444,
+        "max_prompt_tokens": 1372,
+        "mean_prompt_tokens": 688.399,
+        "p95_prompt_tokens": 1073,
+        "p99_prompt_tokens": 1267
+      },
+      "8": {
+        "examples": 6000,
+        "max_conservative_positions": 189,
+        "max_prompt_tokens": 173,
+        "mean_prompt_tokens": 93.94,
+        "p95_prompt_tokens": 157,
+        "p99_prompt_tokens": 167
+      }
+    },
+    "examples": 20000,
+    "global_max": {
+      "capacity": 128,
+      "combined_positions": 3178,
+      "family": "candidate_elimination",
+      "prompt_tokens": 3042
+    }
+  }
+}
