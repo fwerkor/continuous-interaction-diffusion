@@ -1,0 +1,205 @@
+{
+  "complex_logic_dependency_depth_4_plus_tasks": 12000,
+  "complex_logic_internal_refinement_tasks": 12000,
+  "complex_logic_tasks": 12000,
+  "components": [
+    {
+      "causal_jobs_sha256": "7f101139ac44647480ced1b1ffc0dfb5d50aa52b148425c4f636a52d8dff3a96",
+      "name": "public-base-v1",
+      "reference_manifest": "data/public-teacher-v1.train.reference-manifest.json",
+      "tasks": 9030,
+      "tasks_sha256": "b6746a3335e6de0d3a57eb798ef9c168baf7452c2ff258a2a626d37176d91623"
+    },
+    {
+      "causal_jobs_sha256": "79b2ebf3f4a61b49ef479209e0987bd47cd11fcbc6954df4c767b944209e5d18",
+      "name": "public-interaction-v1",
+      "reference_manifest": "data/public-interaction-teacher-v1.reference-manifest.json",
+      "tasks": 9025,
+      "tasks_sha256": "d1943b8453683c65cd31a1cd775a5b51a81a7de5c34e54d790b8e2c43d3f14dd"
+    },
+    {
+      "causal_jobs_sha256": "f0b3b904e0e83dddc3669595b65fe91d86982539b4c59a108e07e1e769c7ccc7",
+      "name": "mechanism-teacher-v1",
+      "reference_manifest": "data/mechanism-teacher-v1.reference-manifest.json",
+      "tasks": 10000,
+      "tasks_sha256": "29d8ba7e53d8e25c35fbbe4cb26fa41b65ae57b64b7506a1db410c9a2e3972be"
+    },
+    {
+      "causal_jobs_sha256": "f63562d1f8df1e558a30037bf6e0bf5d283f16325cb523d5afe7f8865b4bc430",
+      "name": "computational-teacher-v1",
+      "reference_manifest": "data/computational-teacher-v1.reference-manifest.json",
+      "tasks": 12000,
+      "tasks_sha256": "be066237eb26bd2ba9fda60cb93d3c57c1ee2e0d98d74b684abb0b019ebb4a88"
+    },
+    {
+      "causal_jobs_sha256": "23c73eabc33d7412387df94ba46dbd8169f50d695bf1fd1fa3f0bd39317f245e",
+      "name": "symbolic-teacher-v1",
+      "reference_manifest": "data/symbolic-teacher-v1.reference-manifest.json",
+      "tasks": 15600,
+      "tasks_sha256": "9cda6ee0c3207eadac5b7236c186da979b0470d02407a93c63ea3d3ff2acaaea"
+    },
+    {
+      "causal_jobs_sha256": "f6e7432b5f394a1700d49632be8f9d8f0a7769db8f7149464c4b13ecb27df081",
+      "name": "speculative-local-correction-v1",
+      "reference_manifest": "data/correction-teacher-v1.reference-manifest.json",
+      "tasks": 10000,
+      "tasks_sha256": "837ecf7b52ecf6c4e220e738e6f8fd02acef111450da89f20f2a297dcaf37a79"
+    },
+    {
+      "name": "complex-logic-reasoning-v2",
+      "reference_manifest": "data/logic-teacher-v2.reference-manifest.json",
+      "tasks": 12000,
+      "tasks_sha256": "b97aa553ce37e295f766f9a19bbefaf1a5458e8c9f7121901bfdf637c47e2b45",
+      "teacher_protocol": "deterministic-no-tool-refinement-plan"
+    },
+    {
+      "name": "cid-self-identity-v1",
+      "reference_manifest": "data/self-identity-teacher-v1.reference-manifest.json",
+      "tasks": 720,
+      "tasks_sha256": "1cb98605e9bf53b2f0bc85c17357f51ea45a283e0b3ca50da5a80b4df10c3f47",
+      "teacher_protocol": "deterministic-no-tool-self-model"
+    },
+    {
+      "name": "multilingual-v1",
+      "reference_manifest": "data/multilingual-v1.reference-manifest.json",
+      "tasks": 1200,
+      "tasks_sha256": "156b9d84bd9625a9253b2b74f2f072a3df3d73365c63f1f0b66f4533d3f040f9",
+      "teacher_protocol": "deterministic-crosslingual-semantic-plan-v1"
+    },
+    {
+      "causal_jobs_sha256": "5a301bb7733ec6403f4c04691f637e0fdbde4753abeca5bd4fbd114ce8988803",
+      "name": "composed-tool-reasoning-v2",
+      "reference_manifest": "data/composed-teacher-v2.reference-manifest.json",
+      "tasks": 12000,
+      "tasks_sha256": "01da291f35baf736c9c9e814007310d0edb1cb6f30098b079187e83eda3bddea",
+      "teacher_protocol": "surface-diversified-v2-preserve-semantic-plan"
+    },
+    {
+      "augmentation": "accepted-natural-task-tool-restraint",
+      "name": "natural-tool-restraint-v1",
+      "reference_manifest": "data/tool-restraint-teacher-v1.reference-manifest.json",
+      "tasks": 6500,
+      "tasks_sha256": "c8f28f286e627b214ae02b2b9d891db13fb09b946a3629e4436e6b06398cf125"
+    },
+    {
+      "name": "compositional-longtail-reasoning-v1",
+      "reference_manifest": "data/compositional-teacher-v1.reference-manifest.json",
+      "tasks": 20000,
+      "tasks_sha256": "fe1723c51f931a464051ed32319556c6a27cb0d4741460611512d7d9c8cf6937",
+      "teacher_protocol": "deterministic-no-tool-refinement-plan"
+    },
+    {
+      "causal_jobs_sha256": "dd0414b50559387343228c4095869cce8aad538b93919615303bba14e656551e",
+      "name": "long-horizon-tool-reasoning-v2",
+      "reference_manifest": "data/long-horizon-teacher-v2.reference-manifest.json",
+      "tasks": 12000,
+      "tasks_sha256": "769da7e597ccb6569d3522ce8f483be7c3d7d86917ee9c86ab26c727a382d5f4",
+      "teacher_protocol": "surface-diversified-v2-preserve-semantic-plan"
+    },
+    {
+      "augmentation": "deep-longtail-tool-restraint",
+      "name": "deep-tool-restraint-v1",
+      "reference_manifest": "data/deep-tool-restraint-v1.reference-manifest.json",
+      "tasks": 4000,
+      "tasks_sha256": "68dfb4ccea6d3741657da5135153d0af4f821d15f17b803ecc32920ca8936534",
+      "teacher_protocol": "accepted-deep-no-tool-plan-with-irrelevant-tool-exposed"
+    }
+  ],
+  "composed_dependency_depth_3_tasks": 6000,
+  "composed_tool_reasoning_tasks": 12000,
+  "compositional_capacity_bucket_counts": {
+    "128": 2000,
+    "16": 5000,
+    "32": 4000,
+    "64": 3000,
+    "8": 6000
+  },
+  "compositional_dependency_depth_16_plus_tasks": 7640,
+  "compositional_dependency_depth_3_plus_tasks": 17934,
+  "compositional_dependency_depth_4_plus_tasks": 16184,
+  "compositional_dependency_depth_8_plus_tasks": 12366,
+  "compositional_internal_correction_tasks": 2000,
+  "compositional_longtail_tasks": 20000,
+  "computational_dependency_depth_2_tasks": 6000,
+  "computational_parallel_then_merge_tasks": 2400,
+  "correction_dependency_depth_2_tasks": 10000,
+  "deep_tool_restraint_capacity_bucket_counts": {
+    "128": 1000,
+    "16": 1000,
+    "32": 1000,
+    "64": 1000
+  },
+  "deep_tool_restraint_depth_16_plus_tasks": 2611,
+  "deep_tool_restraint_min_dependency_depth": 8,
+  "deep_tool_restraint_tasks": 4000,
+  "dependency_depth_16_plus_tasks": 10251,
+  "dependency_depth_3_plus_tasks": 53048,
+  "dependency_depth_4_plus_tasks": 44330,
+  "dependency_depth_8_plus_tasks": 17054,
+  "generalization_probe_tasks_excluded": 4000,
+  "intentional_deep_restraint_overlap_with_compositional_longtail": 4000,
+  "intentional_tool_restraint_overlap_with_public_base": 6500,
+  "long_horizon_dependency_depth_histogram": {
+    "4": 3334,
+    "5": 5334,
+    "6": 3332
+  },
+  "long_horizon_depth_4_plus_tasks": 12000,
+  "long_horizon_depth_6_plus_tasks": 3332,
+  "long_horizon_max_trajectory_steps": 33,
+  "long_horizon_tool_reasoning_tasks": 12000,
+  "mode_counts": {
+    "no_tool": 39641,
+    "tool_required": 80791,
+    "tools_available_unnecessary": 13643
+  },
+  "mode_fractions": {
+    "no_tool": 0.29566,
+    "tool_required": 0.60258,
+    "tools_available_unnecessary": 0.10176
+  },
+  "multilingual_cross_lingual_tasks": 1200,
+  "multilingual_prompt_language_counts": {
+    "en": 300,
+    "es": 225,
+    "ja": 225,
+    "zh": 450
+  },
+  "multilingual_source_language_pair_counts": {
+    "en->ja": 225,
+    "en->zh": 450,
+    "fr->es": 225,
+    "zh->en": 300
+  },
+  "name": "training-semantic-mixture-v11",
+  "self_identity_language_counts": {
+    "en": 540,
+    "zh": 180
+  },
+  "self_identity_tasks": 720,
+  "semantic_tasks": 134075,
+  "sequential_dependency_tasks": 45710,
+  "speculative_local_correction_tasks": 10000,
+  "split": "train-v11-surface-diverse-composition-long-horizon-plus-deep-tool-restraint",
+  "super_complex_64_plus_tasks": 5000,
+  "surface_diverse_replacements": {
+    "composed-tool-reasoning-v2": {
+      "largest_normalized_prompt_group": 11,
+      "normalized_prompt_signatures": 4672,
+      "replaces": "composed-tool-reasoning-v1"
+    },
+    "long-horizon-tool-reasoning-v2": {
+      "largest_normalized_prompt_group": 11,
+      "normalized_prompt_signatures": 4062,
+      "replaces": "long-horizon-tool-reasoning-v1"
+    }
+  },
+  "symbolic_dependency_depth_2_tasks": 3600,
+  "symbolic_parallel_then_merge_tasks": 1200,
+  "thought_capacity_required": 128,
+  "tool_required_dependency_depth_4_plus_tasks": 12146,
+  "tool_required_dependency_depth_6_plus_tasks": 3332,
+  "tool_restraint_tasks": 6500,
+  "ultra_complex_128_tasks": 2000,
+  "version": 11
+}

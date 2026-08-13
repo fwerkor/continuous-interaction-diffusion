@@ -179,24 +179,25 @@ Convert a pool into teacher-ready CID tasks and causal evidence-exposure jobs wi
 cid prepare-public-distillation
 ```
 
-The current overall semantic mixture is pinned by `data/training-semantic-mixture-v10.json` and
-contains **130,075 semantic tasks** across 13 components. v10 includes the 20,000-task compositional
-long-tail curriculum plus 12,000 long-horizon tool-reasoning tasks. The long-tail component spans
-8/16/32/64/128 physical TCT-slot buckets and keeps its separate 4,000-task OOD probe out of training.
-The long-horizon component contains only depth-4-to-6 dependent tool graphs, including serial
-cross-source chains, alias/entity/policy resolution, stale-state refresh, and fork/join barriers.
+The current overall semantic mixture is pinned by `data/training-semantic-mixture-v11.json` and
+contains **134,075 semantic tasks** across 14 components. v11 keeps the v10 capability coverage but
+replaces the template-heavy composed and long-horizon slices with surface-diversified v2 equivalents.
+The composed replacement has 4,672 normalized prompt signatures (up from 8 in v1), and long-horizon
+v2 has 4,062 (up from 6); neither v1 is duplicated in the v11 training mixture. v11 also adds 4,000
+depth-8+ tool-restraint hard negatives, balanced across 16/32/64/128 TCT-slot buckets, restoring
+`tools_available_unnecessary` to **10.176%** of semantic tasks.
 
 The corresponding compiled training mixture is pinned by
-`data/training-trajectory-mixture-v10.json`: **301,948 runtime trajectories and 2,032,831 adjacent
-supervised transitions**. Its maximum TCT capacity is 128; the tensorizer still allocates each
+`data/training-trajectory-mixture-v11.json`: **305,948 runtime trajectories and 2,054,831 adjacent
+supervised transitions**. Its maximum TCT capacity remains 128; the tensorizer allocates each
 trajectory at its actual slot footprint and pads mixed-capacity batches only to the largest footprint
 in that batch. Materialize the component-order training file with:
 
 ```bash
 cid materialize-trajectory-mixture \
-  --spec data/training-trajectory-mixture-v10.json \
-  --output data/generated/training-trajectories-v10.jsonl \
-  --manifest-output data/generated/training-trajectories-v10.manifest.json
+  --spec data/training-trajectory-mixture-v11.json \
+  --output data/generated/training-trajectories-v11.jsonl \
+  --manifest-output data/generated/training-trajectories-v11.manifest.json
 ```
 
 The materializer verifies every component SHA/count and global `example_id` uniqueness before
@@ -238,6 +239,19 @@ cid build-correction-training
 The released component contains 30,000 validated causal stages and 20,000 compiled trajectories;
 its exact generation, review, correction-audit, and compilation hashes are pinned by
 `data/correction-teacher-v1.reference-manifest.json`.
+
+Build the v11 data-quality additions reproducibly with:
+
+```bash
+cid build-surface-diverse-training --component composed
+cid build-surface-diverse-training --component long-horizon
+cid build-deep-tool-restraint-training
+```
+
+The surface-v2 builders preserve each source task's evidence, reference answer, and accepted TCT
+semantic plan while changing only the task ID and deterministic prompt wrapper. The deep-restraint
+builder reuses accepted compositional long-tail plans, exposes an irrelevant read-only lookup source,
+and keeps every selected task free of evidence arrivals and tool needs.
 
 Generated task data lives under `data/generated/` and is not committed. Every record retains exact
 upstream provenance; semantic IDs are deduplicated and assigned to the CID train/validation/test

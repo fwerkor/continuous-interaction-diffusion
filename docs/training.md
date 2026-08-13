@@ -267,12 +267,13 @@ zero rejects, missing responses, or soft warnings, and all 10,000 plans pass bot
 the local-correction audit. Exact hashes are pinned by
 `data/correction-teacher-v1.reference-manifest.json`.
 
-The latest semantic mixture is `data/training-semantic-mixture-v10.json`: **130,075 semantic tasks**
-across 13 components. It preserves the earlier identity, multilingual, composed-tool, and
-tool-restraint curricula while adding both the compositional long-tail curriculum below and 12,000
-long-horizon tool-reasoning tasks. The corresponding compiled mixture is
-`data/training-trajectory-mixture-v10.json`: **301,948 trajectories and 2,032,831 adjacent supervised
-transitions** with a maximum TCT capacity of 128.
+The latest semantic mixture is `data/training-semantic-mixture-v11.json`: **134,075 semantic tasks**
+across 14 components. It retains the v10 capability coverage while replacing the composed and
+long-horizon v1 slices with surface-diversified v2 equivalents and adding 4,000 depth-8+ deep
+tool-restraint hard negatives. The replacement is semantic rather than additive: v1 and v2 are not
+trained together. The corresponding compiled mixture is `data/training-trajectory-mixture-v11.json`:
+**305,948 trajectories and 2,054,831 adjacent supervised transitions**, with a maximum TCT capacity
+of 128. The v10 manifests remain pinned as the immediately preceding historical release.
 
 ### Compositional long-tail curriculum
 
@@ -330,6 +331,36 @@ overall v10 depth-4+ count to 40,330.
 ```bash
 cid build-long-horizon-training
 ```
+
+### v11 surface diversity and deep tool restraint
+
+Two v10 tool-reasoning components had high semantic quality but overly regular task wording: the
+12,000-task composed slice collapsed to eight normalized prompt signatures, and the 12,000-task
+long-horizon slice to six. v11 rebuilds both from their accepted v1 tasks/plans while preserving the
+core prompt, source descriptors, evidence contracts, reference answers, and TCT semantic frames.
+Only a deterministic short wrapper and the task ID change. `composed-tool-reasoning-v2` yields 4,672
+normalized signatures and `long-horizon-tool-reasoning-v2` yields 4,062; the largest normalized
+prompt group in either component is 11. All 24,000 replacement plans pass the normal semantic review.
+
+The new `deep-tool-restraint-v1` component samples 4,000 accepted compositional long-tail tasks with
+dependency depth at least eight. It selects exactly 1,000 tasks from each 16/32/64/128-slot bucket,
+exposes an irrelevant read-only `record_lookup` interface, but provides no external evidence and
+preserves plans with zero tool needs. These hard negatives train tool restraint during genuinely deep
+internal reasoning instead of only on short self-contained questions. They increase the v11
+`tools_available_unnecessary` fraction to 10.176%; 2,611 of the added examples have dependency depth
+at least 16.
+
+```bash
+cid build-surface-diverse-training --component composed
+cid build-surface-diverse-training --component long-horizon
+cid build-deep-tool-restraint-training
+```
+
+The three release manifests are `data/composed-teacher-v2.reference-manifest.json`,
+`data/long-horizon-teacher-v2.reference-manifest.json`, and
+`data/deep-tool-restraint-v1.reference-manifest.json`. v11 references the v2 replacements instead of
+the corresponding v1 components, so surface augmentation does not double-count the same semantic
+supervision.
 
 The historical v5 six-component training input is pinned separately by
 `data/training-trajectory-mixture-v5.json`. It preserves every reviewed schedule variant from

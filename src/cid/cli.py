@@ -247,6 +247,79 @@ def _build_tool_restraint_training(args: argparse.Namespace) -> None:
     )
 
 
+def _build_deep_tool_restraint_training(args: argparse.Namespace) -> None:
+    from cid.deep_restraint_training import (
+        DeepToolRestraintConfig,
+        build_deep_tool_restraint_distillation,
+    )
+
+    manifest = build_deep_tool_restraint_distillation(
+        source_tasks_path=args.source_tasks,
+        source_plans_path=args.source_plans,
+        output_dir=args.output_dir,
+        reference_manifest_output=args.reference_manifest_output,
+        config=DeepToolRestraintConfig(
+            count_per_bucket=args.count_per_bucket,
+            min_dependency_depth=args.min_dependency_depth,
+            capacity_buckets=tuple(args.capacity_buckets),
+            seed=args.seed,
+        ),
+    )
+    print(
+        f"tasks={manifest['semantic_tasks']} trajectories={manifest['compiled_trajectories']} "
+        f"transitions={manifest['compiled_transitions']} "
+        f"mode=tools_available_unnecessary"
+    )
+
+
+def _build_surface_diverse_training(args: argparse.Namespace) -> None:
+    from cid.surface_diversity_training import (
+        SurfaceDiversityConfig,
+        build_surface_diversified_distillation,
+    )
+
+    if args.component == "composed":
+        source_tasks = "data/generated/composed-teacher-tasks-v1.jsonl"
+        source_plans = "data/generated/composed-teacher-plans-v1.accepted.jsonl"
+        output_dir = "data/generated/composed-v2"
+        reference = "data/composed-teacher-v2.reference-manifest.json"
+        config = SurfaceDiversityConfig(
+            component_name="composed-tool-reasoning-v2",
+            file_stem="composed-v2",
+            thought_capacity=8,
+            variants_per_task=2,
+            min_delay_steps=1,
+            max_delay_steps=4,
+            seed=args.seed,
+            max_tasks=args.max_tasks,
+        )
+    else:
+        source_tasks = "data/generated/long-horizon-v1/long-horizon-teacher-tasks-v1.jsonl"
+        source_plans = "data/generated/long-horizon-v1/long-horizon-teacher-plans-v1.accepted.jsonl"
+        output_dir = "data/generated/long-horizon-v2"
+        reference = "data/long-horizon-teacher-v2.reference-manifest.json"
+        config = SurfaceDiversityConfig(
+            component_name="long-horizon-tool-reasoning-v2",
+            file_stem="long-horizon-v2",
+            thought_capacity=12,
+            variants_per_task=2,
+            min_delay_steps=1,
+            max_delay_steps=5,
+            seed=args.seed,
+            max_tasks=args.max_tasks,
+        )
+    manifest = build_surface_diversified_distillation(
+        source_tasks_path=source_tasks,
+        source_plans_path=source_plans,
+        output_dir=output_dir,
+        reference_manifest_output=reference,
+        config=config,
+    )
+    print(
+        f"tasks={manifest['semantic_tasks']} trajectories={manifest['compiled_trajectories']} "
+        f"signatures={manifest['normalized_prompt_signatures']} output={output_dir}"
+    )
+
 
 def _build_long_horizon_training(args: argparse.Namespace) -> None:
     from cid.long_horizon_training import (
@@ -271,6 +344,7 @@ def _build_long_horizon_training(args: argparse.Namespace) -> None:
         f"transitions={manifest['compiled_transitions']} "
         f"depth4_plus={manifest['depth_4_plus_tasks']}"
     )
+
 
 def _build_compositional_training(args: argparse.Namespace) -> None:
     from cid.compositional_training import (
@@ -1141,6 +1215,37 @@ def main() -> None:
     restraint.add_argument("--count", type=int, default=6500)
     restraint.add_argument("--thought-capacity", type=int, default=8)
     restraint.add_argument("--seed", type=int, default=20260813)
+    deep_restraint = subparsers.add_parser(
+        "build-deep-tool-restraint-training",
+        help="derive deep long-tail tasks where exposed external tools should remain unused",
+    )
+    deep_restraint.add_argument(
+        "--source-tasks", default="data/generated/compositional-teacher-tasks-v1.jsonl"
+    )
+    deep_restraint.add_argument(
+        "--source-plans",
+        default="data/generated/compositional-teacher-plans-v1.accepted.jsonl",
+    )
+    deep_restraint.add_argument("--output-dir", default="data/generated/deep-tool-restraint-v1")
+    deep_restraint.add_argument(
+        "--reference-manifest-output",
+        default="data/deep-tool-restraint-v1.reference-manifest.json",
+    )
+    deep_restraint.add_argument("--count-per-bucket", type=int, default=1000)
+    deep_restraint.add_argument("--min-dependency-depth", type=int, default=8)
+    deep_restraint.add_argument(
+        "--capacity-buckets", type=int, nargs="+", default=[16, 32, 64, 128]
+    )
+    deep_restraint.add_argument("--seed", type=int, default=20260813)
+
+    surface = subparsers.add_parser(
+        "build-surface-diverse-training",
+        help="build surface-diversified v2 replacements for composed or long-horizon data",
+    )
+    surface.add_argument("--component", choices=("composed", "long-horizon"), required=True)
+    surface.add_argument("--max-tasks", type=int)
+    surface.add_argument("--seed", type=int, default=20260813)
+
     long_horizon = subparsers.add_parser(
         "build-long-horizon-training",
         help="build depth-4-to-6 dependent asynchronous read-only tool trajectories",
@@ -1383,6 +1488,10 @@ def main() -> None:
         _build_composed_training(args)
     elif args.command == "build-tool-restraint-training":
         _build_tool_restraint_training(args)
+    elif args.command == "build-deep-tool-restraint-training":
+        _build_deep_tool_restraint_training(args)
+    elif args.command == "build-surface-diverse-training":
+        _build_surface_diverse_training(args)
     elif args.command == "build-long-horizon-training":
         _build_long_horizon_training(args)
     elif args.command == "build-compositional-training":

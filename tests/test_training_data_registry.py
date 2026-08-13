@@ -378,3 +378,97 @@ def test_training_trajectory_mixture_v10_combines_128_slots_and_long_horizon_too
     assert deep_tools["examples"] == long_horizon["compiled_trajectories"] == 24_000
     assert deep_tools["transitions"] == long_horizon["compiled_transitions"] == 447_626
     assert deep_tools["sha256"] == long_horizon["compiled_sha256"]
+
+
+def test_training_semantic_mixture_v11_adds_surface_v2_and_deep_restraint() -> None:
+    mixture = _load("data/training-semantic-mixture-v11.json")
+    composed = _load("data/composed-teacher-v2.reference-manifest.json")
+    long_horizon = _load("data/long-horizon-teacher-v2.reference-manifest.json")
+    deep = _load("data/deep-tool-restraint-v1.reference-manifest.json")
+    by_name = {component["name"]: component for component in mixture["components"]}
+
+    assert mixture["name"] == "training-semantic-mixture-v11"
+    assert mixture["version"] == 11
+    assert mixture["semantic_tasks"] == 134_075
+    assert mixture["mode_counts"] == {
+        "no_tool": 39_641,
+        "tool_required": 80_791,
+        "tools_available_unnecessary": 13_643,
+    }
+    assert mixture["mode_fractions"] == {
+        "no_tool": 0.29566,
+        "tool_required": 0.60258,
+        "tools_available_unnecessary": 0.10176,
+    }
+    assert mixture["dependency_depth_3_plus_tasks"] == 53_048
+    assert mixture["dependency_depth_4_plus_tasks"] == 44_330
+    assert mixture["dependency_depth_8_plus_tasks"] == 17_054
+    assert mixture["dependency_depth_16_plus_tasks"] == 10_251
+    assert mixture["deep_tool_restraint_tasks"] == 4_000
+    assert mixture["deep_tool_restraint_depth_16_plus_tasks"] == 2_611
+    assert sum(component["tasks"] for component in mixture["components"]) == 134_075
+
+    assert "composed-tool-reasoning-v1" not in by_name
+    assert "long-horizon-tool-reasoning-v1" not in by_name
+    assert by_name["composed-tool-reasoning-v2"]["tasks_sha256"] == composed["tasks_sha256"]
+    assert by_name["long-horizon-tool-reasoning-v2"]["tasks_sha256"] == long_horizon["tasks_sha256"]
+    assert by_name["deep-tool-restraint-v1"]["tasks_sha256"] == deep["tasks_sha256"]
+
+    assert composed["semantic_tasks"] == 12_000
+    assert composed["review_rejected"] == 0
+    assert composed["normalized_prompt_signatures"] == 4_672
+    assert composed["largest_normalized_prompt_group"] == 11
+    assert long_horizon["semantic_tasks"] == 12_000
+    assert long_horizon["review_rejected"] == 0
+    assert long_horizon["normalized_prompt_signatures"] == 4_062
+    assert long_horizon["largest_normalized_prompt_group"] == 11
+    assert deep["semantic_tasks"] == 4_000
+    assert deep["review_rejected"] == 0
+    assert deep["tasks_without_evidence"] == 4_000
+    assert deep["plans_without_needs"] == 4_000
+    assert deep["capacity_bucket_counts"] == {
+        "16": 1_000,
+        "32": 1_000,
+        "64": 1_000,
+        "128": 1_000,
+    }
+
+
+def test_training_trajectory_mixture_v11_uses_v2_replacements_and_deep_restraint() -> None:
+    mixture = _load("data/training-trajectory-mixture-v11.json")
+    composed = _load("data/composed-teacher-v2.reference-manifest.json")
+    long_horizon = _load("data/long-horizon-teacher-v2.reference-manifest.json")
+    deep = _load("data/deep-tool-restraint-v1.reference-manifest.json")
+    by_name = {component["name"]: component for component in mixture["components"]}
+
+    assert mixture["name"] == "training-trajectory-mixture-v11"
+    assert mixture["version"] == 11
+    assert mixture["examples"] == 305_948
+    assert mixture["transitions"] == 2_054_831
+    assert mixture["thought_capacity_required"] == 128
+    assert mixture["max_trajectory_steps"] == 33
+    assert sum(component["examples"] for component in mixture["components"]) == mixture["examples"]
+    assert (
+        sum(component["transitions"] for component in mixture["components"])
+        == mixture["transitions"]
+    )
+
+    assert "composed" not in by_name
+    assert "long-horizon-tools" not in by_name
+    assert by_name["composed-v2"]["examples"] == composed["compiled_trajectories"] == 24_000
+    assert by_name["composed-v2"]["transitions"] == composed["compiled_transitions"] == 237_058
+    assert by_name["composed-v2"]["sha256"] == composed["compiled_sha256"]
+    assert (
+        by_name["long-horizon-tools-v2"]["examples"]
+        == long_horizon["compiled_trajectories"]
+        == 24_000
+    )
+    assert (
+        by_name["long-horizon-tools-v2"]["transitions"]
+        == long_horizon["compiled_transitions"]
+        == 447_626
+    )
+    assert by_name["long-horizon-tools-v2"]["sha256"] == long_horizon["compiled_sha256"]
+    assert by_name["deep-tool-restraint"]["examples"] == deep["compiled_trajectories"] == 4_000
+    assert by_name["deep-tool-restraint"]["transitions"] == deep["compiled_transitions"] == 22_000
+    assert by_name["deep-tool-restraint"]["sha256"] == deep["compiled_sha256"]
