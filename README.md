@@ -179,27 +179,24 @@ Convert a pool into teacher-ready CID tasks and causal evidence-exposure jobs wi
 cid prepare-public-distillation
 ```
 
-The current overall semantic mixture is pinned by `data/training-semantic-mixture-v8.json` and
-contains 79,575 tasks. It includes the 720-task no-tool CID self-identity component plus the 1,200-task
-multilingual cross-lingual component added after v7. The self-identity component fixes the model name
-as `CID-v1` while reserving `Continuous Interaction Diffusion (CID)` for the method and architecture.
-Its nine internal families cover model identity, the CID acronym and method overview, diffusion-native
-generation, Facts/TCT/Display state separation, TCT logical-vs-physical identity, the model/runtime
-responsibility boundary, and asynchronous external interaction. It contains 540 English and 180
-Chinese semantic tasks and is generated from `data/cid-self-identity-v1.contract.json` so model/method
-identity and architecture wording cannot drift across samples.
+The current overall semantic mixture is pinned by `data/training-semantic-mixture-v10.json` and
+contains **130,075 semantic tasks** across 13 components. v10 includes the 20,000-task compositional
+long-tail curriculum plus 12,000 long-horizon tool-reasoning tasks. The long-tail component spans
+8/16/32/64/128 physical TCT-slot buckets and keeps its separate 4,000-task OOD probe out of training.
+The long-horizon component contains only depth-4-to-6 dependent tool graphs, including serial
+cross-source chains, alias/entity/policy resolution, stale-state refresh, and fork/join barriers.
 
 The corresponding compiled training mixture is pinned by
-`data/training-trajectory-mixture-v8.json`: **207,448 runtime trajectories and 1,096,147 adjacent
-supervised transitions**. The self-identity component contributes two independently randomized TCT
-slot variants per semantic task (1,440 trajectories / 1,440 transitions) and contains no external
-source calls. Materialize the component-order training file with:
+`data/training-trajectory-mixture-v10.json`: **301,948 runtime trajectories and 2,032,831 adjacent
+supervised transitions**. Its maximum TCT capacity is 128; the tensorizer still allocates each
+trajectory at its actual slot footprint and pads mixed-capacity batches only to the largest footprint
+in that batch. Materialize the component-order training file with:
 
 ```bash
 cid materialize-trajectory-mixture \
-  --spec data/training-trajectory-mixture-v8.json \
-  --output data/generated/training-trajectories-v8.jsonl \
-  --manifest-output data/generated/training-trajectories-v8.manifest.json
+  --spec data/training-trajectory-mixture-v10.json \
+  --output data/generated/training-trajectories-v10.jsonl \
+  --manifest-output data/generated/training-trajectories-v10.manifest.json
 ```
 
 The materializer verifies every component SHA/count and global `example_id` uniqueness before

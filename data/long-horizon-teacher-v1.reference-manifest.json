@@ -1,0 +1,66 @@
+{
+  "accepted_plans": 12000,
+  "causal_jobs_sha256": "9d89c72d510aec662e6a0fcaa511a9232bd3db46b948afaac4b54d6ed8492a51",
+  "causal_stage_histogram": {
+    "5": 1334,
+    "6": 3334,
+    "7": 7332
+  },
+  "compiled_sha256": "cf0d2501864a33aacd4a8381cc512548f324ce9a62191ec05b8b976b3cb14ae6",
+  "compiled_trajectories": 24000,
+  "compiled_transitions": 447626,
+  "compiler": {
+    "max_delay_steps": 5,
+    "min_delay_steps": 1,
+    "seed": 20260813,
+    "variants_per_task": 2
+  },
+  "dependency_depth_histogram": {
+    "4": 3334,
+    "5": 5334,
+    "6": 3332
+  },
+  "depth_4_plus_tasks": 12000,
+  "depth_6_plus_tasks": 3332,
+  "evidence_count_histogram": {
+    "4": 1334,
+    "5": 3334,
+    "6": 7332
+  },
+  "exact_verifier_failures": 0,
+  "family_counts": {
+    "alias_policy_chain": 2000,
+    "fork_join_calculate": 2000,
+    "serial_directory_chain": 2000,
+    "serial_then_calculate": 2000,
+    "stale_refresh_chain": 2000,
+    "triple_branch_join": 2000
+  },
+  "format_version": 1,
+  "generator": "cid.long_horizon_training.v1",
+  "max_semantic_text_chars": 94,
+  "mode_counts": {
+    "tool_required": 12000
+  },
+  "name": "long-horizon-tool-reasoning-v1",
+  "plans_sha256": "567f7bcb60916f3e042bd7934f13b7c65e3f396c9f41a37dd26116bd18026eac",
+  "review_rejected": 0,
+  "review_sha256": "791f6a887dc953bd88258d66214b7208e44700478c21c077c56770b8bef57a21",
+  "seed": 20260813,
+  "semantic_tasks": 12000,
+  "semantic_text_cap": 112,
+  "tasks_sha256": "1e457811201b6a14ae2d2ca55b0827d8bf1bdc0be1874f82a61d9e8554dd820b",
+  "tasks_with_anchor": 12000,
+  "tasks_with_link": 12000,
+  "thought_capacity_required": 12,
+  "tool_call_target_counts": {
+    "calculator": 10000,
+    "catalog_lookup": 8000,
+    "current_status": 3332,
+    "entity_directory": 10000,
+    "policy_lookup": 10666,
+    "record_lookup": 12000,
+    "release_registry": 12000
+  },
+  "version": 1
+}

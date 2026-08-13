@@ -95,12 +95,21 @@
       "path": "data/generated/compositional-trajectories-v1.jsonl",
       "sha256": "2d17c953b16c7038f68ac685db0fb5bc9dfa73cfc5d427895a35c1eee3d0af83",
       "transitions": 180000
+    },
+    {
+      "examples": 24000,
+      "manifest": "data/generated/long-horizon-v1/long-horizon-trajectories-v1.manifest.json",
+      "name": "long-horizon-tools",
+      "path": "data/generated/long-horizon-v1/long-horizon-trajectories-v1.jsonl",
+      "sha256": "cf0d2501864a33aacd4a8381cc512548f324ce9a62191ec05b8b976b3cb14ae6",
+      "transitions": 447626
     }
   ],
-  "examples": 277948,
+  "examples": 301948,
+  "max_trajectory_steps": 33,
   "name": "training-trajectory-mixture-v10",
   "semantic_mixture": "data/training-semantic-mixture-v10.json",
   "thought_capacity_required": 128,
-  "transitions": 1585205,
+  "transitions": 2032831,
   "version": 10
 }

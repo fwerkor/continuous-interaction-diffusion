@@ -247,6 +247,31 @@ def _build_tool_restraint_training(args: argparse.Namespace) -> None:
     )
 
 
+
+def _build_long_horizon_training(args: argparse.Namespace) -> None:
+    from cid.long_horizon_training import (
+        LongHorizonTrainingConfig,
+        build_long_horizon_distillation,
+    )
+
+    manifest = build_long_horizon_distillation(
+        output_dir=args.output_dir,
+        reference_manifest_output=args.reference_manifest_output,
+        config=LongHorizonTrainingConfig(
+            count_per_family=args.count_per_family,
+            seed=args.seed,
+            variants_per_task=args.variants_per_task,
+            thought_capacity=args.thought_capacity,
+            min_delay_steps=args.min_delay_steps,
+            max_delay_steps=args.max_delay_steps,
+        ),
+    )
+    print(
+        f"tasks={manifest['semantic_tasks']} trajectories={manifest['compiled_trajectories']} "
+        f"transitions={manifest['compiled_transitions']} "
+        f"depth4_plus={manifest['depth_4_plus_tasks']}"
+    )
+
 def _build_compositional_training(args: argparse.Namespace) -> None:
     from cid.compositional_training import (
         CompositionalTrainingConfig,
@@ -1116,6 +1141,22 @@ def main() -> None:
     restraint.add_argument("--count", type=int, default=6500)
     restraint.add_argument("--thought-capacity", type=int, default=8)
     restraint.add_argument("--seed", type=int, default=20260813)
+    long_horizon = subparsers.add_parser(
+        "build-long-horizon-training",
+        help="build depth-4-to-6 dependent asynchronous read-only tool trajectories",
+    )
+    long_horizon.add_argument("--output-dir", default="data/generated/long-horizon-v1")
+    long_horizon.add_argument(
+        "--reference-manifest-output",
+        default="data/long-horizon-teacher-v1.reference-manifest.json",
+    )
+    long_horizon.add_argument("--count-per-family", type=int, default=2000)
+    long_horizon.add_argument("--variants-per-task", type=int, default=2)
+    long_horizon.add_argument("--thought-capacity", type=int, default=12)
+    long_horizon.add_argument("--min-delay-steps", type=int, default=1)
+    long_horizon.add_argument("--max-delay-steps", type=int, default=5)
+    long_horizon.add_argument("--seed", type=int, default=20260813)
+
     compositional = subparsers.add_parser(
         "build-compositional-training",
         help="build 8/16/32/64/128-slot compositional long-tail reasoning data and OOD probes",
@@ -1342,6 +1383,8 @@ def main() -> None:
         _build_composed_training(args)
     elif args.command == "build-tool-restraint-training":
         _build_tool_restraint_training(args)
+    elif args.command == "build-long-horizon-training":
+        _build_long_horizon_training(args)
     elif args.command == "build-compositional-training":
         _build_compositional_training(args)
 

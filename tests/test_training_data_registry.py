@@ -298,21 +298,30 @@ def test_training_trajectory_mixture_v7_appends_self_identity() -> None:
     assert component["sha256"] == identity["compiled_sha256"]
 
 
-def test_training_semantic_mixture_v10_adds_longtail_without_probe_leakage() -> None:
+def test_training_semantic_mixture_v10_adds_longtail_and_long_horizon_without_probe_leakage() -> (
+    None
+):
     mixture = _load("data/training-semantic-mixture-v10.json")
-    reference = _load("data/compositional-teacher-v1.reference-manifest.json")
+    longtail = _load("data/compositional-teacher-v1.reference-manifest.json")
     probe = _load("data/generalization-probe-v1.reference-manifest.json")
+    long_horizon = _load("data/long-horizon-teacher-v1.reference-manifest.json")
     by_name = {component["name"]: component for component in mixture["components"]}
 
     assert mixture["name"] == "training-semantic-mixture-v10"
     assert mixture["version"] == 10
-    assert mixture["semantic_tasks"] == 118_075
+    assert mixture["semantic_tasks"] == 130_075
     assert mixture["thought_capacity_required"] == 128
     assert mixture["mode_counts"] == {
         "no_tool": 39_641,
-        "tool_required": 68_791,
+        "tool_required": 80_791,
         "tools_available_unnecessary": 9_643,
     }
+    assert mixture["sequential_dependency_tasks"] == 45_710
+    assert mixture["dependency_depth_3_plus_tasks"] == 49_048
+    assert mixture["dependency_depth_4_plus_tasks"] == 40_330
+    assert mixture["dependency_depth_8_plus_tasks"] == 13_054
+    assert mixture["dependency_depth_16_plus_tasks"] == 7_640
+    assert mixture["tool_required_dependency_depth_4_plus_tasks"] == 12_146
     assert mixture["compositional_capacity_bucket_counts"] == {
         "8": 6_000,
         "16": 5_000,
@@ -324,27 +333,48 @@ def test_training_semantic_mixture_v10_adds_longtail_without_probe_leakage() -> 
     assert mixture["ultra_complex_128_tasks"] == 2_000
     assert mixture["generalization_probe_tasks_excluded"] == 4_000
 
-    component = by_name["compositional-longtail-reasoning-v1"]
-    assert component["tasks"] == reference["semantic_tasks"] == 20_000
-    assert component["tasks_sha256"] == reference["tasks_sha256"]
+    compositional = by_name["compositional-longtail-reasoning-v1"]
+    assert compositional["tasks"] == longtail["semantic_tasks"] == 20_000
+    assert compositional["tasks_sha256"] == longtail["tasks_sha256"]
     assert probe["semantic_tasks"] == 4_000
     assert probe["training_eligible"] is False
     assert probe["strict_holdout_axes"] == ["domain"]
     assert all(component["name"] != probe["name"] for component in mixture["components"])
 
+    deep_tools = by_name["long-horizon-tool-reasoning-v1"]
+    assert deep_tools["tasks"] == long_horizon["semantic_tasks"] == 12_000
+    assert deep_tools["tasks_sha256"] == long_horizon["tasks_sha256"]
+    assert deep_tools["causal_jobs_sha256"] == long_horizon["causal_jobs_sha256"]
+    assert long_horizon["depth_4_plus_tasks"] == 12_000
+    assert long_horizon["depth_6_plus_tasks"] == 3_332
+    assert long_horizon["review_rejected"] == 0
+    assert long_horizon["exact_verifier_failures"] == 0
 
-def test_training_trajectory_mixture_v10_raises_capacity_ceiling_to_128() -> None:
+
+def test_training_trajectory_mixture_v10_combines_128_slots_and_long_horizon_tools() -> None:
     mixture = _load("data/training-trajectory-mixture-v10.json")
-    component = next(
-        item for item in mixture["components"] if item["name"] == "compositional-longtail"
-    )
-    reference = _load("data/compositional-teacher-v1.reference-manifest.json")
+    by_name = {component["name"]: component for component in mixture["components"]}
+    longtail = _load("data/compositional-teacher-v1.reference-manifest.json")
+    long_horizon = _load("data/long-horizon-teacher-v1.reference-manifest.json")
 
     assert mixture["name"] == "training-trajectory-mixture-v10"
     assert mixture["version"] == 10
-    assert mixture["examples"] == 277_948
-    assert mixture["transitions"] == 1_585_205
+    assert mixture["examples"] == 301_948
+    assert mixture["transitions"] == 2_032_831
     assert mixture["thought_capacity_required"] == 128
-    assert component["examples"] == reference["compiled_trajectories"] == 40_000
-    assert component["transitions"] == reference["compiled_transitions"] == 180_000
-    assert component["sha256"] == reference["compiled_sha256"]
+    assert mixture["max_trajectory_steps"] == 33
+    assert sum(component["examples"] for component in mixture["components"]) == mixture["examples"]
+    assert (
+        sum(component["transitions"] for component in mixture["components"])
+        == mixture["transitions"]
+    )
+
+    compositional = by_name["compositional-longtail"]
+    assert compositional["examples"] == longtail["compiled_trajectories"] == 40_000
+    assert compositional["transitions"] == longtail["compiled_transitions"] == 180_000
+    assert compositional["sha256"] == longtail["compiled_sha256"]
+
+    deep_tools = by_name["long-horizon-tools"]
+    assert deep_tools["examples"] == long_horizon["compiled_trajectories"] == 24_000
+    assert deep_tools["transitions"] == long_horizon["compiled_transitions"] == 447_626
+    assert deep_tools["sha256"] == long_horizon["compiled_sha256"]

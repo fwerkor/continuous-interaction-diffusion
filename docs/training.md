@@ -267,25 +267,12 @@ zero rejects, missing responses, or soft warnings, and all 10,000 plans pass bot
 the local-correction audit. Exact hashes are pinned by
 `data/correction-teacher-v1.reference-manifest.json`.
 
-The latest semantic mixture is `data/training-semantic-mixture-v8.json`. It contains the corrected
-720-task no-tool self-identity component from v7 plus the later 1,200-task multilingual cross-lingual
-component. The self-identity contract fixes the model name as `CID-v1`, while
-`Continuous Interaction Diffusion (CID)` is explicitly the method/architecture name. Nine internal
-families supervise model identity, CID acronym expansion, a basic CID method overview,
-diffusion-native model class, architecture summary, Facts/TCT/Display separation, TCT structure,
-runtime/model responsibility boundary, and asynchronous interaction. The component uses 540 English
-and 180 Chinese prompts; all 720 plans pass the normal CID semantic review with zero duplicates or
-rejects. Two physical-slot variants per task produce 1,440 trajectories. Exact hashes are pinned by
-`data/self-identity-teacher-v1.reference-manifest.json`.
-
-Build it with:
-
-```bash
-cid build-self-identity-training
-```
-
-The current compiled mixture is `data/training-trajectory-mixture-v8.json`: **207,448 trajectories
-and 1,096,147 adjacent supervised transitions** across nine components.
+The latest semantic mixture is `data/training-semantic-mixture-v10.json`: **130,075 semantic tasks**
+across 13 components. It preserves the earlier identity, multilingual, composed-tool, and
+tool-restraint curricula while adding both the compositional long-tail curriculum below and 12,000
+long-horizon tool-reasoning tasks. The corresponding compiled mixture is
+`data/training-trajectory-mixture-v10.json`: **301,948 trajectories and 2,032,831 adjacent supervised
+transitions** with a maximum TCT capacity of 128.
 
 ### Compositional long-tail curriculum
 
@@ -325,6 +312,24 @@ cid build-compositional-training \
 
 The resulting component is included in `data/training-semantic-mixture-v10.json` and
 `data/training-trajectory-mixture-v10.json`; the 4,000-task probe is explicitly excluded from both.
+
+### Long-horizon tool curriculum
+
+`cid build-long-horizon-training` adds 12,000 tool-required semantic tasks whose dependency depth is
+always 4--6. Six balanced families cover strict serial cross-source lookup, serial lookup followed by
+exact calculation, alias/entity/class/policy/rate resolution, stale-cache correction through current
+authority, two-branch fork/join, and a three-branch barrier before normalization. Every downstream
+need is activated only after the evidence that licenses its arguments has arrived.
+
+All 12,000 deterministic plans pass the standard semantic review and an independent exact verifier;
+no future-evidence leakage is accepted. Two randomized timing/slot schedules per task yield 24,000
+trajectories and 447,626 adjacent supervised transitions, with a maximum trajectory length of 33
+steps. The component contributes 12,000 depth-4+ tool tasks, including 3,332 at depth 6, lifting the
+overall v10 depth-4+ count to 40,330.
+
+```bash
+cid build-long-horizon-training
+```
 
 The historical v5 six-component training input is pinned separately by
 `data/training-trajectory-mixture-v5.json`. It preserves every reviewed schedule variant from

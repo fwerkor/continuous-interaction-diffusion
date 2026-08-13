@@ -86,6 +86,14 @@
       "tasks": 20000,
       "tasks_sha256": "fe1723c51f931a464051ed32319556c6a27cb0d4741460611512d7d9c8cf6937",
       "teacher_protocol": "deterministic-no-tool-refinement-plan"
+    },
+    {
+      "causal_jobs_sha256": "9d89c72d510aec662e6a0fcaa511a9232bd3db46b948afaac4b54d6ed8492a51",
+      "name": "long-horizon-tool-reasoning-v1",
+      "reference_manifest": "data/long-horizon-teacher-v1.reference-manifest.json",
+      "tasks": 12000,
+      "tasks_sha256": "1e457811201b6a14ae2d2ca55b0827d8bf1bdc0be1874f82a61d9e8554dd820b",
+      "teacher_protocol": "deterministic-dependent-tool-plan-v1"
     }
   ],
   "composed_dependency_depth_3_tasks": 6000,
@@ -97,6 +105,7 @@
     "64": 3000,
     "8": 6000
   },
+  "compositional_dependency_depth_16_plus_tasks": 7640,
   "compositional_dependency_depth_3_plus_tasks": 17934,
   "compositional_dependency_depth_4_plus_tasks": 16184,
   "compositional_dependency_depth_8_plus_tasks": 12366,
@@ -105,18 +114,30 @@
   "computational_dependency_depth_2_tasks": 6000,
   "computational_parallel_then_merge_tasks": 2400,
   "correction_dependency_depth_2_tasks": 10000,
-  "dependency_depth_3_plus_tasks": 37048,
+  "dependency_depth_16_plus_tasks": 7640,
+  "dependency_depth_3_plus_tasks": 49048,
+  "dependency_depth_4_plus_tasks": 40330,
+  "dependency_depth_8_plus_tasks": 13054,
   "generalization_probe_tasks_excluded": 4000,
   "intentional_tool_restraint_overlap_with_public_base": 6500,
+  "long_horizon_dependency_depth_histogram": {
+    "4": 3334,
+    "5": 5334,
+    "6": 3332
+  },
+  "long_horizon_depth_4_plus_tasks": 12000,
+  "long_horizon_depth_6_plus_tasks": 3332,
+  "long_horizon_max_trajectory_steps": 33,
+  "long_horizon_tool_reasoning_tasks": 12000,
   "mode_counts": {
     "no_tool": 39641,
-    "tool_required": 68791,
+    "tool_required": 80791,
     "tools_available_unnecessary": 9643
   },
   "mode_fractions": {
-    "no_tool": 0.33573,
-    "tool_required": 0.5826,
-    "tools_available_unnecessary": 0.08167
+    "no_tool": 0.30475,
+    "tool_required": 0.62111,
+    "tools_available_unnecessary": 0.07413
   },
   "multilingual_cross_lingual_tasks": 1200,
   "multilingual_prompt_language_counts": {
@@ -137,14 +158,16 @@
     "zh": 180
   },
   "self_identity_tasks": 720,
-  "semantic_tasks": 118075,
-  "sequential_dependency_tasks": 33710,
+  "semantic_tasks": 130075,
+  "sequential_dependency_tasks": 45710,
   "speculative_local_correction_tasks": 10000,
-  "split": "train-plus-mechanisms-computation-symbolic-correction-deep-logic-self-identity-multilingual-composition-tool-restraint-compositional-longtail",
+  "split": "train-plus-mechanisms-computation-symbolic-correction-deep-logic-self-identity-multilingual-composition-tool-restraint-compositional-longtail-long-horizon-tools",
   "super_complex_64_plus_tasks": 5000,
   "symbolic_dependency_depth_2_tasks": 3600,
   "symbolic_parallel_then_merge_tasks": 1200,
   "thought_capacity_required": 128,
+  "tool_required_dependency_depth_4_plus_tasks": 12146,
+  "tool_required_dependency_depth_6_plus_tasks": 3332,
   "tool_restraint_tasks": 6500,
   "ultra_complex_128_tasks": 2000,
   "version": 10
