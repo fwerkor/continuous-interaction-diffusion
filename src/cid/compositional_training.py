@@ -1448,10 +1448,15 @@ def _recompute(task: TeacherTask) -> str:
     raise ValueError(f"unsupported compositional verifier kind: {kind}")
 
 
+def _logic_spec_fingerprint(task: TeacherTask) -> str:
+    return json.dumps(task.metadata["logic_spec"], sort_keys=True, separators=(",", ":"))
+
+
 def _iter_case_groups(
     config: CompositionalTrainingConfig,
     *,
     probe: bool,
+    forbidden_logic_specs: set[str] | None = None,
 ) -> Iterable[tuple[int, str, tuple[GeneratedCase, ...]]]:
     rng = random.Random(config.seed + (100_003 if probe else 0))
     capacity_counts = dict(config.probe_capacity_counts if probe else config.train_capacity_counts)
@@ -1469,7 +1474,14 @@ def _iter_case_groups(
                         " ".join(case.task.prompt.casefold().split()),
                         str(case.task.reference_answer).casefold(),
                     )
-                    if semantic_key not in seen_prompts:
+                    logic_fingerprint = _logic_spec_fingerprint(case.task)
+                    if (
+                        semantic_key not in seen_prompts
+                        and (
+                            forbidden_logic_specs is None
+                            or logic_fingerprint not in forbidden_logic_specs
+                        )
+                    ):
                         seen_prompts.add(semantic_key)
                         break
                 else:
@@ -1599,7 +1611,11 @@ def build_compositional_training_streaming(
 
     plan_rng = random.Random(config.seed + 77)
 
-    def stream_split(*, probe: bool) -> tuple[dict[str, Any], int, int]:
+    def stream_split(
+        *,
+        probe: bool,
+        forbidden_logic_specs: set[str] | None = None,
+    ) -> tuple[dict[str, Any], int, int, set[str]]:
         paths = probe_paths if probe else train_paths
         variants = config.probe_variants_per_task if probe else config.variants_per_task
         family_counts: Counter[str] = Counter()
@@ -1615,6 +1631,7 @@ def build_compositional_training_streaming(
         transitions = 0
         task_count = 0
         trajectory_count = 0
+        logic_specs: set[str] = set()
 
         handles = {
             name: path.open("w", encoding="utf-8")
@@ -1622,8 +1639,13 @@ def build_compositional_training_streaming(
             if name not in {"manifest", "trajectory_manifest"}
         }
         try:
-            for capacity, family, cases in _iter_case_groups(config, probe=probe):
+            for capacity, family, cases in _iter_case_groups(
+                config,
+                probe=probe,
+                forbidden_logic_specs=forbidden_logic_specs,
+            ):
                 tasks = tuple(case.task for case in cases)
+                logic_specs.update(_logic_spec_fingerprint(task) for task in tasks)
                 plans = tuple(_plan_for(case, plan_rng) for case in cases)
                 reviews = review_teacher_plans(tasks, plans)
                 rejected = tuple(review for review in reviews if not review.accepted)
@@ -1691,10 +1713,18 @@ def build_compositional_training_streaming(
             "exact_verifier_failures": 0,
             "compiled_transitions": transitions,
         }
-        return audit, task_count, trajectory_count
+        return audit, task_count, trajectory_count, logic_specs
 
-    train_audit, train_task_count, train_trajectory_count = stream_split(probe=False)
-    probe_audit, probe_task_count, probe_trajectory_count = stream_split(probe=True)
+    train_audit, train_task_count, train_trajectory_count, train_logic_specs = stream_split(
+        probe=False
+    )
+    probe_audit, probe_task_count, probe_trajectory_count, probe_logic_specs = stream_split(
+        probe=True,
+        forbidden_logic_specs=train_logic_specs,
+    )
+    exact_logic_spec_overlap = len(train_logic_specs & probe_logic_specs)
+    if exact_logic_spec_overlap:
+        raise AssertionError("generalization probe contains training logic specs")
 
     train_manifest = {
         "format_version": 1,
@@ -1728,7 +1758,8 @@ def build_compositional_training_streaming(
         "compiled_transitions": probe_audit["compiled_transitions"],
         "thought_capacity_required": 128,
         "training_eligible": False,
-        "strict_holdout_axes": ["domain"],
+        "strict_holdout_axes": ["domain", "exact_logic_spec"],
+        "exact_logic_spec_overlap_with_training": exact_logic_spec_overlap,
         "generalization_axes": [
             "unseen_domain",
             "higher_dependency_depth",

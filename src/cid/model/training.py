@@ -14,7 +14,7 @@ import torch
 from torch import Tensor
 
 from cid.contracts import FreshnessDemand
-from cid.data import ThoughtTarget, TrajectoryExample
+from cid.data import ThoughtTarget, TrajectoryExample, training_transition_source_steps
 from cid.grounding import AnchorKind, LinkRelation, ObjectKind, ObjectRef
 from cid.lifecycle import MODELED_LIFECYCLES
 from cid.model.diffusion import CIDDiffusionScheduler
@@ -1060,9 +1060,17 @@ class ILLaDATrajectoryTensorizer:
             source_index = source_names.index(binding.source)
             descriptor = example.source_descriptors[source_index]
             declared_arguments = tuple(descriptor.get("arguments", ()))
+            need_is_active = not (
+                binding.freshness is FreshnessDemand.ONCE
+                and _binding_observation_available(example, binding, target_step)
+            )
             for cell_ref in binding.target_cells:
                 slot = target_output_slots.get(cell_ref.identifier)
                 if slot is None:
+                    continue
+                if not need_is_active:
+                    # A one-shot request is complete once its matching observation is visible.
+                    # The explicit zero need target remains supervised for this occupied slot.
                     continue
                 need_targets[0, slot] = binding.confidence
                 source_targets[0, slot] = source_index
@@ -1351,8 +1359,8 @@ def trajectory_transitions(
 ) -> tuple[tuple[TrajectoryExample, int], ...]:
     transitions: list[tuple[TrajectoryExample, int]] = []
     for example in examples:
-        steps = {target.step for target in example.thought_targets}
-        transitions.extend((example, step) for step in sorted(steps) if step + 1 in steps)
+        steps = (target.step for target in example.thought_targets)
+        transitions.extend((example, step) for step in training_transition_source_steps(steps))
     return tuple(transitions)
 
 
@@ -1365,11 +1373,8 @@ def trajectory_rollout_windows(
         raise ValueError("max_horizon must be positive")
     windows: list[CIDRolloutWindow] = []
     for example in examples:
-        source_steps = tuple(
-            step
-            for step in sorted({target.step for target in example.thought_targets})
-            if any(target.step == step + 1 for target in example.thought_targets)
-        )
+        steps = (target.step for target in example.thought_targets)
+        source_steps = training_transition_source_steps(steps)
         if not source_steps:
             continue
         run: list[int] = [source_steps[0]]
@@ -1390,6 +1395,21 @@ def trajectory_rollout_windows(
                     )
                 )
     return tuple(windows)
+
+
+def _binding_observation_available(
+    example: TrajectoryExample,
+    binding: Any,
+    target_step: int,
+) -> bool:
+    """Whether this binding's own observation is visible by ``target_step``."""
+
+    return any(
+        event.arrival_step <= target_step
+        and event.source == binding.source
+        and dict(event.arguments) == dict(binding.arguments)
+        for event in example.events
+    )
 
 
 def balance_rollout_windows_by_semantic_task(

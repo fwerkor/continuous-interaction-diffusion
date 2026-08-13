@@ -278,36 +278,245 @@ def _build_surface_diverse_training(args: argparse.Namespace) -> None:
         build_surface_diversified_distillation,
     )
 
-    if args.component == "composed":
-        source_tasks = "data/generated/composed-teacher-tasks-v1.jsonl"
-        source_plans = "data/generated/composed-teacher-plans-v1.accepted.jsonl"
-        output_dir = "data/generated/composed-v2"
-        reference = "data/composed-teacher-v2.reference-manifest.json"
-        config = SurfaceDiversityConfig(
-            component_name="composed-tool-reasoning-v2",
-            file_stem="composed-v2",
-            thought_capacity=8,
-            variants_per_task=2,
-            min_delay_steps=1,
-            max_delay_steps=4,
-            seed=args.seed,
-            max_tasks=args.max_tasks,
-        )
-    else:
-        source_tasks = "data/generated/long-horizon-v1/long-horizon-teacher-tasks-v1.jsonl"
-        source_plans = "data/generated/long-horizon-v1/long-horizon-teacher-plans-v1.accepted.jsonl"
-        output_dir = "data/generated/long-horizon-v2"
-        reference = "data/long-horizon-teacher-v2.reference-manifest.json"
-        config = SurfaceDiversityConfig(
-            component_name="long-horizon-tool-reasoning-v2",
-            file_stem="long-horizon-v2",
-            thought_capacity=12,
-            variants_per_task=2,
-            min_delay_steps=1,
-            max_delay_steps=5,
-            seed=args.seed,
-            max_tasks=args.max_tasks,
-        )
+    presets = {
+        "composed": (
+            "data/generated/composed-teacher-tasks-v1.jsonl",
+            "data/generated/composed-teacher-plans-v1.accepted.jsonl",
+            "data/generated/composed-v2",
+            "data/composed-teacher-v2.reference-manifest.json",
+            SurfaceDiversityConfig(
+                component_name="composed-tool-reasoning-v2",
+                file_stem="composed-v2",
+                thought_capacity=8,
+                variants_per_task=2,
+                min_delay_steps=1,
+                max_delay_steps=4,
+                seed=args.seed,
+                max_tasks=args.max_tasks,
+            ),
+        ),
+        "long-horizon": (
+            "data/generated/long-horizon-v1/long-horizon-teacher-tasks-v1.jsonl",
+            "data/generated/long-horizon-v1/long-horizon-teacher-plans-v1.accepted.jsonl",
+            "data/generated/long-horizon-v2",
+            "data/long-horizon-teacher-v2.reference-manifest.json",
+            SurfaceDiversityConfig(
+                component_name="long-horizon-tool-reasoning-v2",
+                file_stem="long-horizon-v2",
+                thought_capacity=12,
+                variants_per_task=2,
+                min_delay_steps=1,
+                max_delay_steps=5,
+                seed=args.seed,
+                max_tasks=args.max_tasks,
+            ),
+        ),
+        "mechanism-v3": (
+            "data/generated/mechanism-teacher-tasks-v1.jsonl",
+            "data/generated/mechanism-teacher-plans-v1.accepted.jsonl",
+            "data/generated/mechanism-v3",
+            "data/mechanism-teacher-v3.reference-manifest.json",
+            SurfaceDiversityConfig(
+                component_name="mechanism-teacher-v3",
+                file_stem="mechanism-v3",
+                thought_capacity=8,
+                variants_per_task=4,
+                min_delay_steps=1,
+                max_delay_steps=4,
+                seed=args.seed,
+                max_tasks=args.max_tasks,
+                surface_version=3,
+                diversify_semantic_text=True,
+            ),
+        ),
+        "computational-v3": (
+            "data/generated/computational-teacher-tasks-v1.jsonl",
+            "data/generated/computational-teacher-plans-v1.accepted.jsonl",
+            "data/generated/computational-v3",
+            "data/computational-teacher-v3.reference-manifest.json",
+            SurfaceDiversityConfig(
+                component_name="computational-teacher-v3",
+                file_stem="computational-v3",
+                thought_capacity=8,
+                variants_per_task=2,
+                min_delay_steps=1,
+                max_delay_steps=4,
+                seed=args.seed,
+                max_tasks=args.max_tasks,
+                surface_version=3,
+                diversify_semantic_text=True,
+            ),
+        ),
+        "symbolic-v3": (
+            "data/generated/symbolic-teacher-tasks-v1.jsonl",
+            "data/generated/symbolic-teacher-plans-v1.accepted.jsonl",
+            "data/generated/symbolic-v3",
+            "data/symbolic-teacher-v3.reference-manifest.json",
+            SurfaceDiversityConfig(
+                component_name="symbolic-teacher-v3",
+                file_stem="symbolic-v3",
+                thought_capacity=8,
+                variants_per_task=2,
+                min_delay_steps=1,
+                max_delay_steps=4,
+                seed=args.seed,
+                max_tasks=args.max_tasks,
+                surface_version=3,
+                diversify_semantic_text=True,
+            ),
+        ),
+        "correction-v3": (
+            "data/generated/correction-teacher-tasks-v1.jsonl",
+            "data/generated/correction-teacher-plans-v1.accepted.jsonl",
+            "data/generated/correction-v3",
+            "data/correction-teacher-v3.reference-manifest.json",
+            SurfaceDiversityConfig(
+                component_name="speculative-local-correction-v3",
+                file_stem="correction-v3",
+                thought_capacity=8,
+                variants_per_task=2,
+                min_delay_steps=1,
+                max_delay_steps=4,
+                seed=args.seed,
+                max_tasks=args.max_tasks,
+                surface_version=3,
+                diversify_semantic_text=True,
+            ),
+        ),
+        "composed-v3": (
+            "data/generated/composed-v2/composed-v2-teacher-tasks.jsonl",
+            "data/generated/composed-v2/composed-v2-teacher-plans.accepted.jsonl",
+            "data/generated/composed-v3",
+            "data/composed-teacher-v3.reference-manifest.json",
+            SurfaceDiversityConfig(
+                component_name="composed-tool-reasoning-v3",
+                file_stem="composed-v3",
+                thought_capacity=8,
+                variants_per_task=2,
+                min_delay_steps=1,
+                max_delay_steps=4,
+                seed=args.seed,
+                max_tasks=args.max_tasks,
+                surface_version=3,
+                diversify_prompt=False,
+                diversify_semantic_text=True,
+            ),
+        ),
+        "long-horizon-v3": (
+            "data/generated/long-horizon-v2/long-horizon-v2-teacher-tasks.jsonl",
+            "data/generated/long-horizon-v2/long-horizon-v2-teacher-plans.accepted.jsonl",
+            "data/generated/long-horizon-v3",
+            "data/long-horizon-teacher-v3.reference-manifest.json",
+            SurfaceDiversityConfig(
+                component_name="long-horizon-tool-reasoning-v3",
+                file_stem="long-horizon-v3",
+                thought_capacity=12,
+                variants_per_task=2,
+                min_delay_steps=1,
+                max_delay_steps=5,
+                seed=args.seed,
+                max_tasks=args.max_tasks,
+                surface_version=3,
+                diversify_prompt=False,
+                diversify_semantic_text=True,
+            ),
+        ),
+        "logic-v3": (
+            "data/generated/logic-teacher-tasks-v1.jsonl",
+            "data/generated/logic-teacher-plans-v1.accepted.jsonl",
+            "data/generated/logic-v3",
+            "data/logic-teacher-v3.reference-manifest.json",
+            SurfaceDiversityConfig(
+                component_name="complex-logic-reasoning-v3",
+                file_stem="logic-v3",
+                thought_capacity=8,
+                variants_per_task=2,
+                min_delay_steps=1,
+                max_delay_steps=4,
+                seed=args.seed,
+                max_tasks=args.max_tasks,
+                surface_version=3,
+                diversify_prompt=False,
+                diversify_semantic_text=True,
+            ),
+        ),
+        "self-identity-v3": (
+            "data/generated/self-identity-teacher-tasks-v1.jsonl",
+            "data/generated/self-identity-teacher-plans-v1.accepted.jsonl",
+            "data/generated/self-identity-v3",
+            "data/self-identity-teacher-v3.reference-manifest.json",
+            SurfaceDiversityConfig(
+                component_name="cid-self-identity-v3",
+                file_stem="self-identity-v3",
+                thought_capacity=8,
+                variants_per_task=2,
+                min_delay_steps=1,
+                max_delay_steps=4,
+                seed=args.seed,
+                max_tasks=args.max_tasks,
+                surface_version=3,
+                diversify_prompt=False,
+                diversify_semantic_text=True,
+            ),
+        ),
+        "multilingual-v3": (
+            "data/generated/multilingual-v1/teacher-tasks-v1.jsonl",
+            "data/generated/multilingual-v1/teacher-plans-v1.accepted.jsonl",
+            "data/generated/multilingual-v3",
+            "data/multilingual-v3.reference-manifest.json",
+            SurfaceDiversityConfig(
+                component_name="multilingual-v3",
+                file_stem="multilingual-v3",
+                thought_capacity=8,
+                variants_per_task=2,
+                min_delay_steps=1,
+                max_delay_steps=4,
+                seed=args.seed,
+                max_tasks=args.max_tasks,
+                surface_version=3,
+                diversify_semantic_text=True,
+            ),
+        ),
+        "compositional-v3": (
+            "data/generated/compositional-teacher-tasks-v1.jsonl",
+            "data/generated/compositional-teacher-plans-v1.accepted.jsonl",
+            "data/generated/compositional-v3",
+            "data/compositional-teacher-v3.reference-manifest.json",
+            SurfaceDiversityConfig(
+                component_name="compositional-longtail-reasoning-v3",
+                file_stem="compositional-v3",
+                thought_capacity=128,
+                variants_per_task=2,
+                min_delay_steps=1,
+                max_delay_steps=4,
+                seed=args.seed,
+                max_tasks=args.max_tasks,
+                surface_version=3,
+                diversify_prompt=False,
+                diversify_semantic_text=True,
+            ),
+        ),
+        "deep-restraint-v3": (
+            "data/generated/deep-tool-restraint-v1/deep-tool-restraint-teacher-tasks-v1.jsonl",
+            "data/generated/deep-tool-restraint-v1/deep-tool-restraint-teacher-plans-v1.accepted.jsonl",
+            "data/generated/deep-restraint-v3",
+            "data/deep-tool-restraint-v3.reference-manifest.json",
+            SurfaceDiversityConfig(
+                component_name="deep-tool-restraint-v3",
+                file_stem="deep-restraint-v3",
+                thought_capacity=128,
+                variants_per_task=1,
+                min_delay_steps=1,
+                max_delay_steps=4,
+                seed=args.seed,
+                max_tasks=args.max_tasks,
+                surface_version=3,
+                diversify_prompt=False,
+                diversify_semantic_text=True,
+            ),
+        ),
+    }
+    source_tasks, source_plans, output_dir, reference, config = presets[args.component]
     manifest = build_surface_diversified_distillation(
         source_tasks_path=source_tasks,
         source_plans_path=source_plans,
@@ -451,6 +660,15 @@ def _materialize_trajectory_mixture(args: argparse.Namespace) -> None:
         f"examples={manifest['examples']} transitions={manifest['transitions']} "
         f"sha256={manifest['sha256']} path={args.output} manifest={args.manifest_output}"
     )
+
+
+def _audit_training_data(args: argparse.Namespace) -> None:
+    from cid.training_audit import audit_training_trajectories
+
+    audit = audit_training_trajectories(args.data)
+    print(json.dumps(audit.to_dict(), ensure_ascii=False, sort_keys=True))
+    if args.strict and not audit.ok:
+        raise SystemExit(2)
 
 
 def _build_public_task_pool(args: argparse.Namespace) -> None:
@@ -723,6 +941,7 @@ def _train_stage_a(args: argparse.Namespace) -> None:
         ILLaDACIDAdapter,
         ILLaDACIDConfig,
         ILLaDATrajectoryTensorizer,
+        balance_rollout_windows_by_semantic_task,
         shard_rollout_windows,
         trajectory_rollout_windows,
         wrap_stage_a_ddp,
@@ -820,9 +1039,11 @@ def _train_stage_a(args: argparse.Namespace) -> None:
         examples = load_jsonl(args.data)
         if args.max_examples is not None:
             examples = examples[: args.max_examples]
-        windows = trajectory_rollout_windows(
-            examples,
-            max_horizon=args.rollout_horizon,
+        windows = balance_rollout_windows_by_semantic_task(
+            trajectory_rollout_windows(
+                examples,
+                max_horizon=args.rollout_horizon,
+            )
         )
         if not windows:
             raise ValueError("training data contains no adjacent thought transitions")
@@ -895,6 +1116,7 @@ def _train_stage_b(args: argparse.Namespace) -> None:
         ILLaDACIDAdapter,
         ILLaDACIDConfig,
         ILLaDATrajectoryTensorizer,
+        balance_rollout_windows_by_semantic_task,
         load_cid_adapter_checkpoint,
         load_stage_b_checkpoint,
         save_stage_b_checkpoint,
@@ -1018,9 +1240,11 @@ def _train_stage_b(args: argparse.Namespace) -> None:
         examples = load_jsonl(args.data)
         if args.max_examples is not None:
             examples = examples[: args.max_examples]
-        windows = trajectory_rollout_windows(
-            examples,
-            max_horizon=args.rollout_horizon,
+        windows = balance_rollout_windows_by_semantic_task(
+            trajectory_rollout_windows(
+                examples,
+                max_horizon=args.rollout_horizon,
+            )
         )
         if not windows:
             raise ValueError("training data contains no adjacent thought transitions")
@@ -1240,9 +1464,27 @@ def main() -> None:
 
     surface = subparsers.add_parser(
         "build-surface-diverse-training",
-        help="build surface-diversified v2 replacements for composed or long-horizon data",
+        help="build surface-diversified replacements for template-heavy training components",
     )
-    surface.add_argument("--component", choices=("composed", "long-horizon"), required=True)
+    surface.add_argument(
+        "--component",
+        choices=(
+            "composed",
+            "long-horizon",
+            "mechanism-v3",
+            "computational-v3",
+            "symbolic-v3",
+            "correction-v3",
+            "composed-v3",
+            "long-horizon-v3",
+            "logic-v3",
+            "self-identity-v3",
+            "multilingual-v3",
+            "compositional-v3",
+            "deep-restraint-v3",
+        ),
+        required=True,
+    )
     surface.add_argument("--max-tasks", type=int)
     surface.add_argument("--seed", type=int, default=20260813)
 
@@ -1312,6 +1554,12 @@ def main() -> None:
     trajectory_mixture.add_argument("--spec", required=True)
     trajectory_mixture.add_argument("--output", required=True)
     trajectory_mixture.add_argument("--manifest-output", required=True)
+    training_audit = subparsers.add_parser(
+        "audit-training-data",
+        help="audit actual trainable transition mass and causal first-need invariants",
+    )
+    training_audit.add_argument("--data", required=True)
+    training_audit.add_argument("--strict", action="store_true")
     public_pool = subparsers.add_parser(
         "build-public-task-pool",
         help="build the pinned public semantic-task pool from registered training splits",
@@ -1507,6 +1755,8 @@ def main() -> None:
         _dataset_manifest(args)
     elif args.command == "materialize-trajectory-mixture":
         _materialize_trajectory_mixture(args)
+    elif args.command == "audit-training-data":
+        _audit_training_data(args)
     elif args.command == "build-public-task-pool":
         _build_public_task_pool(args)
     elif args.command == "prepare-public-distillation":

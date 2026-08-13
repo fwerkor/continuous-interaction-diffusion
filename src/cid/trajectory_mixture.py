@@ -8,6 +8,8 @@ from dataclasses import dataclass
 from pathlib import Path
 from typing import Any
 
+from cid.data import adjacent_transition_source_steps, training_transition_source_steps
+
 
 @dataclass(frozen=True, slots=True)
 class TrajectoryMixtureComponent:
@@ -17,6 +19,8 @@ class TrajectoryMixtureComponent:
     sha256: str
     examples: int
     transitions: int
+    bootstrap_transitions: int | None = None
+    training_transitions: int | None = None
 
     @classmethod
     def from_dict(cls, raw: dict[str, Any]) -> TrajectoryMixtureComponent:
@@ -27,6 +31,16 @@ class TrajectoryMixtureComponent:
             sha256=str(raw["sha256"]),
             examples=int(raw["examples"]),
             transitions=int(raw["transitions"]),
+            bootstrap_transitions=(
+                int(raw["bootstrap_transitions"])
+                if "bootstrap_transitions" in raw
+                else None
+            ),
+            training_transitions=(
+                int(raw["training_transitions"])
+                if "training_transitions" in raw
+                else None
+            ),
         )
 
 
@@ -69,6 +83,10 @@ def materialize_trajectory_mixture(
     output_bytes = 0
     output_examples = 0
     expected_transitions = 0
+    expected_bootstrap_transitions = 0
+    expected_training_transitions = 0
+    trainable_examples = 0
+    zero_training_transition_examples = 0
     tag_counts: Counter[str] = Counter()
     sources: set[str] = set()
     thought_capacity_required = 0
@@ -105,6 +123,10 @@ def materialize_trajectory_mixture(
                 source_sha = hashlib.sha256()
                 line_count = 0
                 component_transitions = 0
+                component_bootstrap_transitions = 0
+                component_training_transitions = 0
+                component_trainable_examples = 0
+                component_zero_training_transition_examples = 0
                 with source.open("rb") as handle:
                     for raw_line in handle:
                         source_sha.update(raw_line)
@@ -149,7 +171,15 @@ def materialize_trajectory_mixture(
                         )
                         thought_targets = record.get("thought_targets", ())
                         steps = {int(target["step"]) for target in thought_targets}
-                        component_transitions += sum(1 for step in steps if step + 1 in steps)
+                        adjacent_sources = adjacent_transition_source_steps(steps)
+                        training_sources = training_transition_source_steps(steps)
+                        component_transitions += len(adjacent_sources)
+                        component_bootstrap_transitions += int(-1 in training_sources)
+                        component_training_transitions += len(training_sources)
+                        if training_sources:
+                            component_trainable_examples += 1
+                        else:
+                            component_zero_training_transition_examples += 1
                         thought_capacity_required = max(
                             thought_capacity_required,
                             max((int(target["slot"]) + 1 for target in thought_targets), default=0),
@@ -173,8 +203,28 @@ def materialize_trajectory_mixture(
                         f"component {component.name} transition count {component_transitions} "
                         f"!= {component.transitions}"
                     )
+                if (
+                    component.bootstrap_transitions is not None
+                    and component_bootstrap_transitions != component.bootstrap_transitions
+                ):
+                    raise ValueError(
+                        f"component {component.name} bootstrap transition count "
+                        f"{component_bootstrap_transitions} != {component.bootstrap_transitions}"
+                    )
+                if (
+                    component.training_transitions is not None
+                    and component_training_transitions != component.training_transitions
+                ):
+                    raise ValueError(
+                        f"component {component.name} training transition count "
+                        f"{component_training_transitions} != {component.training_transitions}"
+                    )
                 output_examples += line_count
                 expected_transitions += component_transitions
+                expected_bootstrap_transitions += component_bootstrap_transitions
+                expected_training_transitions += component_training_transitions
+                trainable_examples += component_trainable_examples
+                zero_training_transition_examples += component_zero_training_transition_examples
                 component_records.append(
                     {
                         "name": component.name,
@@ -182,6 +232,12 @@ def materialize_trajectory_mixture(
                         "sha256": component.sha256,
                         "examples": component.examples,
                         "transitions": component.transitions,
+                        "bootstrap_transitions": component_bootstrap_transitions,
+                        "training_transitions": component_training_transitions,
+                        "trainable_examples": component_trainable_examples,
+                        "zero_training_transition_examples": (
+                            component_zero_training_transition_examples
+                        ),
                     }
                 )
             temp.flush()
@@ -201,6 +257,10 @@ def materialize_trajectory_mixture(
         "bytes": output_bytes,
         "examples": output_examples,
         "transitions": expected_transitions,
+        "bootstrap_transitions": expected_bootstrap_transitions,
+        "training_transitions": expected_training_transitions,
+        "trainable_examples": trainable_examples,
+        "zero_training_transition_examples": zero_training_transition_examples,
         "tag_counts": dict(sorted(tag_counts.items())),
         "sources": sorted(sources),
         "thought_capacity_required": thought_capacity_required,

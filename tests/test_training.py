@@ -10,7 +10,15 @@ from types import SimpleNamespace
 
 import pytest
 
-from cid.data import BindingTarget, DisplayTarget, GroundingTarget, ThoughtTarget, TrajectoryExample
+from cid.contracts import FreshnessDemand
+from cid.data import (
+    BindingTarget,
+    DisplayTarget,
+    ExternalEvent,
+    GroundingTarget,
+    ThoughtTarget,
+    TrajectoryExample,
+)
 from cid.grounding import Anchor, AnchorKind, CognitiveLink, LinkRelation, ObjectRef
 from cid.state import CellLifecycle, CognitiveRole
 
@@ -27,6 +35,7 @@ CIDTrainer = cid_model.CIDTrainer
 CIDTrainerConfig = cid_model.CIDTrainerConfig
 CIDTrainerState = cid_model.CIDTrainerState
 CIDRolloutState = cid_model.CIDRolloutState
+balance_rollout_windows_by_semantic_task = cid_model.balance_rollout_windows_by_semantic_task
 collate_training_steps = cid_model.collate_training_steps
 load_cid_adapter_checkpoint = cid_model.load_cid_adapter_checkpoint
 load_stage_b_checkpoint = cid_model.load_stage_b_checkpoint
@@ -249,6 +258,109 @@ def test_trajectory_tensorizer_runs_full_optimizer_step() -> None:
     assert all(parameter.grad is None for parameter in adapter.backbone.parameters())
 
 
+def test_bootstrap_transition_trains_single_snapshot_from_empty_tct() -> None:
+    base = make_trajectory()
+    single = replace(
+        base,
+        example_id="single-frame",
+        target_display="Planning.",
+        source_descriptors=(),
+        binding_targets=(),
+        thought_targets=tuple(target for target in base.thought_targets if target.step == 0),
+        display_targets=(DisplayTarget(step=0, text="Planning."),),
+        grounding_targets=(),
+    )
+
+    transitions = trajectory_transitions((single,))
+    windows = trajectory_rollout_windows((single,), max_horizon=4)
+    assert [(example.example_id, step) for example, step in transitions] == [("single-frame", -1)]
+    assert tuple(window.source_steps for window in windows) == ((-1,),)
+
+    adapter = make_adapter(seed=124)
+    tensorizer = ILLaDATrajectoryTensorizer(adapter, TinyTokenizer())
+    sample = tensorizer.tensorize(single, source_step=-1, timestep=1.0)
+
+    assert not sample.batch.slot_occupancy.any()
+    assert sample.targets.allocation_targets[0, 0] == 1
+    assert sample.targets.allocation_mask[0, 0]
+    assert sample.targets.thought_mask[0, 0]
+
+    trainer = CIDTrainer(
+        adapter,
+        tensorizer,
+        CIDTrainerConfig(timestep_min=1.0, timestep_max=1.0),
+    )
+    report = trainer.train_examples((single,), epochs=1, shuffle=False)
+    assert report.transitions == 1
+
+
+def test_one_shot_need_is_supervised_before_but_not_after_its_observation() -> None:
+    base = make_trajectory()
+    arguments = {"key": "latency_ms", "scope": "production"}
+    need_step = ThoughtTarget(
+        step=0,
+        slot=0,
+        cell_id="need",
+        semantic_text="Need the documented latency.",
+        roles={CognitiveRole.INFORMATION_NEED: 1.0},
+        uncertainty=0.8,
+        noise=0.8,
+    )
+    percept_step = ThoughtTarget(
+        step=1,
+        slot=0,
+        cell_id="need",
+        semantic_text="Observed latency: 37.",
+        roles={CognitiveRole.PERCEPT: 1.0},
+        uncertainty=0.05,
+        noise=0.02,
+        lifecycle=CellLifecycle.STABLE,
+    )
+    example = replace(
+        base,
+        binding_targets=(
+            BindingTarget(
+                need_id="latency",
+                source="docs",
+                first_need_step=0,
+                executable_step=0,
+                arguments=arguments,
+                argument_steps={"key": 0, "scope": 0},
+                target_cells=(ObjectRef.cell("need"),),
+            ),
+        ),
+        events=(
+            ExternalEvent(
+                source="docs",
+                value="37",
+                arrival_step=1,
+                arguments=arguments,
+            ),
+        ),
+        thought_targets=(need_step, percept_step),
+        display_targets=(DisplayTarget(step=0, text="Waiting."), DisplayTarget(step=1, text="37")),
+        grounding_targets=(),
+    )
+
+    adapter = make_adapter(seed=125)
+    tensorizer = ILLaDATrajectoryTensorizer(adapter, TinyTokenizer())
+    bootstrap = tensorizer.tensorize(example, source_step=-1, timestep=1.0)
+    assimilate = tensorizer.tensorize(example, source_step=0, timestep=1.0)
+
+    assert bootstrap.targets.need_targets[0, 0] == 1
+    assert bootstrap.targets.source_targets[0, 0] == 0
+    assert assimilate.targets.need_targets[0, 0] == 0
+    assert assimilate.targets.source_targets[0, 0] == -100
+
+    persistent = replace(
+        example,
+        binding_targets=(replace(example.binding_targets[0], freshness=FreshnessDemand.ALWAYS),),
+    )
+    refresh = tensorizer.tensorize(persistent, source_step=0, timestep=1.0)
+    assert refresh.targets.need_targets[0, 0] == 1
+    assert refresh.targets.source_targets[0, 0] == 0
+
+
 def test_frozen_text_encoder_snapshot_is_independent_from_live_backbone() -> None:
     adapter = make_adapter()
     tokenizer = TinyTokenizer()
@@ -423,9 +535,9 @@ def test_trainer_uses_configured_micro_batches() -> None:
 
     report = trainer.train_examples(examples, epochs=2, shuffle=False)
 
-    assert report.transitions == 4
-    assert report.optimizer_steps == 1
-    assert trainer.state.transitions_seen == 4
+    assert report.transitions == 8
+    assert report.optimizer_steps == 2
+    assert trainer.state.transitions_seen == 8
 
 
 def test_trainer_checkpoint_restores_trainable_state_optimizer_and_progress(tmp_path) -> None:
@@ -444,10 +556,10 @@ def test_trainer_checkpoint_restores_trainable_state_optimizer_and_progress(tmp_
     )
     report = trainer.train_examples((make_trajectory(),), epochs=2, shuffle=True)
 
-    assert report.transitions == 2
-    assert report.optimizer_steps == 1
-    assert trainer.state.transitions_seen == 2
-    assert trainer.state.optimizer_steps == 1
+    assert report.transitions == 4
+    assert report.optimizer_steps == 2
+    assert trainer.state.transitions_seen == 4
+    assert trainer.state.optimizer_steps == 2
     assert trainer.state.epochs_completed == 2
 
     path = tmp_path / "stage-a.pt"
@@ -477,8 +589,8 @@ def test_trainer_checkpoint_restores_trainable_state_optimizer_and_progress(tmp_
     inference_adapter.set_backbone_trainable(True)
     loaded_state = load_cid_adapter_checkpoint(inference_adapter, path)
     assert loaded_state == CIDTrainerState(
-        transitions_seen=2,
-        optimizer_steps=1,
+        transitions_seen=4,
+        optimizer_steps=2,
         epochs_completed=2,
     )
     inference_parameters = dict(inference_adapter.named_parameters())
@@ -512,7 +624,7 @@ def test_transition_sharding_is_balanced_deterministic_and_complete() -> None:
     )
 
     assert shards == repeated
-    assert {len(shard) for shard in shards} == {2}
+    assert {len(shard) for shard in shards} == {4}
     observed_ids = {example.example_id for shard in shards for example, _ in shard}
     assert observed_ids == {example.example_id for example in examples}
 
@@ -550,8 +662,8 @@ def test_stage_a_ddp_handles_batches_with_unused_external_modules(tmp_path) -> N
 
         report = trainer.train_examples((no_external,), epochs=2, shuffle=False)
 
-        assert report.transitions == 2
-        assert report.optimizer_steps == 2
+        assert report.transitions == 4
+        assert report.optimizer_steps == 4
         assert torch.isfinite(torch.tensor(report.mean_loss))
     finally:
         dist.destroy_process_group()
@@ -604,8 +716,8 @@ def test_stage_b_fsdp_runs_full_parameter_optimizer_step_on_cpu(tmp_path) -> Non
 
         report = trainer.train_examples((make_trajectory(),), epochs=1, shuffle=False)
 
-        assert report.transitions == 1
-        assert report.optimizer_steps == 1
+        assert report.transitions == 2
+        assert report.optimizer_steps == 2
         assert not torch.equal(
             before,
             adapter.backbone.get_decoder().layers[0].projection.weight,
@@ -803,9 +915,36 @@ def test_self_rollout_feeds_previous_prediction_into_next_transition() -> None:
 
     report = trainer.train_rollout_windows(windows, epochs=1, shuffle=False)
 
-    assert report.transitions == 2
-    assert tensorizer.rollout_flags == [False, True]
+    assert report.transitions == 3
+    assert tensorizer.rollout_flags == [False, False, True]
     assert trainer.state.epochs_completed == 1
+
+
+def test_semantic_task_balancing_equalizes_total_transition_loss_mass() -> None:
+    short = replace(
+        make_trajectory(),
+        example_id="short-schedule",
+        metadata={"semantic_task_id": "short"},
+    )
+    long = replace(
+        make_rollout_trajectory(),
+        example_id="long-schedule",
+        metadata={"semantic_task_id": "long"},
+    )
+    windows = trajectory_rollout_windows((short, long), max_horizon=8)
+    balanced = balance_rollout_windows_by_semantic_task(windows)
+
+    mass: dict[str, float] = {}
+    for window in balanced:
+        task_id = str(window.example.metadata["semantic_task_id"])
+        mass[task_id] = mass.get(task_id, 0.0) + len(window.source_steps) * window.loss_weight
+
+    assert mass["short"] == pytest.approx(mass["long"])
+    total_transitions = sum(len(window.source_steps) for window in balanced)
+    weighted_transitions = sum(
+        len(window.source_steps) * window.loss_weight for window in balanced
+    )
+    assert weighted_transitions == pytest.approx(total_transitions)
 
 
 def test_rollout_curriculum_and_window_sharding_are_deterministic() -> None:
@@ -839,4 +978,4 @@ def test_rollout_curriculum_and_window_sharding_are_deterministic() -> None:
         )
         for rank in range(3)
     )
-    assert {tuple(len(window.source_steps) for window in shard) for shard in shards} == {(2, 2)}
+    assert {tuple(len(window.source_steps) for window in shard) for shard in shards} == {(3, 3)}

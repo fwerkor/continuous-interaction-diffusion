@@ -34,6 +34,8 @@ def test_materialize_trajectory_mixture_preserves_component_bytes_and_counts(tmp
                 "sha256": first.sha256,
                 "examples": first.examples,
                 "transitions": first.transitions,
+                "bootstrap_transitions": first.bootstrap_transitions,
+                "training_transitions": first.training_transitions,
             },
             {
                 "name": "second",
@@ -42,6 +44,8 @@ def test_materialize_trajectory_mixture_preserves_component_bytes_and_counts(tmp
                 "sha256": second.sha256,
                 "examples": second.examples,
                 "transitions": second.transitions,
+                "bootstrap_transitions": second.bootstrap_transitions,
+                "training_transitions": second.training_transitions,
             },
         ],
     }
@@ -57,11 +61,19 @@ def test_materialize_trajectory_mixture_preserves_component_bytes_and_counts(tmp
     assert output.read_bytes() == first_data.read_bytes() + second_data.read_bytes()
     assert manifest["examples"] == len(examples)
     assert manifest["transitions"] == first.transitions + second.transitions
+    assert manifest["bootstrap_transitions"] == len(examples)
+    assert manifest["training_transitions"] == (
+        first.training_transitions + second.training_transitions
+    )
+    assert manifest["trainable_examples"] == len(examples)
+    assert manifest["zero_training_transition_examples"] == 0
     assert manifest["thought_capacity_required"] <= 8
     inspected = inspect_dataset(output)
     assert inspected.sha256 == manifest["sha256"]
     assert inspected.examples == manifest["examples"]
     assert inspected.transitions == manifest["transitions"]
+    assert inspected.bootstrap_transitions == manifest["bootstrap_transitions"]
+    assert inspected.training_transitions == manifest["training_transitions"]
     assert inspected.tag_counts == manifest["tag_counts"]
     assert list(inspected.sources) == manifest["sources"]
     assert inspected.thought_capacity_required == manifest["thought_capacity_required"]

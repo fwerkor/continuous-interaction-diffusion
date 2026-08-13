@@ -323,6 +323,21 @@ def dump_jsonl(examples: Iterable[TrajectoryExample], path: str | Path) -> None:
             handle.write(json.dumps(raw, ensure_ascii=False, separators=(",", ":")) + "\n")
 
 
+def adjacent_transition_source_steps(steps: Iterable[int]) -> tuple[int, ...]:
+    """Source steps for teacher snapshots that have an adjacent successor."""
+
+    unique = frozenset(int(step) for step in steps)
+    return tuple(step for step in sorted(unique) if step + 1 in unique)
+
+
+def training_transition_source_steps(steps: Iterable[int]) -> tuple[int, ...]:
+    """All trainable source steps, including the virtual empty-state bootstrap."""
+
+    unique = frozenset(int(step) for step in steps)
+    bootstrap = (-1,) if 0 in unique else ()
+    return bootstrap + adjacent_transition_source_steps(unique)
+
+
 def _source_descriptor_from_dict(raw: Mapping[str, Any]) -> dict[str, Any]:
     descriptor = dict(raw)
     descriptor["arguments"] = tuple(dict(argument) for argument in descriptor.get("arguments", ()))

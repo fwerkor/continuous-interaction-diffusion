@@ -6,12 +6,23 @@ from cid.deep_restraint_training import (
     DeepToolRestraintConfig,
     generate_deep_tool_restraint_examples,
 )
-from cid.distill import TeacherCellPlan, TeacherFrame, TeacherPlan, TeacherTask
+from cid.distill import (
+    TeacherCellPlan,
+    TeacherEvidence,
+    TeacherFrame,
+    TeacherNeed,
+    TeacherPlan,
+    TeacherTask,
+    dump_teacher_plans,
+    dump_teacher_tasks,
+    review_teacher_plans,
+)
 from cid.grounding import Anchor, AnchorKind, CognitiveLink, LinkRelation, ObjectRef
 from cid.state import CellLifecycle, CognitiveRole
 from cid.surface_diversity_training import (
     SurfaceDiversityConfig,
     _normalized_surface_signature,
+    build_surface_diversified_distillation,
     diversify_tasks_and_plans,
 )
 
@@ -81,6 +92,156 @@ def test_surface_v2_preserves_core_semantics_while_diversifying_prompts() -> Non
         assert plan.task_id == f"surface-v2-{source.task_id}"
         assert plan.frames == source_plan.frames
         assert plan.final_answer == source_plan.final_answer
+
+
+def test_surface_v3_varies_semantic_transport_without_changing_typed_plan_semantics() -> None:
+    tasks = tuple(_source_task(capacity=16, index=index, common_prompt=True) for index in range(96))
+    plans = tuple(_source_plan(task) for task in tasks)
+    config = SurfaceDiversityConfig(
+        component_name="fixture-v3",
+        file_stem="fixture-v3",
+        thought_capacity=16,
+        seed=31,
+        surface_version=3,
+        diversify_semantic_text=True,
+    )
+
+    diversified_tasks, diversified_plans = diversify_tasks_and_plans(tasks, plans, config)
+    changed_texts = 0
+    source_plan_by_id = {plan.task_id: plan for plan in plans}
+    for task, plan in zip(diversified_tasks, diversified_plans, strict=True):
+        source_id = str(task.metadata["source_task_id"])
+        source_plan = source_plan_by_id[source_id]
+        assert task.metadata["surface_version"] == 3
+        assert plan.final_answer == source_plan.final_answer
+        assert len(plan.frames) == len(source_plan.frames)
+        for frame, source_frame in zip(plan.frames, source_plan.frames, strict=True):
+            assert frame.phase == source_frame.phase
+            assert frame.display == source_frame.display
+            for cell, source_cell in zip(frame.cells, source_frame.cells, strict=True):
+                assert source_cell.semantic_text in cell.semantic_text
+                assert cell.roles == source_cell.roles
+                assert cell.lifecycle == source_cell.lifecycle
+                assert cell.anchors == source_cell.anchors
+                assert cell.links == source_cell.links
+                assert len(cell.semantic_text) <= config.semantic_text_cap
+                changed_texts += cell.semantic_text != source_cell.semantic_text
+    assert changed_texts > len(tasks)
+
+
+def test_surface_v3_retries_only_collided_semantic_wrapper(tmp_path) -> None:
+    source = {
+        "name": "docs",
+        "description": "read documentation",
+        "arguments": ({"name": "key", "kind": "string", "required": True},),
+    }
+    task = TeacherTask(
+        task_id="collision-source",
+        prompt="Return the documented status.",
+        source_descriptors=(source,),
+        evidence=(
+            TeacherEvidence(
+                evidence_id="e0",
+                source="docs",
+                value="active",
+                arguments={"key": "status"},
+            ),
+        ),
+    )
+    initial = TeacherFrame(
+        "initial",
+        "pending",
+        (TeacherCellPlan("plan", "Plan a documentation lookup.", {CognitiveRole.PLAN: 1.0}),),
+    )
+    pre = TeacherFrame(
+        "pre",
+        "pending",
+        (
+            TeacherCellPlan(
+                "plan",
+                "The answer must use documentation.",
+                {CognitiveRole.CONSTRAINT: 1.0},
+            ),
+            TeacherCellPlan(
+                "need",
+                "Need the documented status.",
+                {CognitiveRole.INFORMATION_NEED: 1.0},
+                uncertainty=0.9,
+                noise=0.8,
+            ),
+        ),
+    )
+    after_cells = (
+        TeacherCellPlan(
+            "plan",
+            "The documentation requirement is satisfied.",
+            {CognitiveRole.CONSTRAINT: 1.0},
+            uncertainty=0.1,
+            noise=0.1,
+            lifecycle=CellLifecycle.STABLE,
+        ),
+        TeacherCellPlan(
+            "need",
+            "The documented status is active.",
+            {CognitiveRole.CONCLUSION: 1.0},
+            uncertainty=0.05,
+            noise=0.1,
+            lifecycle=CellLifecycle.STABLE,
+        ),
+    )
+    plan = TeacherPlan(
+        task_id=task.task_id,
+        final_answer="active",
+        frames=(
+            initial,
+            pre,
+            TeacherFrame("after:e0", "active", after_cells),
+            TeacherFrame("final", "active", after_cells),
+        ),
+        needs=(
+            TeacherNeed(
+                "lookup",
+                "need",
+                "e0",
+                "pre",
+                "docs",
+                {"key": "status"},
+            ),
+        ),
+    )
+    assert review_teacher_plans((task,), (plan,))[0].accepted
+
+    config = SurfaceDiversityConfig(
+        component_name="collision-fixture-v3",
+        file_stem="collision-v3",
+        thought_capacity=8,
+        variants_per_task=1,
+        seed=3,
+        surface_version=3,
+        diversify_prompt=False,
+        diversify_semantic_text=True,
+    )
+    diversified_tasks, diversified_plans = diversify_tasks_and_plans((task,), (plan,), config)
+    initial_review = review_teacher_plans(diversified_tasks, diversified_plans)[0]
+    assert not initial_review.accepted
+    assert any("leaks future evidence" in reason for reason in initial_review.reasons)
+
+    tasks_path = tmp_path / "source-tasks.jsonl"
+    plans_path = tmp_path / "source-plans.jsonl"
+    dump_teacher_tasks((task,), tasks_path)
+    dump_teacher_plans((plan,), plans_path)
+    manifest = build_surface_diversified_distillation(
+        tasks_path,
+        plans_path,
+        tmp_path / "generated",
+        tmp_path / "reference-manifest.json",
+        config,
+    )
+
+    assert manifest["accepted_plans"] == 1
+    assert manifest["review_rejected"] == 0
+    assert manifest["semantic_text_retry_plans"] == 1
+    assert manifest["semantic_text_fallback_plans"] == 0
 
 
 def _source_task(*, capacity: int, index: int, common_prompt: bool = False) -> TeacherTask:

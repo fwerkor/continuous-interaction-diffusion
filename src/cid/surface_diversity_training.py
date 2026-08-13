@@ -83,6 +83,74 @@ _ID_RE = re.compile(r"\b[a-z][a-z0-9-]*-\d{4,}\b", re.IGNORECASE)
 _NUMBER_RE = re.compile(r"(?<![a-z])[-+]?\d+(?:\.\d+)?", re.IGNORECASE)
 _SPACE_RE = re.compile(r"\s+")
 
+_SEMANTIC_ROLE_PREFIXES = {
+    "information_need": (
+        "Open need: ",
+        "Required evidence: ",
+        "Pending input: ",
+        "Unresolved requirement: ",
+        "Needed observation: ",
+        "External requirement: ",
+    ),
+    "percept": (
+        "Observed state: ",
+        "Available evidence: ",
+        "Current observation: ",
+        "Evidence summary: ",
+        "Observed value: ",
+        "Percept state: ",
+    ),
+    "conclusion": (
+        "Resolved conclusion: ",
+        "Current conclusion: ",
+        "Answer state: ",
+        "Conclusion summary: ",
+        "Resolved answer: ",
+        "Final-state conclusion: ",
+    ),
+    "constraint": (
+        "Active constraint: ",
+        "Constraint state: ",
+        "Current restriction: ",
+        "Applicable constraint: ",
+        "Scope constraint: ",
+        "Constraint summary: ",
+    ),
+    "hypothesis": (
+        "Working hypothesis: ",
+        "Current hypothesis: ",
+        "Provisional state: ",
+        "Candidate state: ",
+        "Hypothesis summary: ",
+        "Current candidate: ",
+    ),
+    "plan": (
+        "Current plan: ",
+        "Plan state: ",
+        "Next-step plan: ",
+        "Working plan: ",
+        "Plan summary: ",
+        "Active plan: ",
+    ),
+    "default": (
+        "Current state: ",
+        "State summary: ",
+        "Working state: ",
+        "Current note: ",
+        "State note: ",
+        "Snapshot state: ",
+    ),
+}
+
+_SEMANTIC_STAGE_SUFFIXES = (
+    "",
+    " [current]",
+    " [tracked]",
+    " [task-local]",
+    " [state]",
+    " [active context]",
+)
+
 
 @dataclass(frozen=True, slots=True)
 class SurfaceDiversityConfig:
@@ -94,6 +162,10 @@ class SurfaceDiversityConfig:
     max_delay_steps: int = 4
     seed: int = 20260813
     max_tasks: int | None = None
+    surface_version: int = 2
+    diversify_prompt: bool = True
+    diversify_semantic_text: bool = False
+    semantic_text_cap: int = 144
 
     def __post_init__(self) -> None:
         if not self.component_name or not self.file_stem:
@@ -106,6 +178,10 @@ class SurfaceDiversityConfig:
             raise ValueError("invalid delay range")
         if self.max_tasks is not None and self.max_tasks <= 0:
             raise ValueError("max_tasks must be positive when provided")
+        if self.surface_version <= 0:
+            raise ValueError("surface_version must be positive")
+        if self.semantic_text_cap <= 0:
+            raise ValueError("semantic_text_cap must be positive")
 
 
 def build_surface_diversified_distillation(
@@ -123,6 +199,52 @@ def build_surface_diversified_distillation(
 
     reviews = review_teacher_plans(tasks, plans)
     rejected = tuple(review for review in reviews if not review.accepted)
+    semantic_text_retry_plans = 0
+    semantic_text_fallback_plans = 0
+    if rejected and config.diversify_semantic_text:
+        # Surface wrappers are intentionally semantically weak, but external
+        # evidence values are arbitrary. A wrapper token such as "active"
+        # can therefore accidentally equal a future evidence value and turn
+        # an otherwise causal source plan into a leaking one. Retry alternate
+        # deterministic wrappers for only the collided task; preserve the
+        # source semantic text only when every safe wrapper candidate fails.
+        # The normal causal reviewer remains the acceptance gate throughout.
+        rejected_ids = {review.task_id for review in rejected}
+        source_plan_by_id = {plan.task_id: plan for plan in source_plans}
+        task_by_id = {task.task_id: task for task in tasks}
+        repaired: list[TeacherPlan] = []
+        for plan in plans:
+            if plan.task_id not in rejected_ids:
+                repaired.append(plan)
+                continue
+            task = task_by_id[plan.task_id]
+            source_task_id = str(task.metadata["source_task_id"])
+            source_plan = source_plan_by_id[source_task_id]
+            replacement: TeacherPlan | None = None
+            # Most collisions are accidental lexical matches between a
+            # wrapper (for example "Active plan") and an unseen evidence
+            # value (for example "active").  Re-sample only the wrappers for
+            # this task and keep the first variant that satisfies the same
+            # causal reviewer.  This preserves semantic-surface diversity
+            # without weakening evidence visibility.
+            for retry in range(1, 32):
+                candidate = _surface_semantic_plan(
+                    replace(source_plan, task_id=plan.task_id),
+                    source_task_id,
+                    config,
+                    variant_offset=retry,
+                )
+                if review_teacher_plans((task,), (candidate,))[0].accepted:
+                    replacement = candidate
+                    semantic_text_retry_plans += 1
+                    break
+            if replacement is None:
+                replacement = replace(source_plan, task_id=plan.task_id)
+                semantic_text_fallback_plans += 1
+            repaired.append(replacement)
+        plans = tuple(repaired)
+        reviews = review_teacher_plans(tasks, plans)
+        rejected = tuple(review for review in reviews if not review.accepted)
     if rejected:
         raise RuntimeError(
             f"surface-diversified review rejected {len(rejected)} plans: "
@@ -159,6 +281,12 @@ def build_surface_diversified_distillation(
     dump_dataset_manifest(trajectory_manifest, paths["trajectory_manifest"])
 
     signatures = Counter(_normalized_surface_signature(task.prompt) for task in tasks)
+    semantic_signatures = Counter(
+        _normalized_surface_signature(cell.semantic_text)
+        for plan in plans
+        for frame in plan.frames
+        for cell in frame.cells
+    )
     family_counts = Counter(str(task.metadata.get("family", "unknown")) for task in tasks)
     max_semantic = max(
         len(cell.semantic_text) for plan in plans for frame in plan.frames for cell in frame.cells
@@ -173,23 +301,37 @@ def build_surface_diversified_distillation(
     manifest = {
         "format_version": 1,
         "name": config.component_name,
-        "version": 2,
-        "generator": "cid.surface_diversity_training.v2",
+        "version": config.surface_version,
+        "generator": f"cid.surface_diversity_training.v{config.surface_version}",
         "seed": config.seed,
         "semantic_tasks": len(tasks),
         "accepted_plans": len(plans),
         "review_rejected": 0,
         "compiled_trajectories": trajectory_manifest.examples,
         "compiled_transitions": trajectory_manifest.transitions,
+        "compiled_bootstrap_transitions": trajectory_manifest.bootstrap_transitions,
+        "compiled_training_transitions": trajectory_manifest.training_transitions,
         "thought_capacity_required": config.thought_capacity,
         "family_counts": dict(sorted(family_counts.items())),
         "normalized_prompt_signatures": len(signatures),
         "largest_normalized_prompt_group": max(signatures.values()),
         "normalized_prompt_signature_ratio": round(len(signatures) / len(tasks), 6),
+        "normalized_semantic_text_signatures": len(semantic_signatures),
+        "largest_normalized_semantic_text_group": max(semantic_signatures.values()),
+        "normalized_semantic_text_signature_ratio": round(
+            len(semantic_signatures) / sum(semantic_signatures.values()), 6
+        ),
         "max_semantic_text_chars": max_semantic,
         "tasks_with_anchor": tasks_with_anchor,
         "tasks_with_link": tasks_with_link,
-        "surface_payload_policy": "preserve-core-prompt-and-semantic-plan; vary safe wrappers",
+        "surface_payload_policy": (
+            "preserve core task/evidence/typed plan semantics; vary prompt and semantic transport "
+            "surfaces according to config"
+        ),
+        "diversify_prompt": config.diversify_prompt,
+        "diversify_semantic_text": config.diversify_semantic_text,
+        "semantic_text_retry_plans": semantic_text_retry_plans,
+        "semantic_text_fallback_plans": semantic_text_fallback_plans,
         "compiler": {
             "variants_per_task": config.variants_per_task,
             "min_delay_steps": config.min_delay_steps,
@@ -234,24 +376,63 @@ def diversify_tasks_and_plans(
     for source_task in source_tasks:
         if source_task.task_id not in plan_by_id:
             raise ValueError(f"source task {source_task.task_id!r} has no accepted plan")
-        task_id = f"surface-v2-{source_task.task_id}"
+        task_id = f"surface-v{config.surface_version}-{source_task.task_id}"
         task = replace(
             source_task,
             task_id=task_id,
-            prompt=_surface_prompt(source_task, config.seed),
+            prompt=(
+                _surface_prompt(source_task, config.seed)
+                if config.diversify_prompt
+                else source_task.prompt
+            ),
             metadata={
                 **dict(source_task.metadata),
-                "surface_version": 2,
+                "surface_version": config.surface_version,
                 "source_task_id": source_task.task_id,
                 "augmentation": "surface_diversification",
-                "generated_by": "cid.surface_diversity_training.v2",
+                "generated_by": f"cid.surface_diversity_training.v{config.surface_version}",
             },
         )
-        plan = replace(plan_by_id[source_task.task_id], task_id=task_id)
+        source_plan = plan_by_id[source_task.task_id]
+        plan = replace(source_plan, task_id=task_id)
+        if config.diversify_semantic_text:
+            plan = _surface_semantic_plan(plan, source_task.task_id, config)
         tasks.append(task)
         plans.append(plan)
     paired = sorted(zip(tasks, plans, strict=True), key=lambda pair: pair[0].task_id)
     return tuple(item[0] for item in paired), tuple(item[1] for item in paired)
+
+
+def _surface_semantic_plan(
+    plan: TeacherPlan,
+    source_task_id: str,
+    config: SurfaceDiversityConfig,
+    *,
+    variant_offset: int = 0,
+) -> TeacherPlan:
+    frames = []
+    for frame in plan.frames:
+        cells = []
+        for cell in frame.cells:
+            role = max(cell.roles, key=cell.roles.__getitem__, default=None)
+            role_name = getattr(role, "value", str(role)) if role is not None else "default"
+            prefixes = _SEMANTIC_ROLE_PREFIXES.get(role_name, _SEMANTIC_ROLE_PREFIXES["default"])
+            digest = hashlib.sha256(
+                (
+                    f"{config.seed}|{variant_offset}|{source_task_id}|"
+                    f"{frame.phase}|{cell.cell_id}"
+                ).encode()
+            ).digest()
+            prefix = prefixes[digest[0] % len(prefixes)]
+            suffix = _SEMANTIC_STAGE_SUFFIXES[digest[1] % len(_SEMANTIC_STAGE_SUFFIXES)]
+            candidate = f"{prefix}{cell.semantic_text}{suffix}"
+            if len(candidate) > config.semantic_text_cap:
+                candidate = f"{prefix}{cell.semantic_text}"
+            if len(candidate) > config.semantic_text_cap:
+                candidate = cell.semantic_text
+            cells.append(replace(cell, semantic_text=candidate))
+        frames.append(replace(frame, cells=tuple(cells)))
+    return replace(plan, frames=tuple(frames))
 
 
 def _select_tasks(

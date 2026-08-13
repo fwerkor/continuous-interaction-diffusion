@@ -22,6 +22,10 @@ def test_dataset_manifest_is_deterministic_and_describes_training_shape(tmp_path
     assert first == second
     assert first.examples == 5
     assert first.transitions > first.examples
+    assert first.bootstrap_transitions == first.examples
+    assert first.training_transitions == first.transitions + first.bootstrap_transitions
+    assert first.trainable_examples == first.examples
+    assert first.zero_training_transition_examples == 0
     assert first.sha256 == hashlib.sha256(data.read_bytes()).hexdigest()
     assert first.thought_capacity_required <= 8
     assert first.max_trajectory_steps >= 3
@@ -38,4 +42,6 @@ def test_dataset_manifest_is_deterministic_and_describes_training_shape(tmp_path
     payload = json.loads(manifest_path.read_text())
     assert payload["sha256"] == first.sha256
     assert payload["examples"] == 5
+    assert payload["training_transitions"] == first.training_transitions
+    assert payload["bootstrap_transitions"] == 5
     assert payload["schema"] == "cid.TrajectoryExample.v1"

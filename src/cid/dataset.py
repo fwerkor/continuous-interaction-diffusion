@@ -7,7 +7,11 @@ from dataclasses import dataclass
 from pathlib import Path
 from typing import Any
 
-from cid.data import TrajectoryExample
+from cid.data import (
+    TrajectoryExample,
+    adjacent_transition_source_steps,
+    training_transition_source_steps,
+)
 
 
 @dataclass(frozen=True, slots=True)
@@ -18,6 +22,10 @@ class DatasetManifest:
     bytes: int
     examples: int
     transitions: int
+    bootstrap_transitions: int
+    training_transitions: int
+    trainable_examples: int
+    zero_training_transition_examples: int
     tag_counts: dict[str, int]
     sources: tuple[str, ...]
     thought_capacity_required: int
@@ -31,6 +39,10 @@ class DatasetManifest:
             "bytes": self.bytes,
             "examples": self.examples,
             "transitions": self.transitions,
+            "bootstrap_transitions": self.bootstrap_transitions,
+            "training_transitions": self.training_transitions,
+            "trainable_examples": self.trainable_examples,
+            "zero_training_transition_examples": self.zero_training_transition_examples,
             "tag_counts": dict(self.tag_counts),
             "sources": list(self.sources),
             "thought_capacity_required": self.thought_capacity_required,
@@ -44,6 +56,10 @@ def inspect_dataset(path: str | Path) -> DatasetManifest:
     byte_count = 0
     example_count = 0
     transition_count = 0
+    bootstrap_transition_count = 0
+    training_transition_count = 0
+    trainable_example_count = 0
+    zero_training_transition_examples = 0
     tags: Counter[str] = Counter()
     sources: set[str] = set()
     thought_capacity_required = 0
@@ -68,7 +84,16 @@ def inspect_dataset(path: str | Path) -> DatasetManifest:
                 for descriptor in example.source_descriptors
                 if str(descriptor.get("name", ""))
             )
-            transition_count += _transition_count(example)
+            steps = {target.step for target in example.thought_targets}
+            adjacent_sources = adjacent_transition_source_steps(steps)
+            training_sources = training_transition_source_steps(steps)
+            transition_count += len(adjacent_sources)
+            bootstrap_transition_count += int(-1 in training_sources)
+            training_transition_count += len(training_sources)
+            if training_sources:
+                trainable_example_count += 1
+            else:
+                zero_training_transition_examples += 1
             thought_capacity_required = max(
                 thought_capacity_required,
                 max((target.slot + 1 for target in example.thought_targets), default=0),
@@ -85,6 +110,10 @@ def inspect_dataset(path: str | Path) -> DatasetManifest:
         bytes=byte_count,
         examples=example_count,
         transitions=transition_count,
+        bootstrap_transitions=bootstrap_transition_count,
+        training_transitions=training_transition_count,
+        trainable_examples=trainable_example_count,
+        zero_training_transition_examples=zero_training_transition_examples,
         tag_counts=dict(sorted(tags.items())),
         sources=tuple(sorted(sources)),
         thought_capacity_required=thought_capacity_required,
@@ -99,11 +128,6 @@ def dump_dataset_manifest(manifest: DatasetManifest, path: str | Path) -> None:
         json.dumps(manifest.to_dict(), ensure_ascii=False, sort_keys=True, indent=2) + "\n",
         encoding="utf-8",
     )
-
-
-def _transition_count(example: TrajectoryExample) -> int:
-    steps = {target.step for target in example.thought_targets}
-    return sum(1 for step in steps if step + 1 in steps)
 
 
 def _dataset_tag(example: TrajectoryExample) -> str:
