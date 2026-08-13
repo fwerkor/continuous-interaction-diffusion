@@ -107,12 +107,3 @@ def test_surface_summary_validation_detects_stale_cached_stat(tmp_path: Path) ->
     assert issues[0].key == "normalized_semantic_text_signatures"
     assert issues[0].declared == 11
     assert issues[0].actual == 12
-
-
-def test_pinned_v12_surface_summaries_match_reference_manifests() -> None:
-    root = Path(__file__).resolve().parents[1]
-
-    assert not find_surface_summary_mismatches(
-        root,
-        "data/training-semantic-mixture-v12.json",
-    )

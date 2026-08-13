@@ -157,7 +157,7 @@ includes a complete tiny-backbone optimizer step with the pretrained backbone fr
 
 The raw semantic-task pool is built separately from CID trajectories. Public sources, exact
 revisions, licenses, upstream splits, and sampling quotas are registered in
-`data/public-datasets.json` and `data/public-interaction-datasets.json`, with the complete registry
+`configs/public-datasets.json` and `configs/public-interaction-datasets.json`, with the complete registry
 documented in `docs/public-datasets.md`. Build the pinned 10,000-task general pool with:
 
 ```bash
@@ -168,7 +168,7 @@ Build the separate 10,000-task interaction-heavy pool from 2WikiMultiHopQA and M
 
 ```bash
 cid build-public-task-pool \
-  --registry data/public-interaction-datasets.json \
+  --registry configs/public-interaction-datasets.json \
   --output data/generated/public-interaction-task-pool-v1.jsonl \
   --manifest-output data/generated/public-interaction-task-pool-v1.manifest.json
 ```
@@ -179,32 +179,38 @@ Convert a pool into teacher-ready CID tasks and causal evidence-exposure jobs wi
 cid prepare-public-distillation
 ```
 
-The current semantic release is pinned by `data/training-semantic-mixture-v13.json`: **140,797
-semantic tasks across 15 components**. v13 adds 8,675 grounded long-form variants of accepted natural
-tool tasks, diversifies their tool schemas across six profiles, upgrades the logic/compositional/deep-
-restraint TCT surfaces to v4, and regenerates the 4,000-task compositional OOD probe with zero exact
-logic-spec overlap with training. The new grounded targets have a median length of 181 characters;
-all 8,675 retain anchors and typed links.
+Released CID datasets are published on Hugging Face at `fwerkor/CID-Dataset`; the GitHub
+repository intentionally does not track release data or release manifests. The local `data/` tree is
+a gitignored build/training workspace. **v12 and v13 are both preserved as complete releases** so
+training artifacts do not skip a version.
 
-The trainer balances schedule variants and trajectory length at semantic-task granularity, then
-applies explicit component `training_weight`. v13 uses this only where the audit showed a distribution
-gap: natural source/augmentation supervision receives **36.8% of effective semantic loss mass**,
-natural tool interaction **28.0%**, grounded long-form display supervision **18.1%**, and tool-
-restraint supervision **8.2%**. The unweighted task counts remain in the manifest, so augmentation is
-not presented as independent source data.
+- **v12:** 132,122 semantic tasks, 305,948 trajectories, 2,303,169 training transitions;
+  materialized SHA-256 `2f2da01e3963b4ac758e023dcb8659afc2d81999c88fd9df361ec058112f3478`.
+- **v13 (current):** 140,797 semantic tasks, 323,298 trajectories, 2,485,228 training transitions;
+  materialized SHA-256 `fcda158c66f911b9521e37ffcbdba038710bde607a4762f498b0e70bd99f5de2`.
 
-The corresponding trajectory specification is `data/training-trajectory-mixture-v13.json`:
-**323,298 runtime trajectories and 2,485,228 training transitions** before per-task loss weighting.
-Its maximum TCT capacity remains 128; the tensorizer allocates each trajectory at its actual slot
-footprint and pads mixed-capacity batches only to the largest footprint in that batch. Materialize the
-component-order training file with:
+v13 adds 8,675 grounded long-form variants of accepted natural tool tasks, six equivalent tool-schema
+profiles, v4 surface diversification for the logic/compositional/deep-restraint slices, and a
+4,000-task compositional OOD probe with zero exact logic-spec overlap with training. The grounded
+display targets have a median length of 181 characters and retain typed anchors and links.
+
+The trainer first equalizes schedule/trajectory loss mass at semantic-task granularity and then
+applies explicit component `training_weight`. In v13, natural source/augmentation supervision receives
+about 36.8% of effective semantic loss mass, natural tool interaction 28.0%, grounded long-form
+display supervision 18.1%, and tool-restraint supervision 8.2%.
+
+Download a pinned release into the local gitignored workspace before training, for example:
 
 ```bash
-cid materialize-trajectory-mixture \
-  --spec data/training-trajectory-mixture-v13.json \
-  --output data/generated/training-trajectories-v13.jsonl \
-  --manifest-output data/generated/training-trajectories-v13.manifest.json
+hf download fwerkor/CID-Dataset \
+  data/generated/training-trajectories-v13.jsonl \
+  manifests/training-trajectories-v13.materialized.json \
+  --repo-type dataset --local-dir .cid/hf-v13
 ```
+
+You may train directly from the downloaded materialized JSONL, or download the component directories
+and `manifests/training-trajectory-mixture-v13.json` if you want to reproduce materialization with
+`cid materialize-trajectory-mixture`.
 
 The materializer verifies every component SHA/count and global `example_id` uniqueness before
 writing the combined file. Training shuffles rollout windows per epoch unless `--no-shuffle` is
@@ -222,8 +228,7 @@ Build the deterministic computational teacher jobs with:
 cid build-computational-training
 ```
 
-The pinned build and self-distillation hashes are recorded in
-`data/computational-teacher-v1.reference-manifest.json`.
+The pinned build and self-distillation hashes are published with the component in the Hugging Face dataset repository.
 
 Build the deterministic symbolic teacher jobs with:
 
@@ -232,9 +237,7 @@ cid build-symbolic-training
 ```
 
 The symbolic component contains 34,800 causal teacher stages; all 15,600 semantic plans pass the
-quality gate and compile to 31,200 independently randomized runtime trajectories. Its exact build,
-review, tool-replay, and compilation hashes are pinned by
-`data/symbolic-teacher-v1.reference-manifest.json`.
+quality gate and compile to 31,200 independently randomized runtime trajectories. Its exact build, review, tool-replay, and compilation hashes are published with the component in the Hugging Face dataset repository.
 
 Build the deterministic speculative local-correction teacher jobs with:
 
@@ -243,8 +246,7 @@ cid build-correction-training
 ```
 
 The released component contains 30,000 validated causal stages and 20,000 compiled trajectories;
-its exact generation, review, correction-audit, and compilation hashes are pinned by
-`data/correction-teacher-v1.reference-manifest.json`.
+its exact generation, review, correction-audit, and compilation hashes are published with the component in the Hugging Face dataset repository.
 
 Build the current data-quality additions reproducibly with:
 
@@ -264,7 +266,7 @@ high-frequency TCT state templates. The deep-restraint builder reuses accepted c
 exposes an irrelevant read-only source, and keeps every selected task free of evidence arrivals and
 tool needs.
 
-Generated task data lives under `data/generated/` and is not committed. Every record retains exact
+Generated task data lives under the gitignored local `data/` workspace and is never committed to GitHub. Every record retains exact
 upstream provenance; semantic IDs are deduplicated and assigned to the CID train/validation/test
 split before later toolization or timing augmentation.
 

@@ -1,8 +1,8 @@
 # Public dataset registry
 
 CID keeps every externally sourced training-task dataset in pinned registries. The general-purpose
-pool is defined by `data/public-datasets.json`; the interaction-heavy multi-hop pool is defined by
-`data/public-interaction-datasets.json`. These registries are the source of truth for repository,
+pool is defined by `configs/public-datasets.json`; the interaction-heavy multi-hop pool is defined by
+`configs/public-interaction-datasets.json`. These registries are the source of truth for repository,
 config/split, revision, license, intended use, and sampling quota. Generated task-pool JSONL files
 are intentionally ignored by Git; they can be reproduced with `cid build-public-task-pool`.
 
@@ -97,7 +97,7 @@ Reproduce it with:
 
 ```bash
 cid build-public-task-pool \
-  --registry data/public-interaction-datasets.json \
+  --registry configs/public-interaction-datasets.json \
   --output data/generated/public-interaction-task-pool-v1.jsonl \
   --manifest-output data/generated/public-interaction-task-pool-v1.manifest.json
 ```

@@ -1457,7 +1457,7 @@ def main() -> None:
         "build-self-identity-training",
         help="build deterministic CID model-identity and architecture self-knowledge training data",
     )
-    self_identity.add_argument("--contract", default="data/cid-self-identity-v1.contract.json")
+    self_identity.add_argument("--contract", default="configs/cid-self-identity-v1.contract.json")
     self_identity.add_argument(
         "--tasks-output", default="data/generated/self-identity-teacher-tasks-v1.jsonl"
     )
@@ -1685,7 +1685,7 @@ def main() -> None:
         "build-public-task-pool",
         help="build the pinned public semantic-task pool from registered training splits",
     )
-    public_pool.add_argument("--registry", default="data/public-datasets.json")
+    public_pool.add_argument("--registry", default="configs/public-datasets.json")
     public_pool.add_argument("--output", default="data/generated/public-task-pool-v1.jsonl")
     public_pool.add_argument(
         "--manifest-output",

@@ -175,7 +175,7 @@ def test_arc_adapter_resolves_labeled_answer() -> None:
 
 def test_public_dataset_registry_uses_only_training_sources() -> None:
     registry = json.loads(
-        (Path(__file__).resolve().parents[1] / "data/public-datasets.json").read_text(
+        (Path(__file__).resolve().parents[1] / "configs/public-datasets.json").read_text(
             encoding="utf-8"
         )
     )
@@ -188,9 +188,10 @@ def test_public_dataset_registry_uses_only_training_sources() -> None:
 
 def test_public_interaction_registry_uses_only_training_sources() -> None:
     registry = json.loads(
-        (Path(__file__).resolve().parents[1] / "data/public-interaction-datasets.json").read_text(
-            encoding="utf-8"
-        )
+        (
+            Path(__file__).resolve().parents[1]
+            / "configs/public-interaction-datasets.json"
+        ).read_text(encoding="utf-8")
     )
     assert sum(source["quota"] for source in registry["sources"]) == 10_000
     assert all(source["upstream_split"] == "train" for source in registry["sources"])

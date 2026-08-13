@@ -11,7 +11,7 @@ from cid.self_identity_training import (
 )
 
 ROOT = Path(__file__).resolve().parents[1]
-CONTRACT = ROOT / "data/cid-self-identity-v1.contract.json"
+CONTRACT = ROOT / "configs/cid-self-identity-v1.contract.json"
 
 
 def test_self_identity_generation_is_balanced_unique_and_bilingual() -> None:

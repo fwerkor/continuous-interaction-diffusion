@@ -3,6 +3,14 @@
 The implementation is organized for staged conversion rather than immediate from-scratch 4B
 pretraining.
 
+## Dataset artifact location
+
+The GitHub repository contains implementation, tests, documentation, and the small source registries
+under `configs/`. Released training data, component manifests, and materialized datasets are published
+only in the Hugging Face dataset repository `fwerkor/CID-Dataset`. The local `data/` directory is a
+gitignored workspace used by builders and training commands. Historical `data/...` paths mentioned
+below refer to dataset-release artifacts, not files tracked by GitHub.
+
 ## Stage 0 — runtime oracle
 
 Use scripted/oracle policies to validate binding lifecycle, event timing, cache reuse, dynamic
@@ -267,7 +275,7 @@ zero rejects, missing responses, or soft warnings, and all 10,000 plans pass bot
 the local-correction audit. Exact hashes are pinned by
 `data/correction-teacher-v1.reference-manifest.json`.
 
-The latest semantic mixture is `data/training-semantic-mixture-v13.json`: **140,797 semantic tasks**
+The latest semantic mixture, published as `manifests/training-semantic-mixture-v13.json` on Hugging Face, contains **140,797 semantic tasks**
 across 15 components. It adds 8,675 grounded long-form variants of accepted natural tool tasks and
 replaces the logic/compositional/deep-restraint slices with v4 TCT surfaces. The new grounded display
 targets have a median length of 181 characters and use six deterministic tool-schema profiles while
@@ -277,7 +285,7 @@ Schedule variants and trajectory length are first balanced at semantic-task gran
 component `training_weight` is then applied. The resulting effective semantic loss mass is 36.8%
 natural source/augmentation supervision, 28.0% natural tool interaction, 18.1% grounded long-form
 display supervision, and 8.2% tool restraint. These are weights, not claims of independent source
-examples. The trajectory specification is `data/training-trajectory-mixture-v13.json`:
+examples. The corresponding Hugging Face trajectory specification is `manifests/training-trajectory-mixture-v13.json`:
 **323,298 trajectories and 2,485,228 training transitions**, with maximum TCT capacity 128.
 
 ### Compositional long-tail curriculum
