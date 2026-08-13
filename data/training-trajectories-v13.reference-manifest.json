@@ -1,0 +1,25 @@
+{
+  "bootstrap_transitions": 323298,
+  "bytes": 7749369767,
+  "examples": 323298,
+  "format_version": 1,
+  "max_trajectory_steps": 44,
+  "name": "training-trajectories-v13",
+  "semantic_mixture": "data/training-semantic-mixture-v13.json",
+  "sha256": "fcda158c66f911b9521e37ffcbdba038710bde607a4762f498b0e70bd99f5de2",
+  "strict_audit": {
+    "ok": true,
+    "pre_satisfied_once_bindings": 0,
+    "semantic_mode_conflicts": 0,
+    "trainable_semantic_tasks": 140797,
+    "untrainable_first_need_bindings": 0,
+    "zero_training_transition_semantic_tasks": 0
+  },
+  "thought_capacity_required": 128,
+  "training_transitions": 2485228,
+  "trajectory_mixture": "data/training-trajectory-mixture-v13.json",
+  "trajectory_mixture_sha256": "32700a879abe91a1f2f9e87e5b362df37c1f8877c69fd894ee92b5c72c7ce21b",
+  "transitions": 2161930,
+  "version": 13,
+  "weighting_policy": "semantic-task-balanced component weights injected as metadata.training_weight during materialization"
+}

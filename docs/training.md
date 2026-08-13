@@ -267,13 +267,18 @@ zero rejects, missing responses, or soft warnings, and all 10,000 plans pass bot
 the local-correction audit. Exact hashes are pinned by
 `data/correction-teacher-v1.reference-manifest.json`.
 
-The latest semantic mixture is `data/training-semantic-mixture-v11.json`: **134,075 semantic tasks**
-across 14 components. It retains the v10 capability coverage while replacing the composed and
-long-horizon v1 slices with surface-diversified v2 equivalents and adding 4,000 depth-8+ deep
-tool-restraint hard negatives. The replacement is semantic rather than additive: v1 and v2 are not
-trained together. The corresponding compiled mixture is `data/training-trajectory-mixture-v11.json`:
-**305,948 trajectories and 2,054,831 adjacent supervised transitions**, with a maximum TCT capacity
-of 128. The v10 manifests remain pinned as the immediately preceding historical release.
+The latest semantic mixture is `data/training-semantic-mixture-v13.json`: **140,797 semantic tasks**
+across 15 components. It adds 8,675 grounded long-form variants of accepted natural tool tasks and
+replaces the logic/compositional/deep-restraint slices with v4 TCT surfaces. The new grounded display
+targets have a median length of 181 characters and use six deterministic tool-schema profiles while
+retaining source provenance, anchors, links, and causal evidence contracts.
+
+Schedule variants and trajectory length are first balanced at semantic-task granularity; explicit
+component `training_weight` is then applied. The resulting effective semantic loss mass is 36.8%
+natural source/augmentation supervision, 28.0% natural tool interaction, 18.1% grounded long-form
+display supervision, and 8.2% tool restraint. These are weights, not claims of independent source
+examples. The trajectory specification is `data/training-trajectory-mixture-v13.json`:
+**323,298 trajectories and 2,485,228 training transitions**, with maximum TCT capacity 128.
 
 ### Compositional long-tail curriculum
 

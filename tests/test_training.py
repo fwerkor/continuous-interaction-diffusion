@@ -947,6 +947,33 @@ def test_semantic_task_balancing_equalizes_total_transition_loss_mass() -> None:
     assert weighted_transitions == pytest.approx(total_transitions)
 
 
+def test_semantic_task_balancing_respects_declared_training_weight() -> None:
+    ordinary = replace(
+        make_trajectory(),
+        example_id="ordinary-schedule",
+        metadata={"semantic_task_id": "ordinary", "training_weight": 1.0},
+    )
+    emphasized = replace(
+        make_rollout_trajectory(),
+        example_id="emphasized-schedule",
+        metadata={"semantic_task_id": "emphasized", "training_weight": 3.0},
+    )
+    windows = trajectory_rollout_windows((ordinary, emphasized), max_horizon=8)
+    balanced = balance_rollout_windows_by_semantic_task(windows)
+
+    mass: dict[str, float] = {}
+    for window in balanced:
+        task_id = str(window.example.metadata["semantic_task_id"])
+        mass[task_id] = mass.get(task_id, 0.0) + len(window.source_steps) * window.loss_weight
+
+    assert mass["emphasized"] == pytest.approx(3.0 * mass["ordinary"])
+    total_transitions = sum(len(window.source_steps) for window in balanced)
+    weighted_transitions = sum(
+        len(window.source_steps) * window.loss_weight for window in balanced
+    )
+    assert weighted_transitions == pytest.approx(total_transitions)
+
+
 def test_rollout_curriculum_and_window_sharding_are_deterministic() -> None:
     adapter = make_adapter(seed=103)
     trainer = CIDTrainer(

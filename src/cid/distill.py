@@ -2212,7 +2212,11 @@ def _evidence_markers(value: Any) -> tuple[str, ...]:
 
 
 def _normalized_text(value: str) -> str:
-    return " ".join(value.casefold().split())
+    # Evidence surfaces often differ only by sentence punctuation: a search
+    # result may expose the title ``Example`` while the later record repeats
+    # it as ``Example.``.  Those strings carry the same already-visible fact
+    # and must not be treated as a future-evidence leak.
+    return " ".join(value.casefold().split()).strip(".,;:!?")
 
 
 def _teacher_fingerprint(task: TeacherTask, plan: TeacherPlan) -> str:

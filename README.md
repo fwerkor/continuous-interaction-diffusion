@@ -179,25 +179,31 @@ Convert a pool into teacher-ready CID tasks and causal evidence-exposure jobs wi
 cid prepare-public-distillation
 ```
 
-The current overall semantic mixture is pinned by `data/training-semantic-mixture-v11.json` and
-contains **134,075 semantic tasks** across 14 components. v11 keeps the v10 capability coverage but
-replaces the template-heavy composed and long-horizon slices with surface-diversified v2 equivalents.
-The composed replacement has 4,672 normalized prompt signatures (up from 8 in v1), and long-horizon
-v2 has 4,062 (up from 6); neither v1 is duplicated in the v11 training mixture. v11 also adds 4,000
-depth-8+ tool-restraint hard negatives, balanced across 16/32/64/128 TCT-slot buckets, restoring
-`tools_available_unnecessary` to **10.176%** of semantic tasks.
+The current semantic release is pinned by `data/training-semantic-mixture-v13.json`: **140,797
+semantic tasks across 15 components**. v13 adds 8,675 grounded long-form variants of accepted natural
+tool tasks, diversifies their tool schemas across six profiles, upgrades the logic/compositional/deep-
+restraint TCT surfaces to v4, and regenerates the 4,000-task compositional OOD probe with zero exact
+logic-spec overlap with training. The new grounded targets have a median length of 181 characters;
+all 8,675 retain anchors and typed links.
 
-The corresponding compiled training mixture is pinned by
-`data/training-trajectory-mixture-v11.json`: **305,948 runtime trajectories and 2,054,831 adjacent
-supervised transitions**. Its maximum TCT capacity remains 128; the tensorizer allocates each
-trajectory at its actual slot footprint and pads mixed-capacity batches only to the largest footprint
-in that batch. Materialize the component-order training file with:
+The trainer balances schedule variants and trajectory length at semantic-task granularity, then
+applies explicit component `training_weight`. v13 uses this only where the audit showed a distribution
+gap: natural source/augmentation supervision receives **36.8% of effective semantic loss mass**,
+natural tool interaction **28.0%**, grounded long-form display supervision **18.1%**, and tool-
+restraint supervision **8.2%**. The unweighted task counts remain in the manifest, so augmentation is
+not presented as independent source data.
+
+The corresponding trajectory specification is `data/training-trajectory-mixture-v13.json`:
+**323,298 runtime trajectories and 2,485,228 training transitions** before per-task loss weighting.
+Its maximum TCT capacity remains 128; the tensorizer allocates each trajectory at its actual slot
+footprint and pads mixed-capacity batches only to the largest footprint in that batch. Materialize the
+component-order training file with:
 
 ```bash
 cid materialize-trajectory-mixture \
-  --spec data/training-trajectory-mixture-v11.json \
-  --output data/generated/training-trajectories-v11.jsonl \
-  --manifest-output data/generated/training-trajectories-v11.manifest.json
+  --spec data/training-trajectory-mixture-v13.json \
+  --output data/generated/training-trajectories-v13.jsonl \
+  --manifest-output data/generated/training-trajectories-v13.manifest.json
 ```
 
 The materializer verifies every component SHA/count and global `example_id` uniqueness before
@@ -240,18 +246,23 @@ The released component contains 30,000 validated causal stages and 20,000 compil
 its exact generation, review, correction-audit, and compilation hashes are pinned by
 `data/correction-teacher-v1.reference-manifest.json`.
 
-Build the v11 data-quality additions reproducibly with:
+Build the current data-quality additions reproducibly with:
 
 ```bash
-cid build-surface-diverse-training --component composed
-cid build-surface-diverse-training --component long-horizon
+cid build-natural-interaction-training
+cid build-compositional-training
 cid build-deep-tool-restraint-training
+cid build-surface-diverse-training --component logic-v4
+cid build-surface-diverse-training --component compositional-v4
+cid build-surface-diverse-training --component deep-restraint-v4
 ```
 
-The surface-v2 builders preserve each source task's evidence, reference answer, and accepted TCT
-semantic plan while changing only the task ID and deterministic prompt wrapper. The deep-restraint
-builder reuses accepted compositional long-tail plans, exposes an irrelevant read-only lookup source,
-and keeps every selected task free of evidence arrivals and tool needs.
+The natural-interaction builder preserves accepted public evidence contracts while adding grounded
+long-form display targets and deterministic tool-schema variation. The v4 surface builders preserve
+typed plan semantics, anchors, links, lifecycle, and causal needs while paraphrasing only selected
+high-frequency TCT state templates. The deep-restraint builder reuses accepted compositional plans,
+exposes an irrelevant read-only source, and keeps every selected task free of evidence arrivals and
+tool needs.
 
 Generated task data lives under `data/generated/` and is not committed. Every record retains exact
 upstream provenance; semantic IDs are deduplicated and assigned to the CID train/validation/test

@@ -8,6 +8,7 @@ import pytest
 from cid.release_validation import (
     assert_release_references_resolve,
     find_missing_manifest_references,
+    find_surface_summary_mismatches,
 )
 
 
@@ -71,3 +72,47 @@ def test_release_validation_rejects_missing_path(tmp_path: Path) -> None:
             tmp_path,
             {"manifests/mixture.json"},
         )
+
+
+def test_surface_summary_validation_detects_stale_cached_stat(tmp_path: Path) -> None:
+    (tmp_path / "data").mkdir()
+    (tmp_path / "data" / "component.json").write_text(
+        json.dumps(
+            {
+                "normalized_semantic_text_signatures": 12,
+                "semantic_text_fallback_plans": 0,
+            }
+        )
+        + "\n"
+    )
+    (tmp_path / "data" / "mixture.json").write_text(
+        json.dumps(
+            {
+                "surface_diverse_replacements": {
+                    "component": {
+                        "reference_manifest": "data/component.json",
+                        "normalized_semantic_text_signatures": 11,
+                        "semantic_text_fallback_plans": 0,
+                    }
+                }
+            }
+        )
+        + "\n"
+    )
+
+    issues = find_surface_summary_mismatches(tmp_path, "data/mixture.json")
+
+    assert len(issues) == 1
+    assert issues[0].component == "component"
+    assert issues[0].key == "normalized_semantic_text_signatures"
+    assert issues[0].declared == 11
+    assert issues[0].actual == 12
+
+
+def test_pinned_v12_surface_summaries_match_reference_manifests() -> None:
+    root = Path(__file__).resolve().parents[1]
+
+    assert not find_surface_summary_mismatches(
+        root,
+        "data/training-semantic-mixture-v12.json",
+    )

@@ -2,6 +2,7 @@ from __future__ import annotations
 
 import hashlib
 import json
+import math
 import tempfile
 from collections import Counter
 from dataclasses import dataclass
@@ -21,9 +22,13 @@ class TrajectoryMixtureComponent:
     transitions: int
     bootstrap_transitions: int | None = None
     training_transitions: int | None = None
+    semantic_weight: float = 1.0
 
     @classmethod
     def from_dict(cls, raw: dict[str, Any]) -> TrajectoryMixtureComponent:
+        semantic_weight = float(raw.get("semantic_weight", 1.0))
+        if not math.isfinite(semantic_weight) or semantic_weight <= 0.0:
+            raise ValueError("trajectory mixture semantic_weight must be finite and positive")
         return cls(
             name=str(raw["name"]),
             path=str(raw["path"]),
@@ -41,6 +46,7 @@ class TrajectoryMixtureComponent:
                 if "training_transitions" in raw
                 else None
             ),
+            semantic_weight=semantic_weight,
         )
 
 
@@ -186,9 +192,31 @@ def materialize_trajectory_mixture(
                         )
                         max_trajectory_steps = max(max_trajectory_steps, len(steps))
 
-                        temp.write(raw_line)
-                        output_sha.update(raw_line)
-                        output_bytes += len(raw_line)
+                        output_line = raw_line
+                        if component.semantic_weight != 1.0:
+                            metadata = dict(record.get("metadata", {}))
+                            existing_weight = metadata.get("training_weight")
+                            if existing_weight is not None and not math.isclose(
+                                float(existing_weight), component.semantic_weight
+                            ):
+                                raise ValueError(
+                                    f"component {component.name} training_weight conflicts with "
+                                    "mixture semantic_weight"
+                                )
+                            metadata["training_weight"] = component.semantic_weight
+                            record["metadata"] = metadata
+                            output_line = (
+                                json.dumps(
+                                    record,
+                                    ensure_ascii=False,
+                                    separators=(",", ":"),
+                                ).encode("utf-8")
+                                + b"\n"
+                            )
+
+                        temp.write(output_line)
+                        output_sha.update(output_line)
+                        output_bytes += len(output_line)
                 if source_sha.hexdigest() != component.sha256:
                     raise ValueError(
                         f"component {component.name} file SHA does not match mixture spec"
@@ -234,6 +262,7 @@ def materialize_trajectory_mixture(
                         "transitions": component.transitions,
                         "bootstrap_transitions": component_bootstrap_transitions,
                         "training_transitions": component_training_transitions,
+                        "semantic_weight": component.semantic_weight,
                         "trainable_examples": component_trainable_examples,
                         "zero_training_transition_examples": (
                             component_zero_training_transition_examples
@@ -252,7 +281,10 @@ def materialize_trajectory_mixture(
         "mixture": spec.name,
         "mixture_version": spec.version,
         "mixture_spec_sha256": hashlib.sha256(spec_file.read_bytes()).hexdigest(),
-        "merge_mode": "component-order-concatenation; trainer shuffles rollout windows per epoch",
+        "merge_mode": (
+            "component-order-concatenation with optional semantic training-weight injection; "
+            "trainer shuffles rollout windows per epoch"
+        ),
         "sha256": output_sha.hexdigest(),
         "bytes": output_bytes,
         "examples": output_examples,

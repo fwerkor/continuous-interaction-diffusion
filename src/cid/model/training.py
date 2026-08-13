@@ -1415,20 +1415,29 @@ def _binding_observation_available(
 def balance_rollout_windows_by_semantic_task(
     windows: tuple[CIDRolloutWindow, ...],
 ) -> tuple[CIDRolloutWindow, ...]:
-    """Importance-weight rollout transitions so every semantic task has equal total mass.
+    """Importance-weight rollout transitions by semantic task and declared task weight.
 
-    Schedule variants and long trajectories remain fully present, but the sum of transition weights
-    for each semantic task is identical.  The global transition-weight mean is exactly one, so this
-    does not silently change the optimizer's overall loss scale.
+    Schedule variants and long trajectories remain fully present, while every semantic task receives
+    a total loss mass proportional to ``metadata.training_weight`` (default 1.0).  The global
+    transition-weight mean remains exactly one, so component reweighting changes only the mixture
+    distribution and does not silently change the optimizer's overall loss scale.
     """
 
     if not windows:
         return ()
     transition_counts: dict[str, int] = {}
+    task_weights: dict[str, float] = {}
     task_ids: list[str] = []
     total_transitions = 0
     for window in windows:
         task_id = str(window.example.metadata.get("semantic_task_id") or window.example.example_id)
+        task_weight = float(window.example.metadata.get("training_weight", 1.0))
+        if not math.isfinite(task_weight) or task_weight <= 0.0:
+            raise ValueError("training_weight must be finite and positive")
+        previous_weight = task_weights.get(task_id)
+        if previous_weight is not None and not math.isclose(previous_weight, task_weight):
+            raise ValueError(f"semantic task {task_id!r} has conflicting training_weight values")
+        task_weights[task_id] = task_weight
         count = len(window.source_steps)
         transition_counts[task_id] = transition_counts.get(task_id, 0) + count
         task_ids.append(task_id)
@@ -1436,8 +1445,11 @@ def balance_rollout_windows_by_semantic_task(
     task_count = len(transition_counts)
     if task_count == 0 or total_transitions == 0:
         return windows
+    total_task_weight = sum(task_weights.values())
     weights = {
-        task_id: total_transitions / (task_count * transition_count)
+        task_id: total_transitions
+        * task_weights[task_id]
+        / (total_task_weight * transition_count)
         for task_id, transition_count in transition_counts.items()
     }
     return tuple(

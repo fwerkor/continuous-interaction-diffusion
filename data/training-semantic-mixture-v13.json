@@ -1,8 +1,5 @@
 {
-  "candidate_semantic_tasks": 134075,
-  "complex_logic_dependency_depth_4_plus_tasks": 12000,
-  "complex_logic_internal_refinement_tasks": 12000,
-  "complex_logic_tasks": 12000,
+  "candidate_semantic_tasks": 142750,
   "components": [
     {
       "accepted_plans_sha256": "4b321b7b79c94448495f861a72065706157f995d22427237fb8f8fae7918ed61",
@@ -12,7 +9,8 @@
       "name": "public-base-v1",
       "reference_manifest": "data/public-teacher-v1.train.reference-manifest.json",
       "review_rejected": 518,
-      "tasks": 8512
+      "tasks": 8512,
+      "training_weight": 2.0
     },
     {
       "accepted_plans_sha256": "bce0d3236be2af7a0b256552ededf2f3ef5ce2138abda98a3927128bee2f4537",
@@ -22,7 +20,8 @@
       "name": "public-interaction-v1",
       "reference_manifest": "data/public-interaction-teacher-v1.reference-manifest.json",
       "review_rejected": 1435,
-      "tasks": 7590
+      "tasks": 7590,
+      "training_weight": 2.5
     },
     {
       "candidate_tasks": 10000,
@@ -31,7 +30,8 @@
       "reference_manifest": "data/mechanism-teacher-v3.reference-manifest.json",
       "review_rejected": 0,
       "tasks": 10000,
-      "tasks_sha256": "b2da1a9fecf2e709b4935b56c4696a51683a46b594fa5723ac1558635f282a32"
+      "tasks_sha256": "b2da1a9fecf2e709b4935b56c4696a51683a46b594fa5723ac1558635f282a32",
+      "training_weight": 1.0
     },
     {
       "candidate_tasks": 12000,
@@ -40,7 +40,8 @@
       "reference_manifest": "data/computational-teacher-v3.reference-manifest.json",
       "review_rejected": 0,
       "tasks": 12000,
-      "tasks_sha256": "e6d93831589a853875259e75dd9a47035be6b1f7eeae60a26b046b523eab44bd"
+      "tasks_sha256": "e6d93831589a853875259e75dd9a47035be6b1f7eeae60a26b046b523eab44bd",
+      "training_weight": 1.0
     },
     {
       "candidate_tasks": 15600,
@@ -49,7 +50,8 @@
       "reference_manifest": "data/symbolic-teacher-v3.reference-manifest.json",
       "review_rejected": 0,
       "tasks": 15600,
-      "tasks_sha256": "df5b169398277a133164492bd03d41d1bdd36931a43fbb4f7b23471a214d1b7c"
+      "tasks_sha256": "df5b169398277a133164492bd03d41d1bdd36931a43fbb4f7b23471a214d1b7c",
+      "training_weight": 1.0
     },
     {
       "candidate_tasks": 10000,
@@ -58,16 +60,18 @@
       "reference_manifest": "data/correction-teacher-v3.reference-manifest.json",
       "review_rejected": 0,
       "tasks": 10000,
-      "tasks_sha256": "ee2cc1cbd8c84811ec2797becee8ac1a51e811475f5e92fc529a053a39f42cad"
+      "tasks_sha256": "ee2cc1cbd8c84811ec2797becee8ac1a51e811475f5e92fc529a053a39f42cad",
+      "training_weight": 1.0
     },
     {
       "candidate_tasks": 12000,
-      "causal_jobs_sha256": "64f4c1c0d0b334c18a32fe2022e31d957077f09433e89c3844598c7269d2ff61",
-      "name": "complex-logic-reasoning-v3",
-      "reference_manifest": "data/logic-teacher-v3.reference-manifest.json",
+      "causal_jobs_sha256": "093bcfabbfacfe2a09f6dc0a1d777f24e743cf21560aa2ba0b2aabab9f82c3b4",
+      "name": "complex-logic-reasoning-v4",
+      "reference_manifest": "data/logic-teacher-v4.reference-manifest.json",
       "review_rejected": 0,
       "tasks": 12000,
-      "tasks_sha256": "a387b781324260b417ebcd370c67219295518a28c0da89e13bfdc271a1280d63"
+      "tasks_sha256": "41823635e94f356528e6702a0327c9f23861ced7c7659726beff0e2487b21caf",
+      "training_weight": 1.0
     },
     {
       "candidate_tasks": 720,
@@ -76,7 +80,8 @@
       "reference_manifest": "data/self-identity-teacher-v3.reference-manifest.json",
       "review_rejected": 0,
       "tasks": 720,
-      "tasks_sha256": "db1e42ad9f519b72be67b93f441d5c284e98cb544ca5c6f3046566ad08bc0798"
+      "tasks_sha256": "db1e42ad9f519b72be67b93f441d5c284e98cb544ca5c6f3046566ad08bc0798",
+      "training_weight": 1.0
     },
     {
       "candidate_tasks": 1200,
@@ -85,7 +90,8 @@
       "reference_manifest": "data/multilingual-v3.reference-manifest.json",
       "review_rejected": 0,
       "tasks": 1200,
-      "tasks_sha256": "d7697b7fd5d8c2b5fefd0ebae9472cdb3d0738e19899f3cb192b92392020334e"
+      "tasks_sha256": "d7697b7fd5d8c2b5fefd0ebae9472cdb3d0738e19899f3cb192b92392020334e",
+      "training_weight": 1.0
     },
     {
       "candidate_tasks": 12000,
@@ -94,7 +100,8 @@
       "reference_manifest": "data/composed-teacher-v3.reference-manifest.json",
       "review_rejected": 0,
       "tasks": 12000,
-      "tasks_sha256": "1f2d215b3ef530addccbd692c0b29400057ab26ecb9bad33610bc0ae3b096df9"
+      "tasks_sha256": "1f2d215b3ef530addccbd692c0b29400057ab26ecb9bad33610bc0ae3b096df9",
+      "training_weight": 1.0
     },
     {
       "augmentation": "accepted-natural-task-tool-restraint",
@@ -103,16 +110,18 @@
       "reference_manifest": "data/tool-restraint-teacher-v1.reference-manifest.json",
       "review_rejected": 0,
       "tasks": 6500,
-      "tasks_sha256": "c8f28f286e627b214ae02b2b9d891db13fb09b946a3629e4436e6b06398cf125"
+      "tasks_sha256": "c8f28f286e627b214ae02b2b9d891db13fb09b946a3629e4436e6b06398cf125",
+      "training_weight": 1.5
     },
     {
       "candidate_tasks": 20000,
-      "causal_jobs_sha256": "2d2034340dfcc3611bd8b6e9ae2f935c8f1e931f740ecef2f5b5729780e6c5bb",
-      "name": "compositional-longtail-reasoning-v3",
-      "reference_manifest": "data/compositional-teacher-v3.reference-manifest.json",
+      "causal_jobs_sha256": "4551a80004736763fe4897b07a7a72b4f061b444665ab208234efc9882ae4c61",
+      "name": "compositional-longtail-reasoning-v4",
+      "reference_manifest": "data/compositional-teacher-v4.reference-manifest.json",
       "review_rejected": 0,
       "tasks": 20000,
-      "tasks_sha256": "20bbb0855416334469a56d31d1c095ee5ce74244cf787413a4635742c525418c"
+      "tasks_sha256": "4ac8ea65cbc69693cd46b3945b0399449d93bfad98df7bdd4d23da4ee0eda057",
+      "training_weight": 1.0
     },
     {
       "candidate_tasks": 12000,
@@ -121,96 +130,71 @@
       "reference_manifest": "data/long-horizon-teacher-v3.reference-manifest.json",
       "review_rejected": 0,
       "tasks": 12000,
-      "tasks_sha256": "c51447fc22f0aee4eb993d275598bdb74ba96bfb5ad6482a9c3b8648dcc5400f"
+      "tasks_sha256": "c51447fc22f0aee4eb993d275598bdb74ba96bfb5ad6482a9c3b8648dcc5400f",
+      "training_weight": 1.0
     },
     {
       "candidate_tasks": 4000,
-      "causal_jobs_sha256": "8159f2d03600d2735386656432f6b672340affd860a33c87d65dd9ccd02af42b",
-      "name": "deep-tool-restraint-v3",
-      "reference_manifest": "data/deep-tool-restraint-v3.reference-manifest.json",
+      "causal_jobs_sha256": "ea117cbe12fd06a37e77303d54bdada8de269ed4fb853e92703ed3efd0eaa8db",
+      "name": "deep-tool-restraint-v4",
+      "reference_manifest": "data/deep-tool-restraint-v4.reference-manifest.json",
       "review_rejected": 0,
       "tasks": 4000,
-      "tasks_sha256": "089b4f906725eec67ec253cccd6965c09d8d73dee3d5c6290b7acb61c1bb8b34"
+      "tasks_sha256": "cc7d9b83e93b07ac236ba9d84b84aa9c824847870ed2f1816667b3a828613387",
+      "training_weight": 1.5
+    },
+    {
+      "augmentation": "accepted-natural-tool-task-grounded-long-form-and-schema-diversification",
+      "candidate_tasks": 8675,
+      "causal_jobs_sha256": "fc4690ed25fa4c65ca346831fb30e15628bdd517b90fe2ce3c1edf61aeb44e73",
+      "name": "natural-grounded-interaction-v1",
+      "reference_manifest": "data/natural-interaction-v1.reference-manifest.json",
+      "review_rejected": 0,
+      "source_semantic_tasks": 8675,
+      "tasks": 8675,
+      "tasks_sha256": "04d7abcee1428cd1285b3abfae99fb1addddfca25146c814a26e031c92c75b89",
+      "training_weight": 4.0
     }
   ],
-  "composed_dependency_depth_3_tasks": 6000,
-  "composed_tool_reasoning_tasks": 12000,
-  "compositional_capacity_bucket_counts": {
-    "128": 2000,
-    "16": 5000,
-    "32": 4000,
-    "64": 3000,
-    "8": 6000
-  },
-  "compositional_dependency_depth_16_plus_tasks": 7640,
-  "compositional_dependency_depth_3_plus_tasks": 17934,
-  "compositional_dependency_depth_4_plus_tasks": 16184,
-  "compositional_dependency_depth_8_plus_tasks": 12366,
-  "compositional_internal_correction_tasks": 2000,
-  "compositional_longtail_tasks": 20000,
-  "computational_dependency_depth_2_tasks": 6000,
-  "computational_parallel_then_merge_tasks": 2400,
-  "correction_dependency_depth_2_tasks": 10000,
-  "deep_tool_restraint_capacity_bucket_counts": {
-    "128": 1000,
-    "16": 1000,
-    "32": 1000,
-    "64": 1000
-  },
-  "deep_tool_restraint_depth_16_plus_tasks": 2611,
-  "deep_tool_restraint_min_dependency_depth": 8,
-  "deep_tool_restraint_tasks": 4000,
-  "dependency_depth_16_plus_tasks": 10251,
-  "dependency_depth_3_plus_tasks": 52699,
-  "dependency_depth_4_plus_tasks": 44289,
-  "dependency_depth_8_plus_tasks": 17054,
+  "generalization_probe_exact_logic_spec_overlap": 0,
+  "generalization_probe_strict_holdout_axes": [
+    "domain",
+    "exact_logic_spec"
+  ],
   "generalization_probe_tasks_excluded": 4000,
   "intentional_deep_restraint_overlap_with_compositional_longtail": 4000,
+  "intentional_natural_grounded_augmentation_overlap_with_public_tool_tasks": 8675,
   "intentional_tool_restraint_overlap_with_public_base": 6500,
-  "long_horizon_dependency_depth_histogram": {
-    "4": 3334,
-    "5": 5334,
-    "6": 3332
-  },
-  "long_horizon_depth_4_plus_tasks": 12000,
-  "long_horizon_depth_6_plus_tasks": 3332,
-  "long_horizon_max_trajectory_steps": 33,
-  "long_horizon_tool_reasoning_tasks": 12000,
   "mode_counts": {
     "no_tool": 39433,
-    "tool_required": 79075,
+    "tool_required": 87750,
     "tools_available_unnecessary": 13614
   },
   "mode_fractions": {
-    "no_tool": 0.29846,
-    "tool_required": 0.5985,
-    "tools_available_unnecessary": 0.10304
+    "no_tool": 0.28007,
+    "tool_required": 0.623238,
+    "tools_available_unnecessary": 0.096692
   },
-  "multilingual_cross_lingual_tasks": 1200,
-  "multilingual_prompt_language_counts": {
-    "en": 300,
-    "es": 225,
-    "ja": 225,
-    "zh": 450
+  "name": "training-semantic-mixture-v13",
+  "natural_grounded_long_form_tasks": 8675,
+  "natural_grounded_target_chars": {
+    "max": 480,
+    "p50": 181,
+    "p95": 355
   },
-  "multilingual_source_language_pair_counts": {
-    "en->ja": 225,
-    "en->zh": 450,
-    "fr->es": 225,
-    "zh->en": 300
+  "natural_public_source_semantic_tasks": 16102,
+  "natural_tool_schema_profiles": {
+    "archive": 1467,
+    "corpus": 1427,
+    "documents": 1420,
+    "evidence": 1464,
+    "index": 1390,
+    "knowledge": 1507
   },
-  "name": "training-semantic-mixture-v12",
+  "natural_tool_source_semantic_tasks": 8675,
   "review_rejected": 1953,
-  "self_identity_language_counts": {
-    "en": 540,
-    "zh": 180
-  },
-  "self_identity_tasks": 720,
-  "semantic_tasks": 132122,
-  "sequential_dependency_tasks": 44598,
-  "speculative_local_correction_tasks": 10000,
-  "split": "train-v12-causal-bootstrap-surface-v3-accepted-only",
-  "super_complex_64_plus_tasks": 5000,
+  "semantic_tasks": 140797,
+  "split": "train-v13-natural-grounded-long-form-weighted-strict-ood-surface-v4",
   "surface_diverse_replacements": {
     "cid-self-identity-v3": {
       "largest_normalized_prompt_group": 1,
@@ -220,12 +204,12 @@
       "reference_manifest": "data/self-identity-teacher-v3.reference-manifest.json",
       "semantic_text_fallback_plans": 0
     },
-    "complex-logic-reasoning-v3": {
+    "complex-logic-reasoning-v4": {
       "largest_normalized_prompt_group": 1,
-      "largest_normalized_semantic_text_group": 1947,
+      "largest_normalized_semantic_text_group": 1977,
       "normalized_prompt_signatures": 12000,
-      "normalized_semantic_text_signatures": 41686,
-      "reference_manifest": "data/logic-teacher-v3.reference-manifest.json",
+      "normalized_semantic_text_signatures": 41717,
+      "reference_manifest": "data/logic-teacher-v4.reference-manifest.json",
       "semantic_text_fallback_plans": 0
     },
     "composed-tool-reasoning-v3": {
@@ -236,12 +220,12 @@
       "reference_manifest": "data/composed-teacher-v3.reference-manifest.json",
       "semantic_text_fallback_plans": 0
     },
-    "compositional-longtail-reasoning-v3": {
+    "compositional-longtail-reasoning-v4": {
       "largest_normalized_prompt_group": 12,
-      "largest_normalized_semantic_text_group": 5404,
+      "largest_normalized_semantic_text_group": 5400,
       "normalized_prompt_signatures": 19011,
-      "normalized_semantic_text_signatures": 41301,
-      "reference_manifest": "data/compositional-teacher-v3.reference-manifest.json",
+      "normalized_semantic_text_signatures": 55959,
+      "reference_manifest": "data/compositional-teacher-v4.reference-manifest.json",
       "semantic_text_fallback_plans": 0
     },
     "computational-teacher-v3": {
@@ -252,12 +236,12 @@
       "reference_manifest": "data/computational-teacher-v3.reference-manifest.json",
       "semantic_text_fallback_plans": 0
     },
-    "deep-tool-restraint-v3": {
+    "deep-tool-restraint-v4": {
       "largest_normalized_prompt_group": 4,
-      "largest_normalized_semantic_text_group": 2037,
+      "largest_normalized_semantic_text_group": 2047,
       "normalized_prompt_signatures": 3948,
-      "normalized_semantic_text_signatures": 24252,
-      "reference_manifest": "data/deep-tool-restraint-v3.reference-manifest.json",
+      "normalized_semantic_text_signatures": 30418,
+      "reference_manifest": "data/deep-tool-restraint-v4.reference-manifest.json",
       "semantic_text_fallback_plans": 0
     },
     "long-horizon-tool-reasoning-v3": {
@@ -301,12 +285,14 @@
       "semantic_text_fallback_plans": 0
     }
   },
-  "symbolic_dependency_depth_2_tasks": 3600,
-  "symbolic_parallel_then_merge_tasks": 1200,
   "thought_capacity_required": 128,
-  "tool_required_dependency_depth_4_plus_tasks": 12105,
-  "tool_required_dependency_depth_6_plus_tasks": 3332,
-  "tool_restraint_tasks": 6500,
-  "ultra_complex_128_tasks": 2000,
-  "version": 12
+  "training_mass_policy": {
+    "long_form_grounded_fraction": 0.180758,
+    "natural_source_and_augmentation_fraction": 0.368283,
+    "natural_tool_fraction": 0.279602,
+    "policy": "balance every semantic task across schedule/trajectory length, then scale by explicit component training_weight; normalize global transition-weight mean to 1",
+    "tool_restraint_fraction": 0.082044,
+    "weighted_semantic_mass": 191969.0
+  },
+  "version": 13
 }

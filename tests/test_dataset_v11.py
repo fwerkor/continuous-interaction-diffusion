@@ -22,6 +22,7 @@ from cid.state import CellLifecycle, CognitiveRole
 from cid.surface_diversity_training import (
     SurfaceDiversityConfig,
     _normalized_surface_signature,
+    _rewrite_semantic_core,
     build_surface_diversified_distillation,
     diversify_tasks_and_plans,
 )
@@ -242,6 +243,24 @@ def test_surface_v3_retries_only_collided_semantic_wrapper(tmp_path) -> None:
     assert manifest["review_rejected"] == 0
     assert manifest["semantic_text_retry_plans"] == 1
     assert manifest["semantic_text_fallback_plans"] == 0
+
+
+def test_surface_v4_rewrites_high_frequency_semantic_templates() -> None:
+    source = "Need task-local evidence for the requested fact or relation."
+    variants = {_rewrite_semantic_core(source, selector) for selector in range(12)}
+
+    assert source not in variants
+    assert len(variants) == 6
+    assert all("evidence" in value.casefold() for value in variants)
+
+    reachability = {
+        _rewrite_semantic_core(
+            "node-17 is reachable under the directed-edge and block constraints.", i
+        )
+        for i in range(12)
+    }
+    assert len(reachability) == 6
+    assert all("node-17" in value for value in reachability)
 
 
 def _source_task(*, capacity: int, index: int, common_prompt: bool = False) -> TeacherTask:

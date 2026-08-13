@@ -165,6 +165,7 @@ class SurfaceDiversityConfig:
     surface_version: int = 2
     diversify_prompt: bool = True
     diversify_semantic_text: bool = False
+    rewrite_semantic_text: bool = False
     semantic_text_cap: int = 144
 
     def __post_init__(self) -> None:
@@ -330,6 +331,7 @@ def build_surface_diversified_distillation(
         ),
         "diversify_prompt": config.diversify_prompt,
         "diversify_semantic_text": config.diversify_semantic_text,
+        "rewrite_semantic_text": config.rewrite_semantic_text,
         "semantic_text_retry_plans": semantic_text_retry_plans,
         "semantic_text_fallback_plans": semantic_text_fallback_plans,
         "compiler": {
@@ -425,14 +427,118 @@ def _surface_semantic_plan(
             ).digest()
             prefix = prefixes[digest[0] % len(prefixes)]
             suffix = _SEMANTIC_STAGE_SUFFIXES[digest[1] % len(_SEMANTIC_STAGE_SUFFIXES)]
-            candidate = f"{prefix}{cell.semantic_text}{suffix}"
+            core = (
+                _rewrite_semantic_core(cell.semantic_text, digest[2])
+                if config.rewrite_semantic_text
+                else cell.semantic_text
+            )
+            candidate = f"{prefix}{core}{suffix}"
             if len(candidate) > config.semantic_text_cap:
-                candidate = f"{prefix}{cell.semantic_text}"
+                candidate = f"{prefix}{core}"
+            if len(candidate) > config.semantic_text_cap:
+                candidate = core
             if len(candidate) > config.semantic_text_cap:
                 candidate = cell.semantic_text
             cells.append(replace(cell, semantic_text=candidate))
         frames.append(replace(frame, cells=tuple(cells)))
     return replace(plan, frames=tuple(frames))
+
+
+def _rewrite_semantic_core(text: str, selector: int) -> str:
+    """Paraphrase a small set of high-frequency state templates without changing their payload."""
+
+    exact = {
+        "Need task-local evidence for the requested fact or relation.": (
+            "The requested fact still needs task-local evidence.",
+            "Task-local evidence is required before resolving the requested relation.",
+            "The requested relation remains open until local evidence arrives.",
+            "Keep the requested fact unresolved pending task-local evidence.",
+            "Resolve the requested fact only after the task-local evidence is available.",
+            "Evidence from this task is still needed for the requested relation.",
+        ),
+        (
+            "Several query-relevant branches remain unresolved; preserve them until their merge "
+            "conditions are checked."
+        ): (
+            (
+                "Keep the unresolved query branches separate until their merge conditions are "
+                "verified."
+            ),
+            (
+                "Multiple query branches are still open; retain each until its merge condition is "
+                "checked."
+            ),
+            (
+                "The query still has unresolved branches, so defer their merge until the "
+                "conditions hold."
+            ),
+            (
+                "Preserve the remaining query branches independently while their merge conditions "
+                "are pending."
+            ),
+            "Do not collapse the outstanding query branches before checking how they merge.",
+            "Unresolved query branches must stay distinct until the required merge checks finish.",
+        ),
+    }
+    choices = exact.get(text)
+    if choices is not None:
+        return choices[selector % len(choices)]
+
+    match = re.fullmatch(r"Need task-relevant facts about (.+)\.", text)
+    if match:
+        subject = match.group(1)
+        choices = (
+            f"Need evidence relevant to {subject}.",
+            f"Task-relevant facts about {subject} are still required.",
+            f"Resolve the needed facts for {subject} from the available records.",
+            f"The task still lacks the relevant facts about {subject}.",
+            f"Gather the task-specific evidence concerning {subject}.",
+            f"Evidence about {subject} is needed before continuing.",
+        )
+        return choices[selector % len(choices)]
+
+    match = re.fullmatch(r"(.+) is reachable under the directed-edge and block constraints\.", text)
+    if match:
+        node = match.group(1)
+        choices = (
+            f"The directed path reaches {node} without violating a block.",
+            f"Under the active edge and block rules, {node} remains reachable.",
+            f"A valid directed route to {node} survives all block constraints.",
+            f"The current directed graph permits reaching {node}.",
+            f"Reachability of {node} holds after applying the block constraints.",
+            f"The allowed directed edges still connect the start to {node}.",
+        )
+        return choices[selector % len(choices)]
+
+    match = re.fullmatch(
+        r"(.+) is not reached under the directed-edge and block constraints\.", text
+    )
+    if match:
+        node = match.group(1)
+        choices = (
+            f"No permitted directed path reaches {node} after applying the blocks.",
+            f"The active edge and block rules leave {node} unreachable.",
+            f"Every directed route to {node} is absent or blocked.",
+            f"The current directed graph does not reach {node}.",
+            f"Reachability of {node} fails under the block constraints.",
+            f"The allowed directed edges do not connect the start to {node}.",
+        )
+        return choices[selector % len(choices)]
+
+    match = re.fullmatch(r"Membership closure reaches (.+) without using any converse\.", text)
+    if match:
+        target = match.group(1)
+        choices = (
+            f"Forward membership closure reaches {target} without reversing any rule.",
+            f"The stated membership implications derive {target} in the forward direction only.",
+            f"Membership propagation reaches {target} without assuming a converse.",
+            f"Using only licensed implication directions, the closure includes {target}.",
+            f"The forward closure contains {target}; no converse step is needed.",
+            f"Directed membership reasoning is sufficient to reach {target}.",
+        )
+        return choices[selector % len(choices)]
+
+    return text
 
 
 def _select_tasks(

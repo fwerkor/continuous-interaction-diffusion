@@ -9,11 +9,11 @@
     },
     "compiled_transitions": 22000,
     "dependency_depth_buckets": {
-      "1-8": 236,
+      "1-8": 249,
       "17-32": 945,
       "33-64": 803,
       "65+": 800,
-      "9-16": 1216
+      "9-16": 1203
     },
     "domain_count": 8,
     "exact_verifier_failures": 0,
@@ -29,19 +29,20 @@
       "quantifier_dag": 400,
       "spatial_intervention": 400
     },
-    "link_instances": 1146872,
+    "link_instances": 1146932,
     "max_live_cells": 120,
     "max_physical_slot_index_plus_one": 128,
     "max_semantic_text_chars": 106,
     "surface_style_counts": {
-      "compact": 2014,
-      "ledger": 1329,
-      "narrative": 657
+      "compact": 2012,
+      "ledger": 1327,
+      "narrative": 661
     }
   },
-  "compiled_sha256": "3df644356220f67f5d988d350b21fad5a67a5e67b5620b58f77d534d4ad06f23",
+  "compiled_sha256": "74c7ba7bbb5fc3474f8d8faf177940d5142fc1ce8c916e6682aae814a83461b2",
   "compiled_trajectories": 4000,
   "compiled_transitions": 22000,
+  "exact_logic_spec_overlap_with_training": 0,
   "format_version": 1,
   "generalization_axes": [
     "unseen_domain",
@@ -52,14 +53,15 @@
     "graph_topology_shift"
   ],
   "name": "compositional-generalization-probe-v1",
-  "plans_sha256": "6167587d3468ceeaeff493dab9c1cf7ef938c100a88e24192a86fbe3d8980221",
-  "review_sha256": "15e91763601d95444d4be3da255ad00038ce3de809f6e63599a813d606b9965d",
+  "plans_sha256": "8159a4212ae3cefdef177459dc0d458dab02c0c2ba93f2df26c3855a56399cd5",
+  "review_sha256": "a1e81fa6ecad8805e43c5fd0e1c8b06180479acc8ab85357b15063707891aeac",
   "seed": 20360816,
   "semantic_tasks": 4000,
   "strict_holdout_axes": [
-    "domain"
+    "domain",
+    "exact_logic_spec"
   ],
-  "tasks_sha256": "e78421ff06d13b5671eb59de846883a362a2c633ac11de6a994d9f70f3a36855",
+  "tasks_sha256": "1d986151ef88ac20b12b674a22b576ba9f69a1b292125c768e7ed3c745c465ba",
   "thought_capacity_required": 128,
   "training_eligible": false,
   "version": 1

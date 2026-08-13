@@ -338,7 +338,8 @@ def test_training_semantic_mixture_v10_adds_longtail_and_long_horizon_without_pr
     assert compositional["tasks_sha256"] == longtail["tasks_sha256"]
     assert probe["semantic_tasks"] == 4_000
     assert probe["training_eligible"] is False
-    assert probe["strict_holdout_axes"] == ["domain"]
+    assert probe["strict_holdout_axes"] == ["domain", "exact_logic_spec"]
+    assert probe["exact_logic_spec_overlap_with_training"] == 0
     assert all(component["name"] != probe["name"] for component in mixture["components"])
 
     deep_tools = by_name["long-horizon-tool-reasoning-v1"]

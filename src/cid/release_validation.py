@@ -19,6 +19,15 @@ REFERENCE_KEYS = frozenset(
     }
 )
 RELEASE_PREFIXES = ("data/", "manifests/", "metadata/")
+SURFACE_SUMMARY_KEYS = frozenset(
+    {
+        "largest_normalized_prompt_group",
+        "largest_normalized_semantic_text_group",
+        "normalized_prompt_signatures",
+        "normalized_semantic_text_signatures",
+        "semantic_text_fallback_plans",
+    }
+)
 
 
 @dataclass(frozen=True, slots=True)
@@ -26,6 +35,14 @@ class ManifestReferenceIssue:
     manifest_path: str
     field_path: str
     target: str
+
+
+@dataclass(frozen=True, slots=True)
+class ManifestSummaryIssue:
+    component: str
+    key: str
+    declared: Any
+    actual: Any
 
 
 def find_missing_manifest_references(
@@ -113,3 +130,31 @@ def assert_release_references_resolve(
     raise ValueError(
         f"release contains {len(issues)} missing manifest references: {detail}{suffix}"
     )
+
+
+def find_surface_summary_mismatches(
+    root: str | Path,
+    semantic_mixture: str | Path,
+) -> tuple[ManifestSummaryIssue, ...]:
+    """Check cached surface-diversity summary fields against their reference manifests."""
+
+    root_path = Path(root)
+    mixture_path = root_path / semantic_mixture
+    mixture = json.loads(mixture_path.read_text(encoding="utf-8"))
+    issues: list[ManifestSummaryIssue] = []
+    for component, summary in mixture.get("surface_diverse_replacements", {}).items():
+        reference = summary.get("reference_manifest")
+        if not isinstance(reference, str):
+            continue
+        manifest = json.loads((root_path / reference).read_text(encoding="utf-8"))
+        for key in sorted(SURFACE_SUMMARY_KEYS & summary.keys() & manifest.keys()):
+            if summary[key] != manifest[key]:
+                issues.append(
+                    ManifestSummaryIssue(
+                        component=str(component),
+                        key=key,
+                        declared=summary[key],
+                        actual=manifest[key],
+                    )
+                )
+    return tuple(issues)

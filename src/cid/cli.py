@@ -272,6 +272,33 @@ def _build_deep_tool_restraint_training(args: argparse.Namespace) -> None:
     )
 
 
+def _build_natural_interaction_training(args: argparse.Namespace) -> None:
+    from cid.natural_interaction_training import (
+        NaturalInteractionConfig,
+        build_natural_interaction_augmentation,
+    )
+
+    manifest = build_natural_interaction_augmentation(
+        source_pairs=(
+            (args.public_tasks, args.public_plans),
+            (args.interaction_tasks, args.interaction_plans),
+        ),
+        output_dir=args.output_dir,
+        reference_manifest_output=args.reference_manifest_output,
+        config=NaturalInteractionConfig(
+            thought_capacity=args.thought_capacity,
+            variants_per_task=args.variants_per_task,
+            min_delay_steps=args.min_delay_steps,
+            max_delay_steps=args.max_delay_steps,
+            seed=args.seed,
+        ),
+    )
+    print(
+        f"tasks={manifest['semantic_tasks']} trajectories={manifest['compiled_trajectories']} "
+        f"long_form_targets={manifest['long_form_targets']}"
+    )
+
+
 def _build_surface_diverse_training(args: argparse.Namespace) -> None:
     from cid.surface_diversity_training import (
         SurfaceDiversityConfig,
@@ -513,6 +540,66 @@ def _build_surface_diverse_training(args: argparse.Namespace) -> None:
                 surface_version=3,
                 diversify_prompt=False,
                 diversify_semantic_text=True,
+            ),
+        ),
+        "logic-v4": (
+            "data/generated/logic-teacher-tasks-v1.jsonl",
+            "data/generated/logic-teacher-plans-v1.accepted.jsonl",
+            "data/generated/logic-v4",
+            "data/logic-teacher-v4.reference-manifest.json",
+            SurfaceDiversityConfig(
+                component_name="complex-logic-reasoning-v4",
+                file_stem="logic-v4",
+                thought_capacity=8,
+                variants_per_task=2,
+                min_delay_steps=1,
+                max_delay_steps=4,
+                seed=args.seed,
+                max_tasks=args.max_tasks,
+                surface_version=4,
+                diversify_prompt=False,
+                diversify_semantic_text=True,
+                rewrite_semantic_text=True,
+            ),
+        ),
+        "compositional-v4": (
+            "data/generated/compositional-teacher-tasks-v1.jsonl",
+            "data/generated/compositional-teacher-plans-v1.accepted.jsonl",
+            "data/generated/compositional-v4",
+            "data/compositional-teacher-v4.reference-manifest.json",
+            SurfaceDiversityConfig(
+                component_name="compositional-longtail-reasoning-v4",
+                file_stem="compositional-v4",
+                thought_capacity=128,
+                variants_per_task=2,
+                min_delay_steps=1,
+                max_delay_steps=4,
+                seed=args.seed,
+                max_tasks=args.max_tasks,
+                surface_version=4,
+                diversify_prompt=False,
+                diversify_semantic_text=True,
+                rewrite_semantic_text=True,
+            ),
+        ),
+        "deep-restraint-v4": (
+            "data/generated/deep-tool-restraint-v1/deep-tool-restraint-teacher-tasks-v1.jsonl",
+            "data/generated/deep-tool-restraint-v1/deep-tool-restraint-teacher-plans-v1.accepted.jsonl",
+            "data/generated/deep-restraint-v4",
+            "data/deep-tool-restraint-v4.reference-manifest.json",
+            SurfaceDiversityConfig(
+                component_name="deep-tool-restraint-v4",
+                file_stem="deep-restraint-v4",
+                thought_capacity=128,
+                variants_per_task=1,
+                min_delay_steps=1,
+                max_delay_steps=4,
+                seed=args.seed,
+                max_tasks=args.max_tasks,
+                surface_version=4,
+                diversify_prompt=False,
+                diversify_semantic_text=True,
+                rewrite_semantic_text=True,
             ),
         ),
     }
@@ -1462,6 +1549,37 @@ def main() -> None:
     )
     deep_restraint.add_argument("--seed", type=int, default=20260813)
 
+    natural_interaction = subparsers.add_parser(
+        "build-natural-interaction-training",
+        help="derive grounded long-form natural retrieval trajectories with varied tool schemas",
+    )
+    natural_interaction.add_argument(
+        "--public-tasks", default="data/generated/public-teacher-tasks-v1.train.jsonl"
+    )
+    natural_interaction.add_argument(
+        "--public-plans", default="data/generated/public-teacher-plans-v1.accepted.jsonl"
+    )
+    natural_interaction.add_argument(
+        "--interaction-tasks",
+        default="data/generated/public-interaction-teacher-tasks-v1.train.jsonl",
+    )
+    natural_interaction.add_argument(
+        "--interaction-plans",
+        default="data/generated/public-interaction-teacher-plans-v1.accepted.jsonl",
+    )
+    natural_interaction.add_argument(
+        "--output-dir", default="data/generated/natural-interaction-v1"
+    )
+    natural_interaction.add_argument(
+        "--reference-manifest-output",
+        default="data/natural-interaction-v1.reference-manifest.json",
+    )
+    natural_interaction.add_argument("--variants-per-task", type=int, default=2)
+    natural_interaction.add_argument("--thought-capacity", type=int, default=8)
+    natural_interaction.add_argument("--min-delay-steps", type=int, default=1)
+    natural_interaction.add_argument("--max-delay-steps", type=int, default=4)
+    natural_interaction.add_argument("--seed", type=int, default=20260813)
+
     surface = subparsers.add_parser(
         "build-surface-diverse-training",
         help="build surface-diversified replacements for template-heavy training components",
@@ -1482,6 +1600,9 @@ def main() -> None:
             "multilingual-v3",
             "compositional-v3",
             "deep-restraint-v3",
+            "logic-v4",
+            "compositional-v4",
+            "deep-restraint-v4",
         ),
         required=True,
     )
@@ -1738,6 +1859,8 @@ def main() -> None:
         _build_tool_restraint_training(args)
     elif args.command == "build-deep-tool-restraint-training":
         _build_deep_tool_restraint_training(args)
+    elif args.command == "build-natural-interaction-training":
+        _build_natural_interaction_training(args)
     elif args.command == "build-surface-diverse-training":
         _build_surface_diverse_training(args)
     elif args.command == "build-long-horizon-training":

@@ -114,3 +114,47 @@ def test_materialize_trajectory_mixture_rejects_duplicate_example_ids(tmp_path) 
             tmp_path / "combined.jsonl",
             tmp_path / "combined.manifest.json",
         )
+
+
+def test_materialize_trajectory_mixture_injects_component_semantic_weight(tmp_path) -> None:
+    examples = generate_synthetic(SyntheticConfig(count_per_family=1, seed=23, thought_capacity=8))
+    first_data, first_manifest_path, first = _component(tmp_path, "weighted", examples[:1])
+    second_data, second_manifest_path, second = _component(tmp_path, "ordinary", examples[1:2])
+    spec = {
+        "name": "weighted-mixture",
+        "version": 1,
+        "components": [
+            {
+                "name": "weighted",
+                "path": first_data.name,
+                "manifest": first_manifest_path.name,
+                "sha256": first.sha256,
+                "examples": first.examples,
+                "transitions": first.transitions,
+                "semantic_weight": 2.5,
+            },
+            {
+                "name": "ordinary",
+                "path": second_data.name,
+                "manifest": second_manifest_path.name,
+                "sha256": second.sha256,
+                "examples": second.examples,
+                "transitions": second.transitions,
+            },
+        ],
+    }
+    spec_path = tmp_path / "weighted-mixture.json"
+    spec_path.write_text(json.dumps(spec), encoding="utf-8")
+    output = tmp_path / "combined.jsonl"
+
+    manifest = materialize_trajectory_mixture(
+        spec_path,
+        output,
+        tmp_path / "combined.manifest.json",
+    )
+
+    rows = [json.loads(line) for line in output.read_text(encoding="utf-8").splitlines()]
+    assert rows[0]["metadata"]["training_weight"] == pytest.approx(2.5)
+    assert "training_weight" not in rows[1]["metadata"]
+    assert manifest["components"][0]["semantic_weight"] == pytest.approx(2.5)
+    assert manifest["components"][1]["semantic_weight"] == pytest.approx(1.0)

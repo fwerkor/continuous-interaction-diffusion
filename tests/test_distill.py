@@ -839,6 +839,55 @@ def test_future_leak_check_allows_future_text_already_visible_inside_search_titl
     assert _future_evidence_leaks(task, frames) == ()
 
 
+def test_future_leak_check_ignores_terminal_punctuation_on_visible_search_title() -> None:
+    task = TeacherTask(
+        task_id="search-title-terminal-punctuation",
+        prompt="Find the country from the task-local records.",
+        source_descriptors=(
+            {
+                "name": "workspace_search",
+                "description": "search local records",
+                "arguments": ({"name": "query", "kind": "string", "required": True},),
+            },
+            {
+                "name": "workspace_read",
+                "description": "read one local record",
+                "arguments": ({"name": "resource_id", "kind": "string", "required": True},),
+            },
+        ),
+        evidence=(
+            TeacherEvidence(
+                evidence_id="search-results",
+                source="workspace_search",
+                value=[{"resource_id": "doc-0", "title": "Bolesław I the Brave"}],
+                arguments={"query": "country"},
+            ),
+            TeacherEvidence(
+                evidence_id="support",
+                source="workspace_read",
+                value={"resource_id": "doc-0", "title": "Bolesław I the Brave."},
+                arguments={"resource_id": "doc-0"},
+                depends_on=("search-results",),
+            ),
+        ),
+    )
+    frames = (
+        TeacherFrame(
+            phase="after:search-results",
+            display="Relevant record identified.",
+            cells=(
+                TeacherCellPlan(
+                    cell_id="search",
+                    semantic_text="Relevant records: Bolesław I the Brave.",
+                    roles={CognitiveRole.PERCEPT: 1.0},
+                ),
+            ),
+        ),
+    )
+
+    assert _future_evidence_leaks(task, frames) == ()
+
+
 def test_teacher_quality_review_does_not_match_numeric_future_value_as_substring() -> None:
     source = {
         "name": "calculator",
