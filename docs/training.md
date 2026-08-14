@@ -275,18 +275,27 @@ zero rejects, missing responses, or soft warnings, and all 10,000 plans pass bot
 the local-correction audit. Exact hashes are pinned by
 `data/correction-teacher-v1.reference-manifest.json`.
 
-The latest semantic mixture, published as `manifests/training-semantic-mixture-v13.json` on Hugging Face, contains **140,797 semantic tasks**
-across 15 components. It adds 8,675 grounded long-form variants of accepted natural tool tasks and
-replaces the logic/compositional/deep-restraint slices with v4 TCT surfaces. The new grounded display
-targets have a median length of 181 characters and use six deterministic tool-schema profiles while
-retaining source provenance, anchors, links, and causal evidence contracts.
+The latest semantic mixture, published as `manifests/training-semantic-mixture-v14.json` on Hugging
+Face, contains **192,297 semantic tasks** across 19 components. Relative to v13 it adds 51,500
+independent train-only natural public tasks from Natural Questions Open, OASST1, MultiDoc2Dial, and
+QASPER. Their original user-facing prompts are preserved rather than wrapped in CID-specific
+causality instructions. The existing 4,000-task compositional OOD probe remains excluded from
+training.
 
 Schedule variants and trajectory length are first balanced at semantic-task granularity; explicit
-component `training_weight` is then applied. The resulting effective semantic loss mass is 36.8%
-natural source/augmentation supervision, 28.0% natural tool interaction, 18.1% grounded long-form
-display supervision, and 8.2% tool restraint. These are weights, not claims of independent source
-examples. The corresponding Hugging Face trajectory specification is `manifests/training-trajectory-mixture-v13.json`:
-**323,298 trajectories and 2,485,228 training transitions**, with maximum TCT capacity 128.
+component `training_weight` is then applied. v14 assigns about **49.0%** of effective semantic loss
+mass to natural source/augmentation supervision and **39.0%** to natural tool interaction while
+retaining the existing mechanism, symbolic, correction, long-horizon, compositional, and restraint
+curricula. These are weights, not claims of independent source examples. The corresponding Hugging
+Face trajectory specification is `manifests/training-trajectory-mixture-v14.json`:
+**421,798 trajectories and 3,011,462 training transitions**, with maximum TCT capacity 128.
+
+The four v14 natural sources contribute 51,500 new independent semantic tasks; together with the
+16,102 existing public-source tasks, the release contains **67,602 public-source semantic tasks**
+before counting behavioral augmentations such as tool restraint or grounded response rewriting.
+OASST1 is the main long-form no-tool addition, while MultiDoc2Dial and QASPER add naturally worded
+document-grounded responses. Natural Questions Open primarily broadens the distribution of real
+open-domain query wording.
 
 ### Compositional long-tail curriculum
 

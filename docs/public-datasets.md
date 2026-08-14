@@ -2,17 +2,19 @@
 
 CID keeps every externally sourced training-task dataset in pinned registries. The general-purpose
 pool is defined by `configs/public-datasets.json`; the interaction-heavy multi-hop pool is defined by
-`configs/public-interaction-datasets.json`. These registries are the source of truth for repository,
-config/split, revision, license, intended use, and sampling quota. Generated task-pool JSONL files
-are intentionally ignored by Git; they can be reproduced with `cid build-public-task-pool`.
+`configs/public-interaction-datasets.json`; the v14 natural-language expansion is defined by
+`configs/natural-public-datasets-v1.json`. These registries are the source of truth for repository,
+config/split, revision or archive hash, license, intended use, and sampling quota. Generated JSONL
+artifacts are intentionally ignored by Git and are rebuilt from the pinned inputs.
 
 ## Rules
 
 - Only sources listed in one of the committed public-dataset registries may enter a public task
   pool.
 - Every source is pinned to an exact upstream revision.
-- Training-task construction uses upstream **training** data only. Public benchmark test splits are
-  kept out of this pool so they remain available for later evaluation.
+- Training-task construction uses upstream **training** data only. Public benchmark validation/test
+  splits are not imported into the training release. Datasets used here must not later be reported as
+  unseen CID evaluation benchmarks merely because a different split was used.
 - The semantic task is assigned to CID train/validation/test before any toolization, timing
   randomization, or counterfactual expansion. All descendants of one `semantic_id` must remain in
   the same split.
@@ -136,6 +138,44 @@ Reference manifests for the teacher-ready components are
 `data/public-teacher-v1.train.reference-manifest.json` and
 `data/public-interaction-teacher-v1.train.reference-manifest.json`.
 
-When adding another public dataset, update its registry and this document in the same commit.
-Prefer upstream training splits with clear licensing and preserve evaluation splits for benchmarking
-whenever possible.
+## Natural public curriculum v1 (v14)
+
+v14 adds a separate natural-language curriculum whose purpose is distributional diversity rather
+than another synthetic reasoning family. It keeps upstream user-facing wording intact and does not
+prepend CID-specific dependency or evidence-waiting instructions.
+
+| Registry ID | Upstream dataset | Imported split | Pinned revision / archive | License | v14 tasks | CID use |
+|---|---|---|---|---|---:|---|
+| `nq-open` | `google-research-datasets/nq_open` | train | `5dd9790a83002ad084ddeb7c420dc716852c6f28` | CC-BY-SA-3.0 | 30,000 | Natural open-domain queries with a read-only knowledge lookup |
+| `oasst1` | `OpenAssistant/oasst1` | train | `fdf72ae0827c1cda404aff25b6603abec9e3399b` | Apache-2.0 | 4,500 | Reviewed human multi-turn instructions and responses; no-tool supervision |
+| `multidoc2dial` | IBM MultiDoc2Dial | train dialogues only | archive SHA-256 `f0c034c249663d7b3cb08b19cf2cc2c3d101372485be982621d4711931a1ce00` | CC-BY-3.0 | 15,000 | Human document-grounded dialogue turns using referenced document spans |
+| `qasper` | AllenAI QASPER | train only | archive SHA-256 `a28fdf966db827bcee3d873107d6b6669864fb7ca8fbf73a192f5e39191bdb5a` | CC-BY-4.0 | 2,000 | Research-paper questions grounded by human evidence annotations |
+
+Total: **51,500 new semantic tasks**. The builder filters exact prompt overlap against the existing
+public training tasks and the CID compositional generalization probe, then deduplicates the four new
+sources against one another. All selected tasks pass the normal CID teacher-plan review before
+trajectory compilation.
+
+Natural Questions Open supplies natural question/answer supervision rather than the original full
+Wikipedia evidence bundle, so CID models it as an idealized `knowledge_search` result containing the
+accepted answer aliases. MultiDoc2Dial and QASPER retain explicit document/evidence excerpts. OASST1
+uses only reviewed, non-synthetic English rank-0 assistant responses with additional quality,
+helpfulness, task-failure, PII, appropriateness, and toxicity filters.
+
+Build any pinned component with, for example:
+
+```bash
+cid build-natural-public-training --source nq-open
+```
+
+The source-specific quota and canonical local output paths default from the committed registry.
+`oasst1` compiles one no-tool trajectory per semantic task; the three evidence-backed sources compile
+two independently randomized arrival schedules per task.
+
+The four imported datasets are therefore **training sources**, not eligible unseen benchmark claims
+for the CID paper. Evaluation contamination checks should treat dataset identity, not only exact row
+identity, as the conservative boundary.
+
+When adding another public dataset, update its registry and this document in the same commit. Prefer
+upstream training splits with clear licensing, preserve provenance, and keep prospective CID benchmark
+families outside the training registry.

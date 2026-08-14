@@ -18,6 +18,7 @@ from cid.distill import (
     _competition_math_answer_match,
     _competition_math_choice_match,
     _future_evidence_leaks,
+    _visibility_contains_marker,
     build_teacher_request,
     compile_teacher_plans,
     dump_teacher_plans,
@@ -886,6 +887,13 @@ def test_future_leak_check_ignores_terminal_punctuation_on_visible_search_title(
     )
 
     assert _future_evidence_leaks(task, frames) == ()
+
+
+def test_future_leak_text_markers_do_not_match_inside_unrelated_words() -> None:
+    assert not _visibility_contains_marker("resolve the request before answering", "ann")
+    assert not _visibility_contains_marker("use external information after retrieval", "val")
+    assert _visibility_contains_marker("retrieved answer: ann", "ann")
+    assert _visibility_contains_marker("candidate value is val", "val")
 
 
 def test_teacher_quality_review_does_not_match_numeric_future_value_as_substring() -> None:

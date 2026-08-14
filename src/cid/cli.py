@@ -299,6 +299,52 @@ def _build_natural_interaction_training(args: argparse.Namespace) -> None:
     )
 
 
+def _build_natural_public_training(args: argparse.Namespace) -> None:
+    import json
+    from pathlib import Path
+
+    from cid.natural_public_training import (
+        NaturalPublicBuildConfig,
+        build_natural_public_component,
+        collect_unique_prompts_from_trajectories,
+    )
+
+    registry = json.loads(Path(args.registry).read_text(encoding="utf-8"))
+    source_spec = next(item for item in registry["sources"] if item["id"] == args.source)
+    quota = int(source_spec["quota"])
+    output_dir = args.output_dir or f"data/generated/natural-public-v1/{args.source}"
+    reference_manifest_output = (
+        args.reference_manifest_output
+        or f"data/natural-public-{args.source}-v1.reference-manifest.json"
+    )
+
+    exclude_prompts: list[str] = []
+    for path in args.exclude_trajectories:
+        exclude_prompts.extend(collect_unique_prompts_from_trajectories(path))
+    variants = 1 if args.source == "oasst1" else args.variants_per_task
+    manifest = build_natural_public_component(
+        registry_path=args.registry,
+        output_dir=output_dir,
+        reference_manifest_output=reference_manifest_output,
+        config=NaturalPublicBuildConfig(
+            source=args.source,
+            quota=quota,
+            seed=args.seed,
+            thought_capacity=args.thought_capacity,
+            variants_per_task=variants,
+            min_delay_steps=args.min_delay_steps,
+            max_delay_steps=args.max_delay_steps,
+        ),
+        exclude_prompts=exclude_prompts,
+        cache_dir=args.cache_dir,
+    )
+    print(
+        f"source={args.source} tasks={manifest['semantic_tasks']} "
+        f"trajectories={manifest['compiled_trajectories']} "
+        f"transitions={manifest['compiled_training_transitions']}"
+    )
+
+
 def _build_surface_diverse_training(args: argparse.Namespace) -> None:
     from cid.surface_diversity_training import (
         SurfaceDiversityConfig,
@@ -1580,6 +1626,26 @@ def main() -> None:
     natural_interaction.add_argument("--max-delay-steps", type=int, default=4)
     natural_interaction.add_argument("--seed", type=int, default=20260813)
 
+    natural_public = subparsers.add_parser(
+        "build-natural-public-training",
+        help="build train-only natural public CID tasks and grounded trajectories",
+    )
+    natural_public.add_argument(
+        "--source",
+        required=True,
+        choices=("nq-open", "oasst1", "multidoc2dial", "qasper"),
+    )
+    natural_public.add_argument("--registry", default="configs/natural-public-datasets-v1.json")
+    natural_public.add_argument("--output-dir", default=None)
+    natural_public.add_argument("--reference-manifest-output", default=None)
+    natural_public.add_argument("--exclude-trajectories", nargs="*", default=[])
+    natural_public.add_argument("--cache-dir", default=None)
+    natural_public.add_argument("--variants-per-task", type=int, default=2)
+    natural_public.add_argument("--thought-capacity", type=int, default=8)
+    natural_public.add_argument("--min-delay-steps", type=int, default=1)
+    natural_public.add_argument("--max-delay-steps", type=int, default=4)
+    natural_public.add_argument("--seed", type=int, default=20260814)
+
     surface = subparsers.add_parser(
         "build-surface-diverse-training",
         help="build surface-diversified replacements for template-heavy training components",
@@ -1861,6 +1927,8 @@ def main() -> None:
         _build_deep_tool_restraint_training(args)
     elif args.command == "build-natural-interaction-training":
         _build_natural_interaction_training(args)
+    elif args.command == "build-natural-public-training":
+        _build_natural_public_training(args)
     elif args.command == "build-surface-diverse-training":
         _build_surface_diverse_training(args)
     elif args.command == "build-long-horizon-training":

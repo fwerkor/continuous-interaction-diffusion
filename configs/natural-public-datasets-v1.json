@@ -1,0 +1,51 @@
+{
+  "version": 1,
+  "name": "natural-public-datasets-v1",
+  "seed": 20260814,
+  "policy": {
+    "upstream_splits": "train-only",
+    "preserve_original_prompt": true,
+    "exclude_existing_semantic_prompt_overlap": true,
+    "evaluation_splits_allowed": false
+  },
+  "sources": [
+    {
+      "id": "nq-open",
+      "repo": "google-research-datasets/nq_open",
+      "revision": "5dd9790a83002ad084ddeb7c420dc716852c6f28",
+      "file": "nq_open/train-00000-of-00001.parquet",
+      "license": "CC-BY-SA-3.0",
+      "quota": 30000,
+      "role": "natural-open-domain-query"
+    },
+    {
+      "id": "oasst1",
+      "repo": "OpenAssistant/oasst1",
+      "revision": "fdf72ae0827c1cda404aff25b6603abec9e3399b",
+      "file": "data/train-00000-of-00001-b42a775f407cee45.parquet",
+      "license": "Apache-2.0",
+      "quota": 4500,
+      "role": "human-multiturn-instruction-response"
+    },
+    {
+      "id": "multidoc2dial",
+      "repo": "IBM/multidoc2dial",
+      "revision": "1108a969d076f04c7367f0c2427d1c5d6d6bdaa0",
+      "url": "https://doc2dial.github.io/multidoc2dial/file/multidoc2dial.zip",
+      "sha256": "f0c034c249663d7b3cb08b19cf2cc2c3d101372485be982621d4711931a1ce00",
+      "license": "CC-BY-3.0",
+      "quota": 15000,
+      "role": "human-document-grounded-dialogue"
+    },
+    {
+      "id": "qasper",
+      "repo": "allenai/qasper",
+      "revision": "fdc9d8214fbab5dd782958601db4d678e6934a54",
+      "url": "https://qasper-dataset.s3.us-west-2.amazonaws.com/qasper-train-dev-v0.3.tgz",
+      "sha256": "a28fdf966db827bcee3d873107d6b6669864fb7ca8fbf73a192f5e39191bdb5a",
+      "license": "CC-BY-4.0",
+      "quota": 2000,
+      "role": "expert-paper-grounded-question-answering"
+    }
+  ]
+}

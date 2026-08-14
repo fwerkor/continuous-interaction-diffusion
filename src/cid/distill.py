@@ -2176,11 +2176,14 @@ def _future_evidence_leaks(
 
 
 def _visibility_contains_marker(frame_text: str, marker: str) -> bool:
-    """Match numeric evidence as a token, not as a substring of another number."""
+    """Match evidence surfaces at token boundaries instead of inside unrelated words."""
     numeric = marker.replace(",", "")
     if re.fullmatch(r"[-+]?\d+(?:\.\d+)?", numeric):
         return numeric.lstrip("+") in _number_tokens(frame_text)
-    return marker in frame_text
+    if not marker:
+        return False
+    pattern = rf"(?<!\w){re.escape(marker)}(?!\w)"
+    return re.search(pattern, frame_text) is not None
 
 
 def _frame_visibility_text(frame: TeacherFrame) -> str:

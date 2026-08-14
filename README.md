@@ -157,8 +157,9 @@ includes a complete tiny-backbone optimizer step with the pretrained backbone fr
 
 The raw semantic-task pool is built separately from CID trajectories. Public sources, exact
 revisions, licenses, upstream splits, and sampling quotas are registered in
-`configs/public-datasets.json` and `configs/public-interaction-datasets.json`, with the complete registry
-documented in `docs/public-datasets.md`. Build the pinned 10,000-task general pool with:
+`configs/public-datasets.json`, `configs/public-interaction-datasets.json`, and
+`configs/natural-public-datasets-v1.json`, with the complete registry documented in
+`docs/public-datasets.md`. Build the pinned 10,000-task general pool with:
 
 ```bash
 cid build-public-task-pool
@@ -181,35 +182,40 @@ cid prepare-public-distillation
 
 Released CID datasets are published on Hugging Face at `fwerkor/CID-Dataset`; the GitHub
 repository intentionally does not track release data or release manifests. The local `data/` tree is
-a gitignored build/training workspace. **v12 and v13 are both preserved as complete releases** so
+a gitignored build/training workspace. **v12, v13, and v14 are preserved as complete releases** so
 training artifacts do not skip a version.
 
 - **v12:** 132,122 semantic tasks, 305,948 trajectories, 2,303,169 training transitions;
   materialized SHA-256 `2f2da01e3963b4ac758e023dcb8659afc2d81999c88fd9df361ec058112f3478`.
-- **v13 (current):** 140,797 semantic tasks, 323,298 trajectories, 2,485,228 training transitions;
+- **v13:** 140,797 semantic tasks, 323,298 trajectories, 2,485,228 training transitions;
   materialized SHA-256 `fcda158c66f911b9521e37ffcbdba038710bde607a4762f498b0e70bd99f5de2`.
+- **v14 (current):** 192,297 semantic tasks, 421,798 trajectories, 3,011,462 training transitions.
+  Its materialized SHA-256 is pinned by the Hugging Face release manifest.
 
-v13 adds 8,675 grounded long-form variants of accepted natural tool tasks, six equivalent tool-schema
-profiles, v4 surface diversification for the logic/compositional/deep-restraint slices, and a
-4,000-task compositional OOD probe with zero exact logic-spec overlap with training. The grounded
-display targets have a median length of 181 characters and retain typed anchors and links.
+v14 adds **51,500 independent train-only natural public tasks**: 30,000 Natural Questions Open
+queries, 15,000 MultiDoc2Dial document-grounded dialogue turns, 4,500 high-quality human OASST1
+instruction/response examples, and 2,000 QASPER paper-grounded questions. Together with the existing
+public components this raises independent public-source supervision to 67,602 semantic tasks. The
+new tasks preserve the original user-facing wording; the builder does not prepend CID-specific
+"wait for evidence" or dependency-order scaffolding.
 
 The trainer first equalizes schedule/trajectory loss mass at semantic-task granularity and then
-applies explicit component `training_weight`. In v13, natural source/augmentation supervision receives
-about 36.8% of effective semantic loss mass, natural tool interaction 28.0%, grounded long-form
-display supervision 18.1%, and tool-restraint supervision 8.2%.
+applies explicit component `training_weight`. In v14, natural source/augmentation supervision receives
+about 49.0% of effective semantic loss mass and natural tool interaction about 39.0%. Existing
+mechanism, symbolic, correction, long-horizon, compositional, and restraint curricula remain in the
+mixture rather than being replaced by the new natural data.
 
 Download a pinned release into the local gitignored workspace before training, for example:
 
 ```bash
 hf download fwerkor/CID-Dataset \
-  data/generated/training-trajectories-v13.jsonl \
-  manifests/training-trajectories-v13.materialized.json \
-  --repo-type dataset --local-dir .cid/hf-v13
+  data/generated/training-trajectories-v14.jsonl \
+  manifests/training-trajectories-v14.materialized.json \
+  --repo-type dataset --local-dir .cid/hf-v14
 ```
 
 You may train directly from the downloaded materialized JSONL, or download the component directories
-and `manifests/training-trajectory-mixture-v13.json` if you want to reproduce materialization with
+and `manifests/training-trajectory-mixture-v14.json` if you want to reproduce materialization with
 `cid materialize-trajectory-mixture`.
 
 The materializer verifies every component SHA/count and global `example_id` uniqueness before
@@ -252,6 +258,10 @@ Build the current data-quality additions reproducibly with:
 
 ```bash
 cid build-natural-interaction-training
+cid build-natural-public-training --source nq-open
+cid build-natural-public-training --source oasst1
+cid build-natural-public-training --source multidoc2dial
+cid build-natural-public-training --source qasper
 cid build-compositional-training
 cid build-deep-tool-restraint-training
 cid build-surface-diverse-training --component logic-v4
@@ -266,9 +276,10 @@ high-frequency TCT state templates. The deep-restraint builder reuses accepted c
 exposes an irrelevant read-only source, and keeps every selected task free of evidence arrivals and
 tool needs.
 
-Generated task data lives under the gitignored local `data/` workspace and is never committed to GitHub. Every record retains exact
-upstream provenance; semantic IDs are deduplicated and assigned to the CID train/validation/test
-split before later toolization or timing augmentation.
+Generated task data lives under the gitignored local `data/` workspace and is never committed to
+GitHub. Every public record retains exact upstream provenance. The original public-pool builders
+assign content-keyed CID splits before toolization; the v14 natural-public registry is explicitly
+train-only and is deduplicated before timing augmentation.
 
 For deterministic mechanism-training data before teacher distillation is available:
 
