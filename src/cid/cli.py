@@ -1071,6 +1071,7 @@ def _train_stage_a(args: argparse.Namespace) -> None:
         ILLADA_8B_BASE_REVISION,
         CIDTrainer,
         CIDTrainerConfig,
+        CIDTrainProgress,
         ILLaDACIDAdapter,
         ILLaDACIDConfig,
         ILLaDATrajectoryTensorizer,
@@ -1183,6 +1184,11 @@ def _train_stage_a(args: argparse.Namespace) -> None:
         transition_count_total = sum(len(window.source_steps) for window in windows)
         output_dir = Path(args.output_dir)
         output_dir.mkdir(parents=True, exist_ok=True)
+        metrics_path = output_dir / "train_metrics.jsonl"
+        if args.log_every_steps <= 0:
+            raise ValueError("--log-every-steps must be positive")
+        if args.checkpoint_every_steps <= 0:
+            raise ValueError("--checkpoint-every-steps must be positive")
         trainable = sum(
             parameter.numel() for parameter in adapter.parameters() if parameter.requires_grad
         )
@@ -1195,6 +1201,10 @@ def _train_stage_a(args: argparse.Namespace) -> None:
             )
 
         first_epoch = trainer.state.epochs_completed + 1
+        run_started = time.monotonic()
+        next_checkpoint_step = (
+            trainer.state.optimizer_steps // args.checkpoint_every_steps + 1
+        ) * args.checkpoint_every_steps
         for epoch in range(first_epoch, first_epoch + args.epochs):
             local_windows = shard_rollout_windows(
                 windows,
@@ -1204,8 +1214,88 @@ def _train_stage_a(args: argparse.Namespace) -> None:
                 epoch=epoch,
                 shuffle=not args.no_shuffle,
             )
+            total_local_windows = len(local_windows)
+            resumed_windows = trainer.state.rollout_windows_seen_in_epoch
+            if resumed_windows:
+                if resumed_windows >= total_local_windows:
+                    raise ValueError(
+                        "checkpoint rollout position is outside the current epoch shard"
+                    )
+                local_windows = local_windows[resumed_windows:]
+                if rank == 0:
+                    print(
+                        f"resume epoch={epoch} optimizer_steps={trainer.state.optimizer_steps} "
+                        f"windows_seen={resumed_windows}/{total_local_windows}",
+                        flush=True,
+                    )
             rollout_probability = trainer.rollout_probability()
-            report = trainer.train_rollout_windows(local_windows, epochs=1, shuffle=False)
+
+            def report_progress(
+                progress: CIDTrainProgress,
+                *,
+                current_epoch: int = epoch,
+                current_rollout_probability: float = rollout_probability,
+                current_total_windows: int = total_local_windows,
+            ) -> None:
+                nonlocal next_checkpoint_step
+                loss_sum = progress.mean_loss * progress.transitions
+                interval_transitions = progress.transitions
+                if distributed:
+                    aggregate = torch.tensor(
+                        [loss_sum, float(interval_transitions)],
+                        device=device,
+                        dtype=torch.float64,
+                    )
+                    dist.all_reduce(aggregate)
+                    loss_sum = float(aggregate[0])
+                    interval_transitions = int(aggregate[1])
+                mean_loss = loss_sum / interval_transitions
+                windows_seen = progress.rollout_windows_seen_in_epoch
+                if rank == 0:
+                    record = {
+                        "timestamp": time.time(),
+                        "elapsed_seconds": time.monotonic() - run_started,
+                        "epoch": current_epoch,
+                        "optimizer_steps": progress.optimizer_steps,
+                        "interval_transitions": interval_transitions,
+                        "mean_loss": mean_loss,
+                        "learning_rate": progress.learning_rate,
+                        "rollout_probability": current_rollout_probability,
+                        "windows_seen_in_epoch": windows_seen,
+                        "windows_total_in_epoch": current_total_windows,
+                    }
+                    with metrics_path.open("a", encoding="utf-8") as handle:
+                        handle.write(json.dumps(record, sort_keys=True) + "\n")
+                    print(
+                        f"progress epoch={current_epoch} "
+                        f"optimizer_steps={progress.optimizer_steps} "
+                        f"mean_loss={mean_loss:.6f} lr={progress.learning_rate:.6g} "
+                        f"windows={windows_seen}/{current_total_windows}",
+                        flush=True,
+                    )
+
+                checkpoint_due = progress.optimizer_steps >= next_checkpoint_step
+                if checkpoint_due and windows_seen < current_total_windows:
+                    if rank == 0:
+                        checkpoint = output_dir / "stage-a-latest.pt"
+                        trainer.save_checkpoint(checkpoint)
+                        print(
+                            f"checkpoint optimizer_steps={progress.optimizer_steps} "
+                            f"path={checkpoint}",
+                            flush=True,
+                        )
+                    while next_checkpoint_step <= progress.optimizer_steps:
+                        next_checkpoint_step += args.checkpoint_every_steps
+                    if distributed:
+                        dist.barrier()
+
+            report = trainer.train_rollout_windows(
+                local_windows,
+                epochs=1,
+                shuffle=False,
+                progress_every_optimizer_steps=args.log_every_steps,
+                progress_callback=report_progress,
+            )
 
             loss_sum = report.mean_loss * report.transitions
             transition_count = report.transitions
@@ -1224,10 +1314,14 @@ def _train_stage_a(args: argparse.Namespace) -> None:
             checkpoint = output_dir / f"stage-a-step-{trainer.state.optimizer_steps:08d}.pt"
             if rank == 0:
                 trainer.save_checkpoint(checkpoint)
+                latest = output_dir / "stage-a-latest.pt"
+                latest.unlink(missing_ok=True)
+                latest.symlink_to(checkpoint.name)
                 print(
                     f"epoch={epoch} transitions={transition_count} "
                     f"optimizer_steps={report.optimizer_steps} mean_loss={mean_loss:.6f} "
-                    f"rollout_probability={rollout_probability:.3f} checkpoint={checkpoint}"
+                    f"rollout_probability={rollout_probability:.3f} checkpoint={checkpoint}",
+                    flush=True,
                 )
             if distributed:
                 dist.barrier()
@@ -1868,6 +1962,8 @@ def main() -> None:
     train.add_argument("--seed", type=int, default=0)
     train.add_argument("--max-examples", type=int)
     train.add_argument("--no-shuffle", action="store_true")
+    train.add_argument("--log-every-steps", type=int, default=100)
+    train.add_argument("--checkpoint-every-steps", type=int, default=5000)
     train.add_argument(
         "--gradient-checkpointing",
         action=argparse.BooleanOptionalAction,

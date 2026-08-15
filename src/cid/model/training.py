@@ -219,6 +219,7 @@ class CIDTrainerState:
     transitions_seen: int = 0
     optimizer_steps: int = 0
     epochs_completed: int = 0
+    rollout_windows_seen_in_epoch: int = 0
 
 
 @dataclass(frozen=True, slots=True)
@@ -228,8 +229,18 @@ class CIDTrainReport:
     mean_loss: float
 
 
+@dataclass(frozen=True, slots=True)
+class CIDTrainProgress:
+    transitions: int
+    optimizer_steps: int
+    mean_loss: float
+    rollout_windows_seen_in_epoch: int
+    learning_rate: float
+
+
 class CIDTrainer:
-    CHECKPOINT_VERSION = 1
+    CHECKPOINT_VERSION = 2
+    SUPPORTED_CHECKPOINT_VERSIONS = (1, 2)
 
     def __init__(
         self,
@@ -380,6 +391,7 @@ class CIDTrainer:
             transitions_seen=self.state.transitions_seen + batch_size,
             optimizer_steps=self.state.optimizer_steps,
             epochs_completed=self.state.epochs_completed,
+            rollout_windows_seen_in_epoch=self.state.rollout_windows_seen_in_epoch,
         )
         if self._pending_accumulation >= self.config.gradient_accumulation_steps:
             self._optimizer_step()
@@ -437,14 +449,52 @@ class CIDTrainer:
         *,
         epochs: int = 1,
         shuffle: bool = True,
+        progress_every_optimizer_steps: int | None = None,
+        progress_callback: Callable[[CIDTrainProgress], None] | None = None,
     ) -> CIDTrainReport:
         if epochs <= 0:
             raise ValueError("epochs must be positive")
         if not windows:
             raise ValueError("training data contains no rollout windows")
+        if progress_callback is not None and progress_every_optimizer_steps is None:
+            raise ValueError("progress callback requires progress_every_optimizer_steps")
+        if progress_every_optimizer_steps is not None and progress_every_optimizer_steps <= 0:
+            raise ValueError("progress_every_optimizer_steps must be positive")
         total_loss = 0.0
         total_transitions = 0
         start_optimizer_steps = self.state.optimizer_steps
+        progress_loss = 0.0
+        progress_transitions = 0
+        next_progress_step = None
+        if progress_callback is not None and progress_every_optimizer_steps is not None:
+            next_progress_step = (
+                self.state.optimizer_steps // progress_every_optimizer_steps + 1
+            ) * progress_every_optimizer_steps
+
+        def emit_progress_if_due() -> None:
+            nonlocal progress_loss, progress_transitions, next_progress_step
+            if (
+                progress_callback is None
+                or progress_every_optimizer_steps is None
+                or next_progress_step is None
+                or self.state.optimizer_steps < next_progress_step
+                or progress_transitions == 0
+            ):
+                return
+            progress_callback(
+                CIDTrainProgress(
+                    transitions=progress_transitions,
+                    optimizer_steps=self.state.optimizer_steps,
+                    mean_loss=progress_loss / progress_transitions,
+                    rollout_windows_seen_in_epoch=self.state.rollout_windows_seen_in_epoch,
+                    learning_rate=float(self.optimizer.param_groups[0]["lr"]),
+                )
+            )
+            progress_loss = 0.0
+            progress_transitions = 0
+            while next_progress_step <= self.state.optimizer_steps:
+                next_progress_step += progress_every_optimizer_steps
+
         for _ in range(epochs):
             rollout_probability = self.rollout_probability()
             buckets: dict[tuple[int, float], list[CIDRolloutWindow]] = {}
@@ -463,12 +513,25 @@ class CIDTrainer:
                     )
                     total_loss += loss_sum
                     total_transitions += transitions
+                    progress_loss += loss_sum
+                    progress_transitions += transitions
+                    self.state = CIDTrainerState(
+                        transitions_seen=self.state.transitions_seen,
+                        optimizer_steps=self.state.optimizer_steps,
+                        epochs_completed=self.state.epochs_completed,
+                        rollout_windows_seen_in_epoch=(
+                            self.state.rollout_windows_seen_in_epoch + len(microbatch)
+                        ),
+                    )
+                    emit_progress_if_due()
+            self.flush()
+            emit_progress_if_due()
             self.state = CIDTrainerState(
                 transitions_seen=self.state.transitions_seen,
                 optimizer_steps=self.state.optimizer_steps,
                 epochs_completed=self.state.epochs_completed + 1,
+                rollout_windows_seen_in_epoch=0,
             )
-        self.flush()
         return CIDTrainReport(
             transitions=total_transitions,
             optimizer_steps=self.state.optimizer_steps - start_optimizer_steps,
@@ -511,6 +574,7 @@ class CIDTrainer:
                 transitions_seen=self.state.transitions_seen,
                 optimizer_steps=self.state.optimizer_steps,
                 epochs_completed=self.state.epochs_completed + 1,
+                rollout_windows_seen_in_epoch=self.state.rollout_windows_seen_in_epoch,
             )
         self.flush()
         return CIDTrainReport(
@@ -545,6 +609,9 @@ class CIDTrainer:
             transitions_seen=int(trainer_state["transitions_seen"]),
             optimizer_steps=int(trainer_state["optimizer_steps"]),
             epochs_completed=int(trainer_state.get("epochs_completed", 0)),
+            rollout_windows_seen_in_epoch=int(
+                trainer_state.get("rollout_windows_seen_in_epoch", 0)
+            ),
         )
         self.generator.set_state(state["generator_state"])
         self.shuffle_rng.setstate(state["shuffle_state"])
@@ -553,36 +620,42 @@ class CIDTrainer:
         self.optimizer.zero_grad(set_to_none=True)
 
     def save_checkpoint(self, path: str | Path) -> None:
-        if self._pending_accumulation:
-            raise RuntimeError("flush accumulated gradients before saving a checkpoint")
         destination = Path(path)
         destination.parent.mkdir(parents=True, exist_ok=True)
         trainable_state = {
             name: parameter.detach().cpu().clone() for name, parameter in self._trainable
         }
-        torch.save(
-            {
-                "format_version": self.CHECKPOINT_VERSION,
-                "trainer_config": asdict(self.config),
-                "trainer_state": asdict(self.state),
-                "adapter_config": asdict(self.adapter.config),
-                "backbone": {
-                    "model_type": str(self.adapter.backbone.config.model_type),
-                    "hidden_size": self.adapter.d_model,
-                    "vocab_size": self.adapter.vocab_size,
-                },
-                "trainable_names": self.trainable_parameter_names,
-                "model_state": trainable_state,
-                "optimizer_state": self.optimizer.state_dict(),
-                "generator_state": self.generator.get_state().cpu(),
-                "shuffle_state": self.shuffle_rng.getstate(),
+        gradient_state = {
+            name: parameter.grad.detach().cpu().clone()
+            for name, parameter in self._trainable
+            if parameter.grad is not None
+        }
+        payload = {
+            "format_version": self.CHECKPOINT_VERSION,
+            "trainer_config": asdict(self.config),
+            "trainer_state": asdict(self.state),
+            "adapter_config": asdict(self.adapter.config),
+            "backbone": {
+                "model_type": str(self.adapter.backbone.config.model_type),
+                "hidden_size": self.adapter.d_model,
+                "vocab_size": self.adapter.vocab_size,
             },
-            destination,
-        )
+            "trainable_names": self.trainable_parameter_names,
+            "model_state": trainable_state,
+            "optimizer_state": self.optimizer.state_dict(),
+            "generator_state": self.generator.get_state().cpu(),
+            "shuffle_state": self.shuffle_rng.getstate(),
+            "gradient_state": gradient_state,
+            "pending_accumulation": self._pending_accumulation,
+            "pending_examples": self._pending_examples,
+        }
+        temporary = destination.with_name(f".{destination.name}.tmp")
+        torch.save(payload, temporary)
+        temporary.replace(destination)
 
     def load_checkpoint(self, path: str | Path) -> None:
         checkpoint = torch.load(path, map_location="cpu", weights_only=False)
-        if checkpoint.get("format_version") != self.CHECKPOINT_VERSION:
+        if checkpoint.get("format_version") not in self.SUPPORTED_CHECKPOINT_VERSIONS:
             raise ValueError("unsupported CID trainer checkpoint version")
         if checkpoint["trainer_config"] != asdict(self.config):
             raise ValueError("checkpoint trainer configuration does not match this trainer")
@@ -612,10 +685,20 @@ class CIDTrainer:
             transitions_seen=int(state["transitions_seen"]),
             optimizer_steps=int(state["optimizer_steps"]),
             epochs_completed=int(state.get("epochs_completed", 0)),
+            rollout_windows_seen_in_epoch=int(state.get("rollout_windows_seen_in_epoch", 0)),
         )
-        self._pending_accumulation = 0
-        self._pending_examples = 0
         self.optimizer.zero_grad(set_to_none=True)
+        self._pending_accumulation = int(checkpoint.get("pending_accumulation", 0))
+        self._pending_examples = int(checkpoint.get("pending_examples", 0))
+        gradient_state = checkpoint.get("gradient_state", {})
+        parameters = dict(self._trainable)
+        for name, saved in gradient_state.items():
+            parameter = parameters[name]
+            parameter.grad = saved.to(device=parameter.device, dtype=parameter.dtype)
+        if self._pending_accumulation == 0 and (self._pending_examples or gradient_state):
+            raise ValueError("checkpoint contains gradients without pending accumulation")
+        if self._pending_accumulation > 0 and self._pending_examples <= 0:
+            raise ValueError("checkpoint pending accumulation is missing example count")
 
     def _optimizer_step(self) -> None:
         if self._pending_examples <= 0:
@@ -638,6 +721,7 @@ class CIDTrainer:
             transitions_seen=self.state.transitions_seen,
             optimizer_steps=self.state.optimizer_steps + 1,
             epochs_completed=self.state.epochs_completed,
+            rollout_windows_seen_in_epoch=self.state.rollout_windows_seen_in_epoch,
         )
 
     def _sample_timestep(self) -> float:
@@ -655,7 +739,7 @@ def load_cid_adapter_checkpoint(
     """Load the CID model state from a trainer checkpoint without restoring an optimizer."""
 
     checkpoint = torch.load(path, map_location="cpu", weights_only=False)
-    if checkpoint.get("format_version") != CIDTrainer.CHECKPOINT_VERSION:
+    if checkpoint.get("format_version") not in CIDTrainer.SUPPORTED_CHECKPOINT_VERSIONS:
         raise ValueError("unsupported CID trainer checkpoint version")
     backbone = checkpoint["backbone"]
     if (
@@ -681,6 +765,7 @@ def load_cid_adapter_checkpoint(
         transitions_seen=int(state["transitions_seen"]),
         optimizer_steps=int(state["optimizer_steps"]),
         epochs_completed=int(state.get("epochs_completed", 0)),
+        rollout_windows_seen_in_epoch=int(state.get("rollout_windows_seen_in_epoch", 0)),
     )
 
 

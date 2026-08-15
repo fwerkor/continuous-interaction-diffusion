@@ -669,6 +669,84 @@ def test_trainer_checkpoint_restores_trainable_state_optimizer_and_progress(tmp_
         assert torch.equal(original_parameters[name], inference_parameters[name])
 
 
+def test_trainer_checkpoint_restores_pending_gradient_accumulation(tmp_path) -> None:
+    config = CIDTrainerConfig(
+        learning_rate=1e-3,
+        gradient_accumulation_steps=2,
+        timestep_min=1.0,
+        timestep_max=1.0,
+        seed=11,
+    )
+    example = make_rollout_trajectory()
+
+    baseline_adapter = make_adapter(seed=78)
+    baseline = CIDTrainer(
+        baseline_adapter,
+        ILLaDATrajectoryTensorizer(baseline_adapter, TinyTokenizer()),
+        config,
+    )
+    baseline.train_transition(example, 0)
+    baseline.train_transition(example, 1)
+
+    adapter = make_adapter(seed=78)
+    trainer = CIDTrainer(
+        adapter,
+        ILLaDATrajectoryTensorizer(adapter, TinyTokenizer()),
+        config,
+    )
+    trainer.train_transition(example, 0)
+    path = tmp_path / "mid-accumulation.pt"
+    trainer.save_checkpoint(path)
+
+    restored_adapter = make_adapter(seed=78)
+    restored = CIDTrainer(
+        restored_adapter,
+        ILLaDATrajectoryTensorizer(restored_adapter, TinyTokenizer()),
+        config,
+    )
+    restored.load_checkpoint(path)
+    restored.train_transition(example, 1)
+
+    baseline_parameters = dict(baseline_adapter.named_parameters())
+    restored_parameters = dict(restored_adapter.named_parameters())
+    for name in baseline.trainable_parameter_names:
+        assert torch.allclose(baseline_parameters[name], restored_parameters[name])
+    assert restored.state.optimizer_steps == 1
+
+
+def test_rollout_training_reports_interval_progress() -> None:
+    adapter = make_adapter(seed=79)
+    trainer = CIDTrainer(
+        adapter,
+        ILLaDATrajectoryTensorizer(adapter, TinyTokenizer()),
+        CIDTrainerConfig(
+            learning_rate=1e-3,
+            gradient_accumulation_steps=1,
+            rollout_horizon=2,
+            timestep_min=1.0,
+            timestep_max=1.0,
+        ),
+    )
+    windows = trajectory_rollout_windows((make_rollout_trajectory(),), max_horizon=2)
+    progress = []
+
+    trainer.train_rollout_windows(
+        windows,
+        epochs=1,
+        shuffle=False,
+        progress_every_optimizer_steps=1,
+        progress_callback=progress.append,
+    )
+
+    assert progress
+    assert all(item.mean_loss > 0.0 for item in progress)
+    assert [item.optimizer_steps for item in progress] == sorted(
+        item.optimizer_steps for item in progress
+    )
+    assert progress[-1].rollout_windows_seen_in_epoch == len(windows)
+    assert trainer.state.rollout_windows_seen_in_epoch == 0
+
+
 def test_transition_sharding_is_balanced_deterministic_and_complete() -> None:
     examples = tuple(replace(make_trajectory(), example_id=f"train-{index}") for index in range(5))
     transitions = trajectory_transitions(examples)
