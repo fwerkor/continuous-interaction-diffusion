@@ -84,7 +84,11 @@ class CIDExternalFusion(nn.Module):
             need_weights=False,
         )
         gate = torch.sigmoid(self.external_gate(torch.cat((hidden, external), dim=-1)))
-        return self.final_norm(hidden + gate * external)
+        fused = self.final_norm(hidden + gate * external)
+        # The null token is conditionally included in attention memory. Keep its
+        # parameter connected to every graph so DDP sees a stable trainable set
+        # even when ranks receive different external-memory layouts.
+        return fused + self.null_external.sum() * 0.0
 
     def _external_memory(
         self,

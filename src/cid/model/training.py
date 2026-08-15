@@ -1707,7 +1707,7 @@ def wrap_stage_a_ddp(
     )
     kwargs: dict[str, object] = {
         "device_ids": device_ids,
-        "find_unused_parameters": True,
+        "find_unused_parameters": False,
     }
     if "forward_sync_buffers" in signature(DistributedDataParallel).parameters:
         kwargs["forward_sync_buffers"] = False

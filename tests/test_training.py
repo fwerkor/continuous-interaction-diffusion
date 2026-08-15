@@ -818,6 +818,29 @@ def test_stage_a_ddp_handles_batches_with_unused_external_modules(tmp_path) -> N
         dist.destroy_process_group()
 
 
+def test_stage_a_ddp_two_rank_mixed_external_graph_smoke() -> None:
+    if not dist.is_available():
+        pytest.skip("torch.distributed is unavailable")
+    worker = Path(__file__).with_name("ddp_stage_a_worker.py")
+    completed = subprocess.run(
+        [
+            sys.executable,
+            "-m",
+            "torch.distributed.run",
+            "--standalone",
+            "--nproc-per-node=2",
+            str(worker),
+        ],
+        cwd=Path(__file__).resolve().parents[1],
+        capture_output=True,
+        text=True,
+        timeout=60,
+        check=False,
+    )
+
+    assert completed.returncode == 0, completed.stdout + completed.stderr
+
+
 @pytest.mark.filterwarnings("ignore:FSDP is switching to use.*NO_SHARD.*")
 @pytest.mark.filterwarnings("ignore:When using .*NO_SHARD.*")
 def test_stage_b_fsdp_runs_full_parameter_optimizer_step_on_cpu(tmp_path) -> None:

@@ -1187,7 +1187,12 @@ def _train_stage_a(args: argparse.Namespace) -> None:
         transition_count_total = sum(len(window.source_steps) for window in windows)
         output_dir = Path(args.output_dir)
         output_dir.mkdir(parents=True, exist_ok=True)
-        metrics_path = output_dir / "train_metrics.jsonl"
+        metrics_path = (
+            output_dir / f"train_metrics.rank-{rank:04d}.jsonl"
+            if distributed
+            else output_dir / "train_metrics.jsonl"
+        )
+        rank_zero_metrics_path = output_dir / "train_metrics.jsonl"
         if args.log_every_steps <= 0:
             raise ValueError("--log-every-steps must be positive")
         if args.checkpoint_every_steps <= 0:
@@ -1245,36 +1250,32 @@ def _train_stage_a(args: argparse.Namespace) -> None:
                 loss_sum = progress.mean_loss * progress.transitions
                 raw_loss_sum = progress.raw_mean_loss * progress.transitions
                 interval_transitions = progress.transitions
-                if distributed:
-                    aggregate = torch.tensor(
-                        [loss_sum, raw_loss_sum, float(interval_transitions)],
-                        device=device,
-                        dtype=torch.float64,
-                    )
-                    dist.all_reduce(aggregate)
-                    loss_sum = float(aggregate[0])
-                    raw_loss_sum = float(aggregate[1])
-                    interval_transitions = int(aggregate[2])
                 mean_loss = loss_sum / interval_transitions
                 raw_mean_loss = raw_loss_sum / interval_transitions
                 windows_seen = progress.rollout_windows_seen_in_epoch
+                record = {
+                    "timestamp": time.time(),
+                    "elapsed_seconds": time.monotonic() - run_started,
+                    "epoch": current_epoch,
+                    "rank": rank,
+                    "world_size": world_size,
+                    "aggregation": "local_rank",
+                    "optimizer_steps": progress.optimizer_steps,
+                    "interval_transitions": interval_transitions,
+                    "mean_loss": mean_loss,
+                    "weighted_mean_loss": mean_loss,
+                    "raw_mean_loss": raw_mean_loss,
+                    "learning_rate": progress.learning_rate,
+                    "rollout_probability": current_rollout_probability,
+                    "windows_seen_in_epoch": windows_seen,
+                    "windows_total_in_epoch": current_total_windows,
+                }
+                with metrics_path.open("a", encoding="utf-8") as handle:
+                    handle.write(json.dumps(record, sort_keys=True) + "\n")
                 if rank == 0:
-                    record = {
-                        "timestamp": time.time(),
-                        "elapsed_seconds": time.monotonic() - run_started,
-                        "epoch": current_epoch,
-                        "optimizer_steps": progress.optimizer_steps,
-                        "interval_transitions": interval_transitions,
-                        "mean_loss": mean_loss,
-                        "weighted_mean_loss": mean_loss,
-                        "raw_mean_loss": raw_mean_loss,
-                        "learning_rate": progress.learning_rate,
-                        "rollout_probability": current_rollout_probability,
-                        "windows_seen_in_epoch": windows_seen,
-                        "windows_total_in_epoch": current_total_windows,
-                    }
-                    with metrics_path.open("a", encoding="utf-8") as handle:
-                        handle.write(json.dumps(record, sort_keys=True) + "\n")
+                    if distributed:
+                        with rank_zero_metrics_path.open("a", encoding="utf-8") as handle:
+                            handle.write(json.dumps(record, sort_keys=True) + "\n")
                     print(
                         f"progress epoch={current_epoch} "
                         f"optimizer_steps={progress.optimizer_steps} "
@@ -1296,8 +1297,6 @@ def _train_stage_a(args: argparse.Namespace) -> None:
                         )
                     while next_checkpoint_step <= progress.optimizer_steps:
                         next_checkpoint_step += args.checkpoint_every_steps
-                    if distributed:
-                        dist.barrier()
 
             report = trainer.train_rollout_windows(
                 local_windows,
@@ -1311,17 +1310,6 @@ def _train_stage_a(args: argparse.Namespace) -> None:
             loss_sum = report.mean_loss * report.transitions
             raw_loss_sum = report.raw_mean_loss * report.transitions
             transition_count = report.transitions
-            if distributed:
-                aggregate = torch.tensor(
-                    [loss_sum, raw_loss_sum, float(transition_count)],
-                    device=device,
-                    dtype=torch.float64,
-                )
-                dist.all_reduce(aggregate)
-                loss_sum = float(aggregate[0])
-                raw_loss_sum = float(aggregate[1])
-                transition_count = int(aggregate[2])
-                dist.barrier()
             mean_loss = loss_sum / transition_count
             raw_mean_loss = raw_loss_sum / transition_count
 
@@ -1338,8 +1326,6 @@ def _train_stage_a(args: argparse.Namespace) -> None:
                     f"checkpoint={checkpoint}",
                     flush=True,
                 )
-            if distributed:
-                dist.barrier()
     finally:
         if distributed and dist.is_initialized():
             dist.destroy_process_group()
