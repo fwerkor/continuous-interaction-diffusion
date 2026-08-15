@@ -1094,9 +1094,7 @@ def test_semantic_task_balancing_equalizes_total_transition_loss_mass() -> None:
 
     assert mass["short"] == pytest.approx(mass["long"])
     total_transitions = sum(len(window.source_steps) for window in balanced)
-    weighted_transitions = sum(
-        len(window.source_steps) * window.loss_weight for window in balanced
-    )
+    weighted_transitions = sum(len(window.source_steps) * window.loss_weight for window in balanced)
     assert weighted_transitions == pytest.approx(total_transitions)
 
 
@@ -1121,10 +1119,84 @@ def test_semantic_task_balancing_respects_declared_training_weight() -> None:
 
     assert mass["emphasized"] == pytest.approx(3.0 * mass["ordinary"])
     total_transitions = sum(len(window.source_steps) for window in balanced)
-    weighted_transitions = sum(
-        len(window.source_steps) * window.loss_weight for window in balanced
-    )
+    weighted_transitions = sum(len(window.source_steps) * window.loss_weight for window in balanced)
     assert weighted_transitions == pytest.approx(total_transitions)
+
+
+def test_rollout_sharding_globally_mixes_weighted_microbatches() -> None:
+    examples = tuple(replace(make_trajectory(), example_id=f"mix-{index}") for index in range(24))
+    windows = list(trajectory_rollout_windows(examples, max_horizon=3))
+    weighted = tuple(
+        replace(window, loss_weight=0.5 if index < len(windows) // 2 else 2.0)
+        for index, window in enumerate(windows)
+    )
+    shards = tuple(
+        shard_rollout_windows(
+            weighted,
+            world_size=3,
+            rank=rank,
+            seed=11,
+            epoch=4,
+            micro_batch_size=2,
+        )
+        for rank in range(3)
+    )
+
+    chunk_weight_sequences = []
+    for shard in shards:
+        assert len(shard) % 2 == 0
+        chunk_weights = []
+        for start in range(0, len(shard), 2):
+            pair = shard[start : start + 2]
+            assert pair[0].loss_weight == pair[1].loss_weight
+            chunk_weights.append(pair[0].loss_weight)
+        chunk_weight_sequences.append(tuple(chunk_weights))
+
+    assert len(set(chunk_weight_sequences)) == 1
+    sequence = chunk_weight_sequences[0]
+    assert sequence != tuple(sorted(sequence))
+    assert sum(left != right for left, right in zip(sequence, sequence[1:], strict=False)) >= 2
+
+
+def test_learning_rate_schedule_warms_up_then_cosine_decays() -> None:
+    adapter = make_adapter(seed=107)
+    trainer = CIDTrainer(
+        adapter,
+        ILLaDATrajectoryTensorizer(adapter, TinyTokenizer()),
+        CIDTrainerConfig(
+            learning_rate=1e-3,
+            warmup_steps=2,
+            lr_decay_steps=6,
+            min_learning_rate_ratio=0.1,
+        ),
+    )
+
+    assert trainer._learning_rate_for_step(1) == pytest.approx(5e-4)
+    assert trainer._learning_rate_for_step(2) == pytest.approx(1e-3)
+    assert trainer._learning_rate_for_step(4) == pytest.approx(5.5e-4)
+    assert trainer._learning_rate_for_step(6) == pytest.approx(1e-4)
+    assert trainer._learning_rate_for_step(20) == pytest.approx(1e-4)
+
+
+def test_rollout_report_keeps_raw_and_weighted_loss_separate() -> None:
+    adapter = make_adapter(seed=108)
+    trainer = CIDTrainer(
+        adapter,
+        ILLaDATrajectoryTensorizer(adapter, TinyTokenizer()),
+        CIDTrainerConfig(
+            learning_rate=1e-3,
+            timestep_min=0.0,
+            timestep_max=0.0,
+        ),
+    )
+    window = replace(
+        trajectory_rollout_windows((make_trajectory(),), max_horizon=3)[0],
+        loss_weight=2.5,
+    )
+
+    report = trainer.train_rollout_windows((window,), epochs=1, shuffle=False)
+
+    assert report.mean_loss == pytest.approx(report.raw_mean_loss * 2.5)
 
 
 def test_rollout_curriculum_and_window_sharding_are_deterministic() -> None:

@@ -175,6 +175,9 @@ class CIDTrainerConfig:
     micro_batch_size: int = 1
     gradient_accumulation_steps: int = 1
     max_grad_norm: float = 1.0
+    warmup_steps: int = 0
+    lr_decay_steps: int = 0
+    min_learning_rate_ratio: float = 0.1
     timestep_min: float = 0.05
     timestep_max: float = 1.0
     rollout_horizon: int = 3
@@ -197,6 +200,12 @@ class CIDTrainerConfig:
             raise ValueError("gradient_accumulation_steps must be positive")
         if self.max_grad_norm <= 0.0:
             raise ValueError("max_grad_norm must be positive")
+        if self.warmup_steps < 0 or self.lr_decay_steps < 0:
+            raise ValueError("learning-rate schedule steps must be non-negative")
+        if self.lr_decay_steps and self.warmup_steps > self.lr_decay_steps:
+            raise ValueError("warmup_steps cannot exceed lr_decay_steps")
+        if not 0.0 <= self.min_learning_rate_ratio <= 1.0:
+            raise ValueError("min_learning_rate_ratio must be in [0, 1]")
         if not 0.0 <= self.timestep_min <= self.timestep_max <= 1.0:
             raise ValueError("timestep range must satisfy 0 <= min <= max <= 1")
         if self.rollout_horizon <= 0:
@@ -227,6 +236,7 @@ class CIDTrainReport:
     transitions: int
     optimizer_steps: int
     mean_loss: float
+    raw_mean_loss: float
 
 
 @dataclass(frozen=True, slots=True)
@@ -234,6 +244,7 @@ class CIDTrainProgress:
     transitions: int
     optimizer_steps: int
     mean_loss: float
+    raw_mean_loss: float
     rollout_windows_seen_in_epoch: int
     learning_rate: float
 
@@ -314,7 +325,7 @@ class CIDTrainer:
         windows: tuple[CIDRolloutWindow, ...],
         *,
         rollout_probability: float,
-    ) -> tuple[float, int]:
+    ) -> tuple[float, float, int]:
         if not windows:
             raise ValueError("rollout micro-batch cannot be empty")
         if not 0.0 <= rollout_probability <= 1.0:
@@ -329,6 +340,7 @@ class CIDTrainer:
 
         rollout_states: list[CIDRolloutState | None] = [None] * len(windows)
         loss_sum = 0.0
+        raw_loss_sum = 0.0
         transition_count = 0
         for offset in range(next(iter(lengths))):
             samples: list[CIDTrainingStep] = []
@@ -351,7 +363,9 @@ class CIDTrainer:
                 tuple(samples), loss_scale=loss_weight
             )
             batch_size = len(samples)
-            loss_sum += float(losses.total.detach().float()) * batch_size * loss_weight
+            raw_loss = float(losses.total.detach().float()) * batch_size
+            raw_loss_sum += raw_loss
+            loss_sum += raw_loss * loss_weight
             transition_count += batch_size
             rollout_states = [
                 self._rollout_state_from_prediction(
@@ -362,7 +376,7 @@ class CIDTrainer:
                 )
                 for index, sample in enumerate(samples)
             ]
-        return loss_sum, transition_count
+        return loss_sum, raw_loss_sum, transition_count
 
     def _forward_backward(
         self,
@@ -449,6 +463,7 @@ class CIDTrainer:
         *,
         epochs: int = 1,
         shuffle: bool = True,
+        preserve_order: bool = False,
         progress_every_optimizer_steps: int | None = None,
         progress_callback: Callable[[CIDTrainProgress], None] | None = None,
     ) -> CIDTrainReport:
@@ -461,9 +476,11 @@ class CIDTrainer:
         if progress_every_optimizer_steps is not None and progress_every_optimizer_steps <= 0:
             raise ValueError("progress_every_optimizer_steps must be positive")
         total_loss = 0.0
+        total_raw_loss = 0.0
         total_transitions = 0
         start_optimizer_steps = self.state.optimizer_steps
         progress_loss = 0.0
+        progress_raw_loss = 0.0
         progress_transitions = 0
         next_progress_step = None
         if progress_callback is not None and progress_every_optimizer_steps is not None:
@@ -472,7 +489,7 @@ class CIDTrainer:
             ) * progress_every_optimizer_steps
 
         def emit_progress_if_due() -> None:
-            nonlocal progress_loss, progress_transitions, next_progress_step
+            nonlocal progress_loss, progress_raw_loss, progress_transitions, next_progress_step
             if (
                 progress_callback is None
                 or progress_every_optimizer_steps is None
@@ -486,44 +503,42 @@ class CIDTrainer:
                     transitions=progress_transitions,
                     optimizer_steps=self.state.optimizer_steps,
                     mean_loss=progress_loss / progress_transitions,
+                    raw_mean_loss=progress_raw_loss / progress_transitions,
                     rollout_windows_seen_in_epoch=self.state.rollout_windows_seen_in_epoch,
                     learning_rate=float(self.optimizer.param_groups[0]["lr"]),
                 )
             )
             progress_loss = 0.0
+            progress_raw_loss = 0.0
             progress_transitions = 0
             while next_progress_step <= self.state.optimizer_steps:
                 next_progress_step += progress_every_optimizer_steps
 
         for _ in range(epochs):
             rollout_probability = self.rollout_probability()
-            buckets: dict[tuple[int, float], list[CIDRolloutWindow]] = {}
-            for window in windows:
-                key = (len(window.source_steps), window.loss_weight)
-                buckets.setdefault(key, []).append(window)
-            for key in sorted(buckets):
-                bucket = buckets[key]
-                if shuffle:
-                    self.shuffle_rng.shuffle(bucket)
-                for start in range(0, len(bucket), self.config.micro_batch_size):
-                    microbatch = tuple(bucket[start : start + self.config.micro_batch_size])
-                    loss_sum, transitions = self.train_rollout_microbatch(
-                        microbatch,
-                        rollout_probability=rollout_probability,
-                    )
-                    total_loss += loss_sum
-                    total_transitions += transitions
-                    progress_loss += loss_sum
-                    progress_transitions += transitions
-                    self.state = CIDTrainerState(
-                        transitions_seen=self.state.transitions_seen,
-                        optimizer_steps=self.state.optimizer_steps,
-                        epochs_completed=self.state.epochs_completed,
-                        rollout_windows_seen_in_epoch=(
-                            self.state.rollout_windows_seen_in_epoch + len(microbatch)
-                        ),
-                    )
-                    emit_progress_if_due()
+            microbatches = self._rollout_microbatches(
+                windows, shuffle=shuffle, preserve_order=preserve_order
+            )
+            for microbatch in microbatches:
+                loss_sum, raw_loss_sum, transitions = self.train_rollout_microbatch(
+                    microbatch,
+                    rollout_probability=rollout_probability,
+                )
+                total_loss += loss_sum
+                total_raw_loss += raw_loss_sum
+                total_transitions += transitions
+                progress_loss += loss_sum
+                progress_raw_loss += raw_loss_sum
+                progress_transitions += transitions
+                self.state = CIDTrainerState(
+                    transitions_seen=self.state.transitions_seen,
+                    optimizer_steps=self.state.optimizer_steps,
+                    epochs_completed=self.state.epochs_completed,
+                    rollout_windows_seen_in_epoch=(
+                        self.state.rollout_windows_seen_in_epoch + len(microbatch)
+                    ),
+                )
+                emit_progress_if_due()
             self.flush()
             emit_progress_if_due()
             self.state = CIDTrainerState(
@@ -536,7 +551,45 @@ class CIDTrainer:
             transitions=total_transitions,
             optimizer_steps=self.state.optimizer_steps - start_optimizer_steps,
             mean_loss=total_loss / total_transitions,
+            raw_mean_loss=total_raw_loss / total_transitions,
         )
+
+    def _rollout_microbatches(
+        self,
+        windows: tuple[CIDRolloutWindow, ...],
+        *,
+        shuffle: bool,
+        preserve_order: bool,
+    ) -> list[tuple[CIDRolloutWindow, ...]]:
+        if preserve_order:
+            microbatches: list[tuple[CIDRolloutWindow, ...]] = []
+            current: list[CIDRolloutWindow] = []
+            current_key: tuple[int, float] | None = None
+            for window in windows:
+                key = (len(window.source_steps), window.loss_weight)
+                if current and (key != current_key or len(current) >= self.config.micro_batch_size):
+                    microbatches.append(tuple(current))
+                    current = []
+                current.append(window)
+                current_key = key
+            if current:
+                microbatches.append(tuple(current))
+            return microbatches
+
+        buckets: dict[tuple[int, float], list[CIDRolloutWindow]] = {}
+        for window in windows:
+            key = (len(window.source_steps), window.loss_weight)
+            buckets.setdefault(key, []).append(window)
+        microbatches = []
+        for key in sorted(buckets):
+            bucket = buckets[key]
+            if shuffle:
+                self.shuffle_rng.shuffle(bucket)
+            for start in range(0, len(bucket), self.config.micro_batch_size):
+                microbatches.append(tuple(bucket[start : start + self.config.micro_batch_size]))
+        if shuffle:
+            self.shuffle_rng.shuffle(microbatches)
+        return microbatches
 
     def rollout_probability(self) -> float:
         if self.config.rollout_horizon <= 1:
@@ -577,10 +630,12 @@ class CIDTrainer:
                 rollout_windows_seen_in_epoch=self.state.rollout_windows_seen_in_epoch,
             )
         self.flush()
+        mean_loss = sum(losses) / len(losses)
         return CIDTrainReport(
             transitions=len(losses),
             optimizer_steps=self.state.optimizer_steps - start_optimizer_steps,
-            mean_loss=sum(losses) / len(losses),
+            mean_loss=mean_loss,
+            raw_mean_loss=mean_loss,
         )
 
     def reseed(self, seed: int) -> None:
@@ -703,6 +758,7 @@ class CIDTrainer:
     def _optimizer_step(self) -> None:
         if self._pending_examples <= 0:
             raise RuntimeError("optimizer step requires accumulated examples")
+        self._set_learning_rate_for_step(self.state.optimizer_steps + 1)
         for _, parameter in self._trainable:
             if parameter.grad is not None:
                 parameter.grad.div_(self._pending_examples)
@@ -723,6 +779,29 @@ class CIDTrainer:
             epochs_completed=self.state.epochs_completed,
             rollout_windows_seen_in_epoch=self.state.rollout_windows_seen_in_epoch,
         )
+
+    def _set_learning_rate_for_step(self, step: int) -> None:
+        learning_rate = self._learning_rate_for_step(step)
+        for group in self.optimizer.param_groups:
+            group["lr"] = learning_rate
+
+    def _learning_rate_for_step(self, step: int) -> float:
+        if step <= 0:
+            raise ValueError("optimizer step must be positive")
+        if self.config.warmup_steps and step <= self.config.warmup_steps:
+            scale = step / self.config.warmup_steps
+        elif self.config.lr_decay_steps:
+            decay_span = max(1, self.config.lr_decay_steps - self.config.warmup_steps)
+            progress = min(
+                1.0,
+                max(0.0, (step - self.config.warmup_steps) / decay_span),
+            )
+            cosine = 0.5 * (1.0 + math.cos(math.pi * progress))
+            floor = self.config.min_learning_rate_ratio
+            scale = floor + (1.0 - floor) * cosine
+        else:
+            scale = 1.0
+        return self.config.learning_rate * scale
 
     def _sample_timestep(self) -> float:
         if self.config.timestep_min == self.config.timestep_max:
@@ -1539,9 +1618,7 @@ def balance_rollout_windows_by_semantic_task(
         return windows
     total_task_weight = sum(task_weights.values())
     weights = {
-        task_id: total_transitions
-        * task_weights[task_id]
-        / (total_task_weight * transition_count)
+        task_id: total_transitions * task_weights[task_id] / (total_task_weight * transition_count)
         for task_id, transition_count in transition_counts.items()
     }
     return tuple(
@@ -1582,14 +1659,17 @@ def shard_rollout_windows(
     seed: int,
     epoch: int,
     shuffle: bool = True,
+    micro_batch_size: int = 1,
 ) -> tuple[CIDRolloutWindow, ...]:
     if world_size <= 0:
         raise ValueError("world_size must be positive")
     if not 0 <= rank < world_size:
         raise ValueError("rank must be in [0, world_size)")
+    if micro_batch_size <= 0:
+        raise ValueError("micro_batch_size must be positive")
     if not windows:
         return ()
-    local: list[CIDRolloutWindow] = []
+    local_microbatches: list[tuple[CIDRolloutWindow, ...]] = []
     keys = sorted({(len(window.source_steps), window.loss_weight) for window in windows})
     for bucket_index, key in enumerate(keys):
         length, loss_weight = key
@@ -1603,8 +1683,12 @@ def shard_rollout_windows(
         padding = (-len(bucket)) % world_size
         if padding:
             bucket.extend(bucket[:padding])
-        local.extend(bucket[rank::world_size])
-    return tuple(local)
+        local_bucket = bucket[rank::world_size]
+        for start in range(0, len(local_bucket), micro_batch_size):
+            local_microbatches.append(tuple(local_bucket[start : start + micro_batch_size]))
+    if shuffle:
+        random.Random(seed + epoch * 1_000_003 + 97).shuffle(local_microbatches)
+    return tuple(window for microbatch in local_microbatches for window in microbatch)
 
 
 def wrap_stage_a_ddp(

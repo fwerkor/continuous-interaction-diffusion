@@ -1156,6 +1156,9 @@ def _train_stage_a(args: argparse.Namespace) -> None:
                 micro_batch_size=args.micro_batch_size,
                 gradient_accumulation_steps=args.gradient_accumulation_steps,
                 max_grad_norm=args.max_grad_norm,
+                warmup_steps=args.warmup_steps,
+                lr_decay_steps=args.lr_decay_steps,
+                min_learning_rate_ratio=args.min_learning_rate_ratio,
                 timestep_min=args.timestep_min,
                 timestep_max=args.timestep_max,
                 rollout_horizon=args.rollout_horizon,
@@ -1213,6 +1216,7 @@ def _train_stage_a(args: argparse.Namespace) -> None:
                 seed=args.seed,
                 epoch=epoch,
                 shuffle=not args.no_shuffle,
+                micro_batch_size=args.micro_batch_size,
             )
             total_local_windows = len(local_windows)
             resumed_windows = trainer.state.rollout_windows_seen_in_epoch
@@ -1239,17 +1243,20 @@ def _train_stage_a(args: argparse.Namespace) -> None:
             ) -> None:
                 nonlocal next_checkpoint_step
                 loss_sum = progress.mean_loss * progress.transitions
+                raw_loss_sum = progress.raw_mean_loss * progress.transitions
                 interval_transitions = progress.transitions
                 if distributed:
                     aggregate = torch.tensor(
-                        [loss_sum, float(interval_transitions)],
+                        [loss_sum, raw_loss_sum, float(interval_transitions)],
                         device=device,
                         dtype=torch.float64,
                     )
                     dist.all_reduce(aggregate)
                     loss_sum = float(aggregate[0])
-                    interval_transitions = int(aggregate[1])
+                    raw_loss_sum = float(aggregate[1])
+                    interval_transitions = int(aggregate[2])
                 mean_loss = loss_sum / interval_transitions
+                raw_mean_loss = raw_loss_sum / interval_transitions
                 windows_seen = progress.rollout_windows_seen_in_epoch
                 if rank == 0:
                     record = {
@@ -1259,6 +1266,8 @@ def _train_stage_a(args: argparse.Namespace) -> None:
                         "optimizer_steps": progress.optimizer_steps,
                         "interval_transitions": interval_transitions,
                         "mean_loss": mean_loss,
+                        "weighted_mean_loss": mean_loss,
+                        "raw_mean_loss": raw_mean_loss,
                         "learning_rate": progress.learning_rate,
                         "rollout_probability": current_rollout_probability,
                         "windows_seen_in_epoch": windows_seen,
@@ -1269,7 +1278,8 @@ def _train_stage_a(args: argparse.Namespace) -> None:
                     print(
                         f"progress epoch={current_epoch} "
                         f"optimizer_steps={progress.optimizer_steps} "
-                        f"mean_loss={mean_loss:.6f} lr={progress.learning_rate:.6g} "
+                        f"raw_loss={raw_mean_loss:.6f} weighted_loss={mean_loss:.6f} "
+                        f"lr={progress.learning_rate:.6g} "
                         f"windows={windows_seen}/{current_total_windows}",
                         flush=True,
                     )
@@ -1293,23 +1303,27 @@ def _train_stage_a(args: argparse.Namespace) -> None:
                 local_windows,
                 epochs=1,
                 shuffle=False,
+                preserve_order=True,
                 progress_every_optimizer_steps=args.log_every_steps,
                 progress_callback=report_progress,
             )
 
             loss_sum = report.mean_loss * report.transitions
+            raw_loss_sum = report.raw_mean_loss * report.transitions
             transition_count = report.transitions
             if distributed:
                 aggregate = torch.tensor(
-                    [loss_sum, float(transition_count)],
+                    [loss_sum, raw_loss_sum, float(transition_count)],
                     device=device,
                     dtype=torch.float64,
                 )
                 dist.all_reduce(aggregate)
                 loss_sum = float(aggregate[0])
-                transition_count = int(aggregate[1])
+                raw_loss_sum = float(aggregate[1])
+                transition_count = int(aggregate[2])
                 dist.barrier()
             mean_loss = loss_sum / transition_count
+            raw_mean_loss = raw_loss_sum / transition_count
 
             checkpoint = output_dir / f"stage-a-step-{trainer.state.optimizer_steps:08d}.pt"
             if rank == 0:
@@ -1319,8 +1333,9 @@ def _train_stage_a(args: argparse.Namespace) -> None:
                 latest.symlink_to(checkpoint.name)
                 print(
                     f"epoch={epoch} transitions={transition_count} "
-                    f"optimizer_steps={report.optimizer_steps} mean_loss={mean_loss:.6f} "
-                    f"rollout_probability={rollout_probability:.3f} checkpoint={checkpoint}",
+                    f"optimizer_steps={report.optimizer_steps} raw_loss={raw_mean_loss:.6f} "
+                    f"weighted_loss={mean_loss:.6f} rollout_probability={rollout_probability:.3f} "
+                    f"checkpoint={checkpoint}",
                     flush=True,
                 )
             if distributed:
@@ -1496,9 +1511,12 @@ def _train_stage_b(args: argparse.Namespace) -> None:
                 seed=args.seed,
                 epoch=epoch,
                 shuffle=not args.no_shuffle,
+                micro_batch_size=args.micro_batch_size,
             )
             rollout_probability = trainer.rollout_probability()
-            report = trainer.train_rollout_windows(local_windows, epochs=1, shuffle=False)
+            report = trainer.train_rollout_windows(
+                local_windows, epochs=1, shuffle=False, preserve_order=True
+            )
             aggregate = torch.tensor(
                 [report.mean_loss * report.transitions, float(report.transitions)],
                 device=device,
@@ -1952,6 +1970,9 @@ def main() -> None:
     train.add_argument("--micro-batch-size", type=int, default=1)
     train.add_argument("--gradient-accumulation-steps", type=int, default=8)
     train.add_argument("--max-grad-norm", type=float, default=1.0)
+    train.add_argument("--warmup-steps", type=int, default=0)
+    train.add_argument("--lr-decay-steps", type=int, default=0)
+    train.add_argument("--min-learning-rate-ratio", type=float, default=0.1)
     train.add_argument("--timestep-min", type=float, default=0.05)
     train.add_argument("--timestep-max", type=float, default=1.0)
     train.add_argument("--rollout-horizon", type=int, default=3)
