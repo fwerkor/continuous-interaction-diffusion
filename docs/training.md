@@ -133,11 +133,14 @@ inputs and use the live, trainable embedding inside the FSDP forward. Besides av
 out-of-forward access to sharded parameters, this keeps target embeddings stationary while the
 language model changes.
 
-Stage B checkpoints use `torch.distributed.checkpoint` for model and optimizer state. No rank
-materializes a full 8B state dict. Rank-local trainer files preserve diffusion RNG, shuffle RNG,
-transition/optimizer counts, and completed epoch count. Metadata pins backbone geometry, CID
-adapter config, original world size, and the training JSONL SHA-256. Resume rejects a different
-dataset or world size and continues the next global epoch rather than restarting the shuffle seed.
+Stage B checkpoints use FSDP sharded model state with `torch.distributed.checkpoint`, so no rank
+materializes a full 8B model state dict. Optimizer state is stored rank-locally because Stage B
+resume already requires the original world size; this also avoids PyTorch 2.5's legacy
+`ShardedTensor` failure for logical parameters that have no local shard on a rank. Rank-local
+trainer files preserve diffusion RNG, shuffle RNG, transition/optimizer counts, and completed epoch
+count. Metadata pins the checkpoint layout, backbone geometry, CID adapter config, original world
+size, and the training JSONL SHA-256. Resume rejects a different dataset or world size and continues
+the next global epoch rather than restarting the shuffle seed.
 
 An optional Stage A CID-only checkpoint may initialize the CID heads before full unfreezing. It is
 mutually exclusive with Stage B `--resume`, which already restores the entire model and optimizer.

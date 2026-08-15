@@ -6,12 +6,18 @@ from types import SimpleNamespace
 
 import torch
 import torch.distributed as dist
-import torch.distributed.checkpoint as dcp
 from torch import nn
-from torch.distributed.checkpoint.state_dict import StateDictOptions, get_state_dict
 from torch.distributed.fsdp import FullyShardedDataParallel, ShardingStrategy
 
-from cid.model import CIDTensorBatch, ILLaDACIDAdapter, ILLaDACIDConfig, wrap_stage_b_fsdp
+from cid.model import (
+    CIDTensorBatch,
+    ILLaDACIDAdapter,
+    ILLaDACIDConfig,
+    load_stage_b_checkpoint,
+    load_stage_b_model_checkpoint,
+    save_stage_b_checkpoint,
+    wrap_stage_b_fsdp,
+)
 
 
 class TinyConfig:
@@ -74,6 +80,18 @@ class TinyBackbone(nn.Module):
         return self.decoder
 
 
+class TinyTrainer:
+    def __init__(self, adapter: ILLaDACIDAdapter, marker: int = 0) -> None:
+        self.adapter = adapter
+        self.marker = marker
+
+    def local_progress_state(self) -> dict[str, int]:
+        return {"marker": self.marker}
+
+    def restore_local_progress_state(self, state: dict[str, int]) -> None:
+        self.marker = state["marker"]
+
+
 def make_batch() -> CIDTensorBatch:
     d = TinyConfig.hidden_size
     return CIDTensorBatch(
@@ -117,16 +135,60 @@ def main() -> None:
         optimizer.step()
         optimizer.zero_grad(set_to_none=True)
 
-        options = StateDictOptions(full_state_dict=False, cpu_offload=True)
-        model_state, optimizer_state = get_state_dict(fsdp, optimizer, options=options)
         checkpoint = Path(os.environ["CID_FSDP_SMOKE_DIR"])
-        dcp.save(
-            {"model": model_state, "optimizer": optimizer_state},
-            checkpoint_id=checkpoint,
+        trainer = TinyTrainer(adapter, marker=dist.get_rank() + 10)
+        save_stage_b_checkpoint(
+            fsdp,
+            optimizer,
+            trainer,
+            checkpoint,
+            dataset_sha256="two-rank-smoke",
         )
         dist.barrier()
-        if dist.get_rank() == 0:
-            assert (checkpoint / ".metadata").is_file()
+
+        torch.manual_seed(303)
+        restored_adapter = ILLaDACIDAdapter(
+            TinyBackbone(),
+            ILLaDACIDConfig(max_thought_slots=4, max_display_tokens=16),
+            freeze_backbone=False,
+        )
+        restored = wrap_stage_b_fsdp(
+            restored_adapter,
+            device_id=torch.device("cpu"),
+            compute_dtype=torch.bfloat16,
+        )
+        restored_optimizer = torch.optim.AdamW(restored.parameters(), lr=1e-3)
+        restored_trainer = TinyTrainer(restored_adapter)
+        load_stage_b_checkpoint(
+            restored,
+            restored_optimizer,
+            restored_trainer,
+            checkpoint,
+            expected_dataset_sha256="two-rank-smoke",
+        )
+        assert restored_trainer.marker == dist.get_rank() + 10
+
+        restored_output = restored(make_batch())
+        restored_loss = restored_output.thought_semantic.float().square().mean()
+        restored_loss = restored_loss + restored_output.display_logits.float().square().mean()
+        restored_loss.backward()
+        restored.clip_grad_norm_(1.0)
+        restored_optimizer.step()
+        restored_optimizer.zero_grad(set_to_none=True)
+
+        torch.manual_seed(404)
+        inference_adapter = ILLaDACIDAdapter(
+            TinyBackbone(),
+            ILLaDACIDConfig(max_thought_slots=4, max_display_tokens=16),
+            freeze_backbone=False,
+        )
+        inference = wrap_stage_b_fsdp(
+            inference_adapter,
+            device_id=torch.device("cpu"),
+            compute_dtype=torch.bfloat16,
+        )
+        load_stage_b_model_checkpoint(inference, inference_adapter, checkpoint)
+        inference(make_batch())
     finally:
         dist.destroy_process_group()
 

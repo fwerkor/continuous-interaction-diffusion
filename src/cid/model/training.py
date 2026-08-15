@@ -1578,6 +1578,24 @@ def wrap_stage_b_fsdp(
     )
 
 
+def _stage_b_sharded_state_dict_context(model: torch.nn.Module) -> Any:
+    from torch.distributed.fsdp import (
+        FullyShardedDataParallel,
+        ShardedStateDictConfig,
+        StateDictType,
+    )
+
+    # PyTorch 2.5's distributed-checkpoint get_state_dict() path fails when an
+    # unflattened FSDP parameter has no local shard on a rank. The underlying
+    # FSDP sharded state-dict path handles those zero-local-shard tensors and
+    # remains compatible with Distributed Checkpoint storage.
+    return FullyShardedDataParallel.state_dict_type(
+        model,
+        StateDictType.SHARDED_STATE_DICT,
+        ShardedStateDictConfig(offload_to_cpu=True),
+    )
+
+
 def save_stage_b_checkpoint(
     model: torch.nn.Module,
     optimizer: torch.optim.Optimizer,
@@ -1588,7 +1606,6 @@ def save_stage_b_checkpoint(
 ) -> None:
     import torch.distributed as dist
     import torch.distributed.checkpoint as dcp
-    from torch.distributed.checkpoint.state_dict import StateDictOptions, get_state_dict
 
     if not dist.is_initialized():
         raise RuntimeError("Stage B checkpointing requires an initialized process group")
@@ -1597,11 +1614,15 @@ def save_stage_b_checkpoint(
         destination.mkdir(parents=True, exist_ok=True)
     dist.barrier()
 
-    options = StateDictOptions(full_state_dict=False, cpu_offload=True)
-    model_state, optimizer_state = get_state_dict(model, optimizer, options=options)
+    with _stage_b_sharded_state_dict_context(model):
+        model_state = model.state_dict()
     dcp.save(
-        {"model": model_state, "optimizer": optimizer_state},
+        {"model": model_state},
         checkpoint_id=destination / "distributed",
+    )
+    torch.save(
+        optimizer.state_dict(),
+        destination / f"optimizer-rank-{dist.get_rank():04d}.pt",
     )
     torch.save(
         trainer.local_progress_state(),
@@ -1609,8 +1630,10 @@ def save_stage_b_checkpoint(
     )
     if dist.get_rank() == 0:
         metadata = {
-            "format_version": 1,
+            "format_version": 2,
             "kind": "cid-stage-b-fsdp",
+            "model_state_layout": "fsdp-sharded-dcp",
+            "optimizer_state_layout": "rank-local",
             "world_size": dist.get_world_size(),
             "dataset_sha256": dataset_sha256,
             "adapter_config": asdict(trainer.adapter.config),
@@ -1637,18 +1660,18 @@ def load_stage_b_checkpoint(
 ) -> None:
     import torch.distributed as dist
     import torch.distributed.checkpoint as dcp
-    from torch.distributed.checkpoint.state_dict import (
-        StateDictOptions,
-        get_state_dict,
-        set_state_dict,
-    )
 
     if not dist.is_initialized():
         raise RuntimeError("Stage B checkpointing requires an initialized process group")
     source = Path(path)
     metadata = json.loads((source / "metadata.json").read_text(encoding="utf-8"))
-    if metadata.get("format_version") != 1 or metadata.get("kind") != "cid-stage-b-fsdp":
+    if metadata.get("format_version") != 2 or metadata.get("kind") != "cid-stage-b-fsdp":
         raise ValueError("unsupported Stage B checkpoint format")
+    if (
+        metadata.get("model_state_layout") != "fsdp-sharded-dcp"
+        or metadata.get("optimizer_state_layout") != "rank-local"
+    ):
+        raise ValueError("unsupported Stage B checkpoint state layout")
     if int(metadata["world_size"]) != dist.get_world_size():
         raise ValueError("Stage B resume currently requires the original world size")
     if (
@@ -1666,16 +1689,18 @@ def load_stage_b_checkpoint(
     ):
         raise ValueError("Stage B checkpoint backbone geometry does not match")
 
-    options = StateDictOptions(full_state_dict=False, cpu_offload=True)
-    model_state, optimizer_state = get_state_dict(model, optimizer, options=options)
-    distributed_state = {"model": model_state, "optimizer": optimizer_state}
+    with _stage_b_sharded_state_dict_context(model):
+        model_state = model.state_dict()
+    distributed_state = {"model": model_state}
     dcp.load(distributed_state, checkpoint_id=source / "distributed")
-    set_state_dict(
-        model,
-        optimizer,
-        model_state_dict=distributed_state["model"],
-        optim_state_dict=distributed_state["optimizer"],
-        options=options,
+    with _stage_b_sharded_state_dict_context(model):
+        model.load_state_dict(distributed_state["model"])
+    optimizer.load_state_dict(
+        torch.load(
+            source / f"optimizer-rank-{dist.get_rank():04d}.pt",
+            map_location="cpu",
+            weights_only=False,
+        )
     )
     local_state = torch.load(
         source / f"rank-{dist.get_rank():04d}.pt",
@@ -1695,18 +1720,15 @@ def load_stage_b_model_checkpoint(
 
     import torch.distributed as dist
     import torch.distributed.checkpoint as dcp
-    from torch.distributed.checkpoint.state_dict import (
-        StateDictOptions,
-        get_model_state_dict,
-        set_model_state_dict,
-    )
 
     if not dist.is_initialized():
         raise RuntimeError("Stage B model loading requires an initialized process group")
     source = Path(path)
     metadata = json.loads((source / "metadata.json").read_text(encoding="utf-8"))
-    if metadata.get("format_version") != 1 or metadata.get("kind") != "cid-stage-b-fsdp":
+    if metadata.get("format_version") != 2 or metadata.get("kind") != "cid-stage-b-fsdp":
         raise ValueError("unsupported Stage B checkpoint format")
+    if metadata.get("model_state_layout") != "fsdp-sharded-dcp":
+        raise ValueError("unsupported Stage B checkpoint model state layout")
     if int(metadata["world_size"]) != dist.get_world_size():
         raise ValueError("Stage B evaluation requires the checkpoint's original world size")
     if metadata["adapter_config"] != asdict(adapter.config):
@@ -1719,13 +1741,10 @@ def load_stage_b_model_checkpoint(
     ):
         raise ValueError("Stage B checkpoint backbone geometry does not match")
 
-    options = StateDictOptions(full_state_dict=False, cpu_offload=True)
-    model_state = get_model_state_dict(model, options=options)
+    with _stage_b_sharded_state_dict_context(model):
+        model_state = model.state_dict()
     distributed_state = {"model": model_state}
     dcp.load(distributed_state, checkpoint_id=source / "distributed")
-    set_model_state_dict(
-        model,
-        distributed_state["model"],
-        options=options,
-    )
+    with _stage_b_sharded_state_dict_context(model):
+        model.load_state_dict(distributed_state["model"])
     dist.barrier()

@@ -800,6 +800,7 @@ def test_stage_b_fsdp_runs_full_parameter_optimizer_step_on_cpu(tmp_path) -> Non
         )
         assert (checkpoint / "metadata.json").is_file()
         assert (checkpoint / "rank-0000.pt").is_file()
+        assert (checkpoint / "optimizer-rank-0000.pt").is_file()
     finally:
         dist.destroy_process_group()
 
@@ -830,7 +831,10 @@ def test_stage_b_fsdp_full_shard_two_rank_smoke(tmp_path) -> None:
     )
 
     assert completed.returncode == 0, completed.stdout + completed.stderr
-    assert (checkpoint / ".metadata").is_file()
+    assert (checkpoint / "distributed" / ".metadata").is_file()
+    assert (checkpoint / "metadata.json").is_file()
+    assert (checkpoint / "optimizer-rank-0000.pt").is_file()
+    assert (checkpoint / "optimizer-rank-0001.pt").is_file()
 
 
 def make_rollout_trajectory() -> TrajectoryExample:
