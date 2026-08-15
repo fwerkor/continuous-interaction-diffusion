@@ -215,6 +215,77 @@ def make_adapter(*, seed: int = 123) -> ILLaDACIDAdapter:
     )
 
 
+def test_trajectory_tensorizer_recycles_retired_source_slot() -> None:
+    adapter = make_adapter()
+    tensorizer = ILLaDATrajectoryTensorizer(adapter, TinyTokenizer())
+    trajectory = replace(
+        make_trajectory(),
+        binding_targets=(),
+        grounding_targets=(),
+        source_descriptors=(),
+        thought_targets=(
+            ThoughtTarget(
+                step=0,
+                slot=0,
+                cell_id="retired",
+                semantic_text="The old work item is complete.",
+                roles={CognitiveRole.PLAN: 1.0},
+                uncertainty=0.0,
+                noise=0.0,
+                lifecycle=CellLifecycle.RETIRED,
+            ),
+            ThoughtTarget(
+                step=1,
+                slot=0,
+                cell_id="replacement",
+                semantic_text="Reuse the released slot for new work.",
+                roles={CognitiveRole.PLAN: 1.0},
+                uncertainty=0.2,
+                noise=0.2,
+            ),
+        ),
+    )
+
+    sample = tensorizer.tensorize(trajectory, source_step=0, timestep=1.0)
+
+    assert sample.targets.allocation_targets[0, 0] == 1
+    assert sample.targets.thought_mask[0, 0]
+
+
+def test_trajectory_tensorizer_rejects_reuse_of_live_source_slot() -> None:
+    adapter = make_adapter()
+    tensorizer = ILLaDATrajectoryTensorizer(adapter, TinyTokenizer())
+    trajectory = replace(
+        make_trajectory(),
+        binding_targets=(),
+        grounding_targets=(),
+        source_descriptors=(),
+        thought_targets=(
+            ThoughtTarget(
+                step=0,
+                slot=0,
+                cell_id="live",
+                semantic_text="The current work item is still live.",
+                roles={CognitiveRole.PLAN: 1.0},
+                uncertainty=0.2,
+                noise=0.2,
+            ),
+            ThoughtTarget(
+                step=1,
+                slot=0,
+                cell_id="replacement",
+                semantic_text="This must not overwrite live work.",
+                roles={CognitiveRole.PLAN: 1.0},
+                uncertainty=0.2,
+                noise=0.2,
+            ),
+        ),
+    )
+
+    with pytest.raises(ValueError, match="occupied source slot"):
+        tensorizer.tensorize(trajectory, source_step=0, timestep=1.0)
+
+
 def test_trajectory_tensorizer_runs_full_optimizer_step() -> None:
     adapter = make_adapter()
     tensorizer = ILLaDATrajectoryTensorizer(adapter, TinyTokenizer())

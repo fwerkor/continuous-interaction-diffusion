@@ -1191,7 +1191,9 @@ class ILLaDATrajectoryTensorizer:
         capacity: int,
     ) -> dict[str, int]:
         current_by_id = {cell.cell_id: cell for cell in current}
-        current_slots = {cell.slot for cell in current}
+        occupied_source_slots = {
+            cell.slot for cell in current if cell.lifecycle is not CellLifecycle.RETIRED
+        }
         slots: dict[str, int] = {}
         used: set[int] = set()
         for cell in target:
@@ -1199,7 +1201,7 @@ class ILLaDATrajectoryTensorizer:
                 slot = current_by_id[cell.cell_id].slot
             else:
                 slot = cell.slot
-                if slot in current_slots:
+                if slot in occupied_source_slots:
                     raise ValueError(
                         "new thought target cannot allocate into an occupied source slot"
                     )
@@ -1209,7 +1211,12 @@ class ILLaDATrajectoryTensorizer:
                 )
             slots[cell.cell_id] = slot
             used.add(slot)
-        missing = set(current_by_id) - {cell.cell_id for cell in target}
+        target_ids = {cell.cell_id for cell in target}
+        missing = {
+            cell_id
+            for cell_id, cell in current_by_id.items()
+            if cell_id not in target_ids and cell.lifecycle is not CellLifecycle.RETIRED
+        }
         if missing:
             names = ", ".join(sorted(missing))
             raise ValueError(f"target snapshot removed cells without RETIRED state: {names}")
