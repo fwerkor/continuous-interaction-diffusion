@@ -329,6 +329,53 @@ def test_trajectory_tensorizer_runs_full_optimizer_step() -> None:
     assert all(parameter.grad is None for parameter in adapter.backbone.parameters())
 
 
+def test_trajectory_tensorizer_truncates_display_to_configured_capacity() -> None:
+    adapter = ILLaDACIDAdapter(
+        TinyBackbone(),
+        ILLaDACIDConfig(max_thought_slots=4, max_display_tokens=4),
+        freeze_backbone=True,
+    )
+    tensorizer = ILLaDATrajectoryTensorizer(adapter, TinyTokenizer())
+    example = replace(
+        make_trajectory(),
+        target_display="abcdefghij",
+        display_targets=(DisplayTarget(step=1, text="abcdefghij"),),
+    )
+
+    sample = tensorizer.tensorize(example, source_step=0, timestep=1.0)
+    expected = TinyTokenizer()(
+        "abcd",
+        add_special_tokens=False,
+        return_tensors="pt",
+    )["input_ids"]
+
+    assert sample.batch.display_ids.shape[1] == 4
+    assert torch.equal(sample.targets.display_ids, expected)
+    assert adapter(sample.batch).display_logits.shape[1] == 4
+
+
+def test_trajectory_tensorizer_reserves_context_for_tct_and_prompt() -> None:
+    adapter = ILLaDACIDAdapter(
+        TinyBackbone(),
+        ILLaDACIDConfig(max_thought_slots=4, max_display_tokens=16),
+        freeze_backbone=True,
+    )
+    tensorizer = ILLaDATrajectoryTensorizer(adapter, TinyTokenizer())
+    example = replace(
+        make_trajectory(),
+        prompt="p" * 54,
+        target_display="abcdefghij",
+        display_targets=(DisplayTarget(step=1, text="abcdefghij"),),
+    )
+
+    sample = tensorizer.tensorize(example, source_step=0, timestep=1.0)
+
+    # 64 positions - 4 configured TCT slots - 56 prompt tokens = 4 display tokens.
+    assert sample.batch.display_ids.shape[1] == 4
+    assert sample.targets.display_ids.shape[1] == 4
+    assert adapter(sample.batch).display_logits.shape[1] == 4
+
+
 def test_bootstrap_transition_trains_single_snapshot_from_empty_tct() -> None:
     base = make_trajectory()
     single = replace(

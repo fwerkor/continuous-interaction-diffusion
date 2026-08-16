@@ -935,8 +935,18 @@ class ILLaDATrajectoryTensorizer:
             generator=generator,
         )
 
+        prompt_ids = self.text_encoder.tokenize(example.prompt, add_special_tokens=True)
         target_display = self._display_text(example, target_step)
         target_display_ids = self.text_encoder.tokenize(target_display, add_special_tokens=False)
+        display_budget = min(
+            self.adapter.config.max_display_tokens,
+            self.adapter.max_position_embeddings
+            - capacity
+            - prompt_ids.shape[1],
+        )
+        if display_budget < 0:
+            raise ValueError("prompt and configured TCT capacity exceed iLLaDA context capacity")
+        target_display_ids = target_display_ids[:, :display_budget]
         if rollout_state is None:
             display_corruption = self.scheduler.corrupt_display(
                 target_display_ids,
@@ -960,7 +970,6 @@ class ILLaDATrajectoryTensorizer:
                 (display_input_ids == ILLADA_MASK_TOKEN_ID).to(dtype=dtype).unsqueeze(-1)
             )
 
-        prompt_ids = self.text_encoder.tokenize(example.prompt, add_special_tokens=True)
         fact_memory = self.text_encoder.encode_texts(
             tuple(
                 f"fact={key} | value={stable_text(value)}"
