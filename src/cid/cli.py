@@ -1336,6 +1336,7 @@ def _train_stage_b(args: argparse.Namespace) -> None:
     import torch
     import torch.distributed as dist
     from transformers import AutoTokenizer
+    from transformers.optimization import Adafactor
 
     from cid.model import (
         ILLADA_8B_BASE,
@@ -1425,11 +1426,25 @@ def _train_stage_b(args: argparse.Namespace) -> None:
             device_id=device,
             compute_dtype=compute_dtype,
         )
-        optimizer = torch.optim.AdamW(
-            fsdp_model.parameters(),
-            lr=args.learning_rate,
-            weight_decay=args.weight_decay,
-        )
+        if args.optimizer == "adamw":
+            optimizer = torch.optim.AdamW(
+                fsdp_model.parameters(),
+                lr=args.learning_rate,
+                weight_decay=args.weight_decay,
+            )
+        else:
+            optimizer = Adafactor(
+                fsdp_model.parameters(),
+                lr=args.learning_rate,
+                eps=(1e-30, 1e-3),
+                clip_threshold=1.0,
+                decay_rate=-0.8,
+                beta1=None,
+                weight_decay=args.weight_decay,
+                scale_parameter=False,
+                relative_step=False,
+                warmup_init=False,
+            )
         tensorizer = ILLaDATrajectoryTensorizer(
             adapter,
             tokenizer,
@@ -2095,6 +2110,7 @@ def main() -> None:
     train_full.add_argument("--dtype", choices=("bf16", "fp16"), default="bf16")
     train_full.add_argument("--epochs", type=int, default=1)
     train_full.add_argument("--learning-rate", type=float, default=1e-5)
+    train_full.add_argument("--optimizer", choices=("adamw", "adafactor"), default="adamw")
     train_full.add_argument("--weight-decay", type=float, default=0.01)
     train_full.add_argument("--micro-batch-size", type=int, default=1)
     train_full.add_argument("--gradient-accumulation-steps", type=int, default=8)

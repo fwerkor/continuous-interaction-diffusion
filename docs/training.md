@@ -119,11 +119,13 @@ This DDP path is for the frozen-backbone Stage A phase.
 
 ### Stage B FSDP full-parameter launcher
 
-`cid train-full` is the full-parameter continuation path for the six-A6000 setup. It requires a
-multi-GPU `torchrun` job and wraps each native iLLaDA decoder layer with FSDP `FULL_SHARD` using
-`use_orig_params=True`. The underlying trainable parameters remain FP32 master weights; BF16 is the
-default forward and gradient-reduction dtype. `CIDTrainer` delegates gradient clipping to FSDP so
-the norm is computed across shards instead of clipping each rank's local fragment independently.
+`cid train-full` is the full-parameter continuation path. It requires a multi-GPU `torchrun` job
+and wraps each native iLLaDA decoder layer with FSDP `FULL_SHARD` using `use_orig_params=True`. The
+underlying trainable parameters remain FP32 master weights; BF16 is the default forward and
+gradient-reduction dtype. AdamW remains the default optimizer. Memory-constrained two-GPU runs may
+select `--optimizer adafactor`, which uses factored second-moment state and avoids the two dense FP32
+Adam moment tensors. `CIDTrainer` delegates gradient clipping to FSDP so the norm is computed across
+shards instead of clipping each rank's local fragment independently.
 
 The trajectory tensorizer cannot call a sharded token embedding outside FSDP forward. Before the
 model is wrapped, Stage B therefore copies the pretrained input embedding into a frozen BF16 text

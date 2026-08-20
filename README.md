@@ -430,7 +430,10 @@ updates.
 
 Full-parameter checkpoints are directories written with `torch.distributed.checkpoint`; model and
 optimizer states stay sharded and are never gathered as an 8B checkpoint on rank 0. Each rank also
-saves its own diffusion/shuffle RNG state and progress. Resume with:
+saves its own diffusion/shuffle RNG state and progress. `--optimizer adafactor` is available for
+memory-constrained two-GPU runs; its factored second-moment state avoids the two FP32 Adam moment
+tensors that otherwise make an 8B FULL_SHARD run exceed a 48 GiB device before activations. Resume
+with:
 
 ```bash
 torchrun --standalone --nproc-per-node=6 -m cid.cli train-full \
