@@ -1530,11 +1530,14 @@ def _train_stage_b(args: argparse.Namespace) -> None:
             resumed_windows = trainer.state.rollout_windows_seen_in_epoch
             if resumed_windows:
                 if resumed_windows >= total_local_windows:
-                    raise ValueError("checkpoint rollout position is outside the current epoch shard")
+                    raise ValueError(
+                        "checkpoint rollout position is outside the current epoch shard"
+                    )
                 local_windows = local_windows[resumed_windows:]
                 if rank == 0:
                     print(
-                        f"resume stage=B epoch={epoch} optimizer_steps={trainer.state.optimizer_steps} "
+                        f"resume stage=B epoch={epoch} "
+                        f"optimizer_steps={trainer.state.optimizer_steps} "
                         f"windows_seen={resumed_windows}/{total_local_windows}",
                         flush=True,
                     )
@@ -1575,7 +1578,10 @@ def _train_stage_b(args: argparse.Namespace) -> None:
                     )
 
                 checkpoint_due = progress.optimizer_steps >= next_checkpoint_step
-                if not checkpoint_due or progress.rollout_windows_seen_in_epoch >= current_total_windows:
+                if (
+                    not checkpoint_due
+                    or progress.rollout_windows_seen_in_epoch >= current_total_windows
+                ):
                     return
 
                 clean = torch.tensor(
