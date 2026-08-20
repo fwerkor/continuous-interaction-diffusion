@@ -137,10 +137,14 @@ Stage B checkpoints use FSDP sharded model state with `torch.distributed.checkpo
 materializes a full 8B model state dict. Optimizer state is stored rank-locally because Stage B
 resume already requires the original world size; this also avoids PyTorch 2.5's legacy
 `ShardedTensor` failure for logical parameters that have no local shard on a rank. Rank-local
-trainer files preserve diffusion RNG, shuffle RNG, transition/optimizer counts, and completed epoch
-count. Metadata pins the checkpoint layout, backbone geometry, CID adapter config, original world
-size, and the training JSONL SHA-256. Resume rejects a different dataset or world size and continues
-the next global epoch rather than restarting the shuffle seed.
+trainer files preserve diffusion RNG, shuffle RNG, transition/optimizer counts, completed epoch
+count, and the per-rank rollout-window cursor. By default the launcher logs every 100 optimizer
+steps and writes a periodic checkpoint every 5,000 steps at the next clean gradient-accumulation
+boundary, without flushing a partial accumulation early. `stage-b-latest` points at the newest
+completed checkpoint, and the previous periodic checkpoint is not removed until its successor has
+finished writing. Metadata pins the checkpoint layout, backbone geometry, CID adapter config,
+original world size, and the training JSONL SHA-256. Resume rejects a different dataset or world
+size and continues from the saved epoch position and shuffle state.
 
 An optional Stage A CID-only checkpoint may initialize the CID heads before full unfreezing. It is
 mutually exclusive with Stage B `--resume`, which already restores the entire model and optimizer.

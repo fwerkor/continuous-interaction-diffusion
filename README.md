@@ -444,9 +444,14 @@ torchrun --standalone --nproc-per-node=6 -m cid.cli train-full \
 ```
 
 Resume currently requires the same world size and the exact same training JSONL SHA-256. Global
-epoch numbering and per-rank RNG state continue from the checkpoint. The launcher serializes the
-initial full-model load across ranks to limit host-RAM pressure; the final A6000 memory envelope must
-still be measured on the real cards before increasing micro-batch size.
+epoch numbering, per-rank rollout position, and RNG state continue from the checkpoint. During a
+long epoch, the launcher logs progress every 100 optimizer steps and attempts a resumable checkpoint
+every 5,000 steps at the next clean gradient-accumulation boundary. `stage-b-latest` points at the
+newest completed checkpoint, and the previous periodic checkpoint is retained until its replacement
+has finished writing. Both intervals are configurable with `--log-every-steps` and
+`--checkpoint-every-steps`. The launcher serializes the initial full-model load across ranks to
+limit host-RAM pressure; the final A6000 memory envelope must still be measured on the real cards
+before increasing micro-batch size.
 
 ### Neural replay benchmark
 

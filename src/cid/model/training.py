@@ -298,6 +298,10 @@ class CIDTrainer:
     def trainable_parameter_names(self) -> tuple[str, ...]:
         return tuple(name for name, _ in self._trainable)
 
+    @property
+    def pending_accumulation_steps(self) -> int:
+        return self._pending_accumulation
+
     def train_transition(self, example: TrajectoryExample, source_step: int) -> CIDLoss:
         return self.train_microbatch(((example, source_step),))
 

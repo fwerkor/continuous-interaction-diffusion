@@ -4,6 +4,7 @@ import argparse
 import asyncio
 import json
 import os
+import shutil
 import time
 from dataclasses import asdict
 from pathlib import Path
@@ -1488,6 +1489,17 @@ def _train_stage_b(args: argparse.Namespace) -> None:
             )
         dist.barrier()
 
+        if args.log_every_steps <= 0:
+            raise ValueError("--log-every-steps must be positive")
+        if args.checkpoint_every_steps <= 0:
+            raise ValueError("--checkpoint-every-steps must be positive")
+        metrics_path = output_dir / f"train_metrics.rank-{rank:04d}.jsonl"
+        run_started = time.monotonic()
+        next_checkpoint_step = (
+            trainer.state.optimizer_steps // args.checkpoint_every_steps + 1
+        ) * args.checkpoint_every_steps
+        last_periodic_checkpoint: Path | None = None
+
         first_epoch = trainer.state.epochs_completed + 1
         for epoch in range(first_epoch, first_epoch + args.epochs):
             local_windows = shard_rollout_windows(
@@ -1499,9 +1511,98 @@ def _train_stage_b(args: argparse.Namespace) -> None:
                 shuffle=not args.no_shuffle,
                 micro_batch_size=args.micro_batch_size,
             )
+            total_local_windows = len(local_windows)
+            resumed_windows = trainer.state.rollout_windows_seen_in_epoch
+            if resumed_windows:
+                if resumed_windows >= total_local_windows:
+                    raise ValueError("checkpoint rollout position is outside the current epoch shard")
+                local_windows = local_windows[resumed_windows:]
+                if rank == 0:
+                    print(
+                        f"resume stage=B epoch={epoch} optimizer_steps={trainer.state.optimizer_steps} "
+                        f"windows_seen={resumed_windows}/{total_local_windows}",
+                        flush=True,
+                    )
             rollout_probability = trainer.rollout_probability()
+
+            def report_progress(
+                progress,
+                *,
+                current_epoch: int = epoch,
+                current_rollout_probability: float = rollout_probability,
+                current_total_windows: int = total_local_windows,
+            ) -> None:
+                nonlocal next_checkpoint_step, last_periodic_checkpoint
+                record = {
+                    "timestamp": time.time(),
+                    "elapsed_seconds": time.monotonic() - run_started,
+                    "epoch": current_epoch,
+                    "rank": rank,
+                    "world_size": world_size,
+                    "optimizer_steps": progress.optimizer_steps,
+                    "interval_transitions": progress.transitions,
+                    "mean_loss": progress.mean_loss,
+                    "raw_mean_loss": progress.raw_mean_loss,
+                    "learning_rate": progress.learning_rate,
+                    "rollout_probability": current_rollout_probability,
+                    "windows_seen_in_epoch": progress.rollout_windows_seen_in_epoch,
+                    "windows_total_in_epoch": current_total_windows,
+                }
+                with metrics_path.open("a", encoding="utf-8") as handle:
+                    handle.write(json.dumps(record, sort_keys=True) + "\n")
+                if rank == 0:
+                    print(
+                        f"progress stage=B epoch={current_epoch} "
+                        f"optimizer_steps={progress.optimizer_steps} "
+                        f"loss={progress.mean_loss:.6f} raw_loss={progress.raw_mean_loss:.6f} "
+                        f"windows={progress.rollout_windows_seen_in_epoch}/{current_total_windows}",
+                        flush=True,
+                    )
+
+                checkpoint_due = progress.optimizer_steps >= next_checkpoint_step
+                if not checkpoint_due or progress.rollout_windows_seen_in_epoch >= current_total_windows:
+                    return
+
+                clean = torch.tensor(
+                    [1 if trainer.pending_accumulation_steps == 0 else 0],
+                    device=device,
+                    dtype=torch.int32,
+                )
+                dist.all_reduce(clean, op=dist.ReduceOp.MIN)
+                if int(clean.item()) == 0:
+                    return
+
+                checkpoint = output_dir / f"stage-b-step-{progress.optimizer_steps:08d}"
+                save_stage_b_checkpoint(
+                    fsdp_model,
+                    optimizer,
+                    trainer,
+                    checkpoint,
+                    dataset_sha256=dataset_manifest.sha256,
+                )
+                previous = last_periodic_checkpoint
+                last_periodic_checkpoint = checkpoint
+                if rank == 0:
+                    latest = output_dir / "stage-b-latest"
+                    latest.unlink(missing_ok=True)
+                    latest.symlink_to(checkpoint.name, target_is_directory=True)
+                    if previous is not None and previous != checkpoint:
+                        shutil.rmtree(previous, ignore_errors=True)
+                    print(
+                        f"checkpoint stage=B optimizer_steps={progress.optimizer_steps} "
+                        f"path={checkpoint}",
+                        flush=True,
+                    )
+                while next_checkpoint_step <= progress.optimizer_steps:
+                    next_checkpoint_step += args.checkpoint_every_steps
+
             report = trainer.train_rollout_windows(
-                local_windows, epochs=1, shuffle=False, preserve_order=True
+                local_windows,
+                epochs=1,
+                shuffle=False,
+                preserve_order=True,
+                progress_every_optimizer_steps=args.log_every_steps,
+                progress_callback=report_progress,
             )
             aggregate = torch.tensor(
                 [report.mean_loss * report.transitions, float(report.transitions)],
@@ -1521,6 +1622,12 @@ def _train_stage_b(args: argparse.Namespace) -> None:
                 dataset_sha256=dataset_manifest.sha256,
             )
             if rank == 0:
+                latest = output_dir / "stage-b-latest"
+                latest.unlink(missing_ok=True)
+                latest.symlink_to(checkpoint.name, target_is_directory=True)
+                if last_periodic_checkpoint is not None and last_periodic_checkpoint != checkpoint:
+                    shutil.rmtree(last_periodic_checkpoint, ignore_errors=True)
+                    last_periodic_checkpoint = None
                 print(
                     f"epoch={epoch} transitions={transition_count} "
                     f"optimizer_steps={report.optimizer_steps} mean_loss={mean_loss:.6f} "
@@ -2002,6 +2109,8 @@ def main() -> None:
     train_full.add_argument("--seed", type=int, default=0)
     train_full.add_argument("--max-examples", type=int)
     train_full.add_argument("--no-shuffle", action="store_true")
+    train_full.add_argument("--log-every-steps", type=int, default=100)
+    train_full.add_argument("--checkpoint-every-steps", type=int, default=5000)
     train_full.add_argument(
         "--gradient-checkpointing",
         action=argparse.BooleanOptionalAction,
