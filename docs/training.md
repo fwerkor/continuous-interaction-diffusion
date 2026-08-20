@@ -119,40 +119,47 @@ This DDP path is for the frozen-backbone Stage A phase.
 
 ### Stage B FSDP full-parameter launcher
 
-`cid train-full` is the full-parameter continuation path. It requires a multi-GPU `torchrun` job
-and wraps each native iLLaDA decoder layer with FSDP `FULL_SHARD` using `use_orig_params=True`. The
-underlying trainable parameters remain FP32 master weights; BF16 is the default forward and
-gradient-reduction dtype. AdamW remains the default optimizer. Memory-constrained two-GPU runs may
-select `--optimizer adafactor`, which uses factored second-moment state and avoids the two dense FP32
-Adam moment tensors. `CIDTrainer` delegates gradient clipping to FSDP so the norm is computed across
-shards instead of clipping each rank's local fragment independently.
+`cid train-full` is the quality-first full-parameter continuation path after Stage A. It uses FSDP
+`FULL_SHARD` with `use_orig_params=True`, FP32 master parameters, BF16 forward/reduction, and AdamW.
+The 8B production path requires at least four GPU ranks; six A6000s are preferred. The launcher does
+not automatically replace AdamW with a lower-memory optimizer or CPU offload when fewer GPUs are
+available, since either change would alter the intended training dynamics.
 
-The trajectory tensorizer cannot call a sharded token embedding outside FSDP forward. Before the
-model is wrapped, Stage B therefore copies the pretrained input embedding into a frozen BF16 text
-encoder. Dataset semantic transport text, external-memory records, and grounding/argument retrieval
-targets are encoded through that fixed snapshot. Prompt and display IDs remain ordinary model
-inputs and use the live, trainable embedding inside the FSDP forward. Besides avoiding illegal
-out-of-forward access to sharded parameters, this keeps target embeddings stationary while the
-language model changes.
+Stage B separates optimization policy by parameter role. CID modules use the configured peak
+learning rate (`1e-5` by default), while iLLaDA backbone groups use `backbone_lr_scale=0.5`. Matrix
+and embedding weights receive `weight_decay=0.01`; one-dimensional norm weights and biases receive
+zero decay. The trainer preserves these group multipliers through a 3% linear warmup and cosine
+decay to 10% of peak. The default target transition batch is 32 and gradient accumulation is derived
+from the actual world size unless explicitly overridden. At micro-batch 1 this resolves to 8
+accumulation steps on four ranks and 5 on six ranks.
 
-Stage B checkpoints use FSDP sharded model state with `torch.distributed.checkpoint`, so no rank
-materializes a full 8B model state dict. Optimizer state is stored rank-locally because Stage B
-resume already requires the original world size; this also avoids PyTorch 2.5's legacy
-`ShardedTensor` failure for logical parameters that have no local shard on a rank. Rank-local
-trainer files preserve diffusion RNG, shuffle RNG, transition/optimizer counts, completed epoch
-count, and the per-rank rollout-window cursor. By default the launcher logs every 100 optimizer
-steps and writes a periodic checkpoint every 5,000 steps at the next clean gradient-accumulation
-boundary, without flushing a partial accumulation early. `stage-b-latest` points at the newest
-completed checkpoint, and the previous periodic checkpoint is not removed until its successor has
-finished writing. Metadata pins the checkpoint layout, backbone geometry, CID adapter config,
-original world size, and the training JSONL SHA-256. Resume rejects a different dataset or world
-size and continues from the saved epoch position and shuffle state.
+Stage B starts at rollout probability 1.0 by default. Stage A has already performed the
+teacher-forcing-to-rollout curriculum, so restarting that curriculum after unfreezing the backbone
+would train the full model on an easier distribution than the one used at inference. `--epochs` is a
+target-total count: resuming a partially completed one-epoch run with `--epochs 1` finishes that
+same epoch instead of scheduling a second one.
 
-An optional Stage A CID-only checkpoint may initialize the CID heads before full unfreezing. It is
-mutually exclusive with Stage B `--resume`, which already restores the entire model and optimizer.
-The repository tests the FSDP path both with a CPU world-size-1 checkpoint round trip and a true
-two-rank Gloo `FULL_SHARD` forward/backward/distributed-checkpoint smoke. The real 8B A6000 memory
-ceiling still needs to be measured before raising local micro-batch size above one.
+The adapter is initially loaded as FP32 on CPU. A frozen BF16 snapshot of the input embedding is
+copied to the local GPU for dataset semantic transport targets and external-memory text, then FSDP
+moves and shards the trainable wrap units via `device_id`. This avoids a transient full-model FP32
+GPU copy before sharding. Prompt and display token IDs still use the live trainable embedding inside
+the FSDP forward, while the fixed snapshot keeps target embeddings stationary as the backbone
+changes.
+
+Stage B checkpoints use FSDP sharded model state with `torch.distributed.checkpoint`; optimizer
+state remains rank-local. Rank-local trainer state preserves the LR schedule, diffusion/shuffle RNG,
+transition and optimizer counts, completed epochs, and the per-rank rollout-window cursor. The
+default launcher logs every 100 optimizer steps and writes a periodic checkpoint every 2,500 steps
+at a clean gradient-accumulation boundary. `stage-b-latest` is updated only after a checkpoint is
+complete, and the previous periodic checkpoint is removed only after its successor is safe. Resume
+requires the same world size and exact training JSONL SHA-256, and the stored trainer configuration
+prevents silently changing LR, accumulation, or rollout policy midway through a run.
+
+A fresh Stage B run requires `--init-cid-checkpoint`; `--resume` is mutually exclusive and restores
+the complete Stage B model/optimizer state. The repository tests the optimizer grouping and LR
+multipliers, a CPU FSDP checkpoint round trip, and a true two-rank Gloo `FULL_SHARD`
+forward/backward/distributed-checkpoint smoke. The two-rank smoke is a correctness test only; the
+8B production launcher itself enforces four or more GPU ranks.
 
 ### Neural replay benchmark
 

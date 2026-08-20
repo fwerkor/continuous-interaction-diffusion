@@ -405,56 +405,67 @@ a trainer.
 
 ### Stage B full-parameter training
 
-After the CID heads have learned the basic runtime contract, `train-full` unfreezes the whole 8B
-model and uses FSDP `FULL_SHARD` across the six GPUs. Parameters remain FP32 master weights while
-forward/reduction compute uses BF16 by default. Each native iLLaDA decoder layer is an auto-wrap
-unit, so parameter, gradient, and Adam state are sharded instead of replicated on every A6000.
+After Stage A has learned the CID runtime contract, `train-full` performs one joint full-parameter
+continuation of iLLaDA and the CID modules. The production path is deliberately **AdamW-only** and
+requires at least four GPU ranks for the 8B model. Six 48 GiB A6000s are preferred; four are the
+supported minimum. Two-rank training is rejected rather than silently switching optimizer or CPU
+offload semantics. With the current 8.25B iLLaDA checkpoint plus roughly 0.45B CID parameters, the
+FP32 parameter/gradient/Adam state alone is about 32 GiB per rank at world size 4 and 22 GiB at
+world size 6 before activations and FSDP all-gathers.
+
+The default profile is quality-first:
+
+- FSDP `FULL_SHARD`, FP32 master parameters, BF16 forward/reduction, gradient checkpointing enabled;
+- AdamW with `weight_decay=0.01` on matrix/tensor weights and zero decay on one-dimensional
+  norm/bias parameters;
+- peak CID learning rate `1e-5`; the pretrained iLLaDA backbone uses a conservative `0.5` multiplier
+  (`5e-6` by default);
+- 3% linear warmup followed by cosine decay to 10% of the peak rate over the target Stage B epochs;
+- full rollout from the first Stage B batch (`teacher_forcing_epochs=0`, `rollout_ramp_epochs=0`),
+  because the curriculum has already been completed in Stage A;
+- target effective transition batch 32. Gradient accumulation is resolved automatically from the
+  world size: with micro-batch 1 this is 8 on four GPUs and 5 on six GPUs (effective batch 30);
+- one **target total** epoch by default. On resume, `--epochs 1` means finish epoch 1 rather than add
+  another epoch.
+
+A completed Stage A CID checkpoint is required for a fresh Stage B launch:
 
 ```bash
-torchrun --standalone --nproc-per-node=6 -m cid.cli train-full \
+WORLD_SIZE=6
+torchrun --standalone --nproc-per-node=${WORLD_SIZE} -m cid.cli train-full \
   --data data/distilled.jsonl \
-  --output-dir runs/stage-b-6gpu \
-  --init-cid-checkpoint runs/stage-a/stage-a-step-00001000.pt \
+  --output-dir runs/stage-b \
+  --init-cid-checkpoint runs/stage-a/stage-a-final-epoch3.pt \
   --thought-capacity 128 \
-  --micro-batch-size 1 \
-  --gradient-accumulation-steps 8 \
-  --learning-rate 1e-5 \
+  --max-display-tokens 1024 \
   --dtype bf16
 ```
 
-Stage B creates a frozen BF16 snapshot of the pretrained input embedding before FSDP wrapping. The
-snapshot is used only to encode dataset transport targets and external-memory text. Prompt/display
-token IDs still use the live trainable iLLaDA embedding inside the FSDP forward. This avoids calling
-a sharded embedding outside FSDP and keeps the target retrieval space stable while the backbone
-updates.
+The initial FP32 iLLaDA copy stays on host memory while the frozen BF16 text-embedding snapshot is
+created. FSDP then moves and shards wrap units onto each GPU via `device_id`, avoiding a transient
+full FP32 8B allocation on every A6000 before sharding is active. The frozen embedding snapshot is
+used only for dataset transport targets and external-memory text; prompt/display IDs still use the
+live trainable embedding through the FSDP forward.
 
 Full-parameter checkpoints are directories written with `torch.distributed.checkpoint`; model and
-optimizer states stay sharded and are never gathered as an 8B checkpoint on rank 0. Each rank also
-saves its own diffusion/shuffle RNG state and progress. `--optimizer adafactor` is available for
-memory-constrained two-GPU runs; its factored second-moment state avoids the two FP32 Adam moment
-tensors that otherwise make an 8B FULL_SHARD run exceed a 48 GiB device before activations. Resume
-with:
+optimizer states stay sharded and are never gathered as an 8B checkpoint on rank 0. The launcher
+logs every 100 optimizer steps and writes a resumable checkpoint every 2,500 steps at the next clean
+gradient-accumulation boundary. `stage-b-latest` points at the newest completed checkpoint, and the
+previous periodic checkpoint is retained until its replacement is complete. Resume requires the
+same world size, dataset SHA-256, and resolved trainer configuration:
 
 ```bash
-torchrun --standalone --nproc-per-node=6 -m cid.cli train-full \
+torchrun --standalone --nproc-per-node=${WORLD_SIZE} -m cid.cli train-full \
   --data data/distilled.jsonl \
-  --output-dir runs/stage-b-6gpu \
-  --resume runs/stage-b-6gpu/stage-b-step-00002000 \
-  --thought-capacity 128 \
-  --micro-batch-size 1 \
-  --gradient-accumulation-steps 8 \
+  --output-dir runs/stage-b \
+  --resume runs/stage-b/stage-b-step-00002500 \
   --dtype bf16
 ```
 
-Resume currently requires the same world size and the exact same training JSONL SHA-256. Global
-epoch numbering, per-rank rollout position, and RNG state continue from the checkpoint. During a
-long epoch, the launcher logs progress every 100 optimizer steps and attempts a resumable checkpoint
-every 5,000 steps at the next clean gradient-accumulation boundary. `stage-b-latest` points at the
-newest completed checkpoint, and the previous periodic checkpoint is retained until its replacement
-has finished writing. Both intervals are configurable with `--log-every-steps` and
-`--checkpoint-every-steps`. The launcher serializes the initial full-model load across ranks to
-limit host-RAM pressure; the final A6000 memory envelope must still be measured on the real cards
-before increasing micro-batch size.
+The defaults can be overridden for controlled ablations with `--learning-rate`,
+`--backbone-lr-scale`, `--target-global-batch-size`, `--gradient-accumulation-steps`,
+`--warmup-ratio`, and `--min-learning-rate-ratio`, but the release run should keep one frozen
+configuration once it starts.
 
 ### Neural replay benchmark
 
@@ -479,9 +490,9 @@ Stage B checkpoints remain sharded, so evaluation uses the original FSDP world s
 gathering the 8B model onto one rank:
 
 ```bash
-torchrun --standalone --nproc-per-node=6 -m cid.cli benchmark \
+torchrun --standalone --nproc-per-node=${WORLD_SIZE} -m cid.cli benchmark \
   --data data/validation.jsonl \
-  --checkpoint runs/stage-b-6gpu/stage-b-step-00002000 \
+  --checkpoint runs/stage-b/stage-b-step-00002500 \
   --checkpoint-kind stage-b \
   --output runs/eval-stage-b/cases.jsonl \
   --summary-output runs/eval-stage-b/summary.json \

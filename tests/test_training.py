@@ -35,6 +35,7 @@ CIDTrainer = cid_model.CIDTrainer
 CIDTrainerConfig = cid_model.CIDTrainerConfig
 CIDTrainerState = cid_model.CIDTrainerState
 CIDRolloutState = cid_model.CIDRolloutState
+CIDRolloutWindow = cid_model.CIDRolloutWindow
 balance_rollout_windows_by_semantic_task = cid_model.balance_rollout_windows_by_semantic_task
 collate_training_steps = cid_model.collate_training_steps
 load_cid_adapter_checkpoint = cid_model.load_cid_adapter_checkpoint
@@ -43,6 +44,9 @@ load_stage_b_model_checkpoint = cid_model.load_stage_b_model_checkpoint
 save_stage_b_checkpoint = cid_model.save_stage_b_checkpoint
 shard_rollout_windows = cid_model.shard_rollout_windows
 shard_transitions = cid_model.shard_transitions
+stage_b_adamw_parameter_groups = cid_model.stage_b_adamw_parameter_groups
+stage_b_gradient_accumulation_steps = cid_model.stage_b_gradient_accumulation_steps
+stage_b_optimizer_steps_per_epoch = cid_model.stage_b_optimizer_steps_per_epoch
 trajectory_rollout_windows = cid_model.trajectory_rollout_windows
 trajectory_transitions = cid_model.trajectory_transitions
 wrap_stage_a_ddp = cid_model.wrap_stage_a_ddp
@@ -909,12 +913,15 @@ def test_stage_b_fsdp_runs_full_parameter_optimizer_step_on_cpu(tmp_path) -> Non
             device="cpu",
             dtype=torch.bfloat16,
         )
+        optimizer_groups = stage_b_adamw_parameter_groups(
+            adapter, backbone_lr_scale=0.5, weight_decay=0.01
+        )
         fsdp = wrap_stage_b_fsdp(
             adapter,
             device_id=torch.device("cpu"),
             compute_dtype=torch.bfloat16,
         )
-        optimizer = torch.optim.AdamW(fsdp.parameters(), lr=1e-3)
+        optimizer = torch.optim.AdamW(optimizer_groups, lr=1e-3)
         trainer = CIDTrainer(
             adapter,
             ILLaDATrajectoryTensorizer(
@@ -961,12 +968,15 @@ def test_stage_b_fsdp_runs_full_parameter_optimizer_step_on_cpu(tmp_path) -> Non
             device="cpu",
             dtype=torch.bfloat16,
         )
+        restored_optimizer_groups = stage_b_adamw_parameter_groups(
+            restored_adapter, backbone_lr_scale=0.5, weight_decay=0.01
+        )
         restored_fsdp = wrap_stage_b_fsdp(
             restored_adapter,
             device_id=torch.device("cpu"),
             compute_dtype=torch.bfloat16,
         )
-        restored_optimizer = torch.optim.AdamW(restored_fsdp.parameters(), lr=1e-3)
+        restored_optimizer = torch.optim.AdamW(restored_optimizer_groups, lr=1e-3)
         restored_trainer = CIDTrainer(
             restored_adapter,
             ILLaDATrajectoryTensorizer(
@@ -1226,6 +1236,99 @@ def test_rollout_sharding_globally_mixes_weighted_microbatches() -> None:
     sequence = chunk_weight_sequences[0]
     assert sequence != tuple(sorted(sequence))
     assert sum(left != right for left, right in zip(sequence, sequence[1:], strict=False)) >= 2
+
+
+def test_stage_b_batch_resolution_is_stable_across_four_and_six_ranks() -> None:
+    assert stage_b_gradient_accumulation_steps(
+        world_size=4, micro_batch_size=1, target_global_batch_size=32
+    ) == 8
+    assert stage_b_gradient_accumulation_steps(
+        world_size=6, micro_batch_size=1, target_global_batch_size=32
+    ) == 5
+    assert stage_b_gradient_accumulation_steps(
+        world_size=6,
+        micro_batch_size=1,
+        target_global_batch_size=32,
+        explicit_steps=8,
+    ) == 8
+
+
+def test_stage_b_optimizer_step_count_matches_bucket_padding() -> None:
+    example = make_trajectory()
+    windows = tuple(
+        CIDRolloutWindow(example=example, source_steps=(0, 1, 2), loss_weight=1.0)
+        for _ in range(5)
+    ) + tuple(
+        CIDRolloutWindow(example=example, source_steps=(0,), loss_weight=2.0)
+        for _ in range(3)
+    )
+
+    assert stage_b_optimizer_steps_per_epoch(
+        windows,
+        world_size=4,
+        micro_batch_size=1,
+        gradient_accumulation_steps=2,
+    ) == 4
+    assert stage_b_optimizer_steps_per_epoch(
+        windows,
+        world_size=4,
+        micro_batch_size=2,
+        gradient_accumulation_steps=2,
+    ) == 2
+
+
+def test_stage_b_adamw_groups_split_backbone_cid_and_no_decay() -> None:
+    adapter = make_adapter()
+    adapter.set_backbone_trainable(True)
+
+    groups = stage_b_adamw_parameter_groups(
+        adapter, backbone_lr_scale=0.5, weight_decay=0.01
+    )
+    by_name = {str(group["group_name"]): group for group in groups}
+
+    assert set(by_name) == {
+        "backbone-decay",
+        "cid-decay",
+        "cid-no-decay",
+    }
+    assert by_name["backbone-decay"]["lr_scale"] == pytest.approx(0.5)
+    assert by_name["cid-decay"]["lr_scale"] == pytest.approx(1.0)
+    assert by_name["backbone-decay"]["weight_decay"] == pytest.approx(0.01)
+    assert by_name["cid-no-decay"]["weight_decay"] == pytest.approx(0.0)
+
+    grouped = {id(parameter) for group in groups for parameter in group["params"]}
+    trainable = {id(parameter) for parameter in adapter.parameters() if parameter.requires_grad}
+    assert grouped == trainable
+
+
+def test_learning_rate_schedule_preserves_stage_b_group_scales() -> None:
+    adapter = make_adapter()
+    adapter.set_backbone_trainable(True)
+    groups = stage_b_adamw_parameter_groups(
+        adapter, backbone_lr_scale=0.5, weight_decay=0.01
+    )
+    optimizer = torch.optim.AdamW(groups, lr=1e-3)
+    trainer = CIDTrainer(
+        adapter,
+        ILLaDATrajectoryTensorizer(adapter, TinyTokenizer()),
+        CIDTrainerConfig(
+            learning_rate=1e-3,
+            warmup_steps=2,
+            lr_decay_steps=6,
+            min_learning_rate_ratio=0.1,
+        ),
+        optimizer=optimizer,
+    )
+
+    trainer._set_learning_rate_for_step(2)
+    lrs = {str(group["group_name"]): float(group["lr"]) for group in optimizer.param_groups}
+    assert lrs["backbone-decay"] == pytest.approx(5e-4)
+    assert lrs["cid-decay"] == pytest.approx(1e-3)
+
+    trainer._set_learning_rate_for_step(6)
+    lrs = {str(group["group_name"]): float(group["lr"]) for group in optimizer.param_groups}
+    assert lrs["backbone-decay"] == pytest.approx(5e-5)
+    assert lrs["cid-decay"] == pytest.approx(1e-4)
 
 
 def test_learning_rate_schedule_warms_up_then_cosine_decays() -> None:

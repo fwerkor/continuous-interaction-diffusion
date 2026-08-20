@@ -787,7 +787,10 @@ class CIDTrainer:
     def _set_learning_rate_for_step(self, step: int) -> None:
         learning_rate = self._learning_rate_for_step(step)
         for group in self.optimizer.param_groups:
-            group["lr"] = learning_rate
+            lr_scale = float(group.get("lr_scale", 1.0))
+            if not math.isfinite(lr_scale) or lr_scale <= 0.0:
+                raise ValueError("optimizer lr_scale must be finite and positive")
+            group["lr"] = learning_rate * lr_scale
 
     def _learning_rate_for_step(self, step: int) -> float:
         if step <= 0:
@@ -1727,6 +1730,107 @@ def wrap_stage_a_ddp(
     else:
         kwargs["broadcast_buffers"] = False
     return DistributedDataParallel(adapter, **kwargs)
+
+
+def stage_b_gradient_accumulation_steps(
+    *,
+    world_size: int,
+    micro_batch_size: int,
+    target_global_batch_size: int,
+    explicit_steps: int | None = None,
+) -> int:
+    """Resolve accumulation to the closest realizable transition batch."""
+
+    if world_size <= 0 or micro_batch_size <= 0 or target_global_batch_size <= 0:
+        raise ValueError("Stage B batch dimensions must be positive")
+    if explicit_steps is not None:
+        if explicit_steps <= 0:
+            raise ValueError("explicit Stage B gradient accumulation must be positive")
+        return explicit_steps
+    data_parallel_micro_batch = world_size * micro_batch_size
+    return max(
+        1,
+        math.floor(target_global_batch_size / data_parallel_micro_batch + 0.5),
+    )
+
+
+def stage_b_optimizer_steps_per_epoch(
+    windows: tuple[CIDRolloutWindow, ...],
+    *,
+    world_size: int,
+    micro_batch_size: int,
+    gradient_accumulation_steps: int,
+) -> int:
+    """Return exact optimizer steps implied by Stage B bucket padding/sharding."""
+
+    if world_size <= 0 or micro_batch_size <= 0 or gradient_accumulation_steps <= 0:
+        raise ValueError("Stage B optimizer-step dimensions must be positive")
+    if not windows:
+        return 0
+    bucket_counts: dict[tuple[int, float], int] = {}
+    for window in windows:
+        key = (len(window.source_steps), window.loss_weight)
+        bucket_counts[key] = bucket_counts.get(key, 0) + 1
+    microbatches_per_rank = 0
+    for (window_length, _), count in bucket_counts.items():
+        local_windows = math.ceil(count / world_size)
+        local_microbatches = math.ceil(local_windows / micro_batch_size)
+        microbatches_per_rank += local_microbatches * window_length
+    return math.ceil(microbatches_per_rank / gradient_accumulation_steps)
+
+
+def stage_b_adamw_parameter_groups(
+    adapter: ILLaDACIDAdapter,
+    *,
+    backbone_lr_scale: float = 0.5,
+    weight_decay: float = 0.01,
+) -> list[dict[str, object]]:
+    """Build stable AdamW groups for Stage B before FSDP wrapping.
+
+    ``use_orig_params=True`` keeps these original ``nn.Parameter`` objects valid after
+    wrapping. Matrix/tensor weights receive AdamW decay while one-dimensional norm
+    weights and biases do not. The already-trained CID modules keep the base learning
+    rate; the pretrained iLLaDA backbone uses a conservative multiplier to reduce
+    catastrophic forgetting during the one-epoch joint continuation.
+    """
+
+    if not math.isfinite(backbone_lr_scale) or backbone_lr_scale <= 0.0:
+        raise ValueError("backbone_lr_scale must be finite and positive")
+    if not math.isfinite(weight_decay) or weight_decay < 0.0:
+        raise ValueError("weight_decay must be finite and non-negative")
+
+    buckets: dict[tuple[bool, bool], list[torch.nn.Parameter]] = {
+        (True, True): [],
+        (True, False): [],
+        (False, True): [],
+        (False, False): [],
+    }
+    for name, parameter in adapter.named_parameters():
+        if not parameter.requires_grad:
+            continue
+        is_backbone = name.startswith("backbone.")
+        use_decay = parameter.ndim >= 2
+        buckets[(is_backbone, use_decay)].append(parameter)
+
+    groups: list[dict[str, object]] = []
+    for is_backbone, use_decay in ((True, True), (True, False), (False, True), (False, False)):
+        parameters = buckets[(is_backbone, use_decay)]
+        if not parameters:
+            continue
+        groups.append(
+            {
+                "params": parameters,
+                "weight_decay": weight_decay if use_decay else 0.0,
+                "lr_scale": backbone_lr_scale if is_backbone else 1.0,
+                "group_name": (
+                    f"{'backbone' if is_backbone else 'cid'}-"
+                    f"{'decay' if use_decay else 'no-decay'}"
+                ),
+            }
+        )
+    if not groups:
+        raise ValueError("Stage B AdamW requires trainable parameters")
+    return groups
 
 
 def wrap_stage_b_fsdp(

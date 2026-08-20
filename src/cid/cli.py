@@ -1336,7 +1336,6 @@ def _train_stage_b(args: argparse.Namespace) -> None:
     import torch
     import torch.distributed as dist
     from transformers import AutoTokenizer
-    from transformers.optimization import Adafactor
 
     from cid.model import (
         ILLADA_8B_BASE,
@@ -1351,6 +1350,9 @@ def _train_stage_b(args: argparse.Namespace) -> None:
         load_stage_b_checkpoint,
         save_stage_b_checkpoint,
         shard_rollout_windows,
+        stage_b_adamw_parameter_groups,
+        stage_b_gradient_accumulation_steps,
+        stage_b_optimizer_steps_per_epoch,
         trajectory_rollout_windows,
         wrap_stage_b_fsdp,
     )
@@ -1358,11 +1360,42 @@ def _train_stage_b(args: argparse.Namespace) -> None:
 
     if args.resume and args.init_cid_checkpoint:
         raise ValueError("--resume and --init-cid-checkpoint are mutually exclusive")
+    if not args.resume and not args.init_cid_checkpoint:
+        raise ValueError("Stage B requires --init-cid-checkpoint unless --resume is used")
+    if args.epochs <= 0:
+        raise ValueError("--epochs must be positive")
+    if args.micro_batch_size <= 0:
+        raise ValueError("--micro-batch-size must be positive")
+    if args.target_global_batch_size <= 0:
+        raise ValueError("--target-global-batch-size must be positive")
+    if args.gradient_accumulation_steps is not None and args.gradient_accumulation_steps <= 0:
+        raise ValueError("--gradient-accumulation-steps must be positive")
+    if not 0.0 <= args.warmup_ratio < 1.0:
+        raise ValueError("--warmup-ratio must be in [0, 1)")
+    if not 0.0 <= args.min_learning_rate_ratio <= 1.0:
+        raise ValueError("--min-learning-rate-ratio must be in [0, 1]")
+    if args.backbone_lr_scale <= 0.0:
+        raise ValueError("--backbone-lr-scale must be positive")
+
     world_size = int(os.environ.get("WORLD_SIZE", "1"))
-    if world_size < 2:
-        raise RuntimeError("Stage B full-parameter training must run under multi-GPU torchrun")
+    if world_size < 4:
+        raise RuntimeError(
+            "Stage B AdamW for the 8B iLLaDA+CID model requires at least four GPU ranks; "
+            "the current path intentionally does not substitute CPU offload or a lower-memory "
+            "optimizer because those change training semantics"
+        )
     if not torch.cuda.is_available():
         raise RuntimeError("Stage B full-parameter training requires CUDA GPUs")
+
+    gradient_accumulation_steps = stage_b_gradient_accumulation_steps(
+        world_size=world_size,
+        micro_batch_size=args.micro_batch_size,
+        target_global_batch_size=args.target_global_batch_size,
+        explicit_steps=args.gradient_accumulation_steps,
+    )
+    effective_batch = (
+        args.micro_batch_size * gradient_accumulation_steps * world_size
+    )
 
     compute_dtype = {
         "bf16": torch.bfloat16,
@@ -1382,6 +1415,33 @@ def _train_stage_b(args: argparse.Namespace) -> None:
                 "training data requires a larger TCT capacity: "
                 f"{dataset_manifest.thought_capacity_required} > {args.thought_capacity}"
             )
+
+        examples = load_jsonl(args.data)
+        if args.max_examples is not None:
+            examples = examples[: args.max_examples]
+        windows = balance_rollout_windows_by_semantic_task(
+            trajectory_rollout_windows(
+                examples,
+                max_horizon=args.rollout_horizon,
+            )
+        )
+        if not windows:
+            raise ValueError("training data contains no adjacent thought transitions")
+        transition_count_total = sum(len(window.source_steps) for window in windows)
+
+        optimizer_steps_per_epoch = stage_b_optimizer_steps_per_epoch(
+            windows,
+            world_size=world_size,
+            micro_batch_size=args.micro_batch_size,
+            gradient_accumulation_steps=gradient_accumulation_steps,
+        )
+        lr_decay_steps = max(1, optimizer_steps_per_epoch * args.epochs)
+        warmup_steps = (
+            max(1, round(lr_decay_steps * args.warmup_ratio))
+            if args.warmup_ratio > 0.0
+            else 0
+        )
+
         tokenizer_kwargs: dict[str, object] = {"trust_remote_code": True}
         if args.model == ILLADA_8B_BASE:
             tokenizer_kwargs["revision"] = ILLADA_8B_BASE_REVISION
@@ -1392,13 +1452,16 @@ def _train_stage_b(args: argparse.Namespace) -> None:
         )
 
         def load_adapter() -> tuple[ILLaDACIDAdapter, ILLaDATextEncoder]:
+            # Keep the initial FP32 model on host memory. FSDP's device_id moves each wrap
+            # unit onto the local GPU while sharding it, avoiding a transient full-model
+            # FP32 allocation on every A6000 before FULL_SHARD is active.
             model = ILLaDACIDAdapter.from_pretrained(
                 args.model,
                 config=adapter_config,
                 freeze_backbone=True,
                 torch_dtype=torch.float32,
                 low_cpu_mem_usage=True,
-            ).to(device)
+            )
             if args.init_cid_checkpoint:
                 load_cid_adapter_checkpoint(model, args.init_cid_checkpoint)
             snapshot = ILLaDATextEncoder.from_frozen_snapshot(
@@ -1421,30 +1484,22 @@ def _train_stage_b(args: argparse.Namespace) -> None:
         if adapter is None or text_encoder is None:
             raise RuntimeError("failed to load Stage B iLLaDA model on this training rank")
 
+        optimizer_groups = stage_b_adamw_parameter_groups(
+            adapter,
+            backbone_lr_scale=args.backbone_lr_scale,
+            weight_decay=args.weight_decay,
+        )
         fsdp_model = wrap_stage_b_fsdp(
             adapter,
             device_id=device,
             compute_dtype=compute_dtype,
         )
-        if args.optimizer == "adamw":
-            optimizer = torch.optim.AdamW(
-                fsdp_model.parameters(),
-                lr=args.learning_rate,
-                weight_decay=args.weight_decay,
-            )
-        else:
-            optimizer = Adafactor(
-                fsdp_model.parameters(),
-                lr=args.learning_rate,
-                eps=(1e-30, 1e-3),
-                clip_threshold=1.0,
-                decay_rate=-0.8,
-                beta1=None,
-                weight_decay=args.weight_decay,
-                scale_parameter=False,
-                relative_step=False,
-                warmup_init=False,
-            )
+        optimizer = torch.optim.AdamW(
+            optimizer_groups,
+            lr=args.learning_rate,
+            betas=(0.9, 0.999),
+            eps=1e-8,
+        )
         tensorizer = ILLaDATrajectoryTensorizer(
             adapter,
             tokenizer,
@@ -1457,8 +1512,11 @@ def _train_stage_b(args: argparse.Namespace) -> None:
                 learning_rate=args.learning_rate,
                 weight_decay=args.weight_decay,
                 micro_batch_size=args.micro_batch_size,
-                gradient_accumulation_steps=args.gradient_accumulation_steps,
+                gradient_accumulation_steps=gradient_accumulation_steps,
                 max_grad_norm=args.max_grad_norm,
+                warmup_steps=warmup_steps,
+                lr_decay_steps=lr_decay_steps,
+                min_learning_rate_ratio=args.min_learning_rate_ratio,
                 timestep_min=args.timestep_min,
                 timestep_max=args.timestep_max,
                 rollout_horizon=args.rollout_horizon,
@@ -1481,26 +1539,19 @@ def _train_stage_b(args: argparse.Namespace) -> None:
         else:
             trainer.reseed(args.seed + rank)
 
-        examples = load_jsonl(args.data)
-        if args.max_examples is not None:
-            examples = examples[: args.max_examples]
-        windows = balance_rollout_windows_by_semantic_task(
-            trajectory_rollout_windows(
-                examples,
-                max_horizon=args.rollout_horizon,
-            )
-        )
-        if not windows:
-            raise ValueError("training data contains no adjacent thought transitions")
-        transition_count_total = sum(len(window.source_steps) for window in windows)
         output_dir = Path(args.output_dir)
         if rank == 0:
             output_dir.mkdir(parents=True, exist_ok=True)
-            effective_batch = args.micro_batch_size * args.gradient_accumulation_steps * world_size
             print(
                 f"stage=B device={device} world_size={world_size} dtype={args.dtype} "
-                f"examples={len(examples)} transitions={transition_count_total} "
-                f"effective_batch={effective_batch}"
+                f"optimizer=adamw examples={len(examples)} transitions={transition_count_total} "
+                f"target_global_batch={args.target_global_batch_size} "
+                f"effective_batch={effective_batch} grad_accum={gradient_accumulation_steps} "
+                f"peak_cid_lr={args.learning_rate:.3e} "
+                f"peak_backbone_lr={args.learning_rate * args.backbone_lr_scale:.3e} "
+                f"warmup_steps={warmup_steps} lr_decay_steps={lr_decay_steps} "
+                f"target_epochs={args.epochs}",
+                flush=True,
             )
         dist.barrier()
 
@@ -1515,8 +1566,17 @@ def _train_stage_b(args: argparse.Namespace) -> None:
         ) * args.checkpoint_every_steps
         last_periodic_checkpoint: Path | None = None
 
+        if trainer.state.epochs_completed >= args.epochs:
+            if rank == 0:
+                print(
+                    f"Stage B target already satisfied: "
+                    f"epochs_completed={trainer.state.epochs_completed} target={args.epochs}",
+                    flush=True,
+                )
+            return
+
         first_epoch = trainer.state.epochs_completed + 1
-        for epoch in range(first_epoch, first_epoch + args.epochs):
+        for epoch in range(first_epoch, args.epochs + 1):
             local_windows = shard_rollout_windows(
                 windows,
                 world_size=world_size,
@@ -1551,6 +1611,14 @@ def _train_stage_b(args: argparse.Namespace) -> None:
                 current_total_windows: int = total_local_windows,
             ) -> None:
                 nonlocal next_checkpoint_step, last_periodic_checkpoint
+                group_lrs = {
+                    str(group.get("group_name", index)): float(group["lr"])
+                    for index, group in enumerate(optimizer.param_groups)
+                }
+                backbone_lrs = [
+                    lr for name, lr in group_lrs.items() if name.startswith("backbone-")
+                ]
+                cid_lrs = [lr for name, lr in group_lrs.items() if name.startswith("cid-")]
                 record = {
                     "timestamp": time.time(),
                     "elapsed_seconds": time.monotonic() - run_started,
@@ -1562,9 +1630,12 @@ def _train_stage_b(args: argparse.Namespace) -> None:
                     "mean_loss": progress.mean_loss,
                     "raw_mean_loss": progress.raw_mean_loss,
                     "learning_rate": progress.learning_rate,
+                    "backbone_learning_rate": min(backbone_lrs) if backbone_lrs else None,
+                    "cid_learning_rate": max(cid_lrs) if cid_lrs else None,
                     "rollout_probability": current_rollout_probability,
                     "windows_seen_in_epoch": progress.rollout_windows_seen_in_epoch,
                     "windows_total_in_epoch": current_total_windows,
+                    "effective_batch": effective_batch,
                 }
                 with metrics_path.open("a", encoding="utf-8") as handle:
                     handle.write(json.dumps(record, sort_keys=True) + "\n")
@@ -1626,13 +1697,18 @@ def _train_stage_b(args: argparse.Namespace) -> None:
                 progress_callback=report_progress,
             )
             aggregate = torch.tensor(
-                [report.mean_loss * report.transitions, float(report.transitions)],
+                [
+                    report.mean_loss * report.transitions,
+                    report.raw_mean_loss * report.transitions,
+                    float(report.transitions),
+                ],
                 device=device,
                 dtype=torch.float64,
             )
             dist.all_reduce(aggregate)
-            mean_loss = float(aggregate[0] / aggregate[1])
-            transition_count = int(aggregate[1])
+            mean_loss = float(aggregate[0] / aggregate[2])
+            raw_mean_loss = float(aggregate[1] / aggregate[2])
+            transition_count = int(aggregate[2])
 
             checkpoint = output_dir / f"stage-b-step-{trainer.state.optimizer_steps:08d}"
             save_stage_b_checkpoint(
@@ -1652,6 +1728,7 @@ def _train_stage_b(args: argparse.Namespace) -> None:
                 print(
                     f"epoch={epoch} transitions={transition_count} "
                     f"optimizer_steps={report.optimizer_steps} mean_loss={mean_loss:.6f} "
+                    f"raw_mean_loss={raw_mean_loss:.6f} "
                     f"rollout_probability={rollout_probability:.3f} checkpoint={checkpoint}"
                 )
     finally:
@@ -2114,25 +2191,43 @@ def main() -> None:
     train_full.add_argument("--resume")
     train_full.add_argument("--init-cid-checkpoint")
     train_full.add_argument("--dtype", choices=("bf16", "fp16"), default="bf16")
-    train_full.add_argument("--epochs", type=int, default=1)
-    train_full.add_argument("--learning-rate", type=float, default=1e-5)
-    train_full.add_argument("--optimizer", choices=("adamw", "adafactor"), default="adamw")
+    train_full.add_argument(
+        "--epochs",
+        type=int,
+        default=1,
+        help="target total Stage B epochs, including epochs restored by --resume",
+    )
+    train_full.add_argument(
+        "--learning-rate",
+        type=float,
+        default=1e-5,
+        help="peak CID-module learning rate; backbone LR is scaled separately",
+    )
+    train_full.add_argument("--backbone-lr-scale", type=float, default=0.5)
     train_full.add_argument("--weight-decay", type=float, default=0.01)
     train_full.add_argument("--micro-batch-size", type=int, default=1)
-    train_full.add_argument("--gradient-accumulation-steps", type=int, default=8)
+    train_full.add_argument(
+        "--target-global-batch-size",
+        type=int,
+        default=32,
+        help="target transition batch; ignored when gradient accumulation is explicit",
+    )
+    train_full.add_argument("--gradient-accumulation-steps", type=int)
+    train_full.add_argument("--warmup-ratio", type=float, default=0.03)
+    train_full.add_argument("--min-learning-rate-ratio", type=float, default=0.1)
     train_full.add_argument("--max-grad-norm", type=float, default=1.0)
     train_full.add_argument("--timestep-min", type=float, default=0.05)
     train_full.add_argument("--timestep-max", type=float, default=1.0)
     train_full.add_argument("--rollout-horizon", type=int, default=3)
-    train_full.add_argument("--teacher-forcing-epochs", type=int, default=1)
-    train_full.add_argument("--rollout-ramp-epochs", type=int, default=2)
+    train_full.add_argument("--teacher-forcing-epochs", type=int, default=0)
+    train_full.add_argument("--rollout-ramp-epochs", type=int, default=0)
     train_full.add_argument("--thought-capacity", type=int, default=128)
     train_full.add_argument("--max-display-tokens", type=int, default=1024)
     train_full.add_argument("--seed", type=int, default=0)
     train_full.add_argument("--max-examples", type=int)
     train_full.add_argument("--no-shuffle", action="store_true")
     train_full.add_argument("--log-every-steps", type=int, default=100)
-    train_full.add_argument("--checkpoint-every-steps", type=int, default=5000)
+    train_full.add_argument("--checkpoint-every-steps", type=int, default=2500)
     train_full.add_argument(
         "--gradient-checkpointing",
         action=argparse.BooleanOptionalAction,

@@ -16,6 +16,7 @@ from cid.model import (
     load_stage_b_checkpoint,
     load_stage_b_model_checkpoint,
     save_stage_b_checkpoint,
+    stage_b_adamw_parameter_groups,
     wrap_stage_b_fsdp,
 )
 
@@ -118,6 +119,9 @@ def main() -> None:
             ILLaDACIDConfig(max_thought_slots=4, max_display_tokens=16),
             freeze_backbone=False,
         )
+        optimizer_groups = stage_b_adamw_parameter_groups(
+            adapter, backbone_lr_scale=0.5, weight_decay=0.01
+        )
         fsdp = wrap_stage_b_fsdp(
             adapter,
             device_id=torch.device("cpu"),
@@ -125,7 +129,7 @@ def main() -> None:
         )
         assert isinstance(fsdp, FullyShardedDataParallel)
         assert fsdp.sharding_strategy is ShardingStrategy.FULL_SHARD
-        optimizer = torch.optim.AdamW(fsdp.parameters(), lr=1e-3)
+        optimizer = torch.optim.AdamW(optimizer_groups, lr=1e-3)
 
         output = fsdp(make_batch())
         loss = output.thought_semantic.float().square().mean()
@@ -152,12 +156,15 @@ def main() -> None:
             ILLaDACIDConfig(max_thought_slots=4, max_display_tokens=16),
             freeze_backbone=False,
         )
+        restored_optimizer_groups = stage_b_adamw_parameter_groups(
+            restored_adapter, backbone_lr_scale=0.5, weight_decay=0.01
+        )
         restored = wrap_stage_b_fsdp(
             restored_adapter,
             device_id=torch.device("cpu"),
             compute_dtype=torch.bfloat16,
         )
-        restored_optimizer = torch.optim.AdamW(restored.parameters(), lr=1e-3)
+        restored_optimizer = torch.optim.AdamW(restored_optimizer_groups, lr=1e-3)
         restored_trainer = TinyTrainer(restored_adapter)
         load_stage_b_checkpoint(
             restored,
