@@ -14,6 +14,8 @@ class ILLaDATextEncoder:
 
     def __init__(self, adapter: ILLaDACIDAdapter, tokenizer: Any) -> None:
         self._embedding = adapter.input_embeddings
+        self._output_device = self._embedding.weight.device
+        self._output_dtype = self._embedding.weight.dtype
         self.tokenizer = tokenizer
         self.d_model = adapter.d_model
 
@@ -25,21 +27,36 @@ class ILLaDATextEncoder:
         *,
         device: torch.device | str,
         dtype: torch.dtype = torch.bfloat16,
+        embedding_device: torch.device | str | None = None,
     ) -> ILLaDATextEncoder:
         snapshot = cls.__new__(cls)
-        weight = adapter.input_embeddings.weight.detach().to(device=device, dtype=dtype).clone()
+        output_device = torch.device(device)
+        storage_device = (
+            torch.device(embedding_device) if embedding_device is not None else output_device
+        )
+        weight = (
+            adapter.input_embeddings.weight.detach()
+            .to(device=storage_device, dtype=dtype)
+            .clone()
+        )
         snapshot._embedding = nn.Embedding.from_pretrained(weight, freeze=True)
+        snapshot._output_device = output_device
+        snapshot._output_dtype = dtype
         snapshot.tokenizer = tokenizer
         snapshot.d_model = adapter.d_model
         return snapshot
 
     @property
     def device(self) -> torch.device:
-        return self._embedding.weight.device
+        return self._output_device
 
     @property
     def dtype(self) -> torch.dtype:
-        return self._embedding.weight.dtype
+        return self._output_dtype
+
+    @property
+    def embedding_device(self) -> torch.device:
+        return self._embedding.weight.device
 
     def tokenize(self, text: str, *, add_special_tokens: bool) -> Tensor:
         if not text:
@@ -67,13 +84,14 @@ class ILLaDATextEncoder:
             padding=True,
             return_tensors="pt",
         )
-        input_ids = encoded["input_ids"].to(device=self.device)
-        attention_mask = encoded["attention_mask"].to(device=self.device, dtype=self.dtype)
+        input_ids = encoded["input_ids"].to(device=self.embedding_device)
         if detach:
             with torch.no_grad():
                 embeddings = self._embedding(input_ids)
         else:
             embeddings = self._embedding(input_ids)
+        embeddings = embeddings.to(device=self.device, dtype=self.dtype)
+        attention_mask = encoded["attention_mask"].to(device=self.device, dtype=self.dtype)
         weights = attention_mask.unsqueeze(-1)
         pooled = (embeddings * weights).sum(dim=1)
         pooled = pooled / weights.sum(dim=1).clamp_min(1.0)

@@ -1840,6 +1840,7 @@ def wrap_stage_b_fsdp(
     compute_dtype: torch.dtype = torch.bfloat16,
 ) -> torch.nn.Module:
     from torch.distributed.fsdp import (
+        BackwardPrefetch,
         FullyShardedDataParallel,
         MixedPrecision,
         ShardingStrategy,
@@ -1866,6 +1867,7 @@ def wrap_stage_b_fsdp(
         ),
         device_id=device_id,
         sync_module_states=False,
+        backward_prefetch=BackwardPrefetch.BACKWARD_POST,
         limit_all_gathers=True,
         use_orig_params=True,
     )

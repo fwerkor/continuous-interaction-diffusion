@@ -1469,6 +1469,7 @@ def _train_stage_b(args: argparse.Namespace) -> None:
                 tokenizer,
                 device=device,
                 dtype=compute_dtype,
+                embedding_device="cpu",
             )
             model.set_backbone_trainable(True)
             if args.gradient_checkpointing:
@@ -1499,6 +1500,7 @@ def _train_stage_b(args: argparse.Namespace) -> None:
             lr=args.learning_rate,
             betas=(0.9, 0.999),
             eps=1e-8,
+            foreach=False,
         )
         tensorizer = ILLaDATrajectoryTensorizer(
             adapter,
