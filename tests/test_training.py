@@ -45,6 +45,7 @@ save_stage_b_checkpoint = cid_model.save_stage_b_checkpoint
 shard_rollout_windows = cid_model.shard_rollout_windows
 shard_transitions = cid_model.shard_transitions
 stage_b_adamw_parameter_groups = cid_model.stage_b_adamw_parameter_groups
+stage_b_consumed_windows_by_bucket = cid_model.stage_b_consumed_windows_by_bucket
 stage_b_gradient_accumulation_steps = cid_model.stage_b_gradient_accumulation_steps
 stage_b_optimizer_steps_per_epoch = cid_model.stage_b_optimizer_steps_per_epoch
 trajectory_rollout_windows = cid_model.trajectory_rollout_windows
@@ -1086,7 +1087,8 @@ def test_stage_b_fsdp_runs_full_parameter_optimizer_step_on_cpu(tmp_path) -> Non
         )
         assert (checkpoint / "metadata.json").is_file()
         assert (checkpoint / "rank-0000.pt").is_file()
-        assert (checkpoint / "optimizer-rank-0000.pt").is_file()
+        assert (checkpoint / "distributed" / ".metadata").is_file()
+        assert not (checkpoint / "optimizer-rank-0000.pt").exists()
     finally:
         dist.destroy_process_group()
 
@@ -1119,8 +1121,55 @@ def test_stage_b_fsdp_full_shard_two_rank_smoke(tmp_path) -> None:
     assert completed.returncode == 0, completed.stdout + completed.stderr
     assert (checkpoint / "distributed" / ".metadata").is_file()
     assert (checkpoint / "metadata.json").is_file()
-    assert (checkpoint / "optimizer-rank-0000.pt").is_file()
-    assert (checkpoint / "optimizer-rank-0001.pt").is_file()
+    assert (checkpoint / "rank-0000.pt").is_file()
+    assert (checkpoint / "rank-0001.pt").is_file()
+    assert not (checkpoint / "optimizer-rank-0000.pt").exists()
+
+
+def test_stage_b_fsdp_checkpoint_reshards_optimizer_across_world_sizes(tmp_path) -> None:
+    if not dist.is_available():
+        pytest.skip("torch.distributed is unavailable")
+    checkpoint = tmp_path / "elastic-checkpoint"
+    save_worker = Path(__file__).with_name("fsdp_stage_b_worker.py")
+    load_worker = Path(__file__).with_name("fsdp_stage_b_elastic_load_worker.py")
+    env = os.environ.copy()
+    env["CID_FSDP_SMOKE_DIR"] = str(checkpoint)
+
+    saved = subprocess.run(
+        [
+            sys.executable,
+            "-m",
+            "torch.distributed.run",
+            "--standalone",
+            "--nproc-per-node=2",
+            str(save_worker),
+        ],
+        cwd=Path(__file__).resolve().parents[1],
+        env=env,
+        capture_output=True,
+        text=True,
+        timeout=60,
+        check=False,
+    )
+    assert saved.returncode == 0, saved.stdout + saved.stderr
+
+    loaded = subprocess.run(
+        [
+            sys.executable,
+            "-m",
+            "torch.distributed.run",
+            "--standalone",
+            "--nproc-per-node=3",
+            str(load_worker),
+        ],
+        cwd=Path(__file__).resolve().parents[1],
+        env=env,
+        capture_output=True,
+        text=True,
+        timeout=60,
+        check=False,
+    )
+    assert loaded.returncode == 0, loaded.stdout + loaded.stderr
 
 
 def make_rollout_trajectory() -> TrajectoryExample:
@@ -1308,6 +1357,64 @@ def test_stage_b_batch_resolution_is_stable_across_four_and_six_ranks() -> None:
         target_global_batch_size=32,
         explicit_steps=8,
     ) == 8
+
+
+def test_stage_b_bucket_cursor_repartitions_remaining_windows_without_replay() -> None:
+    base = make_trajectory()
+    windows = tuple(
+        CIDRolloutWindow(
+            example=replace(base, example_id=f"elastic-{index}"),
+            source_steps=(0,),
+            loss_weight=1.0,
+        )
+        for index in range(10)
+    )
+    old_shards = tuple(
+        shard_rollout_windows(
+            windows,
+            world_size=4,
+            rank=rank,
+            seed=17,
+            epoch=1,
+            micro_batch_size=1,
+        )
+        for rank in range(4)
+    )
+    cursor = stage_b_consumed_windows_by_bucket(
+        windows,
+        old_shards[0],
+        local_windows_seen=2,
+        world_size=4,
+    )
+    consumed_ids = {
+        window.example.example_id
+        for shard in old_shards
+        for window in shard[:2]
+    }
+    new_shards = tuple(
+        shard_rollout_windows(
+            windows,
+            world_size=2,
+            rank=rank,
+            seed=17,
+            epoch=1,
+            micro_batch_size=1,
+            consumed_windows_by_bucket=cursor,
+        )
+        for rank in range(2)
+    )
+    remaining_ids = {
+        window.example.example_id
+        for shard in new_shards
+        for window in shard
+    }
+
+    assert len(consumed_ids) == 8
+    assert len(remaining_ids) == 2
+    assert consumed_ids.isdisjoint(remaining_ids)
+    assert consumed_ids | remaining_ids == {
+        window.example.example_id for window in windows
+    }
 
 
 def test_stage_b_optimizer_step_count_matches_bucket_padding() -> None:

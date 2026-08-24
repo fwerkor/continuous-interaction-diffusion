@@ -679,6 +679,39 @@ class CIDTrainer:
         self._pending_examples = 0
         self.optimizer.zero_grad(set_to_none=True)
 
+    def restore_portable_progress_state(
+        self,
+        state: Mapping[str, Any],
+        *,
+        seed: int,
+    ) -> None:
+        """Restore clean trainer progress after changing the data-parallel world size.
+
+        Gradient accumulation is derived from world size in Stage B, so it is the only
+        trainer setting allowed to change. Rank-local RNG streams cannot be preserved
+        when ranks are added or removed; reseeding gives every new rank a deterministic
+        continuation while model/optimizer state and the global data cursor remain exact.
+        """
+
+        saved_config = dict(state["trainer_config"])
+        current_config = asdict(self.config)
+        saved_config["gradient_accumulation_steps"] = current_config[
+            "gradient_accumulation_steps"
+        ]
+        if saved_config != current_config:
+            raise ValueError("checkpoint trainer configuration does not match this trainer")
+        trainer_state = state["trainer_state"]
+        self.state = CIDTrainerState(
+            transitions_seen=int(trainer_state["transitions_seen"]),
+            optimizer_steps=int(trainer_state["optimizer_steps"]),
+            epochs_completed=int(trainer_state.get("epochs_completed", 0)),
+            rollout_windows_seen_in_epoch=0,
+        )
+        self._pending_accumulation = 0
+        self._pending_examples = 0
+        self.optimizer.zero_grad(set_to_none=True)
+        self.reseed(seed)
+
     def save_checkpoint(self, path: str | Path) -> None:
         destination = Path(path)
         destination.parent.mkdir(parents=True, exist_ok=True)
@@ -1668,6 +1701,44 @@ def shard_transitions(
     return tuple(order[rank::world_size])
 
 
+def _stage_b_rollout_bucket_key(window: CIDRolloutWindow) -> str:
+    return f"{len(window.source_steps)}:{float(window.loss_weight).hex()}"
+
+
+def stage_b_consumed_windows_by_bucket(
+    windows: tuple[CIDRolloutWindow, ...],
+    local_windows: tuple[CIDRolloutWindow, ...],
+    *,
+    local_windows_seen: int,
+    world_size: int,
+    base_consumed_by_bucket: Mapping[str, int] | None = None,
+) -> dict[str, int]:
+    """Return a world-size-portable cursor for a synchronized Stage B shard prefix."""
+
+    if world_size <= 0:
+        raise ValueError("world_size must be positive")
+    if not 0 <= local_windows_seen <= len(local_windows):
+        raise ValueError("local_windows_seen is outside the Stage B shard")
+    totals: dict[str, int] = {}
+    for window in windows:
+        key = _stage_b_rollout_bucket_key(window)
+        totals[key] = totals.get(key, 0) + 1
+    consumed = {key: int(value) for key, value in (base_consumed_by_bucket or {}).items()}
+    for key, value in consumed.items():
+        if key not in totals or value < 0 or value > totals[key]:
+            raise ValueError("invalid Stage B base bucket cursor")
+    local_counts: dict[str, int] = {}
+    for window in local_windows[:local_windows_seen]:
+        key = _stage_b_rollout_bucket_key(window)
+        local_counts[key] = local_counts.get(key, 0) + 1
+    for key, local_count in local_counts.items():
+        consumed[key] = min(
+            totals[key],
+            consumed.get(key, 0) + local_count * world_size,
+        )
+    return {key: value for key, value in consumed.items() if value}
+
+
 def shard_rollout_windows(
     windows: tuple[CIDRolloutWindow, ...],
     *,
@@ -1677,6 +1748,7 @@ def shard_rollout_windows(
     epoch: int,
     shuffle: bool = True,
     micro_batch_size: int = 1,
+    consumed_windows_by_bucket: Mapping[str, int] | None = None,
 ) -> tuple[CIDRolloutWindow, ...]:
     if world_size <= 0:
         raise ValueError("world_size must be positive")
@@ -1697,6 +1769,14 @@ def shard_rollout_windows(
         ]
         if shuffle:
             random.Random(seed + epoch * 1009 + length * 100_003 + bucket_index).shuffle(bucket)
+        portable_key = _stage_b_rollout_bucket_key(bucket[0])
+        consumed = int((consumed_windows_by_bucket or {}).get(portable_key, 0))
+        if consumed < 0 or consumed > len(bucket):
+            raise ValueError("invalid Stage B consumed bucket cursor")
+        if consumed:
+            bucket = bucket[consumed:]
+        if not bucket:
+            continue
         padding = (-len(bucket)) % world_size
         if padding:
             bucket.extend(bucket[:padding])
@@ -1877,6 +1957,7 @@ def wrap_stage_b_fsdp(
 def _stage_b_sharded_state_dict_context(model: torch.nn.Module) -> Any:
     from torch.distributed.fsdp import (
         FullyShardedDataParallel,
+        ShardedOptimStateDictConfig,
         ShardedStateDictConfig,
         StateDictType,
     )
@@ -1889,6 +1970,7 @@ def _stage_b_sharded_state_dict_context(model: torch.nn.Module) -> Any:
         model,
         StateDictType.SHARDED_STATE_DICT,
         ShardedStateDictConfig(offload_to_cpu=True),
+        ShardedOptimStateDictConfig(offload_to_cpu=True),
     )
 
 
@@ -1899,9 +1981,11 @@ def save_stage_b_checkpoint(
     path: str | Path,
     *,
     dataset_sha256: str | None = None,
+    epoch_progress: Mapping[str, Any] | None = None,
 ) -> None:
     import torch.distributed as dist
     import torch.distributed.checkpoint as dcp
+    from torch.distributed.fsdp import FullyShardedDataParallel
 
     if not dist.is_initialized():
         raise RuntimeError("Stage B checkpointing requires an initialized process group")
@@ -1912,13 +1996,10 @@ def save_stage_b_checkpoint(
 
     with _stage_b_sharded_state_dict_context(model):
         model_state = model.state_dict()
+        optimizer_state = FullyShardedDataParallel.optim_state_dict(model, optimizer)
     dcp.save(
-        {"model": model_state},
+        {"model": model_state, "optimizer": optimizer_state},
         checkpoint_id=destination / "distributed",
-    )
-    torch.save(
-        optimizer.state_dict(),
-        destination / f"optimizer-rank-{dist.get_rank():04d}.pt",
     )
     torch.save(
         trainer.local_progress_state(),
@@ -1926,10 +2007,10 @@ def save_stage_b_checkpoint(
     )
     if dist.get_rank() == 0:
         metadata = {
-            "format_version": 2,
+            "format_version": 3,
             "kind": "cid-stage-b-fsdp",
             "model_state_layout": "fsdp-sharded-dcp",
-            "optimizer_state_layout": "rank-local",
+            "optimizer_state_layout": "fsdp-sharded-dcp",
             "world_size": dist.get_world_size(),
             "dataset_sha256": dataset_sha256,
             "adapter_config": asdict(trainer.adapter.config),
@@ -1939,6 +2020,8 @@ def save_stage_b_checkpoint(
                 "vocab_size": trainer.adapter.vocab_size,
             },
         }
+        if epoch_progress is not None:
+            metadata["epoch_progress"] = dict(epoch_progress)
         (destination / "metadata.json").write_text(
             json.dumps(metadata, sort_keys=True, indent=2) + "\n",
             encoding="utf-8",
@@ -1953,23 +2036,28 @@ def load_stage_b_checkpoint(
     path: str | Path,
     *,
     expected_dataset_sha256: str | None = None,
-) -> None:
+) -> dict[str, Any]:
     import torch.distributed as dist
     import torch.distributed.checkpoint as dcp
+    from torch.distributed.fsdp import FullyShardedDataParallel
 
     if not dist.is_initialized():
         raise RuntimeError("Stage B checkpointing requires an initialized process group")
     source = Path(path)
     metadata = json.loads((source / "metadata.json").read_text(encoding="utf-8"))
-    if metadata.get("format_version") != 2 or metadata.get("kind") != "cid-stage-b-fsdp":
+    version = int(metadata.get("format_version", 0))
+    if version not in (2, 3) or metadata.get("kind") != "cid-stage-b-fsdp":
         raise ValueError("unsupported Stage B checkpoint format")
-    if (
-        metadata.get("model_state_layout") != "fsdp-sharded-dcp"
-        or metadata.get("optimizer_state_layout") != "rank-local"
-    ):
+    if metadata.get("model_state_layout") != "fsdp-sharded-dcp":
         raise ValueError("unsupported Stage B checkpoint state layout")
-    if int(metadata["world_size"]) != dist.get_world_size():
-        raise ValueError("Stage B resume currently requires the original world size")
+    saved_world_size = int(metadata["world_size"])
+    current_world_size = dist.get_world_size()
+    if version == 2 and metadata.get("optimizer_state_layout") != "rank-local":
+        raise ValueError("unsupported Stage B checkpoint state layout")
+    if version == 3 and metadata.get("optimizer_state_layout") != "fsdp-sharded-dcp":
+        raise ValueError("unsupported Stage B checkpoint state layout")
+    if version == 2 and saved_world_size != current_world_size:
+        raise ValueError("Stage B v2 resume requires the original world size")
     if (
         expected_dataset_sha256 is not None
         and metadata.get("dataset_sha256") != expected_dataset_sha256
@@ -1991,20 +2079,47 @@ def load_stage_b_checkpoint(
     dcp.load(distributed_state, checkpoint_id=source / "distributed")
     with _stage_b_sharded_state_dict_context(model):
         model.load_state_dict(distributed_state["model"])
-    optimizer.load_state_dict(
-        torch.load(
-            source / f"optimizer-rank-{dist.get_rank():04d}.pt",
+    if version == 3:
+        optimizer_state = dcp.load_sharded_optimizer_state_dict(
+            distributed_state["model"],
+            optimizer_key="optimizer",
+            storage_reader=dcp.FileSystemReader(source / "distributed"),
+        )["optimizer"]
+        flattened_optimizer_state = FullyShardedDataParallel.optim_state_dict_to_load(
+            model,
+            optimizer,
+            optimizer_state,
+        )
+        optimizer.load_state_dict(flattened_optimizer_state)
+    else:
+        optimizer.load_state_dict(
+            torch.load(
+                source / f"optimizer-rank-{dist.get_rank():04d}.pt",
+                map_location="cpu",
+                weights_only=False,
+            )
+        )
+
+    if saved_world_size == current_world_size:
+        local_state_path = source / f"rank-{dist.get_rank():04d}.pt"
+        local_state = torch.load(local_state_path, map_location="cpu", weights_only=False)
+        trainer.restore_local_progress_state(local_state)
+    else:
+        portable_state = torch.load(
+            source / "rank-0000.pt",
             map_location="cpu",
             weights_only=False,
         )
-    )
-    local_state = torch.load(
-        source / f"rank-{dist.get_rank():04d}.pt",
-        map_location="cpu",
-        weights_only=False,
-    )
-    trainer.restore_local_progress_state(local_state)
+        trainer.restore_portable_progress_state(
+            portable_state,
+            seed=(
+                trainer.config.seed
+                + dist.get_rank()
+                + int(portable_state["trainer_state"]["optimizer_steps"]) * 104729
+            ),
+        )
     dist.barrier()
+    return metadata
 
 
 def load_stage_b_model_checkpoint(
@@ -2021,12 +2136,13 @@ def load_stage_b_model_checkpoint(
         raise RuntimeError("Stage B model loading requires an initialized process group")
     source = Path(path)
     metadata = json.loads((source / "metadata.json").read_text(encoding="utf-8"))
-    if metadata.get("format_version") != 2 or metadata.get("kind") != "cid-stage-b-fsdp":
+    if (
+        int(metadata.get("format_version", 0)) not in (2, 3)
+        or metadata.get("kind") != "cid-stage-b-fsdp"
+    ):
         raise ValueError("unsupported Stage B checkpoint format")
     if metadata.get("model_state_layout") != "fsdp-sharded-dcp":
         raise ValueError("unsupported Stage B checkpoint model state layout")
-    if int(metadata["world_size"]) != dist.get_world_size():
-        raise ValueError("Stage B evaluation requires the checkpoint's original world size")
     if metadata["adapter_config"] != asdict(adapter.config):
         raise ValueError("Stage B checkpoint adapter configuration does not match")
     backbone = metadata["backbone"]

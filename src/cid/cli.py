@@ -1351,6 +1351,7 @@ def _train_stage_b(args: argparse.Namespace) -> None:
         save_stage_b_checkpoint,
         shard_rollout_windows,
         stage_b_adamw_parameter_groups,
+        stage_b_consumed_windows_by_bucket,
         stage_b_gradient_accumulation_steps,
         stage_b_optimizer_steps_per_epoch,
         trajectory_rollout_windows,
@@ -1370,6 +1371,8 @@ def _train_stage_b(args: argparse.Namespace) -> None:
         raise ValueError("--target-global-batch-size must be positive")
     if args.gradient_accumulation_steps is not None and args.gradient_accumulation_steps <= 0:
         raise ValueError("--gradient-accumulation-steps must be positive")
+    if args.mlp_chunk_size <= 0 or args.norm_chunk_size <= 0:
+        raise ValueError("Stage B chunk sizes must be positive")
     if not 0.0 <= args.warmup_ratio < 1.0:
         raise ValueError("--warmup-ratio must be in [0, 1)")
     if not 0.0 <= args.min_learning_rate_ratio <= 1.0:
@@ -1429,6 +1432,15 @@ def _train_stage_b(args: argparse.Namespace) -> None:
             raise ValueError("training data contains no adjacent thought transitions")
         transition_count_total = sum(len(window.source_steps) for window in windows)
 
+        resume_rank0_state = None
+        if args.resume:
+            resume_path = Path(args.resume)
+            resume_rank0_state = torch.load(
+                resume_path / "rank-0000.pt",
+                map_location="cpu",
+                weights_only=False,
+            )
+
         optimizer_steps_per_epoch = stage_b_optimizer_steps_per_epoch(
             windows,
             world_size=world_size,
@@ -1441,6 +1453,10 @@ def _train_stage_b(args: argparse.Namespace) -> None:
             if args.warmup_ratio > 0.0
             else 0
         )
+        if resume_rank0_state is not None:
+            saved_trainer_config = resume_rank0_state["trainer_config"]
+            lr_decay_steps = int(saved_trainer_config["lr_decay_steps"])
+            warmup_steps = int(saved_trainer_config["warmup_steps"])
 
         tokenizer_kwargs: dict[str, object] = {"trust_remote_code": True}
         if args.model == ILLADA_8B_BASE:
@@ -1474,8 +1490,8 @@ def _train_stage_b(args: argparse.Namespace) -> None:
             model.set_backbone_trainable(True)
             if args.gradient_checkpointing:
                 model.set_gradient_checkpointing(True, use_reentrant=False)
-            model.set_mlp_chunk_size(getattr(args, "mlp_chunk_size", 512))
-            model.set_norm_chunk_size(getattr(args, "norm_chunk_size", 512))
+            model.set_mlp_chunk_size(args.mlp_chunk_size)
+            model.set_norm_chunk_size(args.norm_chunk_size)
             return model, snapshot
 
         adapter = None
@@ -1532,8 +1548,9 @@ def _train_stage_b(args: argparse.Namespace) -> None:
             forward_model=fsdp_model,
             gradient_clipper=fsdp_model.clip_grad_norm_,
         )
+        loaded_checkpoint_metadata = None
         if args.resume:
-            load_stage_b_checkpoint(
+            loaded_checkpoint_metadata = load_stage_b_checkpoint(
                 fsdp_model,
                 optimizer,
                 trainer,
@@ -1543,6 +1560,27 @@ def _train_stage_b(args: argparse.Namespace) -> None:
         else:
             trainer.reseed(args.seed + rank)
 
+        saved_world_size = (
+            int(loaded_checkpoint_metadata["world_size"])
+            if loaded_checkpoint_metadata is not None
+            else world_size
+        )
+        world_size_changed = saved_world_size != world_size
+        saved_partial_windows = (
+            int(resume_rank0_state["trainer_state"].get("rollout_windows_seen_in_epoch", 0))
+            if resume_rank0_state is not None
+            else 0
+        )
+        resume_epoch_progress = (
+            loaded_checkpoint_metadata.get("epoch_progress")
+            if loaded_checkpoint_metadata is not None
+            else None
+        )
+        if world_size_changed and saved_partial_windows and resume_epoch_progress is None:
+            raise ValueError(
+                "cross-world-size Stage B resume requires a v3 partial-epoch data cursor"
+            )
+
         output_dir = Path(args.output_dir)
         if rank == 0:
             output_dir.mkdir(parents=True, exist_ok=True)
@@ -1551,6 +1589,7 @@ def _train_stage_b(args: argparse.Namespace) -> None:
                 f"optimizer=adamw examples={len(examples)} transitions={transition_count_total} "
                 f"target_global_batch={args.target_global_batch_size} "
                 f"effective_batch={effective_batch} grad_accum={gradient_accumulation_steps} "
+                f"mlp_chunk={args.mlp_chunk_size} norm_chunk={args.norm_chunk_size} "
                 f"peak_cid_lr={args.learning_rate:.3e} "
                 f"peak_backbone_lr={args.learning_rate * args.backbone_lr_scale:.3e} "
                 f"warmup_steps={warmup_steps} lr_decay_steps={lr_decay_steps} "
@@ -1581,7 +1620,18 @@ def _train_stage_b(args: argparse.Namespace) -> None:
 
         first_epoch = trainer.state.epochs_completed + 1
         for epoch in range(first_epoch, args.epochs + 1):
-            local_windows = shard_rollout_windows(
+            epoch_base_consumed: dict[str, int] = {}
+            if epoch == first_epoch and resume_epoch_progress is not None:
+                if int(resume_epoch_progress.get("epoch", epoch)) != epoch:
+                    raise ValueError("Stage B checkpoint epoch cursor does not match trainer state")
+                cursor_name = (
+                    "consumed_by_bucket" if world_size_changed else "base_consumed_by_bucket"
+                )
+                epoch_base_consumed = {
+                    str(key): int(value)
+                    for key, value in resume_epoch_progress.get(cursor_name, {}).items()
+                }
+            epoch_shard = shard_rollout_windows(
                 windows,
                 world_size=world_size,
                 rank=rank,
@@ -1589,15 +1639,15 @@ def _train_stage_b(args: argparse.Namespace) -> None:
                 epoch=epoch,
                 shuffle=not args.no_shuffle,
                 micro_batch_size=args.micro_batch_size,
+                consumed_windows_by_bucket=epoch_base_consumed,
             )
-            total_local_windows = len(local_windows)
+            total_local_windows = len(epoch_shard)
             resumed_windows = trainer.state.rollout_windows_seen_in_epoch
             if resumed_windows:
                 if resumed_windows >= total_local_windows:
                     raise ValueError(
                         "checkpoint rollout position is outside the current epoch shard"
                     )
-                local_windows = local_windows[resumed_windows:]
                 if rank == 0:
                     print(
                         f"resume stage=B epoch={epoch} "
@@ -1605,6 +1655,13 @@ def _train_stage_b(args: argparse.Namespace) -> None:
                         f"windows_seen={resumed_windows}/{total_local_windows}",
                         flush=True,
                     )
+            local_windows = epoch_shard[resumed_windows:]
+            if world_size_changed and rank == 0 and epoch == first_epoch:
+                print(
+                    f"elastic-resume stage=B old_world_size={saved_world_size} "
+                    f"new_world_size={world_size} optimizer_steps={trainer.state.optimizer_steps}",
+                    flush=True,
+                )
             rollout_probability = trainer.rollout_probability()
 
             def report_progress(
@@ -1613,6 +1670,8 @@ def _train_stage_b(args: argparse.Namespace) -> None:
                 current_epoch: int = epoch,
                 current_rollout_probability: float = rollout_probability,
                 current_total_windows: int = total_local_windows,
+                current_epoch_shard=epoch_shard,
+                current_base_consumed=epoch_base_consumed,
             ) -> None:
                 nonlocal next_checkpoint_step, last_periodic_checkpoint
                 group_lrs = {
@@ -1669,12 +1728,24 @@ def _train_stage_b(args: argparse.Namespace) -> None:
                     return
 
                 checkpoint = output_dir / f"stage-b-step-{progress.optimizer_steps:08d}"
+                consumed_by_bucket = stage_b_consumed_windows_by_bucket(
+                    windows,
+                    current_epoch_shard,
+                    local_windows_seen=progress.rollout_windows_seen_in_epoch,
+                    world_size=world_size,
+                    base_consumed_by_bucket=current_base_consumed,
+                )
                 save_stage_b_checkpoint(
                     fsdp_model,
                     optimizer,
                     trainer,
                     checkpoint,
                     dataset_sha256=dataset_manifest.sha256,
+                    epoch_progress={
+                        "epoch": current_epoch,
+                        "base_consumed_by_bucket": current_base_consumed,
+                        "consumed_by_bucket": consumed_by_bucket,
+                    },
                 )
                 previous = last_periodic_checkpoint
                 last_periodic_checkpoint = checkpoint
@@ -2217,6 +2288,18 @@ def main() -> None:
         help="target transition batch; ignored when gradient accumulation is explicit",
     )
     train_full.add_argument("--gradient-accumulation-steps", type=int)
+    train_full.add_argument(
+        "--mlp-chunk-size",
+        type=int,
+        default=256,
+        help="token chunk size for exact iLLaDA MLP evaluation",
+    )
+    train_full.add_argument(
+        "--norm-chunk-size",
+        type=int,
+        default=256,
+        help="token chunk size for exact iLLaDA RMSNorm evaluation",
+    )
     train_full.add_argument("--warmup-ratio", type=float, default=0.03)
     train_full.add_argument("--min-learning-rate-ratio", type=float, default=0.1)
     train_full.add_argument("--max-grad-norm", type=float, default=1.0)

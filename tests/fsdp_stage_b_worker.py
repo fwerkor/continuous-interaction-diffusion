@@ -85,12 +85,27 @@ class TinyTrainer:
     def __init__(self, adapter: ILLaDACIDAdapter, marker: int = 0) -> None:
         self.adapter = adapter
         self.marker = marker
+        self.config = SimpleNamespace(seed=19)
+        self.portable_seed: int | None = None
 
-    def local_progress_state(self) -> dict[str, int]:
-        return {"marker": self.marker}
+    def local_progress_state(self) -> dict[str, object]:
+        return {
+            "marker": self.marker,
+            "trainer_config": {"gradient_accumulation_steps": dist.get_world_size()},
+            "trainer_state": {"optimizer_steps": 1},
+        }
 
-    def restore_local_progress_state(self, state: dict[str, int]) -> None:
-        self.marker = state["marker"]
+    def restore_local_progress_state(self, state: dict[str, object]) -> None:
+        self.marker = int(state["marker"])
+
+    def restore_portable_progress_state(
+        self,
+        state: dict[str, object],
+        *,
+        seed: int,
+    ) -> None:
+        self.marker = int(state["marker"])
+        self.portable_seed = seed
 
 
 def make_batch() -> CIDTensorBatch:
