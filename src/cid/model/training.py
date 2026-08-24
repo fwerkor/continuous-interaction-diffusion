@@ -380,6 +380,7 @@ class CIDTrainer:
                 )
                 for index, sample in enumerate(samples)
             ]
+            del output, training_batch, losses, samples
         return loss_sum, raw_loss_sum, transition_count
 
     def _forward_backward(

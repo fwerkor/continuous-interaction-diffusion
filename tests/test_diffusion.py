@@ -101,6 +101,61 @@ def test_display_refinement_can_revise_visible_tokens_without_emitting_mask() ->
     assert not refined.eq(5).any()
 
 
+def test_chunked_display_refinement_matches_full_softmax_reference() -> None:
+    scheduler = CIDDiffusionScheduler(mask_token_id=5)
+    generator = torch.Generator().manual_seed(29)
+    tokens = torch.randint(6, 64, (2, 73), generator=generator)
+    tokens[:, ::5] = 5
+    logits = torch.randn(2, 73, 64, generator=generator)
+
+    filtered_logits = logits.float().clone()
+    filtered_logits[..., 5] = torch.finfo(filtered_logits.dtype).min
+    probabilities = torch.softmax(filtered_logits, dim=-1)
+    confidence, predicted = probabilities.max(dim=-1)
+    expected = tokens.clone()
+    for batch_index in range(tokens.shape[0]):
+        masked_positions = torch.nonzero(tokens[batch_index] == 5, as_tuple=False).flatten()
+        reveal_count = (masked_positions.numel() + 1) // 2
+        ranked = masked_positions[
+            confidence[batch_index, masked_positions].argsort(descending=True)
+        ]
+        expected[batch_index, ranked[:reveal_count]] = predicted[
+            batch_index, ranked[:reveal_count]
+        ]
+
+        visible_positions = torch.nonzero(tokens[batch_index] != 5, as_tuple=False).flatten()
+        current_ids = tokens[batch_index, visible_positions]
+        current_confidence = probabilities[
+            batch_index,
+            visible_positions,
+            current_ids,
+        ]
+        gains = confidence[batch_index, visible_positions] - current_confidence
+        candidates = (
+            (predicted[batch_index, visible_positions] != current_ids) & (gains >= 0.05)
+        )
+        candidate_positions = visible_positions[candidates]
+        candidate_gains = gains[candidates]
+        revision_count = min(
+            candidate_positions.numel(),
+            (visible_positions.numel() + 3) // 4,
+        )
+        ranked = candidate_positions[candidate_gains.argsort(descending=True)]
+        expected[batch_index, ranked[:revision_count]] = predicted[
+            batch_index, ranked[:revision_count]
+        ]
+
+    actual = scheduler.refine_display(
+        tokens,
+        logits,
+        reveal_fraction=0.5,
+        revision_fraction=0.25,
+        revision_margin=0.05,
+    )
+
+    assert torch.equal(actual, expected)
+
+
 def test_diffusion_scheduler_validates_timestep_range() -> None:
     scheduler = CIDDiffusionScheduler(mask_token_id=5)
 

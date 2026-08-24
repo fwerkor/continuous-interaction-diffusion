@@ -1,6 +1,7 @@
 from __future__ import annotations
 
 from dataclasses import dataclass
+from types import MethodType
 
 import torch
 from torch import nn
@@ -13,6 +14,25 @@ from cid.model.tensors import CIDTensorBatch, CIDTensorOutput
 ILLADA_8B_BASE = "GSAI-ML/iLLaDA-8B-Base"
 ILLADA_8B_BASE_REVISION = "a1b5b5f8a31a3854a46205ee584178c04b45ec9a"
 ILLADA_MASK_TOKEN_ID = 5
+
+
+def _chunked_illada_mlp_forward(module: nn.Module, x: torch.Tensor) -> torch.Tensor:
+    chunk_size = int(module._cid_mlp_chunk_size)
+    if x.ndim != 3 or x.shape[1] <= chunk_size:
+        return module.dropout(
+            module.down_proj(module.act_fn(module.gate_proj(x)) * module.up_proj(x))
+        )
+    outputs = []
+    for start in range(0, x.shape[1], chunk_size):
+        chunk = x[:, start : start + chunk_size]
+        outputs.append(
+            module.dropout(
+                module.down_proj(
+                    module.act_fn(module.gate_proj(chunk)) * module.up_proj(chunk)
+                )
+            )
+        )
+    return torch.cat(outputs, dim=1)
 
 
 @dataclass(frozen=True, slots=True)
@@ -129,14 +149,43 @@ class ILLaDACIDAdapter(nn.Module):
         for parameter in self.backbone.parameters():
             parameter.requires_grad_(trainable)
 
-    def set_gradient_checkpointing(self, enabled: bool) -> None:
+    def set_gradient_checkpointing(
+        self,
+        enabled: bool,
+        *,
+        use_reentrant: bool | None = None,
+    ) -> None:
         method_name = (
             "gradient_checkpointing_enable" if enabled else "gradient_checkpointing_disable"
         )
         method = getattr(self.backbone, method_name, None)
         if method is None:
             raise RuntimeError("iLLaDA backbone does not expose gradient checkpointing controls")
-        method()
+        if enabled and use_reentrant is not None:
+            method(gradient_checkpointing_kwargs={"use_reentrant": use_reentrant})
+        else:
+            method()
+
+    def set_mlp_chunk_size(self, chunk_size: int | None) -> None:
+        """Chunk token-wise iLLaDA MLP evaluation without changing its function."""
+        if chunk_size is None:
+            return
+        if chunk_size <= 0:
+            raise ValueError("MLP chunk size must be positive")
+        decoder = self.backbone.get_decoder()
+        layers = getattr(decoder, "layers", None)
+        if layers is None or len(layers) == 0:
+            raise RuntimeError("iLLaDA decoder does not expose layers for MLP chunking")
+        resid_pdrop = float(getattr(self.backbone.config, "resid_pdrop", 0.0))
+        if resid_pdrop != 0.0:
+            raise RuntimeError("exact MLP chunking requires zero residual dropout")
+        for layer in layers:
+            mlp = getattr(layer, "mlp", None)
+            required = ("gate_proj", "up_proj", "down_proj", "act_fn", "dropout")
+            if mlp is None or any(not hasattr(mlp, name) for name in required):
+                raise RuntimeError("iLLaDA decoder layer does not expose the expected MLP")
+            mlp._cid_mlp_chunk_size = int(chunk_size)
+            mlp.forward = MethodType(_chunked_illada_mlp_forward, mlp)
 
     @property
     def input_embeddings(self) -> nn.Module:

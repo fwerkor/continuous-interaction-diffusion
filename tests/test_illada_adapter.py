@@ -52,6 +52,7 @@ class TinyILLaDABackbone(nn.Module):
         self.lm_head = nn.Linear(self.config.hidden_size, self.config.vocab_size, bias=False)
         self.lm_head.weight = self.embed_tokens.weight
         self.gradient_checkpointing = False
+        self.gradient_checkpointing_kwargs = None
 
     def get_input_embeddings(self):
         return self.embed_tokens
@@ -62,8 +63,9 @@ class TinyILLaDABackbone(nn.Module):
     def get_decoder(self):
         return self.decoder
 
-    def gradient_checkpointing_enable(self):
+    def gradient_checkpointing_enable(self, gradient_checkpointing_kwargs=None):
         self.gradient_checkpointing = True
+        self.gradient_checkpointing_kwargs = gradient_checkpointing_kwargs
 
     def gradient_checkpointing_disable(self):
         self.gradient_checkpointing = False
@@ -178,6 +180,9 @@ def test_illada_adapter_controls_backbone_gradient_checkpointing() -> None:
 
     adapter.set_gradient_checkpointing(True)
     assert backbone.gradient_checkpointing
+    assert backbone.gradient_checkpointing_kwargs is None
+    adapter.set_gradient_checkpointing(True, use_reentrant=False)
+    assert backbone.gradient_checkpointing_kwargs == {"use_reentrant": False}
     adapter.set_gradient_checkpointing(False)
     assert not backbone.gradient_checkpointing
 

@@ -52,6 +52,7 @@ trajectory_transitions = cid_model.trajectory_transitions
 wrap_stage_a_ddp = cid_model.wrap_stage_a_ddp
 wrap_stage_b_fsdp = cid_model.wrap_stage_b_fsdp
 cid_loss = cid_model.cid_loss
+chunked_illada_mlp_forward = import_module("cid.model.illada")._chunked_illada_mlp_forward
 
 
 class TinyConfig:
@@ -217,6 +218,32 @@ def make_adapter(*, seed: int = 123) -> ILLaDACIDAdapter:
         ILLaDACIDConfig(max_thought_slots=4, max_display_tokens=16),
         freeze_backbone=True,
     )
+
+
+def test_chunked_illada_mlp_matches_unchunked_forward_and_input_gradient() -> None:
+    torch.manual_seed(11)
+    module = SimpleNamespace(
+        gate_proj=nn.Linear(16, 48, bias=False),
+        up_proj=nn.Linear(16, 48, bias=False),
+        down_proj=nn.Linear(48, 16, bias=False),
+        act_fn=nn.SiLU(),
+        dropout=nn.Dropout(0.0),
+        _cid_mlp_chunk_size=7,
+    )
+    reference_input = torch.randn(2, 23, 16, requires_grad=True)
+    chunked_input = reference_input.detach().clone().requires_grad_(True)
+
+    reference = module.dropout(
+        module.down_proj(
+            module.act_fn(module.gate_proj(reference_input)) * module.up_proj(reference_input)
+        )
+    )
+    chunked = chunked_illada_mlp_forward(module, chunked_input)
+    reference_grad = torch.autograd.grad(reference.sum(), reference_input)[0]
+    chunked_grad = torch.autograd.grad(chunked.sum(), chunked_input)[0]
+
+    assert torch.allclose(chunked, reference, rtol=1e-6, atol=1e-6)
+    assert torch.allclose(chunked_grad, reference_grad, rtol=1e-6, atol=1e-6)
 
 
 def test_trajectory_tensorizer_recycles_retired_source_slot() -> None:
