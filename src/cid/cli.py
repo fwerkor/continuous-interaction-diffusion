@@ -1607,7 +1607,7 @@ def _train_stage_b(args: argparse.Namespace) -> None:
         next_checkpoint_step = (
             trainer.state.optimizer_steps // args.checkpoint_every_steps + 1
         ) * args.checkpoint_every_steps
-        last_periodic_checkpoint: Path | None = None
+        last_periodic_checkpoint = Path(args.resume) if args.resume else None
 
         if trainer.state.epochs_completed >= args.epochs:
             if rank == 0:
