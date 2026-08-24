@@ -1475,6 +1475,7 @@ def _train_stage_b(args: argparse.Namespace) -> None:
             if args.gradient_checkpointing:
                 model.set_gradient_checkpointing(True, use_reentrant=False)
             model.set_mlp_chunk_size(getattr(args, "mlp_chunk_size", 512))
+            model.set_norm_chunk_size(getattr(args, "norm_chunk_size", 512))
             return model, snapshot
 
         adapter = None

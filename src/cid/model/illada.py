@@ -35,6 +35,28 @@ def _chunked_illada_mlp_forward(module: nn.Module, x: torch.Tensor) -> torch.Ten
     return torch.cat(outputs, dim=1)
 
 
+def _chunked_illada_rms_norm_forward(
+    module: nn.Module,
+    hidden_states: torch.Tensor,
+) -> torch.Tensor:
+    chunk_size = int(module._cid_norm_chunk_size)
+    if hidden_states.ndim != 3 or hidden_states.shape[1] <= chunk_size:
+        input_dtype = hidden_states.dtype
+        values = hidden_states.to(torch.float32)
+        variance = values.pow(2).mean(-1, keepdim=True)
+        values = values * torch.rsqrt(variance + module.variance_epsilon)
+        return module.weight * values.to(input_dtype)
+    outputs = []
+    for start in range(0, hidden_states.shape[1], chunk_size):
+        chunk = hidden_states[:, start : start + chunk_size]
+        input_dtype = chunk.dtype
+        values = chunk.to(torch.float32)
+        variance = values.pow(2).mean(-1, keepdim=True)
+        values = values * torch.rsqrt(variance + module.variance_epsilon)
+        outputs.append(module.weight * values.to(input_dtype))
+    return torch.cat(outputs, dim=1)
+
+
 @dataclass(frozen=True, slots=True)
 class ILLaDACIDConfig:
     max_thought_slots: int = 128
@@ -186,6 +208,30 @@ class ILLaDACIDAdapter(nn.Module):
                 raise RuntimeError("iLLaDA decoder layer does not expose the expected MLP")
             mlp._cid_mlp_chunk_size = int(chunk_size)
             mlp.forward = MethodType(_chunked_illada_mlp_forward, mlp)
+
+    def set_norm_chunk_size(self, chunk_size: int | None) -> None:
+        """Chunk token-wise iLLaDA RMSNorm evaluation without changing its function."""
+        if chunk_size is None:
+            return
+        if chunk_size <= 0:
+            raise ValueError("norm chunk size must be positive")
+        decoder = self.backbone.get_decoder()
+        layers = getattr(decoder, "layers", None)
+        if layers is None or len(layers) == 0:
+            raise RuntimeError("iLLaDA decoder does not expose layers for norm chunking")
+        norms = [getattr(decoder, "norm", None)]
+        for layer in layers:
+            norms.extend(
+                (
+                    getattr(layer, "input_layernorm", None),
+                    getattr(layer, "post_attention_layernorm", None),
+                )
+            )
+        for norm in norms:
+            if norm is None or not hasattr(norm, "variance_epsilon") or not hasattr(norm, "weight"):
+                raise RuntimeError("exact norm chunking requires iLLaDA RMSNorm modules")
+            norm._cid_norm_chunk_size = int(chunk_size)
+            norm.forward = MethodType(_chunked_illada_rms_norm_forward, norm)
 
     @property
     def input_embeddings(self) -> nn.Module:
