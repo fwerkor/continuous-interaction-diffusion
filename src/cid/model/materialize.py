@@ -10,7 +10,10 @@ from torch import Tensor
 from cid.contracts import FreshnessDemand, InformationNeed, ModelContext, ModelUpdate
 from cid.grounding import Anchor, AnchorKind, CognitiveLink, LinkRelation, ObjectKind, ObjectRef
 from cid.lifecycle import MODELED_LIFECYCLES
-from cid.model.allocation import prefix_allocation_mask
+from cid.model.allocation import (
+    DEFAULT_MAX_ALLOCATIONS_PER_STEP,
+    prefix_allocation_mask,
+)
 from cid.model.tensors import CIDTensorOutput
 from cid.state import CellLifecycle, CognitiveField, CognitiveRole, DisplayCanvas
 
@@ -102,7 +105,7 @@ class CIDMaterializerConfig:
     anchor_presence_threshold: float = 0.5
     link_presence_threshold: float = 0.5
     retrieval_similarity_threshold: float = 0.2
-    max_allocations_per_step: int = 4
+    max_allocations_per_step: int = DEFAULT_MAX_ALLOCATIONS_PER_STEP
     max_age_s: float = 5.0
 
     def __post_init__(self) -> None:

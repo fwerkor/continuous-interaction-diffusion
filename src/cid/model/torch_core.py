@@ -65,6 +65,7 @@ class TorchCIDCore(nn.Module):
         self.display_position = nn.Embedding(config.max_display_tokens, d)
         self.channel_embedding = nn.Embedding(3, d)
         self.role_projection = nn.Linear(config.num_roles, d, bias=False)
+        self.lifecycle_projection = nn.Linear(config.num_lifecycles, d, bias=False)
         self.scalar_projection = nn.Linear(2, d, bias=False)
         self.occupancy_projection = nn.Linear(1, d, bias=False)
         self.display_noise_projection = nn.Linear(1, d, bias=False)
@@ -131,10 +132,20 @@ class TorchCIDCore(nn.Module):
         p_channel = self.channel_embedding.weight[1][None, None, :]
         y_channel = self.channel_embedding.weight[2][None, None, :]
 
+        lifecycle_features = (
+            torch.zeros(
+                (batch_size, thought_slots, self.config.num_lifecycles),
+                device=thought.device,
+                dtype=thought.dtype,
+            )
+            if batch.lifecycle_features is None
+            else batch.lifecycle_features.to(dtype=thought.dtype)
+        )
         t_scalars = torch.cat((batch.uncertainty, batch.local_noise), dim=-1)
         thought_hidden = (
             thought
             + self.role_projection(batch.role_features)
+            + self.lifecycle_projection(lifecycle_features)
             + self.scalar_projection(t_scalars)
             + self.occupancy_projection(batch.slot_occupancy)
             + t_pos

@@ -17,7 +17,10 @@ from cid.contracts import FreshnessDemand
 from cid.data import ThoughtTarget, TrajectoryExample, training_transition_source_steps
 from cid.grounding import AnchorKind, LinkRelation, ObjectKind, ObjectRef
 from cid.lifecycle import MODELED_LIFECYCLES
-from cid.model.allocation import prefix_allocation_mask
+from cid.model.allocation import (
+    DEFAULT_MAX_ALLOCATIONS_PER_STEP,
+    prefix_allocation_mask,
+)
 from cid.model.diffusion import CIDDiffusionScheduler
 from cid.model.encoding import ILLaDATextEncoder, stable_text
 from cid.model.illada import (
@@ -56,6 +59,7 @@ class CIDRolloutState:
     thought_semantic: Tensor
     role_features: Tensor
     uncertainty: Tensor
+    lifecycle_features: Tensor
     slot_occupancy: Tensor
     display_ids: Tensor
 
@@ -117,6 +121,9 @@ def collate_training_steps(
         ),
         local_noise=_pad_slot_tensors(tuple(step.batch.local_noise for step in steps)),
         slot_occupancy=_pad_slot_tensors(tuple(step.batch.slot_occupancy for step in steps)),
+        lifecycle_features=_pad_slot_tensors(
+            tuple(step.batch.lifecycle_features for step in steps)
+        ),
         prompt_ids=prompt_ids,
         display_ids=display_ids,
         display_noise=display_noise,
@@ -188,7 +195,8 @@ class CIDTrainerConfig:
     rollout_horizon: int = 3
     teacher_forcing_epochs: int = 1
     rollout_ramp_epochs: int = 2
-    rollout_allocation_threshold: float = 0.5
+    rollout_allocation_threshold: float = 0.8
+    rollout_max_allocations_per_step: int = DEFAULT_MAX_ALLOCATIONS_PER_STEP
     rollout_display_reveal_fraction: float = 1.0
     rollout_display_revision_fraction: float = 0.25
     rollout_display_revision_margin: float = 0.05
@@ -224,6 +232,8 @@ class CIDTrainerConfig:
         ):
             if not 0.0 <= getattr(self, name) <= 1.0:
                 raise ValueError(f"{name} must be in [0, 1]")
+        if self.rollout_max_allocations_per_step <= 0:
+            raise ValueError("rollout_max_allocations_per_step must be positive")
         if self.rollout_display_revision_margin < 0.0:
             raise ValueError("rollout_display_revision_margin must be non-negative")
 
@@ -435,9 +445,24 @@ class CIDTrainer:
             occupancy,
             output.allocation_logits[batch_index : batch_index + 1].detach(),
             threshold=self.config.rollout_allocation_threshold,
-            max_allocations=output.allocation_logits.shape[1],
+            max_allocations=self.config.rollout_max_allocations_per_step,
         ).unsqueeze(-1)
+        previous_occupancy = occupancy
         occupancy = occupancy | (~occupancy & allocation)
+        lifecycle_indices = output.lifecycle_logits[
+            batch_index : batch_index + 1
+        ].argmax(dim=-1)
+        lifecycle_features = torch.nn.functional.one_hot(
+            lifecycle_indices, num_classes=self.adapter.config.num_lifecycles
+        ).to(dtype=sample.batch.role_features.dtype)
+        active_index = MODELED_LIFECYCLES.index(CellLifecycle.ACTIVE)
+        newly_allocated = (~previous_occupancy & allocation).squeeze(-1)
+        if bool(newly_allocated.any()):
+            lifecycle_features[newly_allocated] = 0.0
+            lifecycle_features[..., active_index][newly_allocated] = 1.0
+        lifecycle_features = lifecycle_features * occupancy.to(
+            dtype=lifecycle_features.dtype
+        )
 
         display_length = sample.batch.display_ids.shape[1]
         display_ids = self.tensorizer.scheduler.refine_display(
@@ -451,6 +476,7 @@ class CIDTrainer:
             thought_semantic=output.thought_semantic[batch_index : batch_index + 1].detach(),
             role_features=torch.sigmoid(output.role_logits[batch_index : batch_index + 1]).detach(),
             uncertainty=output.uncertainty[batch_index : batch_index + 1].detach(),
+            lifecycle_features=lifecycle_features.detach(),
             slot_occupancy=occupancy.to(dtype=sample.batch.slot_occupancy.dtype).detach(),
             display_ids=display_ids.detach(),
         )
@@ -957,7 +983,6 @@ class ILLaDATrajectoryTensorizer:
         device = self.text_encoder.device
         dtype = self.text_encoder.dtype
         capacity = self._trajectory_thought_capacity(example)
-        current_by_id = {cell.cell_id: cell for cell in current}
         target_by_id = {cell.cell_id: cell for cell in target}
         target_output_slots = self._target_output_slots(current, target, capacity)
 
@@ -969,15 +994,20 @@ class ILLaDATrajectoryTensorizer:
         role_features = torch.zeros(
             (1, capacity, self.adapter.config.num_roles), device=device, dtype=dtype
         )
+        lifecycle_features = torch.zeros(
+            (1, capacity, self.adapter.config.num_lifecycles), device=device, dtype=dtype
+        )
         uncertainty = torch.ones((1, capacity, 1), device=device, dtype=dtype)
         occupancy = torch.zeros((1, capacity, 1), device=device, dtype=dtype)
         role_order = tuple(CognitiveRole)
+        lifecycle_order = MODELED_LIFECYCLES
 
         if rollout_state is None:
             for cell in current:
                 thought_semantic[0, cell.slot] = current_vectors[cell.cell_id]
                 occupancy[0, cell.slot, 0] = 1.0
                 uncertainty[0, cell.slot, 0] = cell.uncertainty
+                lifecycle_features[0, cell.slot, lifecycle_order.index(cell.lifecycle)] = 1.0
                 for role_index, role in enumerate(role_order):
                     role_features[0, cell.slot, role_index] = cell.roles.get(role, 0.0)
         else:
@@ -985,6 +1015,9 @@ class ILLaDATrajectoryTensorizer:
             thought_semantic.copy_(rollout_state.thought_semantic.to(device=device, dtype=dtype))
             role_features.copy_(rollout_state.role_features.to(device=device, dtype=dtype))
             uncertainty.copy_(rollout_state.uncertainty.to(device=device, dtype=dtype))
+            lifecycle_features.copy_(
+                rollout_state.lifecycle_features.to(device=device, dtype=dtype)
+            )
             occupancy.copy_(rollout_state.slot_occupancy.to(device=device, dtype=dtype))
 
         timestep_tensor = torch.tensor([timestep], device=device)
@@ -996,27 +1029,26 @@ class ILLaDATrajectoryTensorizer:
         )
 
         prompt_ids = self.text_encoder.tokenize(example.prompt, add_special_tokens=True)
-        logical_length = (
-            self.adapter.config.max_thought_slots
-            + prompt_ids.shape[1]
-            + self.display_canvas_tokens
-        )
-        if logical_length > self.adapter.max_position_embeddings:
-            raise ValueError(
-                "configured TCT prefix, prompt, and fixed display canvas exceed "
-                "iLLaDA context capacity"
-            )
-
         target_display = self._display_text(example, target_step)
         target_text_ids = self.text_encoder.tokenize(target_display, add_special_tokens=False)
         realized_tokens = target_text_ids.shape[1]
-        if realized_tokens + 1 > self.display_canvas_tokens:
+        display_canvas_tokens = self._display_canvas_size(
+            realized_tokens + 1,
+            rollout_state=rollout_state,
+        )
+        logical_length = (
+            self.adapter.config.max_thought_slots
+            + prompt_ids.shape[1]
+            + display_canvas_tokens
+        )
+        if logical_length > self.adapter.max_position_embeddings:
             raise ValueError(
-                f"display target requires {realized_tokens + 1} tokens including EOS but "
-                f"fixed canvas has capacity {self.display_canvas_tokens}"
+                "configured TCT prefix, prompt, and display bucket exceed "
+                "iLLaDA context capacity"
             )
+
         target_display_ids = torch.full(
-            (1, self.display_canvas_tokens),
+            (1, display_canvas_tokens),
             ILLADA_MASK_TOKEN_ID,
             device=device,
             dtype=torch.long,
@@ -1039,11 +1071,11 @@ class ILLaDATrajectoryTensorizer:
             display_labels = display_corruption.labels
             display_noise = display_corruption.noise * display_supervision_mask.unsqueeze(-1)
         else:
-            if rollout_state.display_ids.shape != target_display_ids.shape:
-                raise ValueError("rollout display physical capacity changed inside a trajectory")
-            display_input_ids = rollout_state.display_ids.to(
-                device=device, dtype=torch.long
-            ).clone()
+            display_input_ids = torch.full_like(target_display_ids, ILLADA_MASK_TOKEN_ID)
+            previous_display = rollout_state.display_ids.to(device=device, dtype=torch.long)
+            if previous_display.shape[1] > display_input_ids.shape[1]:
+                raise ValueError("rollout display exceeds configured training display capacity")
+            display_input_ids[:, : previous_display.shape[1]] = previous_display
             display_labels = target_display_ids.clone()
             display_labels[~display_supervision_mask] = -100
             display_labels[display_input_ids == target_display_ids] = -100
@@ -1098,6 +1130,7 @@ class ILLaDATrajectoryTensorizer:
             fact_memory=fact_memory,
             percept_memory=percept_memory,
             source_memory=source_memory,
+            lifecycle_features=lifecycle_features,
             percept_thought_mask=percept_thought_mask,
             percept_display_mask=percept_display_mask,
         )
@@ -1105,12 +1138,12 @@ class ILLaDATrajectoryTensorizer:
             example=example,
             source_step=source_step,
             target_step=target_step,
-            current_by_id=current_by_id,
             target_by_id=target_by_id,
             target_output_slots=target_output_slots,
             target_vectors=target_vectors,
             display_labels=display_labels,
             input_occupancy=occupancy,
+            input_noise_level=timestep,
             thought_slots=capacity,
             dtype=dtype,
             device=device,
@@ -1173,6 +1206,9 @@ class ILLaDATrajectoryTensorizer:
         expected_scalar = (1, thought_slots, 1)
         if tuple(state.uncertainty.shape) != expected_scalar:
             raise ValueError("rollout uncertainty shape does not match adapter geometry")
+        expected_lifecycle = (1, thought_slots, self.adapter.config.num_lifecycles)
+        if tuple(state.lifecycle_features.shape) != expected_lifecycle:
+            raise ValueError("rollout lifecycle feature shape does not match adapter geometry")
         if tuple(state.slot_occupancy.shape) != expected_scalar:
             raise ValueError("rollout occupancy shape does not match adapter geometry")
         if state.display_ids.ndim != 2 or state.display_ids.shape[0] != 1:
@@ -1185,12 +1221,12 @@ class ILLaDATrajectoryTensorizer:
         example: TrajectoryExample,
         source_step: int,
         target_step: int,
-        current_by_id: Mapping[str, ThoughtTarget],
         target_by_id: Mapping[str, ThoughtTarget],
         target_output_slots: Mapping[str, int],
         target_vectors: Mapping[str, Tensor],
         display_labels: Tensor,
         input_occupancy: Tensor,
+        input_noise_level: float,
         thought_slots: int,
         dtype: torch.dtype,
         device: torch.device,
@@ -1270,20 +1306,30 @@ class ILLaDATrajectoryTensorizer:
             uncertainty[0, slot, 0] = target.uncertainty
             for role_index, role in enumerate(role_order):
                 role_targets[0, slot, role_index] = target.roles.get(role, 0.0)
-            current = current_by_id.get(cell_id)
-            if current is None:
+            actually_occupied = bool(input_occupancy[0, slot, 0])
+            if not actually_occupied:
+                # Allocation/lifecycle are trained against the state actually fed to the model.
+                # A scheduled-sampling miss must therefore remain recoverable on the next step.
                 allocation_targets[0, slot] = 1.0
                 noise_delta[0, slot, 0] = target.noise - 1.0
             else:
                 lifecycle[0, slot] = lifecycle_order.index(target.lifecycle)
-                noise_delta[0, slot, 0] = target.noise - current.noise
-                delta = target.noise - current.noise
+                delta = target.noise - input_noise_level
+                noise_delta[0, slot, 0] = delta
                 if delta > 1e-6:
                     revision_targets[0, slot] = int(RevisionAction.REOPEN)
                 elif delta < -1e-6:
                     revision_targets[0, slot] = int(RevisionAction.STABILIZE)
                 else:
                     revision_targets[0, slot] = int(RevisionAction.KEEP)
+
+        target_slots = set(target_output_slots.values())
+        retired_index = lifecycle_order.index(CellLifecycle.RETIRED)
+        for slot in range(n):
+            if bool(input_occupancy[0, slot, 0]) and slot not in target_slots:
+                # Over-allocation is a structural rollout error. Teach the lifecycle head to
+                # retire the extra occupied cell rather than silently carrying it forever.
+                lifecycle[0, slot] = retired_index
 
         source_names = tuple(str(item.get("name", "")) for item in example.source_descriptors)
         bindings = tuple(
@@ -1506,6 +1552,27 @@ class ILLaDATrajectoryTensorizer:
             names = ", ".join(sorted(missing))
             raise ValueError(f"target snapshot removed cells without RETIRED state: {names}")
         return slots
+
+    def _display_canvas_size(
+        self,
+        required_tokens: int,
+        *,
+        rollout_state: CIDRolloutState | None,
+    ) -> int:
+        if required_tokens <= 0:
+            raise ValueError("display supervision requires at least EOS")
+        maximum = self.adapter.config.max_display_tokens
+        if required_tokens > maximum:
+            raise ValueError(
+                f"display target requires {required_tokens} tokens including EOS but "
+                f"adapter maximum is {maximum}"
+            )
+        canvas = self.display_canvas_tokens
+        while canvas < required_tokens:
+            canvas = min(maximum, canvas * 2)
+        if rollout_state is not None:
+            canvas = max(canvas, int(rollout_state.display_ids.shape[1]))
+        return canvas
 
     def _display_text(self, example: TrajectoryExample, step: int) -> str:
         for target in example.display_targets:

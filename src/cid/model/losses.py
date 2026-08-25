@@ -121,7 +121,7 @@ def cid_loss(
         output.convergence_logits,
         targets.convergence_targets,
     )
-    allocation = _masked_binary_cross_entropy(
+    allocation = _balanced_masked_binary_cross_entropy(
         output.allocation_logits,
         targets.allocation_targets,
         targets.allocation_mask,
@@ -283,6 +283,32 @@ def _masked_vector_mse(prediction: Tensor, target: Tensor, mask: Tensor) -> Tens
     if selected.numel() == 0:
         return prediction.sum() * 0.0
     return selected.mean()
+
+
+def _balanced_masked_binary_cross_entropy(
+    logits: Tensor, target: Tensor, mask: Tensor
+) -> Tensor:
+    """Balance positive/negative allocation supervision within each example.
+
+    Allocation positives are sparse because every free slot after the requested prefix is a
+    negative. A plain masked mean lets those negatives dominate the gradient and can produce a
+    deceptively low loss with probabilities that never cross the runtime allocation threshold.
+    """
+    losses = F.binary_cross_entropy_with_logits(logits, target, reduction="none")
+    rows: list[Tensor] = []
+    for row in range(logits.shape[0]):
+        valid = mask[row].bool()
+        positive = losses[row][valid & (target[row] >= 0.5)]
+        negative = losses[row][valid & (target[row] < 0.5)]
+        if positive.numel() and negative.numel():
+            rows.append(0.5 * (positive.mean() + negative.mean()))
+        elif positive.numel():
+            rows.append(positive.mean())
+        elif negative.numel():
+            rows.append(negative.mean())
+    if not rows:
+        return logits.sum() * 0.0
+    return torch.stack(rows).mean()
 
 
 def _masked_binary_cross_entropy(logits: Tensor, target: Tensor, mask: Tensor) -> Tensor:

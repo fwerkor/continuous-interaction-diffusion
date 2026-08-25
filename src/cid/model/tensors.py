@@ -22,6 +22,7 @@ class CIDTensorBatch:
     fact_memory: Tensor
     percept_memory: Tensor
     source_memory: Tensor
+    lifecycle_features: Tensor | None = None
     percept_thought_mask: Tensor | None = None
     percept_display_mask: Tensor | None = None
     prompt_padding_mask: Tensor | None = None

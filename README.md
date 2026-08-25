@@ -394,13 +394,15 @@ The trainer pads variable-length prompt and external-memory sequences inside eac
 to a deterministic first-free layout and uses only the simultaneous slot footprint required by that
 example (with an eight-slot minimum). The configured maximum TCT width is nevertheless reserved in
 the logical position space, so changing a sample from eight physical slots to 128 cannot shift its
-prompt or display positions. The display uses a fixed physical canvas (`64` tokens by default): the
-realized text is terminated by EOS and positions after EOS receive no token loss. This prevents
-target length from leaking through tensor shape while avoiding a 1024-token canvas on every sample.
-Targets that do not fit the configured canvas are rejected instead of silently truncated. Gradient
-checkpointing is enabled by default for the native iLLaDA stack and can be disabled with
-`--no-gradient-checkpointing`. With the six-GPU example above, the effective transition batch is
-`2 × 8 × 6 = 96`; start at micro-batch 1 if the real trajectory lengths are substantially larger.
+prompt or display positions. `--display-canvas-tokens` is the minimum display bucket (`64` by
+default); training expands it only when needed through coarse buckets (64, 128, 256, 512, 1024,
+then the configured maximum, 1536 by default). The realized text is terminated by EOS and positions
+after EOS receive no token loss. This avoids paying for a 1536-token canvas on short examples while
+keeping every released target representable without truncation. Within self-rollout a display bucket
+may grow but never shrink. Gradient checkpointing is enabled by default for the native iLLaDA stack
+and can be disabled with `--no-gradient-checkpointing`. With the six-GPU example above, the effective
+transition batch is `2 × 8 × 6 = 96`; start at micro-batch 1 if the real trajectory lengths are
+substantially larger.
 
 Stage A checkpoints contain trainable CID parameters, optimizer state, progress, and RNG state; they
 do not duplicate the frozen 8B backbone. Resume with `--resume <checkpoint>`. For inference,
@@ -441,7 +443,7 @@ torchrun --standalone --nproc-per-node=${WORLD_SIZE} -m cid.cli train-full \
   --output-dir runs/stage-b \
   --init-cid-checkpoint runs/stage-a/stage-a-final-epoch3.pt \
   --thought-capacity 128 \
-  --max-display-tokens 1024 \
+  --max-display-tokens 1536 \
   --display-canvas-tokens 64 \
   --dtype bf16
 ```

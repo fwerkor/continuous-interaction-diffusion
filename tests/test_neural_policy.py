@@ -1,5 +1,6 @@
 from __future__ import annotations
 
+from dataclasses import replace
 from importlib import import_module
 from types import SimpleNamespace
 
@@ -95,6 +96,37 @@ class TinyTokenizer:
     @staticmethod
     def _ids(text: str) -> list[int]:
         return [6 + (ord(char) % 20) for char in text[:8]]
+
+
+def test_runtime_tensorizer_preserves_current_lifecycle_as_one_hot() -> None:
+    from cid.state import CellLifecycle
+
+    adapter = ILLaDACIDAdapter(TinyBackbone(), freeze_backbone=True)
+    tensorizer = ILLaDAContextTensorizer(adapter, TinyTokenizer())
+    thought = CognitiveField.empty(capacity=2, width=TinyConfig.hidden_size)
+    thought, cell_id = thought.allocate(semantic=(0.0,) * TinyConfig.hidden_size)
+    slot = thought.slot_of(cell_id)
+    cells = list(thought.cells)
+    cells[slot] = replace(cells[slot], lifecycle=CellLifecycle.WAITING)
+    thought = replace(thought, cells=tuple(cells))
+    context = ModelContext(
+        facts=FactStore().snapshot(),
+        thought=thought,
+        display=DisplayCanvas.masked(length=3, mask_token_id=5),
+        sources=(),
+        percepts=(),
+        step=0,
+        prompt="status",
+    )
+
+    batch = tensorizer(context)
+
+    modeled = import_module("cid.lifecycle").MODELED_LIFECYCLES
+    waiting_index = list(modeled).index(CellLifecycle.WAITING)
+    slot = thought.slot_of(cell_id)
+    assert batch.lifecycle_features[0, slot, waiting_index] == 1.0
+    assert batch.lifecycle_features[0, slot].sum() == 1.0
+    assert batch.lifecycle_features[0, 1].sum() == 0.0
 
 
 async def test_neural_policy_runs_tiny_illada_inside_async_runtime() -> None:

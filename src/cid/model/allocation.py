@@ -3,6 +3,8 @@ from __future__ import annotations
 import torch
 from torch import Tensor
 
+DEFAULT_MAX_ALLOCATIONS_PER_STEP = 32
+
 
 def prefix_allocation_mask(
     occupancy: Tensor,

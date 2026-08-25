@@ -6,6 +6,7 @@ from typing import Any
 import torch
 
 from cid.contracts import ModelContext, ModelUpdate, Percept, SourceDescriptor
+from cid.lifecycle import MODELED_LIFECYCLES
 from cid.model.diffusion import CIDDiffusionScheduler
 from cid.model.encoding import ILLaDATextEncoder, stable_text
 from cid.model.illada import (
@@ -60,6 +61,7 @@ class ILLaDAContextTensorizer:
             )
 
         role_order = tuple(CognitiveRole)
+        lifecycle_order = MODELED_LIFECYCLES
         thought_semantic = torch.tensor(
             [[cell.semantic for cell in thought.cells]],
             device=device,
@@ -75,6 +77,12 @@ class ILLaDAContextTensorizer:
             device=device,
             dtype=dtype,
         )
+        lifecycle_features = torch.zeros(
+            (1, thought.capacity, len(lifecycle_order)), device=device, dtype=dtype
+        )
+        for slot, cell in enumerate(thought.cells):
+            if cell.occupied and cell.lifecycle in lifecycle_order:
+                lifecycle_features[0, slot, lifecycle_order.index(cell.lifecycle)] = 1.0
         uncertainty = torch.tensor(
             [[[cell.uncertainty] for cell in thought.cells]],
             device=device,
@@ -131,6 +139,7 @@ class ILLaDAContextTensorizer:
             fact_memory=fact_memory,
             percept_memory=percept_memory,
             source_memory=source_memory,
+            lifecycle_features=lifecycle_features,
             percept_thought_mask=percept_thought_mask,
             percept_display_mask=percept_display_mask,
             display_padding_mask=display_padding_mask,

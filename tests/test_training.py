@@ -411,6 +411,60 @@ def test_trajectory_tensorizer_rejects_display_that_exceeds_fixed_canvas() -> No
         tensorizer.tensorize(example, source_step=0, timestep=1.0)
 
 
+def test_trajectory_tensorizer_expands_display_to_coarse_bucket() -> None:
+    adapter = ILLaDACIDAdapter(
+        TinyBackbone(),
+        ILLaDACIDConfig(
+            max_thought_slots=4,
+            max_display_tokens=32,
+            display_canvas_tokens=4,
+        ),
+        freeze_backbone=True,
+    )
+    tensorizer = ILLaDATrajectoryTensorizer(adapter, TinyTokenizer())
+    example = replace(
+        make_trajectory(),
+        target_display="abcdefghij",
+        display_targets=(DisplayTarget(step=1, text="abcdefghij"),),
+    )
+
+    sample = tensorizer.tensorize(example, source_step=0, timestep=1.0)
+
+    # 10 target tokens + EOS are rounded to a 16-token training bucket.
+    assert sample.batch.display_ids.shape[1] == 16
+    assert sample.targets.display_ids[0, 10] == tensorizer.eos_token_id
+    assert (sample.targets.display_ids[0, 11:] == -100).all()
+
+
+def test_rollout_display_bucket_can_grow_but_never_shrinks() -> None:
+    adapter = ILLaDACIDAdapter(
+        TinyBackbone(),
+        ILLaDACIDConfig(
+            max_thought_slots=4,
+            max_display_tokens=32,
+            display_canvas_tokens=4,
+        ),
+        freeze_backbone=True,
+    )
+    tensorizer = ILLaDATrajectoryTensorizer(adapter, TinyTokenizer())
+    example = make_rollout_trajectory()
+    teacher = tensorizer.tensorize(example, source_step=1, timestep=0.0)
+    rollout = CIDRolloutState(
+        thought_semantic=teacher.batch.thought_semantic.clone(),
+        role_features=teacher.batch.role_features.clone(),
+        uncertainty=teacher.batch.uncertainty.clone(),
+        lifecycle_features=teacher.batch.lifecycle_features.clone(),
+        slot_occupancy=teacher.batch.slot_occupancy.clone(),
+        display_ids=torch.full((1, 16), 5, dtype=torch.long),
+    )
+
+    sample = tensorizer.tensorize(
+        example, source_step=1, timestep=0.0, rollout_state=rollout
+    )
+
+    assert sample.batch.display_ids.shape[1] == 16
+
+
 def test_trajectory_tensorizer_reserves_context_for_tct_and_prompt() -> None:
     adapter = ILLaDACIDAdapter(
         TinyBackbone(),
@@ -425,7 +479,7 @@ def test_trajectory_tensorizer_reserves_context_for_tct_and_prompt() -> None:
         display_targets=(DisplayTarget(step=1, text="abcdefghij"),),
     )
 
-    with pytest.raises(ValueError, match="fixed display canvas"):
+    with pytest.raises(ValueError, match="display bucket"):
         tensorizer.tensorize(example, source_step=0, timestep=1.0)
 
 
@@ -1181,6 +1235,10 @@ def test_rollout_state_replaces_teacher_input_t_and_y() -> None:
         thought_semantic=torch.full((1, slots, adapter.d_model), 0.25),
         role_features=torch.full((1, slots, adapter.config.num_roles), 0.75),
         uncertainty=torch.full((1, slots, 1), 0.2),
+        lifecycle_features=torch.nn.functional.one_hot(
+            torch.zeros((1, slots), dtype=torch.long),
+            num_classes=adapter.config.num_lifecycles,
+        ).to(torch.float32),
         slot_occupancy=torch.ones((1, slots, 1)),
         display_ids=torch.tensor([[17, *([5] * (tensorizer.display_canvas_tokens - 1))]]),
     )
@@ -1195,10 +1253,84 @@ def test_rollout_state_replaces_teacher_input_t_and_y() -> None:
     assert torch.allclose(sample.batch.thought_semantic, rollout.thought_semantic)
     assert torch.allclose(sample.batch.role_features, rollout.role_features)
     assert torch.allclose(sample.batch.uncertainty, rollout.uncertainty)
+    assert torch.equal(sample.batch.lifecycle_features, rollout.lifecycle_features)
     assert torch.equal(sample.batch.slot_occupancy, rollout.slot_occupancy)
     assert sample.batch.display_ids[0, 0] == 17
     assert sample.targets.display_ids[0, 0] != -100
 
+
+
+def test_rollout_missing_target_cell_is_supervised_for_recovery_allocation() -> None:
+    adapter = make_adapter(seed=111)
+    tensorizer = ILLaDATrajectoryTensorizer(adapter, TinyTokenizer())
+    example = make_rollout_trajectory()
+    teacher = tensorizer.tensorize(example, source_step=1, timestep=0.0)
+    rollout = CIDRolloutState(
+        thought_semantic=teacher.batch.thought_semantic.clone(),
+        role_features=teacher.batch.role_features.clone(),
+        uncertainty=teacher.batch.uncertainty.clone(),
+        lifecycle_features=teacher.batch.lifecycle_features.clone(),
+        slot_occupancy=teacher.batch.slot_occupancy.clone(),
+        display_ids=teacher.batch.display_ids.clone(),
+    )
+    rollout.slot_occupancy[0, 1, 0] = 0.0
+    rollout.thought_semantic[0, 1].zero_()
+    rollout.role_features[0, 1].zero_()
+    rollout.lifecycle_features[0, 1].zero_()
+
+    sample = tensorizer.tensorize(
+        example, source_step=1, timestep=0.25, rollout_state=rollout
+    )
+
+    assert sample.targets.allocation_mask[0, 1]
+    assert sample.targets.allocation_targets[0, 1] == 1.0
+    assert sample.targets.lifecycle[0, 1] == -100
+
+
+def test_existing_cell_noise_delta_uses_model_visible_corruption_level() -> None:
+    adapter = make_adapter(seed=112)
+    tensorizer = ILLaDATrajectoryTensorizer(adapter, TinyTokenizer())
+
+    sample = tensorizer.tensorize(make_trajectory(), source_step=0, timestep=0.8)
+
+    # c0's target noise is 0.3. The model sees local_noise=0.8 after corruption,
+    # so runtime-compatible delta supervision is 0.3 - 0.8, not 0.3 - 0.5.
+    assert sample.batch.local_noise[0, 0, 0] == pytest.approx(0.8)
+    assert sample.targets.noise_delta[0, 0, 0] == pytest.approx(-0.5)
+    assert sample.targets.revision_targets[0, 0] == int(cid_model.RevisionAction.STABILIZE)
+
+
+def test_rollout_extra_occupied_slot_is_supervised_to_retire() -> None:
+    adapter = make_adapter(seed=113)
+    tensorizer = ILLaDATrajectoryTensorizer(adapter, TinyTokenizer())
+    example = make_rollout_trajectory()
+    teacher = tensorizer.tensorize(example, source_step=1, timestep=0.0)
+    rollout = CIDRolloutState(
+        thought_semantic=teacher.batch.thought_semantic.clone(),
+        role_features=teacher.batch.role_features.clone(),
+        uncertainty=teacher.batch.uncertainty.clone(),
+        lifecycle_features=teacher.batch.lifecycle_features.clone(),
+        slot_occupancy=teacher.batch.slot_occupancy.clone(),
+        display_ids=teacher.batch.display_ids.clone(),
+    )
+    rollout.slot_occupancy[0, 3, 0] = 1.0
+    rollout.lifecycle_features[0, 3, 0] = 1.0
+
+    sample = tensorizer.tensorize(
+        example, source_step=1, timestep=0.25, rollout_state=rollout
+    )
+
+    modeled = import_module("cid.lifecycle").MODELED_LIFECYCLES
+    assert sample.targets.lifecycle[0, 3] == modeled.index(CellLifecycle.RETIRED)
+
+
+def test_rollout_allocation_defaults_match_runtime_contract() -> None:
+    materializer = cid_model.CIDMaterializerConfig()
+    trainer = CIDTrainerConfig()
+
+    assert trainer.rollout_allocation_threshold == materializer.allocation_threshold
+    assert trainer.rollout_max_allocations_per_step == materializer.max_allocations_per_step
+    assert materializer.max_allocations_per_step >= 20
 
 def test_self_rollout_feeds_previous_prediction_into_next_transition() -> None:
     class RecordingTensorizer(ILLaDATrajectoryTensorizer):

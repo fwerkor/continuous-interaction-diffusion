@@ -10,6 +10,23 @@ CIDTensorBatch = cid_model.CIDTensorBatch
 TorchCIDConfig = cid_model.TorchCIDConfig
 TorchCIDCore = cid_model.TorchCIDCore
 cid_loss = cid_model.cid_loss
+balanced_allocation_loss = import_module(
+    "cid.model.losses"
+)._balanced_masked_binary_cross_entropy
+
+
+def test_allocation_loss_balances_sparse_positive_against_many_negatives() -> None:
+    logits = torch.zeros((1, 4), requires_grad=True)
+    targets = torch.tensor([[1.0, 0.0, 0.0, 0.0]])
+    mask = torch.ones_like(targets, dtype=torch.bool)
+
+    loss = balanced_allocation_loss(logits, targets, mask)
+    loss.backward()
+
+    positive_gradient = logits.grad[0, 0].abs()
+    negative_gradient_sum = logits.grad[0, 1:].abs().sum()
+    assert positive_gradient == pytest.approx(negative_gradient_sum)
+
 
 
 def test_torch_core_shapes_and_backward() -> None:

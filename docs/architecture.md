@@ -171,8 +171,7 @@ request.
 
 The training model exposes argument presence and one retrieval query for each source-schema argument
 position. An information need can therefore start useful I/O before all required argument slots are
-grounded, while the trace separately records the first fully executable step. That lead time is
-directly measurable and corresponds to RQ1.
+grounded, while the trace separately records the first fully executable step. That lead time is directly measurable in the asynchronous-interaction evaluation.
 
 ## 5. One need, persistent binding
 

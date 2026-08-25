@@ -16,6 +16,7 @@ ILLADA_8B_BASE_REVISION = "a1b5b5f8a31a3854a46205ee584178c04b45ec9a"
 ILLADA_MASK_TOKEN_ID = 5
 ILLADA_EOS_TOKEN_ID = 2
 DEFAULT_DISPLAY_CANVAS_TOKENS = 64
+DEFAULT_MAX_DISPLAY_TOKENS = 1536
 
 
 def _chunked_illada_mlp_forward(module: nn.Module, x: torch.Tensor) -> torch.Tensor:
@@ -62,7 +63,7 @@ def _chunked_illada_rms_norm_forward(
 @dataclass(frozen=True, slots=True)
 class ILLaDACIDConfig:
     max_thought_slots: int = 128
-    max_display_tokens: int = 1024
+    max_display_tokens: int = DEFAULT_MAX_DISPLAY_TOKENS
     display_canvas_tokens: int | None = None
     num_roles: int = 6
     num_lifecycles: int = len(MODELED_LIFECYCLES)
@@ -126,6 +127,9 @@ class ILLaDACIDAdapter(nn.Module):
 
         self.channel_embedding = nn.Embedding(3, self.d_model)
         self.role_projection = nn.Linear(self.config.num_roles, self.d_model, bias=False)
+        self.lifecycle_projection = nn.Linear(
+            self.config.num_lifecycles, self.d_model, bias=False
+        )
         self.scalar_projection = nn.Linear(2, self.d_model, bias=False)
         self.occupancy_projection = nn.Linear(1, self.d_model, bias=False)
         self.display_noise_projection = nn.Linear(1, self.d_model, bias=False)
@@ -258,6 +262,15 @@ class ILLaDACIDAdapter(nn.Module):
         uncertainty = batch.uncertainty.to(dtype=model_dtype)
         local_noise = batch.local_noise.to(dtype=model_dtype)
         slot_occupancy = batch.slot_occupancy.to(dtype=model_dtype)
+        lifecycle_features = (
+            torch.zeros(
+                (*batch.thought_semantic.shape[:2], self.config.num_lifecycles),
+                device=batch.thought_semantic.device,
+                dtype=model_dtype,
+            )
+            if batch.lifecycle_features is None
+            else batch.lifecycle_features.to(dtype=model_dtype)
+        )
         display_noise = batch.display_noise.to(dtype=model_dtype)
         fact_memory = batch.fact_memory.to(dtype=model_dtype)
         percept_memory = batch.percept_memory.to(dtype=model_dtype)
@@ -267,6 +280,7 @@ class ILLaDACIDAdapter(nn.Module):
         thought_hidden = (
             thought
             + self.role_projection(role_features)
+            + self.lifecycle_projection(lifecycle_features)
             + self.scalar_projection(t_scalars)
             + self.occupancy_projection(slot_occupancy)
             + self.channel_embedding.weight[0][None, None, :]
@@ -410,6 +424,10 @@ class ILLaDACIDAdapter(nn.Module):
             raise ValueError("uncertainty must have shape [batch, thought_slots, 1]")
         if batch.local_noise.shape != (batch_size, thought_slots, 1):
             raise ValueError("local_noise must have shape [batch, thought_slots, 1]")
+        if batch.lifecycle_features is not None and batch.lifecycle_features.shape != (
+            batch_size, thought_slots, self.config.num_lifecycles
+        ):
+            raise ValueError("lifecycle_features shape does not match modeled lifecycle states")
 
         if batch.prompt_ids.ndim != 2 or batch.prompt_ids.shape[0] != batch_size:
             raise ValueError("prompt_ids must have shape [batch, prompt_tokens]")
