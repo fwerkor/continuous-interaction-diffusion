@@ -207,7 +207,7 @@ async def test_neural_benchmark_case_runs_replay_and_scores_display() -> None:
     )
 
     assert result.example_id == "bench-1"
-    assert result.final_display_ids == (7,)
-    assert result.evaluation.exact_display is True
+    assert result.final_display_ids == (7,) * 8
+    assert result.evaluation.exact_display is False
     assert result.evaluation.expected_observations == 0
     assert result.evaluation.observation_coverage == 1.0

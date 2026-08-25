@@ -5,8 +5,10 @@ Importing this package requires the optional `train` dependencies.
 
 from cid.model.diffusion import CIDDiffusionScheduler, DisplayCorruption, ThoughtCorruption
 from cid.model.illada import (
+    DEFAULT_DISPLAY_CANVAS_TOKENS,
     ILLADA_8B_BASE,
     ILLADA_8B_BASE_REVISION,
+    ILLADA_EOS_TOKEN_ID,
     ILLADA_MASK_TOKEN_ID,
     ILLaDACIDAdapter,
     ILLaDACIDConfig,
@@ -77,8 +79,10 @@ __all__ = [
     "CIDTrainReport",
     "ClosedWorldMaterializationCatalog",
     "DisplayCorruption",
+    "DEFAULT_DISPLAY_CANVAS_TOKENS",
     "ILLADA_8B_BASE",
     "ILLADA_8B_BASE_REVISION",
+    "ILLADA_EOS_TOKEN_ID",
     "ILLADA_MASK_TOKEN_ID",
     "ILLaDACIDAdapter",
     "ILLaDACIDConfig",

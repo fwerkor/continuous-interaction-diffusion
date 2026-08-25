@@ -343,23 +343,60 @@ class CognitiveField:
 class DisplayCanvas:
     token_ids: tuple[int, ...]
     mask_token_id: int
+    eos_token_id: int | None = None
     step: int = 0
 
     @classmethod
-    def masked(cls, length: int, mask_token_id: int) -> DisplayCanvas:
+    def masked(
+        cls,
+        length: int,
+        mask_token_id: int,
+        *,
+        eos_token_id: int | None = None,
+    ) -> DisplayCanvas:
         if length <= 0:
             raise ValueError("display length must be positive")
-        return cls(token_ids=(mask_token_id,) * length, mask_token_id=mask_token_id)
+        return cls(
+            token_ids=(mask_token_id,) * length,
+            mask_token_id=mask_token_id,
+            eos_token_id=eos_token_id,
+        )
+
+    @property
+    def active_span_length(self) -> int:
+        if self.eos_token_id is None:
+            return len(self.token_ids)
+        try:
+            return self.token_ids.index(self.eos_token_id) + 1
+        except ValueError:
+            return len(self.token_ids)
+
+    @property
+    def realized_length(self) -> int:
+        if self.eos_token_id is None:
+            return len(self.token_ids)
+        try:
+            return self.token_ids.index(self.eos_token_id)
+        except ValueError:
+            return len(self.token_ids)
+
+    @property
+    def visible_token_ids(self) -> tuple[int, ...]:
+        return self.token_ids[: self.realized_length]
 
     @property
     def unresolved(self) -> int:
-        return sum(token == self.mask_token_id for token in self.token_ids)
+        return sum(
+            token == self.mask_token_id
+            for token in self.token_ids[: self.active_span_length]
+        )
 
     def advance(self, token_ids: tuple[int, ...]) -> DisplayCanvas:
         if len(token_ids) != len(self.token_ids):
-            raise ValueError("display length cannot change inside a CID v0 trajectory")
+            raise ValueError("display physical capacity cannot change inside a CID trajectory")
         return DisplayCanvas(
             token_ids=token_ids,
             mask_token_id=self.mask_token_id,
+            eos_token_id=self.eos_token_id,
             step=self.step + 1,
         )

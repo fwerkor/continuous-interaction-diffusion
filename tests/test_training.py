@@ -310,8 +310,9 @@ def test_trajectory_tensorizer_recycles_retired_source_slot() -> None:
 
     sample = tensorizer.tensorize(trajectory, source_step=0, timestep=1.0)
 
-    assert sample.targets.allocation_targets[0, 0] == 1
-    assert sample.targets.thought_mask[0, 0]
+    assert sample.targets.allocation_targets[0, 1] == 1
+    assert sample.targets.allocation_mask[0, 1]
+    assert sample.targets.thought_mask[0, 1]
 
 
 def test_trajectory_tensorizer_rejects_reuse_of_live_source_slot() -> None:
@@ -344,7 +345,7 @@ def test_trajectory_tensorizer_rejects_reuse_of_live_source_slot() -> None:
         ),
     )
 
-    with pytest.raises(ValueError, match="occupied source slot"):
+    with pytest.raises(ValueError, match="removed cells without retirement"):
         tensorizer.tensorize(trajectory, source_step=0, timestep=1.0)
 
 
@@ -360,8 +361,10 @@ def test_trajectory_tensorizer_runs_full_optimizer_step() -> None:
 
     assert sample.batch.thought_semantic.shape == (1, 4, TinyConfig.hidden_size)
     assert sample.batch.prompt_ids.shape[1] > 0
-    assert torch.equal(sample.targets.display_ids, target_display_ids)
-    assert torch.all(sample.batch.display_ids != target_display_ids)
+    assert torch.equal(sample.targets.display_ids[0, :2], target_display_ids[0])
+    assert sample.targets.display_ids[0, 2] == 2
+    assert (sample.targets.display_ids[0, 3:] == -100).all()
+    assert sample.batch.display_ids.shape[1] == tensorizer.display_canvas_tokens
     assert sample.targets.allocation_targets[0, 1] == 1
     assert sample.targets.allocation_mask[0, 1]
     assert sample.targets.thought_mask[0, :2].all()
@@ -391,7 +394,7 @@ def test_trajectory_tensorizer_runs_full_optimizer_step() -> None:
     assert all(parameter.grad is None for parameter in adapter.backbone.parameters())
 
 
-def test_trajectory_tensorizer_truncates_display_to_configured_capacity() -> None:
+def test_trajectory_tensorizer_rejects_display_that_exceeds_fixed_canvas() -> None:
     adapter = ILLaDACIDAdapter(
         TinyBackbone(),
         ILLaDACIDConfig(max_thought_slots=4, max_display_tokens=4),
@@ -404,16 +407,8 @@ def test_trajectory_tensorizer_truncates_display_to_configured_capacity() -> Non
         display_targets=(DisplayTarget(step=1, text="abcdefghij"),),
     )
 
-    sample = tensorizer.tensorize(example, source_step=0, timestep=1.0)
-    expected = TinyTokenizer()(
-        "abcd",
-        add_special_tokens=False,
-        return_tensors="pt",
-    )["input_ids"]
-
-    assert sample.batch.display_ids.shape[1] == 4
-    assert torch.equal(sample.targets.display_ids, expected)
-    assert adapter(sample.batch).display_logits.shape[1] == 4
+    with pytest.raises(ValueError, match="including EOS"):
+        tensorizer.tensorize(example, source_step=0, timestep=1.0)
 
 
 def test_trajectory_tensorizer_reserves_context_for_tct_and_prompt() -> None:
@@ -430,12 +425,8 @@ def test_trajectory_tensorizer_reserves_context_for_tct_and_prompt() -> None:
         display_targets=(DisplayTarget(step=1, text="abcdefghij"),),
     )
 
-    sample = tensorizer.tensorize(example, source_step=0, timestep=1.0)
-
-    # 64 positions - 4 configured TCT slots - 56 prompt tokens = 4 display tokens.
-    assert sample.batch.display_ids.shape[1] == 4
-    assert sample.targets.display_ids.shape[1] == 4
-    assert adapter(sample.batch).display_logits.shape[1] == 4
+    with pytest.raises(ValueError, match="fixed display canvas"):
+        tensorizer.tensorize(example, source_step=0, timestep=1.0)
 
 
 def test_bootstrap_transition_trains_single_snapshot_from_empty_tct() -> None:
@@ -642,7 +633,7 @@ def test_training_collator_pads_variable_sequences_and_external_memory() -> None
     assert training_batch.batch.thought_semantic.shape[0] == 2
     assert training_batch.batch.prompt_padding_mask.shape[0] == 2
     assert training_batch.batch.prompt_padding_mask[1].any()
-    assert training_batch.batch.display_padding_mask[0].any()
+    assert not training_batch.batch.display_padding_mask.any()
     assert training_batch.batch.fact_memory.shape[:2] == (2, 1)
     assert not training_batch.batch.fact_padding_mask[0, 0]
     assert training_batch.batch.fact_padding_mask[1, 0]
@@ -657,42 +648,28 @@ def test_training_collator_pads_variable_sequences_and_external_memory() -> None
     losses.total.backward()
 
 
-def test_trajectory_tensorizer_pads_mixed_thought_capacities_per_batch() -> None:
-    adapter = ILLaDACIDAdapter(
-        TinyBackbone(),
-        ILLaDACIDConfig(max_thought_slots=128, max_display_tokens=16),
-        freeze_backbone=True,
-    )
-    tensorizer = ILLaDATrajectoryTensorizer(
-        adapter,
-        TinyTokenizer(),
-        minimum_thought_slots=8,
-    )
-    small_example = replace(make_trajectory(), prompt="x")
-    small = tensorizer.tensorize(small_example, source_step=0, timestep=1.0)
-    base = replace(make_trajectory(), prompt="y")
-    expanded = replace(
+def test_trajectory_tensorizer_ignores_randomized_physical_slot_placement() -> None:
+    adapter = make_adapter()
+    tensorizer = ILLaDATrajectoryTensorizer(adapter, TinyTokenizer())
+    base = make_trajectory()
+    randomized = replace(
         base,
-        example_id="train-cap32",
+        example_id="train-randomized-slots",
         thought_targets=tuple(
-            replace(target, slot=31 if target.cell_id == "c1" else target.slot)
+            replace(target, slot=(3 - target.slot))
             for target in base.thought_targets
         ),
     )
-    large = tensorizer.tensorize(expanded, source_step=0, timestep=1.0)
 
-    assert small.batch.thought_semantic.shape[1] == 8
-    assert large.batch.thought_semantic.shape[1] == 32
+    left = tensorizer.tensorize(base, source_step=0, timestep=1.0)
+    right = tensorizer.tensorize(randomized, source_step=0, timestep=1.0)
 
-    batch = collate_training_steps((small, large), pad_token_id=1)
-    assert batch.batch.thought_semantic.shape[:2] == (2, 32)
-    assert not batch.batch.slot_occupancy[0, 8:].any()
-    assert not batch.targets.allocation_mask[0, 8:].any()
-    assert (batch.targets.lifecycle[0, 8:] == -100).all()
-
-    output = adapter(batch.batch)
-    losses = cid_loss(output, batch.targets)
-    assert torch.isfinite(losses.total)
+    assert left.batch.thought_semantic.shape == right.batch.thought_semantic.shape
+    assert torch.equal(left.batch.slot_occupancy, right.batch.slot_occupancy)
+    assert torch.equal(left.targets.allocation_targets, right.targets.allocation_targets)
+    assert torch.equal(left.targets.allocation_mask, right.targets.allocation_mask)
+    assert torch.equal(left.targets.thought_mask, right.targets.thought_mask)
+    assert torch.equal(left.targets.source_targets, right.targets.source_targets)
 
 
 def test_trainer_uses_configured_micro_batches() -> None:
@@ -1205,7 +1182,7 @@ def test_rollout_state_replaces_teacher_input_t_and_y() -> None:
         role_features=torch.full((1, slots, adapter.config.num_roles), 0.75),
         uncertainty=torch.full((1, slots, 1), 0.2),
         slot_occupancy=torch.ones((1, slots, 1)),
-        display_ids=torch.tensor([[17]]),
+        display_ids=torch.tensor([[17, *([5] * (tensorizer.display_canvas_tokens - 1))]]),
     )
 
     sample = tensorizer.tensorize(

@@ -29,7 +29,7 @@ class TinyConfig:
     hidden_size = 16
     vocab_size = 32
     num_attention_heads = 4
-    max_position_embeddings = 32
+    max_position_embeddings = 256
 
 
 class IdentityDecoder(nn.Module):

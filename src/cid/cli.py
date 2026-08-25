@@ -1111,6 +1111,7 @@ def _train_stage_a(args: argparse.Namespace) -> None:
         adapter_config = ILLaDACIDConfig(
             max_thought_slots=args.thought_capacity,
             max_display_tokens=args.max_display_tokens,
+            display_canvas_tokens=args.display_canvas_tokens,
         )
 
         def load_adapter() -> ILLaDACIDAdapter:
@@ -1465,6 +1466,7 @@ def _train_stage_b(args: argparse.Namespace) -> None:
         adapter_config = ILLaDACIDConfig(
             max_thought_slots=args.thought_capacity,
             max_display_tokens=args.max_display_tokens,
+            display_canvas_tokens=args.display_canvas_tokens,
         )
 
         def load_adapter() -> tuple[ILLaDACIDAdapter, ILLaDATextEncoder]:
@@ -2246,6 +2248,7 @@ def main() -> None:
     train.add_argument("--rollout-ramp-epochs", type=int, default=2)
     train.add_argument("--thought-capacity", type=int, default=128)
     train.add_argument("--max-display-tokens", type=int, default=1024)
+    train.add_argument("--display-canvas-tokens", type=int, default=64)
     train.add_argument("--seed", type=int, default=0)
     train.add_argument("--max-examples", type=int)
     train.add_argument("--no-shuffle", action="store_true")
@@ -2310,6 +2313,7 @@ def main() -> None:
     train_full.add_argument("--rollout-ramp-epochs", type=int, default=0)
     train_full.add_argument("--thought-capacity", type=int, default=128)
     train_full.add_argument("--max-display-tokens", type=int, default=1024)
+    train_full.add_argument("--display-canvas-tokens", type=int, default=64)
     train_full.add_argument("--seed", type=int, default=0)
     train_full.add_argument("--max-examples", type=int)
     train_full.add_argument("--no-shuffle", action="store_true")

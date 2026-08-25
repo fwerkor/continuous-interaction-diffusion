@@ -17,9 +17,14 @@ from cid.contracts import FreshnessDemand
 from cid.data import ThoughtTarget, TrajectoryExample, training_transition_source_steps
 from cid.grounding import AnchorKind, LinkRelation, ObjectKind, ObjectRef
 from cid.lifecycle import MODELED_LIFECYCLES
+from cid.model.allocation import prefix_allocation_mask
 from cid.model.diffusion import CIDDiffusionScheduler
 from cid.model.encoding import ILLaDATextEncoder, stable_text
-from cid.model.illada import ILLADA_MASK_TOKEN_ID, ILLaDACIDAdapter
+from cid.model.illada import (
+    ILLADA_EOS_TOKEN_ID,
+    ILLADA_MASK_TOKEN_ID,
+    ILLaDACIDAdapter,
+)
 from cid.model.losses import CIDLoss, CIDTargets, cid_loss
 from cid.model.materialize import RevisionAction
 from cid.model.tensors import CIDTensorBatch, CIDTensorOutput, build_percept_routing_masks
@@ -426,9 +431,11 @@ class CIDTrainer:
     ) -> CIDRolloutState:
         input_batch = training_batch.batch
         occupancy = input_batch.slot_occupancy[batch_index : batch_index + 1].detach().bool()
-        allocation = (
-            torch.sigmoid(output.allocation_logits[batch_index : batch_index + 1])
-            >= self.config.rollout_allocation_threshold
+        allocation = prefix_allocation_mask(
+            occupancy,
+            output.allocation_logits[batch_index : batch_index + 1].detach(),
+            threshold=self.config.rollout_allocation_threshold,
+            max_allocations=output.allocation_logits.shape[1],
         ).unsqueeze(-1)
         occupancy = occupancy | (~occupancy & allocation)
 
@@ -901,6 +908,7 @@ class ILLaDATrajectoryTensorizer:
         text_encoder: ILLaDATextEncoder | None = None,
         display_replacement_fraction: float = 0.25,
         minimum_thought_slots: int = 8,
+        display_canvas_tokens: int | None = None,
     ) -> None:
         self.adapter = adapter
         self.tokenizer = tokenizer
@@ -915,6 +923,17 @@ class ILLaDATrajectoryTensorizer:
         self.minimum_thought_slots = min(
             minimum_thought_slots,
             adapter.config.max_thought_slots,
+        )
+        if display_canvas_tokens is None:
+            display_canvas_tokens = adapter.config.display_canvas_tokens
+        if not 1 < display_canvas_tokens <= adapter.config.max_display_tokens:
+            raise ValueError(
+                "display_canvas_tokens must be in [2, adapter max_display_tokens]"
+            )
+        self.display_canvas_tokens = int(display_canvas_tokens)
+        eos_token_id = getattr(tokenizer, "eos_token_id", None)
+        self.eos_token_id = (
+            ILLADA_EOS_TOKEN_ID if eos_token_id is None else int(eos_token_id)
         )
         self.scheduler = scheduler or CIDDiffusionScheduler(ILLADA_MASK_TOKEN_ID)
 
@@ -977,38 +996,60 @@ class ILLaDATrajectoryTensorizer:
         )
 
         prompt_ids = self.text_encoder.tokenize(example.prompt, add_special_tokens=True)
-        target_display = self._display_text(example, target_step)
-        target_display_ids = self.text_encoder.tokenize(target_display, add_special_tokens=False)
-        display_budget = min(
-            self.adapter.config.max_display_tokens,
-            self.adapter.max_position_embeddings
-            - capacity
-            - prompt_ids.shape[1],
+        logical_length = (
+            self.adapter.config.max_thought_slots
+            + prompt_ids.shape[1]
+            + self.display_canvas_tokens
         )
-        if display_budget < 0:
-            raise ValueError("prompt and configured TCT capacity exceed iLLaDA context capacity")
-        target_display_ids = target_display_ids[:, :display_budget]
+        if logical_length > self.adapter.max_position_embeddings:
+            raise ValueError(
+                "configured TCT prefix, prompt, and fixed display canvas exceed "
+                "iLLaDA context capacity"
+            )
+
+        target_display = self._display_text(example, target_step)
+        target_text_ids = self.text_encoder.tokenize(target_display, add_special_tokens=False)
+        realized_tokens = target_text_ids.shape[1]
+        if realized_tokens + 1 > self.display_canvas_tokens:
+            raise ValueError(
+                f"display target requires {realized_tokens + 1} tokens including EOS but "
+                f"fixed canvas has capacity {self.display_canvas_tokens}"
+            )
+        target_display_ids = torch.full(
+            (1, self.display_canvas_tokens),
+            ILLADA_MASK_TOKEN_ID,
+            device=device,
+            dtype=torch.long,
+        )
+        target_display_ids[:, :realized_tokens] = target_text_ids
+        target_display_ids[:, realized_tokens] = self.eos_token_id
+        display_supervision_mask = torch.zeros_like(target_display_ids, dtype=torch.bool)
+        display_supervision_mask[:, : realized_tokens + 1] = True
+
         if rollout_state is None:
             display_corruption = self.scheduler.corrupt_display(
                 target_display_ids,
                 timestep_tensor,
+                eligible_mask=display_supervision_mask,
                 vocab_size=self.adapter.vocab_size,
                 replacement_fraction=self.display_replacement_fraction,
                 generator=generator,
             )
             display_input_ids = display_corruption.token_ids
             display_labels = display_corruption.labels
-            display_noise = display_corruption.noise
+            display_noise = display_corruption.noise * display_supervision_mask.unsqueeze(-1)
         else:
-            display_input_ids = self._resize_rollout_display(
-                rollout_state.display_ids,
-                target_display_ids.shape[1],
-                device=device,
-            )
+            if rollout_state.display_ids.shape != target_display_ids.shape:
+                raise ValueError("rollout display physical capacity changed inside a trajectory")
+            display_input_ids = rollout_state.display_ids.to(
+                device=device, dtype=torch.long
+            ).clone()
             display_labels = target_display_ids.clone()
+            display_labels[~display_supervision_mask] = -100
             display_labels[display_input_ids == target_display_ids] = -100
             display_noise = (
                 (display_input_ids == ILLADA_MASK_TOKEN_ID).to(dtype=dtype).unsqueeze(-1)
+                * display_supervision_mask.unsqueeze(-1)
             )
 
         fact_memory = self.text_encoder.encode_texts(
@@ -1137,26 +1178,6 @@ class ILLaDATrajectoryTensorizer:
         if state.display_ids.ndim != 2 or state.display_ids.shape[0] != 1:
             raise ValueError("rollout display IDs must have shape [1, tokens]")
 
-    @staticmethod
-    def _resize_rollout_display(
-        display_ids: Tensor,
-        target_length: int,
-        *,
-        device: torch.device,
-    ) -> Tensor:
-        result = torch.full(
-            (1, target_length),
-            ILLADA_MASK_TOKEN_ID,
-            dtype=torch.long,
-            device=device,
-        )
-        copy_length = min(target_length, display_ids.shape[1])
-        if copy_length:
-            result[:, :copy_length] = display_ids[:, :copy_length].to(
-                device=device,
-                dtype=torch.long,
-            )
-        return result
 
     def _targets(
         self,
@@ -1374,23 +1395,73 @@ class ILLaDATrajectoryTensorizer:
         )
 
     def _thought_snapshot(self, example: TrajectoryExample, step: int) -> tuple[ThoughtTarget, ...]:
-        snapshot = tuple(target for target in example.thought_targets if target.step == step)
-        capacity = self.adapter.config.max_thought_slots
-        if any(target.slot >= capacity for target in snapshot):
-            raise ValueError("thought target slot exceeds adapter TCT capacity")
-        return snapshot
+        canonical = self._canonical_slot_schedule(example)
+        snapshot = tuple(
+            replace(target, slot=canonical[(target.step, target.cell_id)])
+            for target in example.thought_targets
+            if target.step == step
+        )
+        return tuple(sorted(snapshot, key=lambda target: target.slot))
 
     def _trajectory_thought_capacity(self, example: TrajectoryExample) -> int:
-        required = max(
-            (target.slot + 1 for target in example.thought_targets),
-            default=1,
-        )
+        counts: dict[int, int] = {}
+        for target in example.thought_targets:
+            counts[target.step] = counts.get(target.step, 0) + 1
+        required = max(counts.values(), default=1)
         maximum = self.adapter.config.max_thought_slots
         if required > maximum:
             raise ValueError(
-                f"trajectory requires {required} thought slots but adapter supports {maximum}"
+                f"trajectory requires {required} simultaneous thought slots but adapter "
+                f"supports {maximum}"
             )
         return max(self.minimum_thought_slots, required)
+
+    def _canonical_slot_schedule(
+        self, example: TrajectoryExample
+    ) -> dict[tuple[int, str], int]:
+        capacity = self._trajectory_thought_capacity(example)
+        active_slots: dict[str, int] = {}
+        release_before_next: set[str] = set()
+        schedule: dict[tuple[int, str], int] = {}
+        steps = sorted({target.step for target in example.thought_targets})
+
+        for step in steps:
+            reserved_reclaimed_slots = {
+                active_slots[cell_id]
+                for cell_id in release_before_next
+                if cell_id in active_slots
+            }
+            for cell_id in release_before_next:
+                active_slots.pop(cell_id, None)
+            release_before_next = set()
+            snapshot = tuple(
+                sorted(
+                    (target for target in example.thought_targets if target.step == step),
+                    key=lambda target: target.cell_id,
+                )
+            )
+            snapshot_ids = {target.cell_id for target in snapshot}
+            stale = set(active_slots) - snapshot_ids
+            if stale:
+                names = ", ".join(sorted(stale))
+                raise ValueError(f"thought trajectory removed cells without retirement: {names}")
+
+            used = set(active_slots.values()) | reserved_reclaimed_slots
+            for target in snapshot:
+                if target.cell_id not in active_slots:
+                    try:
+                        slot = next(slot for slot in range(capacity) if slot not in used)
+                    except StopIteration as exc:
+                        raise ValueError(
+                            "thought trajectory exceeds canonical slot capacity"
+                        ) from exc
+                    active_slots[target.cell_id] = slot
+                    used.add(slot)
+                schedule[(step, target.cell_id)] = active_slots[target.cell_id]
+                if target.lifecycle is CellLifecycle.RETIRED:
+                    release_before_next.add(target.cell_id)
+
+        return schedule
 
     def _semantic_vectors(self, snapshot: tuple[ThoughtTarget, ...]) -> dict[str, Tensor]:
         return {

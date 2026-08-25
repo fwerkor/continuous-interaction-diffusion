@@ -10,6 +10,7 @@ from torch import Tensor
 from cid.contracts import FreshnessDemand, InformationNeed, ModelContext, ModelUpdate
 from cid.grounding import Anchor, AnchorKind, CognitiveLink, LinkRelation, ObjectKind, ObjectRef
 from cid.lifecycle import MODELED_LIFECYCLES
+from cid.model.allocation import prefix_allocation_mask
 from cid.model.tensors import CIDTensorOutput
 from cid.state import CellLifecycle, CognitiveField, CognitiveRole, DisplayCanvas
 
@@ -165,19 +166,20 @@ class CIDMaterializer:
         previous: CognitiveField,
         batch_index: int,
     ) -> CognitiveField:
-        allocation_probs = torch.sigmoid(output.allocation_logits[batch_index]).detach()
-        empty_slots = [slot for slot, cell in enumerate(previous.cells) if not cell.occupied]
-        selected_empty = sorted(
-            (
-                (float(allocation_probs[slot]), slot)
-                for slot in empty_slots
-                if float(allocation_probs[slot]) >= self.config.allocation_threshold
-            ),
-            reverse=True,
-        )[: self.config.max_allocations_per_step]
+        occupancy = torch.tensor(
+            [[cell.occupied for cell in previous.cells]],
+            dtype=torch.bool,
+            device=output.allocation_logits.device,
+        )
+        selected = prefix_allocation_mask(
+            occupancy,
+            output.allocation_logits[batch_index : batch_index + 1].detach(),
+            threshold=self.config.allocation_threshold,
+            max_allocations=self.config.max_allocations_per_step,
+        )[0]
 
         field = previous
-        for _, slot in selected_empty:
+        for slot in selected.nonzero(as_tuple=False).flatten().tolist():
             semantic = _vector_tuple(output.thought_semantic[batch_index, slot])
             field, _ = field.allocate(slot=slot, semantic=semantic)
 

@@ -9,7 +9,11 @@ from cid.data import TrajectoryExample
 from cid.evaluation import ReplayEvaluationResult, RuntimeTaskEvaluation, run_replay_case
 from cid.grounding import ObjectKind, ObjectRef
 from cid.model.encoding import ILLaDATextEncoder, stable_text
-from cid.model.illada import ILLADA_MASK_TOKEN_ID, ILLaDACIDAdapter
+from cid.model.illada import (
+    ILLADA_EOS_TOKEN_ID,
+    ILLADA_MASK_TOKEN_ID,
+    ILLaDACIDAdapter,
+)
 from cid.model.materialize import (
     AnchorCandidate,
     ArgumentCandidate,
@@ -71,8 +75,11 @@ async def run_neural_benchmark_case(
     expected_ids = tuple(int(token) for token in expected_ids_tensor[0].tolist())
     if not expected_ids:
         raise ValueError("benchmark target display must tokenize to at least one token")
-    if len(expected_ids) > adapter.config.max_display_tokens:
-        raise ValueError("benchmark target display exceeds adapter display capacity")
+    canvas_tokens = adapter.config.display_canvas_tokens
+    if len(expected_ids) + 1 > canvas_tokens:
+        raise ValueError(
+            "benchmark target display plus EOS exceeds the fixed runtime display canvas"
+        )
 
     thought = (
         teacher_seed_thought(example, adapter, encoder)
@@ -83,8 +90,9 @@ async def run_neural_benchmark_case(
         )
     )
     display = DisplayCanvas.masked(
-        length=len(expected_ids),
+        length=canvas_tokens,
         mask_token_id=ILLADA_MASK_TOKEN_ID,
+        eos_token_id=ILLADA_EOS_TOKEN_ID,
     )
     replay: ReplayEvaluationResult = await run_replay_case(
         policy,
@@ -94,7 +102,7 @@ async def run_neural_benchmark_case(
         expected_display_ids=expected_ids,
         runtime_config=(None if max_steps is None else RuntimeConfig(max_steps=max_steps)),
     )
-    final_ids = tuple(int(token) for token in replay.runtime.display.token_ids)
+    final_ids = tuple(int(token) for token in replay.runtime.display.visible_token_ids)
     return NeuralBenchmarkCaseResult(
         example_id=example.example_id,
         final_text=tokenizer.decode(list(final_ids), skip_special_tokens=True),

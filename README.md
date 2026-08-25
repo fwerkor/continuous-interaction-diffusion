@@ -357,6 +357,7 @@ cid train \
   --data data/synthetic.jsonl \
   --output-dir runs/stage-a \
   --thought-capacity 128 \
+  --display-canvas-tokens 64 \
   --micro-batch-size 2 \
   --gradient-accumulation-steps 8 \
   --dtype bf16
@@ -369,6 +370,7 @@ torchrun --standalone --nproc-per-node=6 -m cid.cli train \
   --data data/synthetic.jsonl \
   --output-dir runs/stage-a-6gpu \
   --thought-capacity 128 \
+  --display-canvas-tokens 64 \
   --micro-batch-size 2 \
   --gradient-accumulation-steps 8 \
   --dtype bf16
@@ -387,16 +389,18 @@ The default rollout horizon is three transitions. Configure this with
 continue to provide the next-step supervision and event schedule; predicted T/Y replaces only the
 input state, preventing incorrect rollouts from becoming self-generated labels.
 
-The trainer pads variable-length prompt/display/external-memory sequences inside each micro-batch.
-`--thought-capacity` is an upper bound: trajectory tensorization uses only the slot footprint required
-by that example (with an eight-slot minimum), and mixed micro-batches pad thought tensors only to the
-largest local footprint. Setting the model ceiling to 128 therefore enables the long-tail curriculum
-without making every ordinary 8-slot example allocate 128 slots. Gradient checkpointing is enabled
-by default for the native iLLaDA stack and can be disabled with
+The trainer pads variable-length prompt and external-memory sequences inside each micro-batch.
+`--thought-capacity` is an upper bound: trajectory tensorization canonicalizes dataset schedule slots
+to a deterministic first-free layout and uses only the simultaneous slot footprint required by that
+example (with an eight-slot minimum). The configured maximum TCT width is nevertheless reserved in
+the logical position space, so changing a sample from eight physical slots to 128 cannot shift its
+prompt or display positions. The display uses a fixed physical canvas (`64` tokens by default): the
+realized text is terminated by EOS and positions after EOS receive no token loss. This prevents
+target length from leaking through tensor shape while avoiding a 1024-token canvas on every sample.
+Targets that do not fit the configured canvas are rejected instead of silently truncated. Gradient
+checkpointing is enabled by default for the native iLLaDA stack and can be disabled with
 `--no-gradient-checkpointing`. With the six-GPU example above, the effective transition batch is
 `2 × 8 × 6 = 96`; start at micro-batch 1 if the real trajectory lengths are substantially larger.
-Per-sample RoPE position IDs are computed from valid token counts, so padding a short prompt beside
-a longer sample cannot shift the logical display positions seen by iLLaDA.
 
 Stage A checkpoints contain trainable CID parameters, optimizer state, progress, and RNG state; they
 do not duplicate the frozen 8B backbone. Resume with `--resume <checkpoint>`. For inference,
@@ -438,6 +442,7 @@ torchrun --standalone --nproc-per-node=${WORLD_SIZE} -m cid.cli train-full \
   --init-cid-checkpoint runs/stage-a/stage-a-final-epoch3.pt \
   --thought-capacity 128 \
   --max-display-tokens 1024 \
+  --display-canvas-tokens 64 \
   --dtype bf16
 ```
 

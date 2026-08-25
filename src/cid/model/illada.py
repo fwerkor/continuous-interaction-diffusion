@@ -14,6 +14,8 @@ from cid.model.tensors import CIDTensorBatch, CIDTensorOutput
 ILLADA_8B_BASE = "GSAI-ML/iLLaDA-8B-Base"
 ILLADA_8B_BASE_REVISION = "a1b5b5f8a31a3854a46205ee584178c04b45ec9a"
 ILLADA_MASK_TOKEN_ID = 5
+ILLADA_EOS_TOKEN_ID = 2
+DEFAULT_DISPLAY_CANVAS_TOKENS = 64
 
 
 def _chunked_illada_mlp_forward(module: nn.Module, x: torch.Tensor) -> torch.Tensor:
@@ -61,6 +63,7 @@ def _chunked_illada_rms_norm_forward(
 class ILLaDACIDConfig:
     max_thought_slots: int = 128
     max_display_tokens: int = 1024
+    display_canvas_tokens: int | None = None
     num_roles: int = 6
     num_lifecycles: int = len(MODELED_LIFECYCLES)
     num_anchor_kinds: int = len(AnchorKind)
@@ -75,6 +78,12 @@ class ILLaDACIDConfig:
     def __post_init__(self) -> None:
         if self.max_thought_slots <= 0 or self.max_display_tokens <= 0:
             raise ValueError("thought and display capacities must be positive")
+        canvas = self.display_canvas_tokens
+        if canvas is None:
+            canvas = min(DEFAULT_DISPLAY_CANVAS_TOKENS, self.max_display_tokens)
+            object.__setattr__(self, "display_canvas_tokens", canvas)
+        if not 1 < canvas <= self.max_display_tokens:
+            raise ValueError("display canvas must fit within configured display capacity")
         if self.num_lifecycles != len(MODELED_LIFECYCLES):
             raise ValueError("lifecycle head predicts ACTIVE/WAITING/STABLE/RETIRED only")
         if self.num_anchor_kinds != len(AnchorKind):
@@ -437,7 +446,7 @@ class ILLaDACIDAdapter(nn.Module):
             device=batch.display_ids.device,
         )
         logical_lengths = (
-            thought_slots
+            self.config.max_thought_slots
             + prompt_keys.sum(dim=1)
             + display_keys.sum(dim=1)
         )
@@ -482,8 +491,8 @@ class ILLaDACIDAdapter(nn.Module):
             return torch.ones((batch_size, length), dtype=torch.bool, device=device)
         return ~padding_mask.to(device=device, dtype=torch.bool)
 
-    @staticmethod
     def _logical_position_ids(
+        self,
         *,
         thought_slots: int,
         prompt_keys: torch.Tensor,
@@ -494,7 +503,7 @@ class ILLaDACIDAdapter(nn.Module):
         thought_positions = torch.arange(thought_slots, device=device).expand(batch_size, -1)
 
         prompt_offsets = prompt_keys.long().cumsum(dim=1) - 1
-        prompt_positions = thought_slots + prompt_offsets
+        prompt_positions = self.config.max_thought_slots + prompt_offsets
         prompt_positions = torch.where(
             prompt_keys,
             prompt_positions,
@@ -503,7 +512,9 @@ class ILLaDACIDAdapter(nn.Module):
 
         prompt_lengths = prompt_keys.sum(dim=1, keepdim=True).long()
         display_offsets = display_keys.long().cumsum(dim=1) - 1
-        display_positions = thought_slots + prompt_lengths + display_offsets
+        display_positions = (
+            self.config.max_thought_slots + prompt_lengths + display_offsets
+        )
         display_positions = torch.where(
             display_keys,
             display_positions,

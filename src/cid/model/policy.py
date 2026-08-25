@@ -98,6 +98,10 @@ class ILLaDAContextTensorizer:
         if bool(((display_ids < 0) | (display_ids >= self.adapter.vocab_size)).any()):
             raise ValueError("display canvas contains token IDs outside the iLLaDA vocabulary")
         display_noise = (display_ids == context.display.mask_token_id).to(dtype).unsqueeze(-1)
+        display_padding_mask = torch.zeros_like(display_ids, dtype=torch.bool)
+        if context.display.active_span_length < len(context.display.token_ids):
+            display_padding_mask[:, context.display.active_span_length :] = True
+            display_noise[:, context.display.active_span_length :] = 0.0
         prompt_ids = self.text_encoder.tokenize(context.prompt, add_special_tokens=True)
 
         fact_memory = self.text_encoder.encode_texts(
@@ -129,6 +133,7 @@ class ILLaDAContextTensorizer:
             source_memory=source_memory,
             percept_thought_mask=percept_thought_mask,
             percept_display_mask=percept_display_mask,
+            display_padding_mask=display_padding_mask,
         )
 
     @staticmethod

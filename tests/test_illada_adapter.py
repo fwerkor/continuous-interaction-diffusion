@@ -22,7 +22,7 @@ class TinyILLaDAConfig:
     hidden_size = 32
     vocab_size = 64
     num_attention_heads = 4
-    max_position_embeddings = 64
+    max_position_embeddings = 256
 
 
 class TinyILLaDADecoder(nn.Module):
@@ -116,10 +116,12 @@ def test_illada_adapter_uses_shared_bidirectional_sequence_and_native_lm_head() 
         batch.slot_occupancy.squeeze(-1).bool(),
     )
     assert backbone.decoder.last_attention_mask[:, 4:].all()
-    assert torch.equal(
-        backbone.decoder.last_position_ids,
-        torch.arange(12).expand(2, -1),
-    )
+    assert backbone.decoder.last_position_ids[0].tolist() == [
+        0, 1, 2, 3, 8, 9, 10, 11, 12, 13, 14, 15
+    ]
+    assert backbone.decoder.last_position_ids[1].tolist() == [
+        0, 1, 2, 3, 8, 9, 10, 11, 12, 13, 14, 15
+    ]
 
     loss = output.display_logits.float().mean() + output.thought_semantic.float().square().mean()
     loss.backward()
@@ -169,9 +171,11 @@ def test_illada_adapter_position_ids_ignore_batch_padding_width() -> None:
     first = backbone.decoder.last_position_ids[0]
     second = backbone.decoder.last_position_ids[1]
     assert first[:4].tolist() == [0, 1, 2, 3]
-    assert first[4:8].tolist() == [4, 5, 0, 0]
-    assert first[8:].tolist() == [6, 7, 8, 0, 0]
-    assert second.tolist() == list(range(13))
+    assert first[4:8].tolist() == [128, 129, 0, 0]
+    assert first[8:].tolist() == [130, 131, 132, 0, 0]
+    assert second[:4].tolist() == [0, 1, 2, 3]
+    assert second[4:8].tolist() == [128, 129, 130, 131]
+    assert second[8:].tolist() == [132, 133, 134, 135, 136]
 
 
 def test_illada_adapter_controls_backbone_gradient_checkpointing() -> None:
@@ -193,8 +197,10 @@ def test_illada_adapter_enforces_backbone_context_capacity() -> None:
         ILLaDACIDConfig(max_thought_slots=48, max_display_tokens=48),
     )
 
+    batch = make_batch(batch_size=1, thought_slots=32, display_length=48)
+    batch.prompt_ids = torch.randint(0, TinyILLaDAConfig.vocab_size, (1, 170))
     with pytest.raises(ValueError, match="context capacity"):
-        adapter(make_batch(batch_size=1, thought_slots=32, display_length=33))
+        adapter(batch)
 
 
 def test_from_pretrained_uses_official_model_id_and_remote_code(monkeypatch) -> None:
@@ -247,3 +253,28 @@ def test_targeted_percept_attention_uses_null_only_for_unrouted_queries() -> Non
         [True, False],
         [False, True],
     ]
+
+
+def test_illada_prompt_and_display_positions_do_not_depend_on_physical_thought_width() -> None:
+    config = ILLaDACIDConfig(max_thought_slots=8, max_display_tokens=16)
+    narrow_backbone = TinyILLaDABackbone()
+    wide_backbone = TinyILLaDABackbone()
+    narrow = ILLaDACIDAdapter(narrow_backbone, config)
+    wide = ILLaDACIDAdapter(wide_backbone, config)
+
+    narrow_batch = make_batch(batch_size=1, thought_slots=4, display_length=5)
+    wide_batch = make_batch(batch_size=1, thought_slots=6, display_length=5)
+    wide_batch.prompt_ids = narrow_batch.prompt_ids.clone()
+
+    narrow(narrow_batch)
+    wide(wide_batch)
+
+    prompt_length = narrow_batch.prompt_ids.shape[1]
+    narrow_positions = narrow_backbone.decoder.last_position_ids[0]
+    wide_positions = wide_backbone.decoder.last_position_ids[0]
+    assert narrow_positions[4 : 4 + prompt_length].tolist() == wide_positions[
+        6 : 6 + prompt_length
+    ].tolist()
+    assert narrow_positions[4 + prompt_length :].tolist() == wide_positions[
+        6 + prompt_length :
+    ].tolist()

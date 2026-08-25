@@ -251,7 +251,7 @@ def evaluate_runtime_result(
     exact_display = (
         None
         if expected_display_ids is None
-        else tuple(result.display.token_ids) == expected_display_ids
+        else result.display.visible_token_ids == expected_display_ids
     )
     return RuntimeTaskEvaluation(
         example_id=example.example_id,

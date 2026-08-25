@@ -3,7 +3,14 @@ import time
 import pytest
 
 from cid.grounding import LinkRelation, ObjectKind
-from cid.state import CellLifecycle, CognitiveField, CognitiveRole, FactItem, FactStore
+from cid.state import (
+    CellLifecycle,
+    CognitiveField,
+    CognitiveRole,
+    DisplayCanvas,
+    FactItem,
+    FactStore,
+)
 
 
 def test_fact_snapshot_is_read_only() -> None:
@@ -113,3 +120,14 @@ def test_split_and_merge_preserve_logical_lineage() -> None:
         link.relation is LinkRelation.DERIVED_FROM for link in field.get(merged).links
     )
     assert all(field.get(child).lifecycle is CellLifecycle.RETIRED for child in children)
+
+
+def test_display_canvas_uses_eos_for_visible_length_and_unresolved_span() -> None:
+    canvas = DisplayCanvas.masked(length=6, mask_token_id=5, eos_token_id=2)
+    updated = canvas.advance((11, 12, 2, 5, 5, 5))
+
+    assert updated.visible_token_ids == (11, 12)
+    assert updated.realized_length == 2
+    assert updated.active_span_length == 3
+    assert updated.unresolved == 0
+    assert len(updated.token_ids) == 6

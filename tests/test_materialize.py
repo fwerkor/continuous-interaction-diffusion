@@ -207,3 +207,19 @@ def test_materializer_requires_learned_convergence_even_when_display_is_filled()
 
     assert update.display.unresolved == 0
     assert not update.converged
+
+
+def test_prefix_allocation_stops_at_first_low_free_slot() -> None:
+    from cid.model.allocation import prefix_allocation_mask
+
+    occupancy = torch.tensor([[True, False, False, False]])
+    logits = torch.tensor([[0.0, 10.0, -10.0, 20.0]])
+
+    selected = prefix_allocation_mask(
+        occupancy,
+        logits,
+        threshold=0.8,
+        max_allocations=4,
+    )
+
+    assert selected.tolist() == [[False, True, False, False]]
