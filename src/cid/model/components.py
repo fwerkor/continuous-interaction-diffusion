@@ -56,8 +56,18 @@ class CIDExternalFusion(nn.Module):
         projected_percepts = self.percept_projection(
             torch.cat((percepts, percept_context), dim=-1)
         )
-        include_null = (
-            percept_query_mask is not None or facts.shape[1] + percepts.shape[1] == 0
+        external_available = self._external_available(
+            batch_size=hidden.shape[0],
+            facts=facts,
+            percepts=projected_percepts,
+            fact_padding_mask=fact_padding_mask,
+            percept_padding_mask=percept_padding_mask,
+        )
+        include_null = percept_query_mask is not None or not bool(external_available.all())
+        null_padding_mask = (
+            external_available
+            if include_null and percept_query_mask is None
+            else None
         )
         external_memory, external_padding_mask = self._external_memory(
             batch_size=hidden.shape[0],
@@ -66,6 +76,7 @@ class CIDExternalFusion(nn.Module):
             fact_padding_mask=fact_padding_mask,
             percept_padding_mask=percept_padding_mask,
             include_null=include_null,
+            null_padding_mask=null_padding_mask,
         )
         attention_mask = self._query_attention_mask(
             hidden=hidden,
@@ -99,6 +110,7 @@ class CIDExternalFusion(nn.Module):
         fact_padding_mask: Tensor | None,
         percept_padding_mask: Tensor | None,
         include_null: bool,
+        null_padding_mask: Tensor | None = None,
     ) -> tuple[Tensor, Tensor | None]:
         fact_count = facts.shape[1]
         percept_count = percepts.shape[1]
@@ -119,11 +131,41 @@ class CIDExternalFusion(nn.Module):
             )
         padding_parts = [fact_padding_mask, percept_padding_mask]
         if include_null:
-            padding_parts.append(
-                torch.zeros((batch_size, 1), dtype=torch.bool, device=memory.device)
-            )
+            if null_padding_mask is None:
+                null_padding_mask = torch.zeros(
+                    batch_size, dtype=torch.bool, device=memory.device
+                )
+            else:
+                if null_padding_mask.shape != (batch_size,):
+                    raise ValueError("null_padding_mask must have shape [batch]")
+                null_padding_mask = null_padding_mask.to(
+                    device=memory.device, dtype=torch.bool
+                )
+            padding_parts.append(null_padding_mask[:, None])
         padding_mask = torch.cat(padding_parts, dim=1)
         return memory, padding_mask if bool(padding_mask.any()) else None
+
+    @staticmethod
+    def _external_available(
+        *,
+        batch_size: int,
+        facts: Tensor,
+        percepts: Tensor,
+        fact_padding_mask: Tensor | None,
+        percept_padding_mask: Tensor | None,
+    ) -> Tensor:
+        available = torch.zeros(batch_size, dtype=torch.bool, device=facts.device)
+        if facts.shape[1]:
+            if fact_padding_mask is None:
+                available |= True
+            else:
+                available |= (~fact_padding_mask.to(facts.device, dtype=torch.bool)).any(dim=1)
+        if percepts.shape[1]:
+            if percept_padding_mask is None:
+                available |= True
+            else:
+                available |= (~percept_padding_mask.to(facts.device, dtype=torch.bool)).any(dim=1)
+        return available
 
     def _query_attention_mask(
         self,

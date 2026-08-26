@@ -271,3 +271,44 @@ def test_torch_core_accepts_empty_external_memory_and_no_sources() -> None:
     assert torch.isfinite(output.thought_semantic).all()
     assert torch.isfinite(output.display_logits).all()
     assert output.source_logits.shape == (1, 2, 0)
+
+
+def test_external_fusion_keeps_mixed_empty_memory_rows_finite() -> None:
+    fusion_cls = import_module("cid.model.components").CIDExternalFusion
+    fusion = fusion_cls(d_model=8, num_heads=2)
+    hidden = torch.randn(2, 3, 8)
+    seed_hidden = torch.randn(2, 3, 8)
+    context_weight = torch.ones(2, 3, 1)
+    facts = torch.randn(2, 1, 8)
+    percepts = torch.empty(2, 0, 8)
+    fact_padding_mask = torch.tensor([[True], [False]])
+
+    output = fusion(
+        hidden,
+        seed_hidden=seed_hidden,
+        context_weight=context_weight,
+        facts=facts,
+        percepts=percepts,
+        fact_padding_mask=fact_padding_mask,
+    )
+
+    assert torch.isfinite(output).all()
+
+
+def test_empty_masked_cross_entropy_zero_does_not_overflow() -> None:
+    masked_cross_entropy = import_module("cid.model.losses")._masked_cross_entropy
+    logits = torch.full(
+        (4, 8),
+        torch.finfo(torch.float32).min,
+        requires_grad=True,
+    )
+    targets = torch.full((4,), -100, dtype=torch.long)
+    mask = torch.zeros(4, dtype=torch.bool)
+
+    loss = masked_cross_entropy(logits, targets, mask)
+    loss.backward()
+
+    assert torch.isfinite(loss)
+    assert loss.item() == 0.0
+    assert logits.grad is not None
+    assert torch.count_nonzero(logits.grad) == 0

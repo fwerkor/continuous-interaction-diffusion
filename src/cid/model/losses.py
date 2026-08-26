@@ -220,7 +220,7 @@ def cid_loss(
     auxiliary = (
         output.auxiliary_loss
         if output.auxiliary_loss is not None
-        else output.thought_semantic.sum() * 0.0
+        else _differentiable_zero(output.thought_semantic)
     )
     total = (
         w.thought * thought
@@ -273,11 +273,16 @@ def cid_loss(
     )
 
 
+def _differentiable_zero(tensor: Tensor) -> Tensor:
+    """Return graph-connected zero without reducing large finite values first."""
+    return (tensor * 0.0).sum()
+
+
 def _masked_cosine_loss(query: Tensor, target: Tensor, mask: Tensor) -> Tensor:
     cosine = F.cosine_similarity(query, target, dim=-1)
     selected = cosine[mask.bool()]
     if selected.numel() == 0:
-        return query.sum() * 0.0
+        return _differentiable_zero(query)
     return (1.0 - selected).mean()
 
 
@@ -289,7 +294,7 @@ def _masked_vector_mse(prediction: Tensor, target: Tensor, mask: Tensor) -> Tens
     per_slot = (prediction - target).float().square().flatten(start_dim=2).mean(dim=-1)
     selected = per_slot[mask.bool()]
     if selected.numel() == 0:
-        return prediction.sum() * 0.0
+        return _differentiable_zero(prediction)
     return selected.mean()
 
 
@@ -315,7 +320,7 @@ def _balanced_masked_binary_cross_entropy(
         elif negative.numel():
             rows.append(negative.mean())
     if not rows:
-        return logits.sum() * 0.0
+        return _differentiable_zero(logits)
     return torch.stack(rows).mean()
 
 
@@ -323,7 +328,7 @@ def _masked_binary_cross_entropy(logits: Tensor, target: Tensor, mask: Tensor) -
     losses = F.binary_cross_entropy_with_logits(logits, target, reduction="none")
     selected = losses[mask.bool()]
     if selected.numel() == 0:
-        return logits.sum() * 0.0
+        return _differentiable_zero(logits)
     return selected.mean()
 
 
@@ -331,7 +336,7 @@ def _masked_cross_entropy(logits: Tensor, target: Tensor, mask: Tensor) -> Tenso
     selected_logits = logits[mask.bool()]
     selected_target = target[mask.bool()]
     if selected_target.numel() == 0:
-        return logits.sum() * 0.0
+        return _differentiable_zero(logits)
     return F.cross_entropy(selected_logits, selected_target)
 
 
