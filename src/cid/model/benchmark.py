@@ -32,6 +32,7 @@ class NeuralBenchmarkCaseResult:
     final_display_ids: tuple[int, ...]
     runtime_steps: int
     evaluation: RuntimeTaskEvaluation
+    trace_events: tuple[dict[str, Any], ...]
 
     def to_dict(self) -> dict[str, Any]:
         return {
@@ -40,6 +41,7 @@ class NeuralBenchmarkCaseResult:
             "final_display_ids": list(self.final_display_ids),
             "runtime_steps": self.runtime_steps,
             "evaluation": asdict(self.evaluation),
+            "trace_events": list(self.trace_events),
         }
 
 
@@ -105,6 +107,7 @@ async def run_neural_benchmark_case(
         final_display_ids=final_ids,
         runtime_steps=replay.runtime.steps,
         evaluation=replay.evaluation,
+        trace_events=replay.runtime.trace.to_dicts(),
     )
 
 

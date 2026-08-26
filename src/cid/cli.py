@@ -1057,7 +1057,9 @@ def _benchmark(args: argparse.Namespace) -> None:
             print(
                 f"tasks={summary.tasks} exact={summary.exact_display_accuracy:.4f} "
                 f"converged={summary.convergence_rate:.4f} "
-                f"coverage={summary.observation_coverage:.4f} output={output}"
+                f"coverage={summary.observation_coverage:.4f} "
+                f"tool_wait={summary.tool_wait_ratio:.4f} "
+                f"hidden={summary.latency_hidden_ratio:.4f} output={output}"
             )
     finally:
         if distributed and dist.is_initialized():

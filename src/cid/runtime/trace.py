@@ -28,3 +28,17 @@ class RuntimeTrace:
 
     def count(self, kind: str) -> int:
         return sum(event.kind == kind for event in self._events)
+
+    def to_dicts(self) -> tuple[dict[str, Any], ...]:
+        if not self._events:
+            return ()
+        origin = self._events[0].timestamp
+        return tuple(
+            {
+                "kind": event.kind,
+                "step": event.step,
+                "timestamp_s": event.timestamp - origin,
+                "payload": dict(event.payload),
+            }
+            for event in self._events
+        )

@@ -324,8 +324,25 @@ async def test_model_compute_overlaps_source_wait() -> None:
     metrics = summarize_runtime(result)
 
     assert result.converged
+    assert result.trace.count("trajectory_started") == 1
+    assert result.trace.count("external_refresh_ready") == 1
+    assert result.trace.count("trajectory_finished") == 1
     assert metrics.model_steps_during_io >= 1
-    assert metrics.tool_wait_overlap_s > 0
+    assert metrics.runtime_wall_time_s > 0
+    assert metrics.model_compute_s > 0
+    assert metrics.tool_calls_completed == 1
+    assert len(metrics.tool_latencies_s) == 1
+    assert metrics.tool_latency_mean_s >= 0.03
+    assert metrics.tool_latency_p50_s == metrics.tool_latency_mean_s
+    assert metrics.tool_latency_p95_s == metrics.tool_latency_mean_s
+    assert metrics.tool_wait_s >= metrics.tool_latency_mean_s
+    assert 0 < metrics.tool_wait_ratio <= 1
+    assert metrics.model_tool_overlap_s > 0
+    assert metrics.tool_wait_overlap_s == metrics.model_tool_overlap_s
+    assert 0 < metrics.latency_hidden_ratio <= 1
+    assert metrics.mean_tool_concurrency > 0
+    assert metrics.peak_tool_concurrency == 1
+    assert metrics.mean_ready_to_bind_s >= 0
 
 
 async def test_dynamic_source_refreshes_without_cache_reuse() -> None:

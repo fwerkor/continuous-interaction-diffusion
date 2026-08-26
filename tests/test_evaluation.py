@@ -140,6 +140,13 @@ async def test_runtime_evaluation_tracks_latency_freshness_and_display() -> None
     assert summary.exact_display_accuracy == 1.0
     assert summary.observation_coverage == 1.0
     assert summary.stale_observation_rate == 0.5
+    assert summary.external_refreshes == 2
+    assert summary.tool_calls_completed == 2
+    assert summary.total_runtime_wall_time_s > 0
+    assert 0 < summary.tool_wait_ratio <= 1
+    assert 0 < summary.latency_hidden_ratio <= 1
+    assert summary.tool_latency_p95_s > 0
+    assert summary.peak_tool_concurrency == 1
 
 
 async def test_replay_runner_delivers_dataset_events_on_exact_runtime_steps() -> None:

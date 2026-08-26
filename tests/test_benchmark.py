@@ -211,3 +211,7 @@ async def test_neural_benchmark_case_runs_replay_and_scores_display() -> None:
     assert result.evaluation.exact_display is False
     assert result.evaluation.expected_observations == 0
     assert result.evaluation.observation_coverage == 1.0
+    payload = result.to_dict()
+    assert payload["trace_events"][0]["kind"] == "trajectory_started"
+    assert any(event["kind"] == "trajectory_finished" for event in payload["trace_events"])
+    assert all(event["timestamp_s"] >= 0 for event in payload["trace_events"])

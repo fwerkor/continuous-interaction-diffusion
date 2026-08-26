@@ -145,6 +145,7 @@ class CIDRuntime:
         completed_steps = 0
         epoch_steps = 0
         started_at = time.monotonic()
+        self.trace.emit("trajectory_started", 0, runtime_step=self._runtime_step)
         deadline = (
             None
             if self.config.max_wall_time_s is None
@@ -371,6 +372,12 @@ class CIDRuntime:
             self._streams.clear()
             self._detached_tasks.clear()
 
+        self.trace.emit(
+            "trajectory_finished",
+            completed_steps,
+            converged=converged,
+            runtime_step=self._runtime_step,
+        )
         thought = self._maybe_reclaim(thought, completed_steps, force=True)
 
         snapshot = self.facts.snapshot()
@@ -479,12 +486,26 @@ class CIDRuntime:
             return
 
         task = asyncio.create_task(source.read(binding.arguments))
-        task.add_done_callback(lambda _: self._external_progress.set())
-        self._jobs[work_key] = _ExternalJob(
+        job = _ExternalJob(
             task=task,
             owner_binding_id=binding.binding_id,
             terminal_validation=terminal_validation,
         )
+        self._jobs[work_key] = job
+
+        def mark_ready(completed: asyncio.Task[Observation]) -> None:
+            if not completed.cancelled():
+                self.trace.emit(
+                    "external_refresh_ready",
+                    step,
+                    binding_id=job.owner_binding_id,
+                    work_key=work_key,
+                    success=completed.exception() is None,
+                    runtime_step=self._runtime_step,
+                )
+            self._external_progress.set()
+
+        task.add_done_callback(mark_ready)
         binding.status = (
             BindingStatus.REFRESHING
             if binding.observation is not None
@@ -658,6 +679,7 @@ class CIDRuntime:
                 "binding_observation_updated",
                 step,
                 binding_id=binding.binding_id,
+                work_key=binding.work_key,
                 version=observation.version,
                 runtime_step=self._runtime_step,
             )

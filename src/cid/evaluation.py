@@ -43,6 +43,27 @@ class RuntimeEvaluationSummary:
     mean_latent_to_executable_steps: float
     mean_binding_to_observation_steps: float
     mean_observation_to_projection_steps: float
+    external_refreshes: int
+    cache_hits: int
+    deduplicated_jobs: int
+    cognitive_projections: int
+    total_runtime_wall_time_s: float
+    mean_runtime_wall_time_s: float
+    total_model_compute_s: float
+    total_tool_wait_s: float
+    tool_wait_ratio: float
+    model_tool_overlap_s: float
+    model_tool_overlap_ratio: float
+    latency_hidden_ratio: float
+    tool_calls_completed: int
+    tool_latency_mean_s: float
+    tool_latency_p50_s: float
+    tool_latency_p95_s: float
+    tool_latency_max_s: float
+    mean_tool_concurrency: float
+    peak_tool_concurrency: int
+    mean_ready_to_bind_s: float
+    ready_to_bind_p95_s: float
 
 
 @dataclass(frozen=True, slots=True)
@@ -184,6 +205,20 @@ def summarize_evaluations(
     expected_observations = sum(item.expected_observations for item in evaluations)
     observed_work_items = sum(item.observed_work_items for item in evaluations)
     stale_observations = sum(item.stale_observations for item in evaluations)
+    interactions = tuple(item.interaction for item in evaluations)
+    total_runtime = sum(item.runtime_wall_time_s for item in interactions)
+    total_tool_wait = sum(item.tool_wait_s for item in interactions)
+    total_model_compute = sum(item.model_compute_s for item in interactions)
+    total_overlap = sum(item.model_tool_overlap_s for item in interactions)
+    tool_latencies = tuple(
+        latency for item in interactions for latency in item.tool_latencies_s
+    )
+    ready_to_bind = tuple(
+        delay for item in interactions for delay in item.ready_to_bind_delays_s
+    )
+    total_tool_service = sum(
+        item.mean_tool_concurrency * item.runtime_wall_time_s for item in interactions
+    )
     return RuntimeEvaluationSummary(
         tasks=len(evaluations),
         convergence_rate=_fraction(sum(item.converged for item in evaluations), len(evaluations)),
@@ -213,6 +248,29 @@ def summarize_evaluations(
         mean_observation_to_projection_steps=_mean_metric(
             evaluations, "mean_observation_to_projection_steps"
         ),
+        external_refreshes=sum(item.external_refreshes for item in interactions),
+        cache_hits=sum(item.cache_hits for item in interactions),
+        deduplicated_jobs=sum(item.deduplicated_jobs for item in interactions),
+        cognitive_projections=sum(item.cognitive_projections for item in interactions),
+        total_runtime_wall_time_s=total_runtime,
+        mean_runtime_wall_time_s=total_runtime / len(evaluations),
+        total_model_compute_s=total_model_compute,
+        total_tool_wait_s=total_tool_wait,
+        tool_wait_ratio=_float_fraction(total_tool_wait, total_runtime),
+        model_tool_overlap_s=total_overlap,
+        model_tool_overlap_ratio=_float_fraction(total_overlap, total_runtime),
+        latency_hidden_ratio=_float_fraction(total_overlap, total_tool_wait),
+        tool_calls_completed=len(tool_latencies),
+        tool_latency_mean_s=_mean_float(tool_latencies),
+        tool_latency_p50_s=_percentile(tool_latencies, 0.50),
+        tool_latency_p95_s=_percentile(tool_latencies, 0.95),
+        tool_latency_max_s=max(tool_latencies, default=0.0),
+        mean_tool_concurrency=_float_fraction(total_tool_service, total_runtime),
+        peak_tool_concurrency=max(
+            (item.peak_tool_concurrency for item in interactions), default=0
+        ),
+        mean_ready_to_bind_s=_mean_float(ready_to_bind),
+        ready_to_bind_p95_s=_percentile(ready_to_bind, 0.95),
     )
 
 
@@ -318,3 +376,22 @@ def _mean_metric(
 ) -> float:
     values = [float(getattr(item.interaction, name)) for item in evaluations]
     return sum(values) / len(values)
+
+
+def _float_fraction(numerator: float, denominator: float) -> float:
+    return numerator / denominator if denominator > 0 else 0.0
+
+
+def _mean_float(values: tuple[float, ...]) -> float:
+    return sum(values) / len(values) if values else 0.0
+
+
+def _percentile(values: tuple[float, ...], quantile: float) -> float:
+    if not values:
+        return 0.0
+    ordered = sorted(values)
+    position = (len(ordered) - 1) * quantile
+    lower = int(position)
+    upper = min(lower + 1, len(ordered) - 1)
+    weight = position - lower
+    return ordered[lower] * (1.0 - weight) + ordered[upper] * weight
