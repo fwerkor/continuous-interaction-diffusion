@@ -9,13 +9,8 @@ from cid.contracts import ModelContext, ModelUpdate, Percept, SourceDescriptor
 from cid.lifecycle import MODELED_LIFECYCLES
 from cid.model.diffusion import CIDDiffusionScheduler
 from cid.model.encoding import ILLaDATextEncoder, stable_text
-from cid.model.illada import (
-    ILLADA_8B_BASE,
-    ILLADA_8B_BASE_REVISION,
-    LLADA_MOE_7B_A1B_BASE,
-    LLADA_MOE_7B_A1B_BASE_REVISION,
-    ILLaDACIDAdapter,
-)
+from cid.model.illada import ILLADA_8B_BASE, ILLaDACIDAdapter
+from cid.model.loading import pretrained_revision
 from cid.model.materialize import CIDMaterializer, ClosedWorldMaterializationCatalog
 from cid.model.tensors import CIDTensorBatch, build_percept_routing_masks
 from cid.state import CognitiveRole, FactItem
@@ -33,7 +28,7 @@ class ILLaDAContextTensorizer:
         self.tokenizer = tokenizer
         self.text_encoder = text_encoder or ILLaDATextEncoder(adapter, tokenizer)
         if self.text_encoder.d_model != adapter.d_model:
-            raise ValueError("runtime text encoder width must match the iLLaDA adapter")
+            raise ValueError("runtime text encoder width must match the CID adapter")
 
     @classmethod
     def from_pretrained(
@@ -45,10 +40,9 @@ class ILLaDAContextTensorizer:
         from transformers import AutoTokenizer
 
         tokenizer_kwargs.setdefault("trust_remote_code", True)
-        if model_name_or_path == ILLADA_8B_BASE:
-            tokenizer_kwargs.setdefault("revision", ILLADA_8B_BASE_REVISION)
-        elif model_name_or_path == LLADA_MOE_7B_A1B_BASE:
-            tokenizer_kwargs.setdefault("revision", LLADA_MOE_7B_A1B_BASE_REVISION)
+        revision = pretrained_revision(model_name_or_path)
+        if revision is not None:
+            tokenizer_kwargs.setdefault("revision", revision)
         tokenizer = AutoTokenizer.from_pretrained(model_name_or_path, **tokenizer_kwargs)
         return cls(adapter, tokenizer)
 
@@ -57,7 +51,7 @@ class ILLaDAContextTensorizer:
         dtype = self.text_encoder.dtype
         thought = context.thought
         if thought.width != self.adapter.d_model:
-            raise ValueError("runtime TCT width does not match iLLaDA hidden size")
+            raise ValueError("runtime TCT width does not match backbone hidden size")
         if (
             context.display.unresolved
             and context.display.mask_token_id != self.adapter.mask_token_id
@@ -110,7 +104,7 @@ class ILLaDAContextTensorizer:
             dtype=torch.long,
         )
         if bool(((display_ids < 0) | (display_ids >= self.adapter.vocab_size)).any()):
-            raise ValueError("display canvas contains token IDs outside the iLLaDA vocabulary")
+            raise ValueError("display canvas contains token IDs outside the backbone vocabulary")
         display_noise = (display_ids == context.display.mask_token_id).to(dtype).unsqueeze(-1)
         display_padding_mask = torch.zeros_like(display_ids, dtype=torch.bool)
         if context.display.active_span_length < len(context.display.token_ids):

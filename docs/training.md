@@ -21,13 +21,16 @@ refresh, fact protection, and metrics independently of neural quality.
 Start from an existing masked-diffusion language model. Freeze most of the backbone initially and
 train:
 
-The supported full-sequence diffusion backbones are `GSAI-ML/iLLaDA-8B-Base` and
-`inclusionAI/LLaDA-MoE-7B-A1B-Base`. `ILLaDACIDAdapter` reuses each model's native token embedding,
-bidirectional decoder, and LM head. With `freeze_backbone=True`, only the CID projections,
-external-perception fusion, and prediction heads are trainable; later stages can unfreeze the same
-backbone without changing the tensor/runtime ABI. For LLaDA-MoE, Stage B also restores the upstream
-router load-balancing objective while Stage A skips router-logit materialization because the router
-is frozen.
+The supported full-sequence diffusion backbones are `GSAI-ML/iLLaDA-8B-Base`,
+`inclusionAI/LLaDA-MoE-7B-A1B-Base`, and `LiquidAI/LFM2.5-Encoder-350M-Diffusion`. The latter is the
+base for CID-v1-0.4B. The common CID adapter reuses each model's native token embedding,
+bidirectional hidden-state stack, and LM head. LFM2 keeps its pretrained mixture of full-attention
+and non-causal short-convolution layers; no architecture morphing is performed. With
+`freeze_backbone=True`, only the CID projections, external-perception fusion, and prediction heads
+are trainable; later stages can unfreeze the same backbone without changing the tensor/runtime ABI.
+For LLaDA-MoE, Stage B also restores the upstream router load-balancing objective while Stage A
+skips router-logit materialization because the router is frozen. The LFM2.5 checkpoint is distributed
+under the upstream LFM Open License v1.0.
 
 - TCT slot projection and role heads;
 - empty-slot allocation and occupied-cell lifecycle heads;
@@ -88,8 +91,9 @@ argument is executable, while keeping argument names/types under the runtime-own
 
 `CIDTrainer` is the first executable Stage A trainer. It supports random diffusion timesteps,
 gradient accumulation, gradient clipping, deterministic transition shuffling, optimizer resume, and
-CID-only checkpoints. When the iLLaDA backbone is frozen, checkpoints contain only trainable CID
-parameters plus optimizer/progress/RNG state; the pinned pretrained backbone is reloaded separately.
+CID-only checkpoints. When the pretrained backbone is frozen, checkpoints contain only trainable
+CID parameters plus optimizer/progress/RNG state; the pinned pretrained backbone is reloaded
+separately.
 `load_cid_adapter_checkpoint()` restores those CID parameters directly for runtime evaluation.
 
 `cid train` runs this path on one device. Under `torchrun`, it switches to DDP automatically. Each
@@ -104,9 +108,10 @@ display, fact, percept, and source dimensions into a variable-length micro-batch
 corresponding attention/padding masks. `CIDTrainerConfig.micro_batch_size` controls this local batch;
 gradient accumulation then scales the effective batch independently. Accumulated gradients are
 normalized by the number of examples rather than by the number of micro-batches, so a smaller final
-micro-batch is not overweighted. Native iLLaDA gradient checkpointing is enabled by the launcher by
-default to reduce activation memory while retaining gradients to CID inputs through the frozen
-backbone. The iLLaDA adapter also constructs per-sample RoPE `position_ids` from valid prompt and
+micro-batch is not overweighted. Native backbone gradient checkpointing is enabled by the launcher
+by default to reduce activation
+memory while retaining gradients to CID inputs through the frozen backbone. The adapter also
+constructs per-sample position IDs from valid prompt and
 display lengths. Padding introduced by another sample therefore does not alter the logical
 positions of a trajectory's display tokens.
 

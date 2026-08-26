@@ -910,18 +910,16 @@ def _benchmark(args: argparse.Namespace) -> None:
     from transformers import AutoTokenizer
 
     from cid.model import (
-        ILLADA_8B_BASE,
-        ILLADA_8B_BASE_REVISION,
-        LLADA_MOE_7B_A1B_BASE,
-        LLADA_MOE_7B_A1B_BASE_REVISION,
         ILLaDACIDAdapter,
         ILLaDACIDConfig,
         load_cid_adapter_checkpoint,
+        load_cid_adapter_from_pretrained,
         load_stage_b_model_checkpoint,
         wrap_stage_b_fsdp,
     )
     from cid.model.benchmark import run_neural_benchmark_case
     from cid.model.encoding import ILLaDATextEncoder
+    from cid.model.loading import pretrained_revision
 
     checkpoint = Path(args.checkpoint)
     stage_b = args.checkpoint_kind == "stage-b"
@@ -957,16 +955,15 @@ def _benchmark(args: argparse.Namespace) -> None:
         "fp32": torch.float32,
     }[args.dtype]
     tokenizer_kwargs: dict[str, object] = {"trust_remote_code": True}
-    if args.model == ILLADA_8B_BASE:
-        tokenizer_kwargs["revision"] = ILLADA_8B_BASE_REVISION
-    elif args.model == LLADA_MOE_7B_A1B_BASE:
-        tokenizer_kwargs["revision"] = LLADA_MOE_7B_A1B_BASE_REVISION
+    revision = pretrained_revision(args.model)
+    if revision is not None:
+        tokenizer_kwargs["revision"] = revision
     tokenizer = AutoTokenizer.from_pretrained(args.model, **tokenizer_kwargs)
 
     try:
 
         def load_adapter() -> ILLaDACIDAdapter:
-            return ILLaDACIDAdapter.from_pretrained(
+            return load_cid_adapter_from_pretrained(
                 args.model,
                 config=adapter_config,
                 freeze_backbone=True,
@@ -983,7 +980,7 @@ def _benchmark(args: argparse.Namespace) -> None:
         else:
             adapter = load_adapter()
         if adapter is None:
-            raise RuntimeError("failed to load benchmark iLLaDA adapter")
+            raise RuntimeError("failed to load benchmark CID adapter")
 
         if stage_b:
             text_encoder = ILLaDATextEncoder.from_frozen_snapshot(
@@ -1072,10 +1069,6 @@ def _train_stage_a(args: argparse.Namespace) -> None:
     from transformers import AutoTokenizer
 
     from cid.model import (
-        ILLADA_8B_BASE,
-        ILLADA_8B_BASE_REVISION,
-        LLADA_MOE_7B_A1B_BASE,
-        LLADA_MOE_7B_A1B_BASE_REVISION,
         CIDTrainer,
         CIDTrainerConfig,
         CIDTrainProgress,
@@ -1083,10 +1076,12 @@ def _train_stage_a(args: argparse.Namespace) -> None:
         ILLaDACIDConfig,
         ILLaDATrajectoryTensorizer,
         balance_rollout_windows_by_semantic_task,
+        load_cid_adapter_from_pretrained,
         shard_rollout_windows,
         trajectory_rollout_windows,
         wrap_stage_a_ddp,
     )
+    from cid.model.loading import pretrained_revision
 
     dtype = {
         "bf16": torch.bfloat16,
@@ -1121,7 +1116,7 @@ def _train_stage_a(args: argparse.Namespace) -> None:
         )
 
         def load_adapter() -> ILLaDACIDAdapter:
-            model = ILLaDACIDAdapter.from_pretrained(
+            model = load_cid_adapter_from_pretrained(
                 args.model,
                 config=adapter_config,
                 freeze_backbone=True,
@@ -1138,16 +1133,15 @@ def _train_stage_a(args: argparse.Namespace) -> None:
         else:
             adapter = load_adapter()
         if adapter is None:
-            raise RuntimeError("failed to load iLLaDA adapter on this training rank")
+            raise RuntimeError("failed to load CID adapter on this training rank")
         if args.gradient_checkpointing:
             adapter.set_gradient_checkpointing(True)
         grouped_moe_layers = adapter.pack_frozen_moe_experts()
 
         tokenizer_kwargs: dict[str, object] = {"trust_remote_code": True}
-        if args.model == ILLADA_8B_BASE:
-            tokenizer_kwargs["revision"] = ILLADA_8B_BASE_REVISION
-        elif args.model == LLADA_MOE_7B_A1B_BASE:
-            tokenizer_kwargs["revision"] = LLADA_MOE_7B_A1B_BASE_REVISION
+        revision = pretrained_revision(args.model)
+        if revision is not None:
+            tokenizer_kwargs["revision"] = revision
         tokenizer = AutoTokenizer.from_pretrained(args.model, **tokenizer_kwargs)
         tensorizer = ILLaDATrajectoryTensorizer(adapter, tokenizer)
         forward_model = (
@@ -1349,10 +1343,6 @@ def _train_stage_b(args: argparse.Namespace) -> None:
     from transformers import AutoTokenizer
 
     from cid.model import (
-        ILLADA_8B_BASE,
-        ILLADA_8B_BASE_REVISION,
-        LLADA_MOE_7B_A1B_BASE,
-        LLADA_MOE_7B_A1B_BASE_REVISION,
         CIDTrainer,
         CIDTrainerConfig,
         ILLaDACIDAdapter,
@@ -1360,6 +1350,7 @@ def _train_stage_b(args: argparse.Namespace) -> None:
         ILLaDATrajectoryTensorizer,
         balance_rollout_windows_by_semantic_task,
         load_cid_adapter_checkpoint,
+        load_cid_adapter_from_pretrained,
         load_stage_b_checkpoint,
         save_stage_b_checkpoint,
         shard_rollout_windows,
@@ -1371,6 +1362,7 @@ def _train_stage_b(args: argparse.Namespace) -> None:
         wrap_stage_b_fsdp,
     )
     from cid.model.encoding import ILLaDATextEncoder
+    from cid.model.loading import pretrained_revision
 
     if args.resume and args.init_cid_checkpoint:
         raise ValueError("--resume and --init-cid-checkpoint are mutually exclusive")
@@ -1470,10 +1462,9 @@ def _train_stage_b(args: argparse.Namespace) -> None:
             warmup_steps = int(saved_trainer_config["warmup_steps"])
 
         tokenizer_kwargs: dict[str, object] = {"trust_remote_code": True}
-        if args.model == ILLADA_8B_BASE:
-            tokenizer_kwargs["revision"] = ILLADA_8B_BASE_REVISION
-        elif args.model == LLADA_MOE_7B_A1B_BASE:
-            tokenizer_kwargs["revision"] = LLADA_MOE_7B_A1B_BASE_REVISION
+        revision = pretrained_revision(args.model)
+        if revision is not None:
+            tokenizer_kwargs["revision"] = revision
         tokenizer = AutoTokenizer.from_pretrained(args.model, **tokenizer_kwargs)
         adapter_config = ILLaDACIDConfig(
             max_thought_slots=args.thought_capacity,
@@ -1485,7 +1476,7 @@ def _train_stage_b(args: argparse.Namespace) -> None:
             # Keep the initial FP32 model on host memory. FSDP's device_id moves each wrap
             # unit onto the local GPU while sharding it, avoiding a transient full-model
             # FP32 allocation on every A6000 before FULL_SHARD is active.
-            model = ILLaDACIDAdapter.from_pretrained(
+            model = load_cid_adapter_from_pretrained(
                 args.model,
                 config=adapter_config,
                 freeze_backbone=True,
@@ -1515,7 +1506,7 @@ def _train_stage_b(args: argparse.Namespace) -> None:
                 adapter, text_encoder = load_adapter()
             dist.barrier()
         if adapter is None or text_encoder is None:
-            raise RuntimeError("failed to load Stage B iLLaDA model on this training rank")
+            raise RuntimeError("failed to load Stage B CID model on this training rank")
 
         optimizer_groups = stage_b_adamw_parameter_groups(
             adapter,
@@ -2237,7 +2228,7 @@ def main() -> None:
     benchmark.add_argument("--seed-teacher-state", action="store_true")
     train = subparsers.add_parser(
         "train",
-        help="run Stage A CID adapter training with a frozen iLLaDA backbone",
+        help="run Stage A CID adapter training with a frozen diffusion backbone",
     )
     train.add_argument("--data", required=True)
     train.add_argument("--output-dir", required=True)
@@ -2274,7 +2265,7 @@ def main() -> None:
     )
     train_full = subparsers.add_parser(
         "train-full",
-        help="run Stage B full-parameter iLLaDA training with FSDP FULL_SHARD",
+        help="run Stage B full-parameter diffusion-backbone training with FSDP FULL_SHARD",
     )
     train_full.add_argument("--data", required=True)
     train_full.add_argument("--output-dir", required=True)

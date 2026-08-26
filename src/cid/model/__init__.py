@@ -18,6 +18,14 @@ from cid.model.illada import (
     ILLaDACIDAdapter,
     ILLaDACIDConfig,
 )
+from cid.model.lfm import (
+    LFM2_DIFFUSION_350M,
+    LFM2_DIFFUSION_350M_REVISION,
+    LFM2_EOS_TOKEN_ID,
+    LFM2_MASK_TOKEN_ID,
+    LFMCIDAdapter,
+)
+from cid.model.loading import load_cid_adapter_from_pretrained
 from cid.model.losses import CIDLoss, CIDLossWeights, CIDTargets, cid_loss
 from cid.model.materialize import (
     AnchorCandidate,
@@ -94,6 +102,11 @@ __all__ = [
     "LLADA_MOE_7B_A1B_BASE_REVISION",
     "LLADA_MOE_EOS_TOKEN_ID",
     "LLADA_MOE_MASK_TOKEN_ID",
+    "LFM2_DIFFUSION_350M",
+    "LFM2_DIFFUSION_350M_REVISION",
+    "LFM2_EOS_TOKEN_ID",
+    "LFM2_MASK_TOKEN_ID",
+    "LFMCIDAdapter",
     "ILLaDACIDAdapter",
     "ILLaDACIDConfig",
     "ILLaDAContextTensorizer",
@@ -103,6 +116,7 @@ __all__ = [
     "balance_rollout_windows_by_semantic_task",
     "collate_training_steps",
     "load_cid_adapter_checkpoint",
+    "load_cid_adapter_from_pretrained",
     "load_stage_b_checkpoint",
     "load_stage_b_model_checkpoint",
     "save_stage_b_checkpoint",

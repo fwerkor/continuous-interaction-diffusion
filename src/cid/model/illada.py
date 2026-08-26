@@ -382,7 +382,7 @@ class ILLaDACIDConfig:
 
 
 class ILLaDACIDAdapter(nn.Module):
-    """CID bridge for compatible full-sequence LLaDA-family diffusion backbones."""
+    """CID bridge shared by supported full-sequence diffusion backbones."""
 
     def __init__(
         self,
@@ -397,12 +397,13 @@ class ILLaDACIDAdapter(nn.Module):
 
         backbone_config = backbone.config
         model_type = str(backbone_config.model_type)
+        self.backbone_family = model_type
         self.is_llada_moe = model_type == "llada" and int(
             getattr(backbone_config, "num_experts", 0)
         ) > 0
-        if model_type != "illada" and not self.is_llada_moe:
+        if model_type not in {"illada", "lfm2"} and not self.is_llada_moe:
             raise ValueError(
-                "expected an iLLaDA or LLaDA-MoE backbone, "
+                "expected an iLLaDA, LLaDA-MoE, or bidirectional LFM2 backbone, "
                 f"got {backbone_config.model_type!r}"
             )
         self.d_model = int(backbone_config.hidden_size)
@@ -411,8 +412,11 @@ class ILLaDACIDAdapter(nn.Module):
         default_mask_token_id = (
             LLADA_MOE_MASK_TOKEN_ID if self.is_llada_moe else ILLADA_MASK_TOKEN_ID
         )
+        configured_mask_token_id = getattr(backbone_config, "mask_token_id", None)
+        if model_type == "lfm2" and configured_mask_token_id is None:
+            raise ValueError("bidirectional LFM2 backbone must define mask_token_id")
         self.mask_token_id = int(
-            getattr(backbone_config, "mask_token_id", None) or default_mask_token_id
+            default_mask_token_id if configured_mask_token_id is None else configured_mask_token_id
         )
         if not 0 <= self.mask_token_id < self.vocab_size:
             raise ValueError("backbone mask token ID must be inside its vocabulary")
@@ -436,7 +440,7 @@ class ILLaDACIDAdapter(nn.Module):
         )
         num_heads = int(backbone_config.num_attention_heads)
         if self.d_model % num_heads:
-            raise ValueError("iLLaDA hidden size must be divisible by its attention head count")
+            raise ValueError("backbone hidden size must be divisible by its attention head count")
 
         self.channel_embedding = nn.Embedding(3, self.d_model)
         self.role_projection = nn.Linear(self.config.num_roles, self.d_model, bias=False)
@@ -501,6 +505,17 @@ class ILLaDACIDAdapter(nn.Module):
             parameter.requires_grad_(trainable)
         self._router_aux_loss_enabled = self.is_llada_moe and trainable
 
+    def hidden_backbone(self) -> nn.Module:
+        if self.backbone_family == "lfm2":
+            hidden = getattr(self.backbone, "lfm2", None)
+            if hidden is None:
+                raise RuntimeError("LFM2 masked-LM wrapper does not expose .lfm2")
+            return hidden
+        get_decoder = getattr(self.backbone, "get_decoder", None)
+        if get_decoder is None:
+            raise RuntimeError("diffusion backbone does not expose a hidden-state model")
+        return get_decoder()
+
     def pack_frozen_moe_experts(self) -> int:
         """Pack frozen MoE experts for PyTorch grouped GEMM execution.
 
@@ -511,7 +526,7 @@ class ILLaDACIDAdapter(nn.Module):
             return 0
         if not hasattr(torch, "_grouped_mm"):
             return 0
-        layers = getattr(self.backbone.get_decoder(), "layers", None)
+        layers = getattr(self.hidden_backbone(), "layers", None)
         if layers is None:
             raise RuntimeError("LLaDA-MoE decoder does not expose layers")
         packed = 0
@@ -534,7 +549,7 @@ class ILLaDACIDAdapter(nn.Module):
         )
         method = getattr(self.backbone, method_name, None)
         if method is None:
-            raise RuntimeError("iLLaDA backbone does not expose gradient checkpointing controls")
+            raise RuntimeError("backbone does not expose gradient checkpointing controls")
         if enabled and use_reentrant is not None:
             method(gradient_checkpointing_kwargs={"use_reentrant": use_reentrant})
         else:
@@ -546,11 +561,9 @@ class ILLaDACIDAdapter(nn.Module):
             return
         if chunk_size <= 0:
             raise ValueError("MLP chunk size must be positive")
-        if self.is_llada_moe:
-            # The MoE FFN receives only routed token rows and does not expose the dense
-            # iLLaDA MLP contract patched below. Its sparse expert path is already token-wise.
+        if self.is_llada_moe or self.backbone_family == "lfm2":
             return
-        decoder = self.backbone.get_decoder()
+        decoder = self.hidden_backbone()
         layers = getattr(decoder, "layers", None)
         if layers is None or len(layers) == 0:
             raise RuntimeError("iLLaDA decoder does not expose layers for MLP chunking")
@@ -571,7 +584,9 @@ class ILLaDACIDAdapter(nn.Module):
             return
         if chunk_size <= 0:
             raise ValueError("norm chunk size must be positive")
-        decoder = self.backbone.get_decoder()
+        if self.backbone_family == "lfm2":
+            return
+        decoder = self.hidden_backbone()
         layers = getattr(decoder, "layers", None)
         if layers is None or len(layers) == 0:
             raise RuntimeError("iLLaDA decoder does not expose layers for norm chunking")
@@ -670,7 +685,7 @@ class ILLaDACIDAdapter(nn.Module):
             decoder_kwargs["output_router_logits"] = True
         for attention in self._llada_moe_attention_modules:
             attention._cid_key_padding_mask = attention_mask
-        decoder_output = self.backbone.get_decoder()(
+        decoder_output = self.hidden_backbone()(
             **decoder_kwargs,
         )
         hidden = decoder_output.last_hidden_state
@@ -772,7 +787,7 @@ class ILLaDACIDAdapter(nn.Module):
         batch_size, thought_slots, width = thought.shape
         if width != self.d_model:
             raise ValueError(
-                f"thought_semantic width {width} does not match iLLaDA hidden size {self.d_model}"
+                f"thought_semantic width {width} does not match backbone hidden size {self.d_model}"
             )
         if thought_slots > self.config.max_thought_slots:
             raise ValueError("thought slot count exceeds configured maximum")
@@ -799,7 +814,7 @@ class ILLaDACIDAdapter(nn.Module):
             name="prompt_padding_mask",
         )
         if bool(((batch.prompt_ids < 0) | (batch.prompt_ids >= self.vocab_size)).any()):
-            raise ValueError("prompt contains token IDs outside the iLLaDA vocabulary")
+            raise ValueError("prompt contains token IDs outside the backbone vocabulary")
         if batch.display_ids.ndim != 2 or batch.display_ids.shape[0] != batch_size:
             raise ValueError("display_ids must have shape [batch, display_tokens]")
         display_length = batch.display_ids.shape[1]
@@ -830,7 +845,7 @@ class ILLaDACIDAdapter(nn.Module):
         )
         if bool((logical_lengths > self.max_position_embeddings).any()):
             raise ValueError(
-                "combined TCT, prompt, and display length exceeds iLLaDA context capacity"
+                "combined TCT, prompt, and display length exceeds backbone context capacity"
             )
         if batch.display_noise.shape != (batch_size, display_length, 1):
             raise ValueError("display_noise must have shape [batch, display_tokens, 1]")

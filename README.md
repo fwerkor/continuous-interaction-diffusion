@@ -106,16 +106,19 @@ For reproducible public task-pool construction:
 python -m pip install -e '.[data]'
 ```
 
-## LLaDA-family backbone adapters
+## Diffusion backbone adapters
 
-CID supports both the dense `GSAI-ML/iLLaDA-8B-Base` production backbone and the sparse
-`inclusionAI/LLaDA-MoE-7B-A1B-Base` variant. Both keep their native masked-token input embedding and
-LM head for the display channel, run `[TCT | prompt | display]` through the same bidirectional
-decoder, and attach CID-specific external-perception fusion and prediction heads. The MoE path keeps
-its 64-expert/Top-8 routing and adds the upstream load-balancing auxiliary loss only when the
-backbone is unfrozen in Stage B. The immutable prompt remains token-level conditioning rather than being flattened
-into protected Facts. Empty TCT slots are masked as attention keys so they can query context for
-allocation without contaminating the current display.
+CID supports three production backbone sizes: dense `GSAI-ML/iLLaDA-8B-Base`, sparse
+`inclusionAI/LLaDA-MoE-7B-A1B-Base`, and the compact
+`LiquidAI/LFM2.5-Encoder-350M-Diffusion` used by CID-v1-0.4B. All three keep the pretrained
+masked-token embedding and LM head, run `[TCT | prompt | display]` through their native
+bidirectional sequence model, and attach the same CID external-perception fusion and prediction
+heads. The LFM2 path preserves its original full-attention/short-convolution stack rather than
+converting its weights into an iLLaDA-shaped model. The MoE path keeps its 64-expert/Top-8 routing
+and adds the upstream load-balancing auxiliary loss only when the backbone is unfrozen in Stage B.
+The immutable prompt remains token-level conditioning rather than being flattened into protected
+Facts. Empty TCT slots are masked as attention keys so they can query context for allocation without
+contaminating the current display.
 
 ```python
 import torch
@@ -129,16 +132,21 @@ model = ILLaDACIDAdapter.from_pretrained(
 ```
 
 The loader pins the official checkpoint revision used by this repository and enables the model's
-required Hugging Face remote code. The full checkpoint is about 16.5 GB. For an interface smoke
+required Hugging Face remote code. Use `load_cid_adapter_from_pretrained()` when the backbone may
+be any supported family; it dispatches LFM2 to `AutoModelForMaskedLM` and LLaDA-family checkpoints
+to their existing causal-LM wrappers. The 8B checkpoint is about 16.5 GB. For an interface smoke
 test using the official iLLaDA implementation without downloading the 8B weights:
 
 ```bash
 python examples/illada_tiny_smoke.py
 ```
 
-Special tokens are backbone-specific: iLLaDA uses mask id `5`, while LLaDA-MoE uses mask id
-`156895` and EOS id `156892`. The adapter carries these IDs into training, runtime, checkpoints, and
-benchmarks so dense-8B and MoE artifacts cannot be mixed silently. `CIDDiffusionScheduler` supplies
+Special tokens are backbone-specific: iLLaDA uses mask id `5`, LLaDA-MoE uses mask id `156895`
+and EOS id `156892`, and LFM2.5 diffusion uses mask id `16` and EOS id `7`. The adapter carries
+these IDs into training, runtime, checkpoints, and benchmarks so artifacts from different backbones
+cannot be mixed silently. The LFM2.5 checkpoint remains subject to its upstream LFM Open License
+v1.0; this repository's Apache-2.0 license does not replace the model-weight license.
+`CIDDiffusionScheduler` supplies
 masked-display corruption, continuous TCT corruption, confidence-ranked iterative reveal, and
 bounded visible-token revision. Training
 mixes ordinary mask corruption with visible wrong-token replacement so the display head learns to

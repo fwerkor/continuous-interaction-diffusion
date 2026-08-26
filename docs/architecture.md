@@ -126,12 +126,13 @@ API is the target for an adapter around an existing masked-diffusion LM: map mod
 the fixed-capacity TCT, retain the model's masked-token denoising for Y, and attach CID
 allocation/lifecycle/role/intent/revision plus typed grounding heads.
 
-The first real bridge is `ILLaDACIDAdapter` for `GSAI-ML/iLLaDA-8B-Base`. iLLaDA accepts
-`inputs_embeds`, so CID runs `[TCT | prompt | display]` through the native bidirectional decoder.
+The production bridge supports iLLaDA, LLaDA-MoE, and bidirectional LFM2.5 diffusion backbones.
+Each accepts `inputs_embeds`, so CID runs `[TCT | prompt | display]` through the checkpoint's native
+bidirectional hidden-state stack. For CID-v1-0.4B this is the original LFM2.5 mixture of attention
+and non-causal short convolution; the adapter does not morph those weights into another architecture.
 The prompt is immutable token-level conditioning, not a fourth mutable cognitive channel and not a
 `FactItem`. This preserves its language structure while reserving F for externally protected facts.
-Display logits still come from the checkpoint's original LM head. The adapter does not replace or
-emulate iLLaDA's language-model stack.
+Display logits still come from the checkpoint's original LM head.
 
 Training micro-batches may pad prompt and display regions to different widths. The adapter therefore
 passes explicit per-sample RoPE `position_ids`: TCT positions remain fixed, valid prompt tokens are

@@ -943,7 +943,7 @@ class ILLaDATrajectoryTensorizer:
         self.tokenizer = tokenizer
         self.text_encoder = text_encoder or ILLaDATextEncoder(adapter, tokenizer)
         if self.text_encoder.d_model != adapter.d_model:
-            raise ValueError("training text encoder width must match the iLLaDA adapter")
+            raise ValueError("training text encoder width must match the CID adapter")
         if not 0.0 <= display_replacement_fraction <= 1.0:
             raise ValueError("display_replacement_fraction must be in [0, 1]")
         if minimum_thought_slots <= 0:
@@ -1047,7 +1047,7 @@ class ILLaDATrajectoryTensorizer:
         if logical_length > self.adapter.max_position_embeddings:
             raise ValueError(
                 "configured TCT prefix, prompt, and display bucket exceed "
-                "iLLaDA context capacity"
+                "backbone context capacity"
             )
 
         target_display_ids = torch.full(
@@ -2016,7 +2016,7 @@ def stage_b_adamw_parameter_groups(
     ``use_orig_params=True`` keeps these original ``nn.Parameter`` objects valid after
     wrapping. Matrix/tensor weights receive AdamW decay while one-dimensional norm
     weights and biases do not. The already-trained CID modules keep the base learning
-    rate; the pretrained iLLaDA backbone uses a conservative multiplier to reduce
+    rate; the pretrained diffusion backbone uses a conservative multiplier to reduce
     catastrophic forgetting during the one-epoch joint continuation.
     """
 
@@ -2075,10 +2075,10 @@ def wrap_stage_b_fsdp(
     )
     from torch.distributed.fsdp.wrap import transformer_auto_wrap_policy
 
-    decoder = adapter.backbone.get_decoder()
+    decoder = adapter.hidden_backbone()
     layers = getattr(decoder, "layers", None)
     if layers is None or len(layers) == 0:
-        raise ValueError("iLLaDA decoder must expose non-empty layers for FSDP auto-wrap")
+        raise ValueError("diffusion backbone must expose non-empty layers for FSDP auto-wrap")
     layer_class = type(layers[0])
     auto_wrap_policy = partial(
         transformer_auto_wrap_policy,

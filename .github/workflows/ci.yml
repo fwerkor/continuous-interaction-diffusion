@@ -30,6 +30,7 @@ jobs:
           pytest
           tests/test_torch_core.py
           tests/test_illada_adapter.py
+          tests/test_lfm_adapter.py
           tests/test_diffusion.py
           tests/test_materialize.py
           tests/test_neural_policy.py
