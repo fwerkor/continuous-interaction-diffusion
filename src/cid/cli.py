@@ -5,6 +5,7 @@ import asyncio
 import json
 import os
 import shutil
+import tempfile
 import time
 from dataclasses import asdict
 from pathlib import Path
@@ -1337,6 +1338,62 @@ def _train_stage_a(args: argparse.Namespace) -> None:
             dist.destroy_process_group()
 
 
+def _stage_b_execution_target(
+    requested_device: str,
+    *,
+    cuda_available: bool,
+    world_size: int,
+    local_rank: int,
+    dtype: str,
+    cpu_offload: bool,
+) -> tuple[str, int | None, str]:
+    """Resolve Stage B compute device and distributed backend."""
+    if requested_device not in {"auto", "cuda", "cpu"}:
+        raise ValueError(f"unsupported Stage B device {requested_device!r}")
+    if world_size <= 0:
+        raise ValueError("Stage B world size must be positive")
+
+    if requested_device == "cuda" and not cuda_available:
+        raise RuntimeError("Stage B was asked to use CUDA, but CUDA is unavailable")
+    use_cuda = requested_device != "cpu" and cuda_available
+    if use_cuda:
+        if world_size < 4:
+            raise RuntimeError(
+                "Stage B CUDA full-parameter CID training requires at least four GPU ranks"
+            )
+        return "cuda", local_rank, "nccl"
+
+    if dtype != "bf16":
+        raise ValueError("Stage B CPU training currently supports --dtype bf16 only")
+    if cpu_offload:
+        raise ValueError("--fsdp-cpu-offload is only meaningful for CUDA Stage B training")
+    return "cpu", None, "gloo"
+
+
+def _init_stage_b_process_group(
+    dist,
+    *,
+    backend: str,
+    world_size: int,
+) -> Path | None:
+    """Initialize torch.distributed, including direct single-process CPU launches."""
+    if dist.is_initialized():
+        return None
+    if "RANK" in os.environ and "WORLD_SIZE" in os.environ:
+        dist.init_process_group(backend=backend)
+        return None
+    if world_size != 1:
+        raise RuntimeError("multi-rank Stage B must be launched with torchrun")
+
+    rendezvous_dir = Path(tempfile.mkdtemp(prefix="cid-stage-b-rdzv-"))
+    dist.init_process_group(
+        backend=backend,
+        init_method=f"file://{rendezvous_dir / 'init'}",
+        rank=0,
+        world_size=1,
+    )
+    return rendezvous_dir
+
 def _train_stage_b(args: argparse.Namespace) -> None:
     import torch
     import torch.distributed as dist
@@ -1386,12 +1443,15 @@ def _train_stage_b(args: argparse.Namespace) -> None:
         raise ValueError("--backbone-lr-scale must be positive")
 
     world_size = int(os.environ.get("WORLD_SIZE", "1"))
-    if world_size < 4:
-        raise RuntimeError(
-            "Stage B full-parameter CID training requires at least four GPU ranks"
-        )
-    if not torch.cuda.is_available():
-        raise RuntimeError("Stage B full-parameter training requires CUDA GPUs")
+    local_rank = int(os.environ.get("LOCAL_RANK", "0"))
+    device_type, device_index, backend = _stage_b_execution_target(
+        args.device,
+        cuda_available=torch.cuda.is_available(),
+        world_size=world_size,
+        local_rank=local_rank,
+        dtype=args.dtype,
+        cpu_offload=args.fsdp_cpu_offload,
+    )
 
     gradient_accumulation_steps = stage_b_gradient_accumulation_steps(
         world_size=world_size,
@@ -1407,10 +1467,17 @@ def _train_stage_b(args: argparse.Namespace) -> None:
         "bf16": torch.bfloat16,
         "fp16": torch.float16,
     }[args.dtype]
-    local_rank = int(os.environ.get("LOCAL_RANK", "0"))
-    torch.cuda.set_device(local_rank)
-    device = torch.device("cuda", local_rank)
-    dist.init_process_group(backend="nccl")
+    if device_type == "cuda":
+        assert device_index is not None
+        torch.cuda.set_device(device_index)
+        device = torch.device("cuda", device_index)
+    else:
+        device = torch.device("cpu")
+    rendezvous_dir = _init_stage_b_process_group(
+        dist,
+        backend=backend,
+        world_size=world_size,
+    )
     rank = dist.get_rank()
     world_size = dist.get_world_size()
 
@@ -1473,9 +1540,8 @@ def _train_stage_b(args: argparse.Namespace) -> None:
         )
 
         def load_adapter() -> tuple[ILLaDACIDAdapter, ILLaDATextEncoder]:
-            # Keep the initial FP32 model on host memory. FSDP's device_id moves each wrap
-            # unit onto the local GPU while sharding it, avoiding a transient full-model
-            # FP32 allocation on every A6000 before FULL_SHARD is active.
+            # Keep the initial FP32 model on host memory. On CUDA, FSDP's device_id moves
+            # each wrap unit onto the local GPU while sharding it; on CPU it shards in place.
             model = load_cid_adapter_from_pretrained(
                 args.model,
                 config=adapter_config,
@@ -1815,6 +1881,8 @@ def _train_stage_b(args: argparse.Namespace) -> None:
     finally:
         if dist.is_initialized():
             dist.destroy_process_group()
+        if rendezvous_dir is not None:
+            shutil.rmtree(rendezvous_dir, ignore_errors=True)
 
 
 def main() -> None:
@@ -2270,6 +2338,12 @@ def main() -> None:
     train_full.add_argument("--data", required=True)
     train_full.add_argument("--output-dir", required=True)
     train_full.add_argument("--model", default="GSAI-ML/iLLaDA-8B-Base")
+    train_full.add_argument(
+        "--device",
+        choices=("auto", "cuda", "cpu"),
+        default="auto",
+        help="Stage B compute device; auto prefers CUDA when available",
+    )
     train_full.add_argument("--resume")
     train_full.add_argument("--init-cid-checkpoint")
     train_full.add_argument("--dtype", choices=("bf16", "fp16"), default="bf16")

@@ -129,10 +129,31 @@ This DDP path is for the frozen-backbone Stage A phase.
 
 `cid train-full` is the quality-first full-parameter continuation path after Stage A. It uses FSDP
 `FULL_SHARD` with `use_orig_params=True`, FP32 master parameters, BF16 forward/reduction, and AdamW.
-The 8B production path requires at least four GPU ranks; six A6000s are preferred. CPU offload stays
-disabled by default, preserving the existing 8B path. `--fsdp-cpu-offload` explicitly moves FSDP
-parameter/gradient shards and optimizer state to host memory while keeping standard AdamW; this is
-the supported low-memory path for the 7B-A1B variant on four 24 GB GPUs.
+The CUDA production path requires at least four GPU ranks; six A6000s are preferred for the 8B
+model. CPU offload stays disabled by default, preserving the existing GPU path.
+`--fsdp-cpu-offload` explicitly moves FSDP parameter/gradient shards and optimizer state to host
+memory while keeping standard AdamW; this is the supported low-memory path for the 7B-A1B variant
+on four 24 GB GPUs.
+
+Stage B can also run entirely on CPU with `--device cpu`. The CPU path uses Gloo and BF16, keeps
+parameters and optimizer state on host memory, and does not require four ranks. A direct one-process
+launch is supported; for large multi-socket servers, `torchrun` can use multiple CPU ranks and real
+FSDP sharding. `--fsdp-cpu-offload` must remain disabled because there is no separate accelerator
+to offload from. For example:
+
+```bash
+OMP_NUM_THREADS=48 MKL_NUM_THREADS=48 \
+  torchrun --standalone --nproc-per-node=2 -m cid.cli train-full \
+  --device cpu --dtype bf16 \
+  --model LiquidAI/LFM2.5-Encoder-350M-Diffusion \
+  --data /path/to/training-trajectories.jsonl \
+  --output-dir /path/to/stage-b \
+  --init-cid-checkpoint /path/to/stage-a-latest.pt
+```
+
+The thread count and CPU-rank count are deployment tuning parameters rather than model semantics.
+On a single-process CPU launch, PyTorch may reduce `FULL_SHARD` to `NO_SHARD`; multi-rank CPU
+launches retain FSDP sharding.
 
 Stage B separates optimization policy by parameter role. CID modules use the configured peak
 learning rate (`1e-5` by default), while iLLaDA backbone groups use `backbone_lr_scale=0.5`. Matrix
