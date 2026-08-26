@@ -33,6 +33,55 @@ class TinyLLaDAMoELayer(nn.Module):
         super().__init__()
         self.projection = nn.Linear(hidden_size, hidden_size, bias=False)
         self.self_attn = TinyLLaDAMoEAttention(hidden_size)
+        self.mlp = TinySparseMoE(hidden_size, num_experts=4, top_k=2)
+
+
+class TinyExpert(nn.Module):
+    def __init__(self, hidden_size: int) -> None:
+        super().__init__()
+        self.gate_proj = nn.Linear(hidden_size, 16, bias=False)
+        self.up_proj = nn.Linear(hidden_size, 16, bias=False)
+        self.down_proj = nn.Linear(16, hidden_size, bias=False)
+        self.act_fn = torch.nn.functional.silu
+
+    def forward(self, hidden_states):
+        return self.down_proj(
+            self.act_fn(self.gate_proj(hidden_states)) * self.up_proj(hidden_states)
+        )
+
+
+class TinySparseMoE(nn.Module):
+    def __init__(self, hidden_size: int, *, num_experts: int, top_k: int) -> None:
+        super().__init__()
+        self.num_experts = num_experts
+        self.top_k = top_k
+        self.norm_topk_prob = False
+        self.expert_bias = None
+        self.gate = nn.Linear(hidden_size, num_experts, bias=False)
+        self.experts = nn.ModuleList(
+            [TinyExpert(hidden_size) for _ in range(num_experts)]
+        )
+
+    def forward(self, hidden_states):
+        batch_size, sequence_length, hidden_dim = hidden_states.shape
+        flat_hidden = hidden_states.reshape(-1, hidden_dim)
+        routing_weights = torch.softmax(
+            self.gate(flat_hidden), dim=1, dtype=torch.float32
+        )
+        routing_weights, selected_experts = torch.topk(
+            routing_weights, self.top_k, dim=-1
+        )
+        routing_weights = routing_weights.to(flat_hidden.dtype)
+        output = torch.zeros_like(flat_hidden)
+        for expert_idx, expert in enumerate(self.experts):
+            token_idx, route_idx = torch.where(selected_experts == expert_idx)
+            expert_output = expert(flat_hidden[token_idx])
+            output.index_add_(
+                0,
+                token_idx,
+                expert_output * routing_weights[token_idx, route_idx, None],
+            )
+        return output.reshape(batch_size, sequence_length, hidden_dim)
 
 
 class TinyLLaDAMoEAttention(nn.Module):
@@ -147,6 +196,25 @@ def test_llada_moe_stage_a_skips_router_auxiliary_loss() -> None:
     assert not backbone.decoder.last_output_router_logits
     assert output.auxiliary_loss is None
     adapter.set_mlp_chunk_size(16)
+
+
+def test_llada_moe_grouped_experts_match_reference_outputs_and_input_gradients() -> None:
+    backbone = TinyLLaDAMoEBackbone()
+    adapter = ILLaDACIDAdapter(backbone, freeze_backbone=True)
+    moe = backbone.decoder.layers[0].mlp
+    reference_input = torch.randn(2, 5, TinyLLaDAMoEConfig.hidden_size, requires_grad=True)
+    grouped_input = reference_input.detach().clone().requires_grad_(True)
+
+    reference_output = moe(reference_input)
+    reference_output.square().sum().backward()
+    packed_layers = adapter.pack_frozen_moe_experts()
+    grouped_output = moe(grouped_input)
+    grouped_output.square().sum().backward()
+
+    assert packed_layers == 1
+    assert len(moe.experts) == 0
+    assert torch.allclose(reference_output, grouped_output, atol=1e-5, rtol=1e-5)
+    assert torch.allclose(reference_input.grad, grouped_input.grad, atol=1e-5, rtol=1e-5)
 
 
 def test_llada_moe_attention_keeps_masked_slots_out_of_key_context() -> None:

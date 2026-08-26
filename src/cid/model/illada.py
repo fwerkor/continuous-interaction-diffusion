@@ -204,6 +204,86 @@ def _install_llada_moe_attention_mask_support(backbone: nn.Module) -> tuple[nn.M
     return tuple(attention_modules)
 
 
+def _grouped_llada_moe_forward(
+    module: nn.Module,
+    hidden_states: torch.Tensor,
+) -> torch.Tensor:
+    """Evaluate frozen LLaDA-MoE experts with three grouped GEMMs per layer."""
+    batch_size, sequence_length, hidden_dim = hidden_states.shape
+    flat_hidden = hidden_states.reshape(-1, hidden_dim)
+    router_logits = module.gate(flat_hidden)
+    routing_weights = torch.softmax(router_logits, dim=1, dtype=torch.float32)
+    if module.expert_bias is not None:
+        routing_weights = routing_weights + module.expert_bias
+    routing_weights, selected_experts = torch.topk(
+        routing_weights, module.top_k, dim=-1
+    )
+    if module.norm_topk_prob:
+        routing_weights = routing_weights / routing_weights.sum(
+            dim=-1, keepdim=True
+        )
+    routing_weights = routing_weights.to(flat_hidden.dtype)
+
+    token_count = flat_hidden.shape[0]
+    token_indices = (
+        torch.arange(token_count, device=flat_hidden.device)[:, None]
+        .expand(-1, module.top_k)
+        .reshape(-1)
+    )
+    flat_experts = selected_experts.reshape(-1)
+    order = torch.argsort(flat_experts, stable=True)
+    sorted_tokens = token_indices[order]
+    sorted_weights = routing_weights.reshape(-1)[order]
+    expert_counts = torch.bincount(
+        flat_experts, minlength=module.num_experts
+    )
+    offsets = expert_counts.cumsum(dim=0, dtype=torch.int32)
+
+    routed = flat_hidden[sorted_tokens]
+    gate = torch._grouped_mm(routed, module._cid_gate_weights, offsets)
+    up = torch._grouped_mm(routed, module._cid_up_weights, offsets)
+    routed = module._cid_act_fn(gate) * up
+    routed = torch._grouped_mm(routed, module._cid_down_weights, offsets)
+    routed = routed * sorted_weights[:, None]
+
+    output = torch.zeros_like(flat_hidden)
+    output.index_add_(0, sorted_tokens, routed)
+    return output.reshape(batch_size, sequence_length, hidden_dim)
+
+
+def _pack_frozen_llada_moe_layer(module: nn.Module) -> None:
+    experts = tuple(module.experts)
+    if not experts:
+        raise RuntimeError("LLaDA-MoE layer does not expose experts")
+    if any(parameter.requires_grad for expert in experts for parameter in expert.parameters()):
+        raise RuntimeError("grouped LLaDA-MoE packing requires frozen expert weights")
+    required = ("gate_proj", "up_proj", "down_proj", "act_fn")
+    if any(any(not hasattr(expert, name) for name in required) for expert in experts):
+        raise RuntimeError("unsupported LLaDA-MoE expert implementation")
+
+    module.register_buffer(
+        "_cid_gate_weights",
+        torch.stack([expert.gate_proj.weight.detach().T for expert in experts])
+        .contiguous(),
+        persistent=False,
+    )
+    module.register_buffer(
+        "_cid_up_weights",
+        torch.stack([expert.up_proj.weight.detach().T for expert in experts])
+        .contiguous(),
+        persistent=False,
+    )
+    module.register_buffer(
+        "_cid_down_weights",
+        torch.stack([expert.down_proj.weight.detach().T for expert in experts])
+        .contiguous(),
+        persistent=False,
+    )
+    module._cid_act_fn = experts[0].act_fn
+    module.experts = nn.ModuleList()
+    module.forward = MethodType(_grouped_llada_moe_forward, module)
+
+
 def _moe_load_balancing_loss(
     router_logits: tuple[torch.Tensor, ...] | None,
     *,
@@ -420,6 +500,28 @@ class ILLaDACIDAdapter(nn.Module):
         for parameter in self.backbone.parameters():
             parameter.requires_grad_(trainable)
         self._router_aux_loss_enabled = self.is_llada_moe and trainable
+
+    def pack_frozen_moe_experts(self) -> int:
+        """Pack frozen MoE experts for PyTorch grouped GEMM execution.
+
+        This is a Stage A runtime optimization. Packed weights are non-persistent
+        because Stage A checkpoints already contain only trainable CID parameters.
+        """
+        if not self.is_llada_moe:
+            return 0
+        if not hasattr(torch, "_grouped_mm"):
+            return 0
+        layers = getattr(self.backbone.get_decoder(), "layers", None)
+        if layers is None:
+            raise RuntimeError("LLaDA-MoE decoder does not expose layers")
+        packed = 0
+        for layer in layers:
+            moe = getattr(layer, "mlp", None)
+            if moe is None or not hasattr(moe, "experts"):
+                continue
+            _pack_frozen_llada_moe_layer(moe)
+            packed += 1
+        return packed
 
     def set_gradient_checkpointing(
         self,

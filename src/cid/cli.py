@@ -1141,6 +1141,7 @@ def _train_stage_a(args: argparse.Namespace) -> None:
             raise RuntimeError("failed to load iLLaDA adapter on this training rank")
         if args.gradient_checkpointing:
             adapter.set_gradient_checkpointing(True)
+        grouped_moe_layers = adapter.pack_frozen_moe_experts()
 
         tokenizer_kwargs: dict[str, object] = {"trust_remote_code": True}
         if args.model == ILLADA_8B_BASE:
@@ -1215,7 +1216,8 @@ def _train_stage_a(args: argparse.Namespace) -> None:
             print(
                 f"device={device} world_size={world_size} dtype={args.dtype} "
                 f"examples={len(examples)} transitions={transition_count_total} "
-                f"trainable_parameters={trainable} effective_batch={effective_batch}"
+                f"trainable_parameters={trainable} effective_batch={effective_batch} "
+                f"grouped_moe_layers={grouped_moe_layers}"
             )
 
         first_epoch = trainer.state.epochs_completed + 1
