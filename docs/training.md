@@ -21,10 +21,13 @@ refresh, fact protection, and metrics independently of neural quality.
 Start from an existing masked-diffusion language model. Freeze most of the backbone initially and
 train:
 
-The first supported backbone is `GSAI-ML/iLLaDA-8B-Base`. `ILLaDACIDAdapter` reuses its native
-token embedding, bidirectional decoder, and LM head. With `freeze_backbone=True`, only the CID
-projections, external-perception fusion, and prediction heads are trainable; later stages can
-unfreeze the same backbone without changing the tensor/runtime ABI.
+The supported full-sequence diffusion backbones are `GSAI-ML/iLLaDA-8B-Base` and
+`inclusionAI/LLaDA-MoE-7B-A1B-Base`. `ILLaDACIDAdapter` reuses each model's native token embedding,
+bidirectional decoder, and LM head. With `freeze_backbone=True`, only the CID projections,
+external-perception fusion, and prediction heads are trainable; later stages can unfreeze the same
+backbone without changing the tensor/runtime ABI. For LLaDA-MoE, Stage B also restores the upstream
+router load-balancing objective while Stage A skips router-logit materialization because the router
+is frozen.
 
 - TCT slot projection and role heads;
 - empty-slot allocation and occupied-cell lifecycle heads;
@@ -121,9 +124,10 @@ This DDP path is for the frozen-backbone Stage A phase.
 
 `cid train-full` is the quality-first full-parameter continuation path after Stage A. It uses FSDP
 `FULL_SHARD` with `use_orig_params=True`, FP32 master parameters, BF16 forward/reduction, and AdamW.
-The 8B production path requires at least four GPU ranks; six A6000s are preferred. The launcher does
-not automatically replace AdamW with a lower-memory optimizer or CPU offload when fewer GPUs are
-available, since either change would alter the intended training dynamics.
+The 8B production path requires at least four GPU ranks; six A6000s are preferred. CPU offload stays
+disabled by default, preserving the existing 8B path. `--fsdp-cpu-offload` explicitly moves FSDP
+parameter/gradient shards and optimizer state to host memory while keeping standard AdamW; this is
+the supported low-memory path for the 7B-A1B variant on four 24 GB GPUs.
 
 Stage B separates optimization policy by parameter role. CID modules use the configured peak
 learning rate (`1e-5` by default), while iLLaDA backbone groups use `backbone_lr_scale=0.5`. Matrix
@@ -156,7 +160,9 @@ requires the same world size and exact training JSONL SHA-256, and the stored tr
 prevents silently changing LR, accumulation, or rollout policy midway through a run.
 
 A fresh Stage B run requires `--init-cid-checkpoint`; `--resume` is mutually exclusive and restores
-the complete Stage B model/optimizer state. The repository tests the optimizer grouping and LR
+the complete Stage B model/optimizer state. `scripts/train_cid_v1_7b_a1b_4x3090.sh` provides a
+separate, resumable 4×3090 launcher whose default root is `/workspace/cid-v1-7b-a1b`; it never
+uses the dense 8B output directories. The repository tests the optimizer grouping and LR
 multipliers, a CPU FSDP checkpoint round trip, and a true two-rank Gloo `FULL_SHARD`
 forward/backward/distributed-checkpoint smoke. The two-rank smoke is a correctness test only; the
 8B production launcher itself enforces four or more GPU ranks.

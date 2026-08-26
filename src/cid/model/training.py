@@ -23,11 +23,7 @@ from cid.model.allocation import (
 )
 from cid.model.diffusion import CIDDiffusionScheduler
 from cid.model.encoding import ILLaDATextEncoder, stable_text
-from cid.model.illada import (
-    ILLADA_EOS_TOKEN_ID,
-    ILLADA_MASK_TOKEN_ID,
-    ILLaDACIDAdapter,
-)
+from cid.model.illada import ILLaDACIDAdapter
 from cid.model.losses import CIDLoss, CIDTargets, cid_loss
 from cid.model.materialize import RevisionAction
 from cid.model.tensors import CIDTensorBatch, CIDTensorOutput, build_percept_routing_masks
@@ -297,7 +293,10 @@ class CIDTrainer:
             lr=self.config.learning_rate,
             weight_decay=self.config.weight_decay,
         )
-        device = adapter.input_embeddings.weight.device
+        # FSDP CPU offload keeps the live parameter shards on host memory between
+        # forwards, while tensorization and diffusion corruption still happen on the
+        # compute device carried by the frozen text-encoder snapshot.
+        device = tensorizer.text_encoder.device
         self.generator = torch.Generator(device=device)
         self.generator.manual_seed(self.config.seed)
         self.shuffle_rng = random.Random(self.config.seed)
@@ -765,6 +764,7 @@ class CIDTrainer:
                 "model_type": str(self.adapter.backbone.config.model_type),
                 "hidden_size": self.adapter.d_model,
                 "vocab_size": self.adapter.vocab_size,
+                "mask_token_id": self.adapter.mask_token_id,
             },
             "trainable_names": self.trainable_parameter_names,
             "model_state": trainable_state,
@@ -794,6 +794,8 @@ class CIDTrainer:
             int(backbone["hidden_size"]) != self.adapter.d_model
             or int(backbone["vocab_size"]) != self.adapter.vocab_size
             or str(backbone["model_type"]) != str(self.adapter.backbone.config.model_type)
+            or int(backbone.get("mask_token_id", self.adapter.mask_token_id))
+            != self.adapter.mask_token_id
         ):
             raise ValueError("checkpoint backbone geometry does not match this adapter")
 
@@ -899,6 +901,7 @@ def load_cid_adapter_checkpoint(
         int(backbone["hidden_size"]) != adapter.d_model
         or int(backbone["vocab_size"]) != adapter.vocab_size
         or str(backbone["model_type"]) != str(adapter.backbone.config.model_type)
+        or int(backbone.get("mask_token_id", adapter.mask_token_id)) != adapter.mask_token_id
     ):
         raise ValueError("checkpoint backbone geometry does not match this adapter")
     if checkpoint["adapter_config"] != asdict(adapter.config):
@@ -959,9 +962,9 @@ class ILLaDATrajectoryTensorizer:
         self.display_canvas_tokens = int(display_canvas_tokens)
         eos_token_id = getattr(tokenizer, "eos_token_id", None)
         self.eos_token_id = (
-            ILLADA_EOS_TOKEN_ID if eos_token_id is None else int(eos_token_id)
+            adapter.eos_token_id if eos_token_id is None else int(eos_token_id)
         )
-        self.scheduler = scheduler or CIDDiffusionScheduler(ILLADA_MASK_TOKEN_ID)
+        self.scheduler = scheduler or CIDDiffusionScheduler(adapter.mask_token_id)
 
     def tensorize(
         self,
@@ -1049,7 +1052,7 @@ class ILLaDATrajectoryTensorizer:
 
         target_display_ids = torch.full(
             (1, display_canvas_tokens),
-            ILLADA_MASK_TOKEN_ID,
+            self.adapter.mask_token_id,
             device=device,
             dtype=torch.long,
         )
@@ -1071,7 +1074,9 @@ class ILLaDATrajectoryTensorizer:
             display_labels = display_corruption.labels
             display_noise = display_corruption.noise * display_supervision_mask.unsqueeze(-1)
         else:
-            display_input_ids = torch.full_like(target_display_ids, ILLADA_MASK_TOKEN_ID)
+            display_input_ids = torch.full_like(
+                target_display_ids, self.adapter.mask_token_id
+            )
             previous_display = rollout_state.display_ids.to(device=device, dtype=torch.long)
             if previous_display.shape[1] > display_input_ids.shape[1]:
                 raise ValueError("rollout display exceeds configured training display capacity")
@@ -1080,7 +1085,9 @@ class ILLaDATrajectoryTensorizer:
             display_labels[~display_supervision_mask] = -100
             display_labels[display_input_ids == target_display_ids] = -100
             display_noise = (
-                (display_input_ids == ILLADA_MASK_TOKEN_ID).to(dtype=dtype).unsqueeze(-1)
+                (display_input_ids == self.adapter.mask_token_id)
+                .to(dtype=dtype)
+                .unsqueeze(-1)
                 * display_supervision_mask.unsqueeze(-1)
             )
 
@@ -2057,9 +2064,11 @@ def wrap_stage_b_fsdp(
     *,
     device_id: int | torch.device,
     compute_dtype: torch.dtype = torch.bfloat16,
+    cpu_offload: bool = False,
 ) -> torch.nn.Module:
     from torch.distributed.fsdp import (
         BackwardPrefetch,
+        CPUOffload,
         FullyShardedDataParallel,
         MixedPrecision,
         ShardingStrategy,
@@ -2085,6 +2094,7 @@ def wrap_stage_b_fsdp(
             buffer_dtype=compute_dtype,
         ),
         device_id=device_id,
+        cpu_offload=CPUOffload(offload_params=cpu_offload),
         sync_module_states=False,
         backward_prefetch=BackwardPrefetch.BACKWARD_POST,
         limit_all_gathers=True,
@@ -2156,6 +2166,7 @@ def save_stage_b_checkpoint(
                 "model_type": str(trainer.adapter.backbone.config.model_type),
                 "hidden_size": trainer.adapter.d_model,
                 "vocab_size": trainer.adapter.vocab_size,
+                "mask_token_id": trainer.adapter.mask_token_id,
             },
         }
         if epoch_progress is not None:
@@ -2208,6 +2219,8 @@ def load_stage_b_checkpoint(
         int(backbone["hidden_size"]) != trainer.adapter.d_model
         or int(backbone["vocab_size"]) != trainer.adapter.vocab_size
         or str(backbone["model_type"]) != str(trainer.adapter.backbone.config.model_type)
+        or int(backbone.get("mask_token_id", trainer.adapter.mask_token_id))
+        != trainer.adapter.mask_token_id
     ):
         raise ValueError("Stage B checkpoint backbone geometry does not match")
 
@@ -2288,6 +2301,7 @@ def load_stage_b_model_checkpoint(
         int(backbone["hidden_size"]) != adapter.d_model
         or int(backbone["vocab_size"]) != adapter.vocab_size
         or str(backbone["model_type"]) != str(adapter.backbone.config.model_type)
+        or int(backbone.get("mask_token_id", adapter.mask_token_id)) != adapter.mask_token_id
     ):
         raise ValueError("Stage B checkpoint backbone geometry does not match")
 

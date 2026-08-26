@@ -91,6 +91,7 @@ class CIDLoss:
     link_relation: Tensor
     link_target_kind: Tensor
     link_ground: Tensor
+    auxiliary: Tensor
 
 
 def cid_loss(
@@ -216,6 +217,11 @@ def cid_loss(
         link_target_embeddings,
         link_mask,
     )
+    auxiliary = (
+        output.auxiliary_loss
+        if output.auxiliary_loss is not None
+        else output.thought_semantic.sum() * 0.0
+    )
     total = (
         w.thought * thought
         + w.convergence * convergence
@@ -238,6 +244,7 @@ def cid_loss(
         + w.link_relation * link_relation
         + w.link_target_kind * link_target_kind
         + w.link_ground * link_ground
+        + auxiliary
     )
     return CIDLoss(
         total=total,
@@ -262,6 +269,7 @@ def cid_loss(
         link_relation=link_relation,
         link_target_kind=link_target_kind,
         link_ground=link_ground,
+        auxiliary=auxiliary,
     )
 
 

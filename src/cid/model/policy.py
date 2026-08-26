@@ -12,7 +12,8 @@ from cid.model.encoding import ILLaDATextEncoder, stable_text
 from cid.model.illada import (
     ILLADA_8B_BASE,
     ILLADA_8B_BASE_REVISION,
-    ILLADA_MASK_TOKEN_ID,
+    LLADA_MOE_7B_A1B_BASE,
+    LLADA_MOE_7B_A1B_BASE_REVISION,
     ILLaDACIDAdapter,
 )
 from cid.model.materialize import CIDMaterializer, ClosedWorldMaterializationCatalog
@@ -46,6 +47,8 @@ class ILLaDAContextTensorizer:
         tokenizer_kwargs.setdefault("trust_remote_code", True)
         if model_name_or_path == ILLADA_8B_BASE:
             tokenizer_kwargs.setdefault("revision", ILLADA_8B_BASE_REVISION)
+        elif model_name_or_path == LLADA_MOE_7B_A1B_BASE:
+            tokenizer_kwargs.setdefault("revision", LLADA_MOE_7B_A1B_BASE_REVISION)
         tokenizer = AutoTokenizer.from_pretrained(model_name_or_path, **tokenizer_kwargs)
         return cls(adapter, tokenizer)
 
@@ -55,9 +58,12 @@ class ILLaDAContextTensorizer:
         thought = context.thought
         if thought.width != self.adapter.d_model:
             raise ValueError("runtime TCT width does not match iLLaDA hidden size")
-        if context.display.unresolved and context.display.mask_token_id != ILLADA_MASK_TOKEN_ID:
+        if (
+            context.display.unresolved
+            and context.display.mask_token_id != self.adapter.mask_token_id
+        ):
             raise ValueError(
-                f"iLLaDA display canvas must use mask token id {ILLADA_MASK_TOKEN_ID}"
+                f"display canvas must use backbone mask token id {self.adapter.mask_token_id}"
             )
 
         role_order = tuple(CognitiveRole)
@@ -245,7 +251,7 @@ class ILLaDANeuralPolicy:
         self.tensorizer = tensorizer
         self.materializer = materializer or CIDMaterializer()
         self.catalog = catalog or ClosedWorldMaterializationCatalog()
-        self.scheduler = scheduler or CIDDiffusionScheduler(ILLADA_MASK_TOKEN_ID)
+        self.scheduler = scheduler or CIDDiffusionScheduler(adapter.mask_token_id)
         self.config = config or ILLaDANeuralPolicyConfig()
         self.forward_model = forward_model or adapter
 

@@ -9,11 +9,7 @@ from cid.data import TrajectoryExample
 from cid.evaluation import ReplayEvaluationResult, RuntimeTaskEvaluation, run_replay_case
 from cid.grounding import ObjectKind, ObjectRef
 from cid.model.encoding import ILLaDATextEncoder, stable_text
-from cid.model.illada import (
-    ILLADA_EOS_TOKEN_ID,
-    ILLADA_MASK_TOKEN_ID,
-    ILLaDACIDAdapter,
-)
+from cid.model.illada import ILLaDACIDAdapter
 from cid.model.materialize import (
     AnchorCandidate,
     ArgumentCandidate,
@@ -91,8 +87,8 @@ async def run_neural_benchmark_case(
     )
     display = DisplayCanvas.masked(
         length=canvas_tokens,
-        mask_token_id=ILLADA_MASK_TOKEN_ID,
-        eos_token_id=ILLADA_EOS_TOKEN_ID,
+        mask_token_id=adapter.mask_token_id,
+        eos_token_id=adapter.eos_token_id,
     )
     replay: ReplayEvaluationResult = await run_replay_case(
         policy,

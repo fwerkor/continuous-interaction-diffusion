@@ -55,6 +55,7 @@ class CIDTensorOutput:
     link_target_query: Tensor
     revision_logits: Tensor
     refresh_logits: Tensor
+    auxiliary_loss: Tensor | None = None
 
 
 def build_percept_routing_masks(

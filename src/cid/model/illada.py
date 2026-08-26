@@ -15,6 +15,10 @@ ILLADA_8B_BASE = "GSAI-ML/iLLaDA-8B-Base"
 ILLADA_8B_BASE_REVISION = "a1b5b5f8a31a3854a46205ee584178c04b45ec9a"
 ILLADA_MASK_TOKEN_ID = 5
 ILLADA_EOS_TOKEN_ID = 2
+LLADA_MOE_7B_A1B_BASE = "inclusionAI/LLaDA-MoE-7B-A1B-Base"
+LLADA_MOE_7B_A1B_BASE_REVISION = "daccaf1ccbf263a427bc9ac2a23b0b004fb275bf"
+LLADA_MOE_MASK_TOKEN_ID = 156895
+LLADA_MOE_EOS_TOKEN_ID = 156892
 DEFAULT_DISPLAY_CANVAS_TOKENS = 64
 DEFAULT_MAX_DISPLAY_TOKENS = 1536
 
@@ -60,6 +64,202 @@ def _chunked_illada_rms_norm_forward(
     return torch.cat(outputs, dim=1)
 
 
+def _rotate_half(hidden_states: torch.Tensor) -> torch.Tensor:
+    half = hidden_states.shape[-1] // 2
+    return torch.cat((-hidden_states[..., half:], hidden_states[..., :half]), dim=-1)
+
+
+def _apply_rotary(
+    query_states: torch.Tensor,
+    key_states: torch.Tensor,
+    cos: torch.Tensor,
+    sin: torch.Tensor,
+) -> tuple[torch.Tensor, torch.Tensor]:
+    cos = cos.unsqueeze(1)
+    sin = sin.unsqueeze(1)
+    return (
+        query_states * cos + _rotate_half(query_states) * sin,
+        key_states * cos + _rotate_half(key_states) * sin,
+    )
+
+
+def _repeat_kv(hidden_states: torch.Tensor, groups: int) -> torch.Tensor:
+    if groups == 1:
+        return hidden_states
+    batch, kv_heads, sequence, head_dim = hidden_states.shape
+    return (
+        hidden_states[:, :, None, :, :]
+        .expand(batch, kv_heads, groups, sequence, head_dim)
+        .reshape(batch, kv_heads * groups, sequence, head_dim)
+    )
+
+
+def _llada_moe_sdpa_forward(
+    module: nn.Module,
+    hidden_states: torch.Tensor,
+    attention_mask: torch.Tensor | None = None,
+    position_ids: torch.Tensor | None = None,
+    past_key_value: object | None = None,
+    output_attentions: bool = False,
+    use_cache: bool = False,
+    cache_position: torch.Tensor | None = None,
+    position_embeddings: tuple[torch.Tensor, torch.Tensor] | None = None,
+    **_: object,
+) -> tuple[torch.Tensor, None, object | None]:
+    """SDPA attention that restores CID key masks dropped by upstream LLaDA-MoE."""
+    del position_ids, cache_position
+    if output_attentions:
+        raise RuntimeError("CID LLaDA-MoE attention does not expose attention weights")
+    if use_cache or past_key_value is not None:
+        raise RuntimeError("CID diffusion attention does not support KV caching")
+    if position_embeddings is None:
+        raise RuntimeError("LLaDA-MoE decoder must provide rotary position embeddings")
+
+    batch_size, sequence_length, _ = hidden_states.shape
+    query_states = module.q_proj(hidden_states)
+    key_states = module.k_proj(hidden_states)
+    if hasattr(module, "q_norm"):
+        query_states = module.q_norm(query_states.reshape(-1, module.head_dim)).reshape(
+            batch_size, sequence_length, -1
+        )
+        key_states = module.k_norm(key_states.reshape(-1, module.head_dim)).reshape(
+            batch_size, sequence_length, -1
+        )
+    value_states = module.v_proj(hidden_states)
+
+    clip_qkv = getattr(module.config, "clip_qkv", None)
+    if clip_qkv is not None:
+        query_states = query_states.clamp(min=-clip_qkv, max=clip_qkv)
+        key_states = key_states.clamp(min=-clip_qkv, max=clip_qkv)
+        value_states = value_states.clamp(min=-clip_qkv, max=clip_qkv)
+
+    query_states = query_states.view(
+        batch_size, sequence_length, module.num_heads, module.head_dim
+    ).transpose(1, 2)
+    key_states = key_states.view(
+        batch_size, sequence_length, module.num_key_value_heads, module.head_dim
+    ).transpose(1, 2)
+    value_states = value_states.view(
+        batch_size, sequence_length, module.num_key_value_heads, module.head_dim
+    ).transpose(1, 2)
+    query_states, key_states = _apply_rotary(
+        query_states, key_states, *position_embeddings
+    )
+    key_states = _repeat_kv(key_states, module.num_key_value_groups)
+    value_states = _repeat_kv(value_states, module.num_key_value_groups)
+
+    key_mask = getattr(module, "_cid_key_padding_mask", attention_mask)
+    sdpa_mask = None
+    if key_mask is not None:
+        if key_mask.ndim == 2:
+            sdpa_mask = key_mask[:, None, None, : key_states.shape[-2]].bool()
+        elif key_mask.ndim == 4:
+            sdpa_mask = key_mask[..., : key_states.shape[-2]]
+        else:
+            raise ValueError("CID LLaDA-MoE attention mask must be rank 2 or rank 4")
+        if hidden_states.device.type == "cuda":
+            query_states = query_states.contiguous()
+            key_states = key_states.contiguous()
+            value_states = value_states.contiguous()
+
+    attention_output = torch.nn.functional.scaled_dot_product_attention(
+        query_states,
+        key_states,
+        value_states,
+        attn_mask=sdpa_mask,
+        dropout_p=module.attention_dropout if module.training else 0.0,
+        is_causal=False,
+    )
+    attention_output = attention_output.transpose(1, 2).contiguous().view(
+        batch_size, sequence_length, module.hidden_size
+    )
+    return module.o_proj(attention_output), None, past_key_value
+
+
+def _install_llada_moe_attention_mask_support(backbone: nn.Module) -> tuple[nn.Module, ...]:
+    decoder = backbone.get_decoder()
+    layers = getattr(decoder, "layers", None)
+    if layers is None or not layers:
+        raise RuntimeError("LLaDA-MoE decoder does not expose layers")
+    attention_modules = []
+    for layer in layers:
+        attention = getattr(layer, "self_attn", None)
+        if attention is None:
+            raise RuntimeError("LLaDA-MoE decoder layer does not expose self attention")
+        required = (
+            "q_proj",
+            "k_proj",
+            "v_proj",
+            "o_proj",
+            "num_heads",
+            "num_key_value_heads",
+            "num_key_value_groups",
+            "head_dim",
+            "hidden_size",
+        )
+        if any(not hasattr(attention, name) for name in required):
+            raise RuntimeError("unsupported LLaDA-MoE attention implementation")
+        attention.forward = MethodType(_llada_moe_sdpa_forward, attention)
+        attention_modules.append(attention)
+    return tuple(attention_modules)
+
+
+def _moe_load_balancing_loss(
+    router_logits: tuple[torch.Tensor, ...] | None,
+    *,
+    num_experts: int,
+    top_k: int,
+    attention_mask: torch.Tensor | None,
+) -> torch.Tensor | None:
+    """Match the upstream LLaDA-MoE router balancing objective.
+
+    CID calls the hidden decoder directly so it can inject TCT embeddings. That bypasses
+    ``LLaDAMoEModelLM.forward()``, where the upstream implementation normally adds this
+    objective. Recompute the same scalar from the decoder router logits instead of silently
+    dropping router supervision during full-parameter Stage B training.
+    """
+
+    if not router_logits:
+        return None
+    compute_device = router_logits[0].device
+    concatenated = torch.cat(
+        tuple(layer_logits.to(compute_device) for layer_logits in router_logits), dim=0
+    )
+    routing_weights = torch.softmax(concatenated, dim=-1, dtype=torch.float32)
+    _, selected_experts = torch.topk(routing_weights, top_k, dim=-1)
+    expert_mask = torch.nn.functional.one_hot(
+        selected_experts, num_classes=num_experts
+    )
+
+    if attention_mask is None:
+        tokens_per_expert = expert_mask.float().mean(dim=0)
+        router_prob_per_expert = routing_weights.mean(dim=0)
+    else:
+        batch_size, sequence_length = attention_mask.shape
+        layer_count = concatenated.shape[0] // (batch_size * sequence_length)
+        expert_attention_mask = (
+            attention_mask[None, :, :, None, None]
+            .expand(layer_count, batch_size, sequence_length, top_k, num_experts)
+            .reshape(-1, top_k, num_experts)
+            .to(device=compute_device, dtype=torch.float32)
+        )
+        tokens_per_expert = (
+            expert_mask.float() * expert_attention_mask
+        ).sum(dim=0) / expert_attention_mask.sum(dim=0).clamp_min(1.0)
+
+        router_attention_mask = (
+            attention_mask[None, :, :, None]
+            .expand(layer_count, batch_size, sequence_length, num_experts)
+            .reshape(-1, num_experts)
+            .to(device=compute_device, dtype=torch.float32)
+        )
+        router_prob_per_expert = (
+            routing_weights * router_attention_mask
+        ).sum(dim=0) / router_attention_mask.sum(dim=0).clamp_min(1.0)
+
+    return torch.sum(tokens_per_expert * router_prob_per_expert.unsqueeze(0)) * num_experts
+
+
 @dataclass(frozen=True, slots=True)
 class ILLaDACIDConfig:
     max_thought_slots: int = 128
@@ -102,7 +302,7 @@ class ILLaDACIDConfig:
 
 
 class ILLaDACIDAdapter(nn.Module):
-    """CID bridge for the native bidirectional iLLaDA masked-diffusion backbone."""
+    """CID bridge for compatible full-sequence LLaDA-family diffusion backbones."""
 
     def __init__(
         self,
@@ -116,11 +316,44 @@ class ILLaDACIDAdapter(nn.Module):
         self.config = config or ILLaDACIDConfig()
 
         backbone_config = backbone.config
-        if backbone_config.model_type != "illada":
-            raise ValueError(f"expected an iLLaDA backbone, got {backbone_config.model_type!r}")
+        model_type = str(backbone_config.model_type)
+        self.is_llada_moe = model_type == "llada" and int(
+            getattr(backbone_config, "num_experts", 0)
+        ) > 0
+        if model_type != "illada" and not self.is_llada_moe:
+            raise ValueError(
+                "expected an iLLaDA or LLaDA-MoE backbone, "
+                f"got {backbone_config.model_type!r}"
+            )
         self.d_model = int(backbone_config.hidden_size)
         self.vocab_size = int(backbone_config.vocab_size)
         self.max_position_embeddings = int(backbone_config.max_position_embeddings)
+        default_mask_token_id = (
+            LLADA_MOE_MASK_TOKEN_ID if self.is_llada_moe else ILLADA_MASK_TOKEN_ID
+        )
+        self.mask_token_id = int(
+            getattr(backbone_config, "mask_token_id", None) or default_mask_token_id
+        )
+        if not 0 <= self.mask_token_id < self.vocab_size:
+            raise ValueError("backbone mask token ID must be inside its vocabulary")
+        self.eos_token_id = int(
+            getattr(
+                backbone_config,
+                "eos_token_id",
+                LLADA_MOE_EOS_TOKEN_ID if self.is_llada_moe else ILLADA_EOS_TOKEN_ID,
+            )
+        )
+        self.router_aux_loss_coef = (
+            float(getattr(backbone_config, "router_aux_loss_coef", 0.0))
+            if self.is_llada_moe
+            else 0.0
+        )
+        self._router_aux_loss_enabled = False
+        self._llada_moe_attention_modules = (
+            _install_llada_moe_attention_mask_support(backbone)
+            if self.is_llada_moe
+            else ()
+        )
         num_heads = int(backbone_config.num_attention_heads)
         if self.d_model % num_heads:
             raise ValueError("iLLaDA hidden size must be divisible by its attention head count")
@@ -174,6 +407,9 @@ class ILLaDACIDAdapter(nn.Module):
         from_pretrained_kwargs.setdefault("trust_remote_code", True)
         if model_name_or_path == ILLADA_8B_BASE:
             from_pretrained_kwargs.setdefault("revision", ILLADA_8B_BASE_REVISION)
+        elif model_name_or_path == LLADA_MOE_7B_A1B_BASE:
+            from_pretrained_kwargs.setdefault("revision", LLADA_MOE_7B_A1B_BASE_REVISION)
+            from_pretrained_kwargs.setdefault("attn_implementation", "sdpa")
         backbone = AutoModelForCausalLM.from_pretrained(
             model_name_or_path,
             **from_pretrained_kwargs,
@@ -183,6 +419,7 @@ class ILLaDACIDAdapter(nn.Module):
     def set_backbone_trainable(self, trainable: bool) -> None:
         for parameter in self.backbone.parameters():
             parameter.requires_grad_(trainable)
+        self._router_aux_loss_enabled = self.is_llada_moe and trainable
 
     def set_gradient_checkpointing(
         self,
@@ -207,6 +444,10 @@ class ILLaDACIDAdapter(nn.Module):
             return
         if chunk_size <= 0:
             raise ValueError("MLP chunk size must be positive")
+        if self.is_llada_moe:
+            # The MoE FFN receives only routed token rows and does not expose the dense
+            # iLLaDA MLP contract patched below. Its sparse expert path is already token-wise.
+            return
         decoder = self.backbone.get_decoder()
         layers = getattr(decoder, "layers", None)
         if layers is None or len(layers) == 0:
@@ -317,11 +558,18 @@ class ILLaDACIDAdapter(nn.Module):
             prompt_keys=prompt_keys,
             display_keys=display_keys,
         )
+        decoder_kwargs: dict[str, object] = {
+            "inputs_embeds": seed_hidden,
+            "attention_mask": attention_mask,
+            "position_ids": position_ids,
+            "return_dict": True,
+        }
+        if self._router_aux_loss_enabled:
+            decoder_kwargs["output_router_logits"] = True
+        for attention in self._llada_moe_attention_modules:
+            attention._cid_key_padding_mask = attention_mask
         decoder_output = self.backbone.get_decoder()(
-            inputs_embeds=seed_hidden,
-            attention_mask=attention_mask,
-            position_ids=position_ids,
-            return_dict=True,
+            **decoder_kwargs,
         )
         hidden = decoder_output.last_hidden_state
 
@@ -346,7 +594,7 @@ class ILLaDACIDAdapter(nn.Module):
 
         t_hidden = hidden[:, :thought_slots]
         y_hidden = hidden[:, thought_slots + prompt_length :]
-        return self.output_heads(
+        output = self.output_heads(
             base_thought=thought,
             thought_hidden=t_hidden,
             thought_occupancy=slot_occupancy,
@@ -354,6 +602,16 @@ class ILLaDACIDAdapter(nn.Module):
             source_memory=source_memory,
             source_padding_mask=batch.source_padding_mask,
         )
+        if self._router_aux_loss_enabled:
+            raw_router_loss = _moe_load_balancing_loss(
+                getattr(decoder_output, "router_logits", None),
+                num_experts=int(self.backbone.config.num_experts),
+                top_k=int(self.backbone.config.num_experts_per_tok),
+                attention_mask=attention_mask,
+            )
+            if raw_router_loss is not None:
+                output.auxiliary_loss = raw_router_loss * self.router_aux_loss_coef
+        return output
 
     def _percept_query_mask(
         self,
@@ -545,6 +803,7 @@ class ILLaDACIDAdapter(nn.Module):
         modules = (
             self.channel_embedding,
             self.role_projection,
+            self.lifecycle_projection,
             self.scalar_projection,
             self.occupancy_projection,
             self.display_noise_projection,

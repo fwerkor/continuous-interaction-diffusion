@@ -912,6 +912,8 @@ def _benchmark(args: argparse.Namespace) -> None:
     from cid.model import (
         ILLADA_8B_BASE,
         ILLADA_8B_BASE_REVISION,
+        LLADA_MOE_7B_A1B_BASE,
+        LLADA_MOE_7B_A1B_BASE_REVISION,
         ILLaDACIDAdapter,
         ILLaDACIDConfig,
         load_cid_adapter_checkpoint,
@@ -957,6 +959,8 @@ def _benchmark(args: argparse.Namespace) -> None:
     tokenizer_kwargs: dict[str, object] = {"trust_remote_code": True}
     if args.model == ILLADA_8B_BASE:
         tokenizer_kwargs["revision"] = ILLADA_8B_BASE_REVISION
+    elif args.model == LLADA_MOE_7B_A1B_BASE:
+        tokenizer_kwargs["revision"] = LLADA_MOE_7B_A1B_BASE_REVISION
     tokenizer = AutoTokenizer.from_pretrained(args.model, **tokenizer_kwargs)
 
     try:
@@ -1070,6 +1074,8 @@ def _train_stage_a(args: argparse.Namespace) -> None:
     from cid.model import (
         ILLADA_8B_BASE,
         ILLADA_8B_BASE_REVISION,
+        LLADA_MOE_7B_A1B_BASE,
+        LLADA_MOE_7B_A1B_BASE_REVISION,
         CIDTrainer,
         CIDTrainerConfig,
         CIDTrainProgress,
@@ -1139,6 +1145,8 @@ def _train_stage_a(args: argparse.Namespace) -> None:
         tokenizer_kwargs: dict[str, object] = {"trust_remote_code": True}
         if args.model == ILLADA_8B_BASE:
             tokenizer_kwargs["revision"] = ILLADA_8B_BASE_REVISION
+        elif args.model == LLADA_MOE_7B_A1B_BASE:
+            tokenizer_kwargs["revision"] = LLADA_MOE_7B_A1B_BASE_REVISION
         tokenizer = AutoTokenizer.from_pretrained(args.model, **tokenizer_kwargs)
         tensorizer = ILLaDATrajectoryTensorizer(adapter, tokenizer)
         forward_model = (
@@ -1341,6 +1349,8 @@ def _train_stage_b(args: argparse.Namespace) -> None:
     from cid.model import (
         ILLADA_8B_BASE,
         ILLADA_8B_BASE_REVISION,
+        LLADA_MOE_7B_A1B_BASE,
+        LLADA_MOE_7B_A1B_BASE_REVISION,
         CIDTrainer,
         CIDTrainerConfig,
         ILLaDACIDAdapter,
@@ -1384,9 +1394,7 @@ def _train_stage_b(args: argparse.Namespace) -> None:
     world_size = int(os.environ.get("WORLD_SIZE", "1"))
     if world_size < 4:
         raise RuntimeError(
-            "Stage B AdamW for the 8B iLLaDA+CID model requires at least four GPU ranks; "
-            "the current path intentionally does not substitute CPU offload or a lower-memory "
-            "optimizer because those change training semantics"
+            "Stage B full-parameter CID training requires at least four GPU ranks"
         )
     if not torch.cuda.is_available():
         raise RuntimeError("Stage B full-parameter training requires CUDA GPUs")
@@ -1462,6 +1470,8 @@ def _train_stage_b(args: argparse.Namespace) -> None:
         tokenizer_kwargs: dict[str, object] = {"trust_remote_code": True}
         if args.model == ILLADA_8B_BASE:
             tokenizer_kwargs["revision"] = ILLADA_8B_BASE_REVISION
+        elif args.model == LLADA_MOE_7B_A1B_BASE:
+            tokenizer_kwargs["revision"] = LLADA_MOE_7B_A1B_BASE_REVISION
         tokenizer = AutoTokenizer.from_pretrained(args.model, **tokenizer_kwargs)
         adapter_config = ILLaDACIDConfig(
             max_thought_slots=args.thought_capacity,
@@ -1514,6 +1524,7 @@ def _train_stage_b(args: argparse.Namespace) -> None:
             adapter,
             device_id=device,
             compute_dtype=compute_dtype,
+            cpu_offload=args.fsdp_cpu_offload,
         )
         optimizer = torch.optim.AdamW(
             optimizer_groups,
@@ -2319,6 +2330,15 @@ def main() -> None:
     train_full.add_argument("--no-shuffle", action="store_true")
     train_full.add_argument("--log-every-steps", type=int, default=100)
     train_full.add_argument("--checkpoint-every-steps", type=int, default=2500)
+    train_full.add_argument(
+        "--fsdp-cpu-offload",
+        action=argparse.BooleanOptionalAction,
+        default=False,
+        help=(
+            "offload FSDP parameter/gradient shards and optimizer state to host memory; "
+            "intended for 24 GB GPUs and disabled by default"
+        ),
+    )
     train_full.add_argument(
         "--gradient-checkpointing",
         action=argparse.BooleanOptionalAction,

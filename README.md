@@ -106,12 +106,14 @@ For reproducible public task-pool construction:
 python -m pip install -e '.[data]'
 ```
 
-## iLLaDA backbone adapter
+## LLaDA-family backbone adapters
 
-CID now includes a real adapter for `GSAI-ML/iLLaDA-8B-Base`. The adapter keeps iLLaDA's native
-masked-token input embedding and LM head for the display channel, runs `[TCT | prompt | display]`
-through the same bidirectional decoder, and attaches CID-specific external-perception fusion and
-prediction heads. The immutable prompt remains token-level conditioning rather than being flattened
+CID supports both the dense `GSAI-ML/iLLaDA-8B-Base` production backbone and the sparse
+`inclusionAI/LLaDA-MoE-7B-A1B-Base` variant. Both keep their native masked-token input embedding and
+LM head for the display channel, run `[TCT | prompt | display]` through the same bidirectional
+decoder, and attach CID-specific external-perception fusion and prediction heads. The MoE path keeps
+its 64-expert/Top-8 routing and adds the upstream load-balancing auxiliary loss only when the
+backbone is unfrozen in Stage B. The immutable prompt remains token-level conditioning rather than being flattened
 into protected Facts. Empty TCT slots are masked as attention keys so they can query context for
 allocation without contaminating the current display.
 
@@ -134,9 +136,11 @@ test using the official iLLaDA implementation without downloading the 8B weights
 python examples/illada_tiny_smoke.py
 ```
 
-iLLaDA's tokenizer uses token id `5` for `<[MASK]>`; the same value is exported as
-`ILLADA_MASK_TOKEN_ID`. `CIDDiffusionScheduler` now supplies masked-display corruption, continuous
-TCT corruption, confidence-ranked iterative reveal, and bounded visible-token revision. Training
+Special tokens are backbone-specific: iLLaDA uses mask id `5`, while LLaDA-MoE uses mask id
+`156895` and EOS id `156892`. The adapter carries these IDs into training, runtime, checkpoints, and
+benchmarks so dense-8B and MoE artifacts cannot be mixed silently. `CIDDiffusionScheduler` supplies
+masked-display corruption, continuous TCT corruption, confidence-ranked iterative reveal, and
+bounded visible-token revision. Training
 mixes ordinary mask corruption with visible wrong-token replacement so the display head learns to
 correct stale text after new evidence arrives instead of treating every revealed token as final.
 
