@@ -433,6 +433,7 @@ class ILLaDACIDAdapter(nn.Module):
             else 0.0
         )
         self._router_aux_loss_enabled = False
+        self.validate_device_values = True
         self._llada_moe_attention_modules = (
             _install_llada_moe_attention_mask_support(backbone)
             if self.is_llada_moe
@@ -504,6 +505,10 @@ class ILLaDACIDAdapter(nn.Module):
         for parameter in self.backbone.parameters():
             parameter.requires_grad_(trainable)
         self._router_aux_loss_enabled = self.is_llada_moe and trainable
+
+    def set_device_value_validation(self, enabled: bool) -> None:
+        """Enable value checks that synchronize accelerator tensors with the host."""
+        self.validate_device_values = bool(enabled)
 
     def hidden_backbone(self) -> nn.Module:
         if self.backbone_family == "lfm2":
@@ -813,7 +818,9 @@ class ILLaDACIDAdapter(nn.Module):
             length=prompt_length,
             name="prompt_padding_mask",
         )
-        if bool(((batch.prompt_ids < 0) | (batch.prompt_ids >= self.vocab_size)).any()):
+        if self.validate_device_values and bool(
+            ((batch.prompt_ids < 0) | (batch.prompt_ids >= self.vocab_size)).any()
+        ):
             raise ValueError("prompt contains token IDs outside the backbone vocabulary")
         if batch.display_ids.ndim != 2 or batch.display_ids.shape[0] != batch_size:
             raise ValueError("display_ids must have shape [batch, display_tokens]")
@@ -843,7 +850,9 @@ class ILLaDACIDAdapter(nn.Module):
             + prompt_keys.sum(dim=1)
             + display_keys.sum(dim=1)
         )
-        if bool((logical_lengths > self.max_position_embeddings).any()):
+        if self.validate_device_values and bool(
+            (logical_lengths > self.max_position_embeddings).any()
+        ):
             raise ValueError(
                 "combined TCT, prompt, and display length exceeds backbone context capacity"
             )

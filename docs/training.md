@@ -135,6 +135,15 @@ model. CPU offload stays disabled by default, preserving the existing GPU path.
 memory while keeping standard AdamW; this is the supported low-memory path for the 7B-A1B variant
 on four 24 GB GPUs.
 
+Ascend NPU uses the same CLI and model adapters. `--device npu` selects HCCL and installs the
+`torch_npu` runtime hooks needed by the PyTorch 2.1 Ascend stack, including fused non-causal SDPA.
+Stage A uses DDP exactly as the CUDA path does. Stage B supports two NPU layouts: a one-NPU BF16
+full-parameter path for compact models such as CID-v1-0.4B, and FSDP `FULL_SHARD` when four or more
+NPU ranks are used for larger backbones. Two- and three-rank NPU Stage B are intentionally rejected
+because those layouts have not been validated. NPU Stage B is BF16-only and does not use
+`--fsdp-cpu-offload`. `CID_NPU_COMPILER_CACHE_DIR` may point to a persistent compiler-cache root;
+each local rank receives its own subdirectory automatically.
+
 Stage B can also run entirely on CPU with `--device cpu`. The CPU path uses Gloo and BF16, keeps
 parameters and optimizer state on host memory, and does not require four ranks. A direct one-process
 launch is supported; for large multi-socket servers, `torchrun` can use multiple CPU ranks and real
@@ -170,28 +179,31 @@ target-total count: resuming a partially completed one-epoch run with `--epochs 
 same epoch instead of scheduling a second one.
 
 The adapter is initially loaded as FP32 on CPU. A frozen BF16 snapshot of the input embedding is
-copied to the local GPU for dataset semantic transport targets and external-memory text, then FSDP
-moves and shards the trainable wrap units via `device_id`. This avoids a transient full-model FP32
-GPU copy before sharding. Prompt and display token IDs still use the live trainable embedding inside
-the FSDP forward, while the fixed snapshot keeps target embeddings stationary as the backbone
-changes.
+placed on the compute device for dataset semantic transport targets and external-memory text. CUDA
+and multi-rank NPU then use FSDP `device_id` to move/shard trainable wrap units; on NPU the freshly
+loaded model is moved off host memory before the next rank loads, limiting shared host-memory peaks.
+Prompt and display token IDs still use the live trainable embedding, while the fixed snapshot keeps
+target embeddings stationary as the backbone changes.
 
-Stage B checkpoints use FSDP sharded model state with `torch.distributed.checkpoint`; optimizer
-state remains rank-local. Rank-local trainer state preserves the LR schedule, diffusion/shuffle RNG,
-transition and optimizer counts, completed epochs, and the per-rank rollout-window cursor. The
-default launcher logs every 100 optimizer steps and writes a periodic checkpoint every 2,500 steps
-at a clean gradient-accumulation boundary. `stage-b-latest` is updated only after a checkpoint is
-complete, and the previous periodic checkpoint is removed only after its successor is safe. Resume
-requires the same world size and exact training JSONL SHA-256, and the stored trainer configuration
-prevents silently changing LR, accumulation, or rollout policy midway through a run.
+Multi-rank Stage B checkpoints use FSDP sharded model state with
+`torch.distributed.checkpoint`. Modern PyTorch stores the optimizer through the same sharded DCP
+path. The Ascend PyTorch 2.1 compatibility path stores the model through DCP but serializes one
+rank-local AdamW state at a time, avoiding both unsupported sharded-optimizer behavior and large
+simultaneous host-memory spikes. The single-NPU compact path uses the trainer's ordinary `.pt`
+checkpoint because no FSDP sharding exists. Rank-local trainer state preserves the LR schedule,
+diffusion/shuffle RNG, transition and optimizer counts, completed epochs, and the per-rank rollout
+cursor. The default launcher logs every 100 optimizer steps and writes periodic checkpoints only at
+clean gradient-accumulation boundaries. The corresponding `stage-b-latest` (or
+`stage-b-latest.pt` for single NPU) is updated only after a checkpoint is complete.
 
 A fresh Stage B run requires `--init-cid-checkpoint`; `--resume` is mutually exclusive and restores
 the complete Stage B model/optimizer state. `scripts/train_cid_v1_7b_a1b_4x3090.sh` provides a
 separate, resumable 4×3090 launcher whose default root is `/workspace/cid-v1-7b-a1b`; it never
 uses the dense 8B output directories. The repository tests the optimizer grouping and LR
 multipliers, a CPU FSDP checkpoint round trip, and a true two-rank Gloo `FULL_SHARD`
-forward/backward/distributed-checkpoint smoke. The two-rank smoke is a correctness test only; the
-8B production launcher itself enforces four or more GPU ranks.
+forward/backward/distributed-checkpoint smoke. The two-rank Gloo smoke is a correctness test only; CUDA Stage B enforces four or more GPU ranks,
+and multi-rank NPU Stage B enforces four or more NPU ranks. The same backbone loader covers iLLaDA
+8B, LLaDA-MoE 7B-A1B, and LFM2.5 0.4B, so hardware selection does not create model-specific forks.
 
 ### Neural replay benchmark
 
@@ -201,8 +213,10 @@ from an empty TCT and a masked display. `--seed-teacher-state` supplies only the
 and is intended as a diagnostic for separating initial allocation failures from downstream binding,
 assimilation, revision, and convergence behavior.
 
-Stage A evaluation is single-process. Stage B evaluation runs under the checkpoint's original FSDP
-world size and restores model shards only; no optimizer is constructed or loaded. Per-case JSONL
+Stage A evaluation is single-process. Sharded Stage B evaluation runs under the checkpoint's
+original accelerator world size and restores model shards only; no optimizer is constructed or
+loaded. A single-NPU compact Stage B `.pt` checkpoint is evaluated directly in one process and uses
+the same NPU BF16 autocast path as training. Per-case JSONL
 records final text/token IDs, runtime steps, and the complete task evaluation. The summary JSON
 aggregates convergence, exact display accuracy, observation coverage/staleness, latent-to-executable
 delay, binding-to-observation delay, and observation-to-projection lag.

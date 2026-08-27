@@ -2,9 +2,9 @@ from __future__ import annotations
 
 from collections.abc import Mapping
 from dataclasses import dataclass, field
-from enum import StrEnum
 from typing import Any, Protocol
 
+from cid._compat import StrEnum
 from cid.grounding import Anchor, ObjectKind, ObjectRef
 from cid.state import CognitiveField, DisplayCanvas, FactSnapshot
 

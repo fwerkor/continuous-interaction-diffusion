@@ -3,10 +3,10 @@ from __future__ import annotations
 from collections.abc import Mapping
 from copy import deepcopy
 from dataclasses import dataclass, field, replace
-from enum import StrEnum
 from types import MappingProxyType
 from typing import Any
 
+from cid._compat import StrEnum
 from cid.grounding import Anchor, CognitiveLink, LinkRelation, ObjectRef
 
 

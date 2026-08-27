@@ -3,9 +3,9 @@ from __future__ import annotations
 import json
 from collections.abc import Mapping
 from dataclasses import dataclass
-from enum import StrEnum
 from typing import Any
 
+from cid._compat import StrEnum
 from cid.contracts import FreshnessDemand, InformationNeed, Observation, SourceDescriptor
 from cid.grounding import ObjectRef
 

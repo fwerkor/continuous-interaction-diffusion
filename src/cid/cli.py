@@ -10,6 +10,13 @@ import time
 from dataclasses import asdict
 from pathlib import Path
 
+from cid.accelerator import (
+    configure_torch_accelerator,
+    distributed_backend,
+    resolve_torch_device_type,
+    torch_device_available,
+    wrap_npu_autocast,
+)
 from cid.composed_training import ComposedTrainingConfig, build_composed_distillation
 from cid.computational_training import (
     ComputationalTrainingConfig,
@@ -924,29 +931,31 @@ def _benchmark(args: argparse.Namespace) -> None:
 
     checkpoint = Path(args.checkpoint)
     stage_b = args.checkpoint_kind == "stage-b"
+    stage_b_sharded = stage_b and checkpoint.is_dir()
     world_size = int(os.environ.get("WORLD_SIZE", "1"))
     rank = int(os.environ.get("RANK", "0"))
     local_rank = int(os.environ.get("LOCAL_RANK", "0"))
-    distributed = stage_b
-    if stage_b:
+    distributed = stage_b_sharded
+    device_type = resolve_torch_device_type(torch, args.device)
+    if stage_b_sharded:
         if world_size < 2:
-            raise RuntimeError("Stage B benchmark must run under multi-GPU torchrun")
-        if not torch.cuda.is_available():
-            raise RuntimeError("Stage B benchmark requires CUDA GPUs")
-        torch.cuda.set_device(local_rank)
-        dist.init_process_group(backend="nccl")
+            raise RuntimeError(
+                "sharded Stage B benchmark must run under multi-accelerator torchrun"
+            )
+        if device_type == "cpu":
+            raise RuntimeError("sharded Stage B benchmark requires CUDA GPUs or Ascend NPUs")
+        configure_torch_accelerator(torch, device_type, local_rank)
+        dist.init_process_group(backend=distributed_backend(device_type))
         rank = dist.get_rank()
         world_size = dist.get_world_size()
-        device = torch.device("cuda", local_rank)
+        device = torch.device(device_type, local_rank)
         metadata = json.loads((checkpoint / "metadata.json").read_text(encoding="utf-8"))
         adapter_config = ILLaDACIDConfig(**metadata["adapter_config"])
     else:
         if world_size > 1:
-            raise RuntimeError("Stage A benchmark is single-process; omit torchrun")
-        device_name = args.device
-        if device_name == "auto":
-            device_name = "cuda" if torch.cuda.is_available() else "cpu"
-        device = torch.device(device_name)
+            raise RuntimeError("unsharded benchmark checkpoints are single-process; omit torchrun")
+        configure_torch_accelerator(torch, device_type, local_rank)
+        device = torch.device(device_type)
         raw = torch.load(checkpoint, map_location="cpu", weights_only=False)
         adapter_config = ILLaDACIDConfig(**raw["adapter_config"])
 
@@ -973,7 +982,7 @@ def _benchmark(args: argparse.Namespace) -> None:
             ).to(device)
 
         adapter = None
-        if stage_b:
+        if stage_b_sharded:
             for loading_rank in range(world_size):
                 if rank == loading_rank:
                     adapter = load_adapter()
@@ -991,12 +1000,22 @@ def _benchmark(args: argparse.Namespace) -> None:
                 dtype=dtype,
             )
             adapter.set_backbone_trainable(True)
-            forward_model = wrap_stage_b_fsdp(
-                adapter,
-                device_id=device,
-                compute_dtype=dtype,
-            )
-            load_stage_b_model_checkpoint(forward_model, adapter, checkpoint)
+            if device_type == "npu":
+                adapter.set_device_value_validation(False)
+            if stage_b_sharded:
+                forward_model = wrap_stage_b_fsdp(
+                    adapter,
+                    device_id=device,
+                    compute_dtype=dtype,
+                )
+                load_stage_b_model_checkpoint(forward_model, adapter, checkpoint)
+            else:
+                load_cid_adapter_checkpoint(adapter, checkpoint)
+                forward_model = (
+                    wrap_npu_autocast(torch, adapter, dtype=dtype)
+                    if device_type == "npu"
+                    else adapter
+                )
         else:
             load_cid_adapter_checkpoint(adapter, checkpoint)
             text_encoder = ILLaDATextEncoder(adapter, tokenizer)
@@ -1095,21 +1114,19 @@ def _train_stage_a(args: argparse.Namespace) -> None:
     distributed = world_size > 1
     rank = int(os.environ.get("RANK", "0"))
     local_rank = int(os.environ.get("LOCAL_RANK", "0"))
+    device_type = resolve_torch_device_type(torch, args.device)
+    configure_torch_accelerator(torch, device_type, local_rank)
     if distributed:
-        use_cuda = args.device != "cpu" and torch.cuda.is_available()
-        backend = "nccl" if use_cuda else "gloo"
-        dist.init_process_group(backend=backend)
+        dist.init_process_group(backend=distributed_backend(device_type))
         rank = dist.get_rank()
         world_size = dist.get_world_size()
-        if use_cuda:
-            torch.cuda.set_device(local_rank)
-            device = f"cuda:{local_rank}"
-        else:
-            device = "cpu"
+        device = (
+            f"{device_type}:{local_rank}"
+            if device_type in {"cuda", "npu"}
+            else "cpu"
+        )
     else:
-        device = args.device
-        if device == "auto":
-            device = "cuda" if torch.cuda.is_available() else "cpu"
+        device = device_type
 
     try:
         adapter_config = ILLaDACIDConfig(
@@ -1137,6 +1154,8 @@ def _train_stage_a(args: argparse.Namespace) -> None:
             adapter = load_adapter()
         if adapter is None:
             raise RuntimeError("failed to load CID adapter on this training rank")
+        if device_type == "npu":
+            adapter.set_device_value_validation(False)
         if args.gradient_checkpointing:
             adapter.set_gradient_checkpointing(True)
         grouped_moe_layers = adapter.pack_frozen_moe_experts()
@@ -1150,7 +1169,11 @@ def _train_stage_a(args: argparse.Namespace) -> None:
         forward_model = (
             wrap_stage_a_ddp(
                 adapter,
-                device_ids=[local_rank] if str(device).startswith("cuda") else None,
+                device_ids=(
+                    [local_rank]
+                    if str(device).split(":", 1)[0] in {"cuda", "npu"}
+                    else None
+                ),
             )
             if distributed
             else adapter
@@ -1344,32 +1367,52 @@ def _stage_b_execution_target(
     requested_device: str,
     *,
     cuda_available: bool,
+    npu_available: bool,
     world_size: int,
     local_rank: int,
     dtype: str,
     cpu_offload: bool,
 ) -> tuple[str, int | None, str]:
     """Resolve Stage B compute device and distributed backend."""
-    if requested_device not in {"auto", "cuda", "cpu"}:
+    if requested_device not in {"auto", "cuda", "npu", "cpu"}:
         raise ValueError(f"unsupported Stage B device {requested_device!r}")
     if world_size <= 0:
         raise ValueError("Stage B world size must be positive")
 
-    if requested_device == "cuda" and not cuda_available:
+    if requested_device == "auto":
+        device_type = "cuda" if cuda_available else "npu" if npu_available else "cpu"
+    else:
+        device_type = requested_device
+
+    if device_type == "cuda" and not cuda_available:
         raise RuntimeError("Stage B was asked to use CUDA, but CUDA is unavailable")
-    use_cuda = requested_device != "cpu" and cuda_available
-    if use_cuda:
+    if device_type == "npu" and not npu_available:
+        raise RuntimeError("Stage B was asked to use an Ascend NPU, but NPU is unavailable")
+
+    if device_type == "cuda":
         if world_size < 4:
             raise RuntimeError(
                 "Stage B CUDA full-parameter CID training requires at least four GPU ranks"
             )
-        return "cuda", local_rank, "nccl"
+        return "cuda", local_rank, distributed_backend("cuda")
+
+    if device_type == "npu":
+        if world_size in {2, 3}:
+            raise RuntimeError(
+                "Stage B NPU training supports one NPU rank for compact models or "
+                "at least four NPU ranks for sharded large-model training"
+            )
+        if dtype != "bf16":
+            raise ValueError("Stage B NPU training currently supports --dtype bf16 only")
+        if cpu_offload:
+            raise ValueError("--fsdp-cpu-offload is not used by NPU Stage B training")
+        return "npu", local_rank, distributed_backend("npu")
 
     if dtype != "bf16":
         raise ValueError("Stage B CPU training currently supports --dtype bf16 only")
     if cpu_offload:
         raise ValueError("--fsdp-cpu-offload is only meaningful for CUDA Stage B training")
-    return "cpu", None, "gloo"
+    return "cpu", None, distributed_backend("cpu")
 
 
 def _init_stage_b_process_group(
@@ -1421,7 +1464,7 @@ def _train_stage_b(args: argparse.Namespace) -> None:
         wrap_stage_b_fsdp,
     )
     from cid.model.encoding import ILLaDATextEncoder
-    from cid.model.loading import pretrained_revision
+    from cid.model.loading import backbone_model_type, pretrained_revision
 
     if args.resume and args.init_cid_checkpoint:
         raise ValueError("--resume and --init-cid-checkpoint are mutually exclusive")
@@ -1448,7 +1491,8 @@ def _train_stage_b(args: argparse.Namespace) -> None:
     local_rank = int(os.environ.get("LOCAL_RANK", "0"))
     device_type, device_index, backend = _stage_b_execution_target(
         args.device,
-        cuda_available=torch.cuda.is_available(),
+        cuda_available=torch_device_available(torch, "cuda"),
+        npu_available=torch_device_available(torch, "npu"),
         world_size=world_size,
         local_rank=local_rank,
         dtype=args.dtype,
@@ -1469,12 +1513,18 @@ def _train_stage_b(args: argparse.Namespace) -> None:
         "bf16": torch.bfloat16,
         "fp16": torch.float16,
     }[args.dtype]
-    if device_type == "cuda":
+    if device_type in {"cuda", "npu"}:
         assert device_index is not None
-        torch.cuda.set_device(device_index)
-        device = torch.device("cuda", device_index)
+        configure_torch_accelerator(torch, device_type, device_index)
+        device = torch.device(device_type, device_index)
     else:
         device = torch.device("cpu")
+    single_npu_stage_b = device_type == "npu" and world_size == 1
+    if single_npu_stage_b and backbone_model_type(args.model) != "lfm2":
+        raise RuntimeError(
+            "single-NPU Stage B is supported only for the compact LFM2 CID-v1-0.4B backbone; "
+            "larger backbones require at least four NPU ranks"
+        )
     rendezvous_dir = _init_stage_b_process_group(
         dist,
         backend=backend,
@@ -1507,8 +1557,11 @@ def _train_stage_b(args: argparse.Namespace) -> None:
         resume_rank0_state = None
         if args.resume:
             resume_path = Path(args.resume)
+            resume_state_path = (
+                resume_path if single_npu_stage_b else resume_path / "rank-0000.pt"
+            )
             resume_rank0_state = torch.load(
-                resume_path / "rank-0000.pt",
+                resume_state_path,
                 map_location="cpu",
                 weights_only=False,
             )
@@ -1560,6 +1613,11 @@ def _train_stage_b(args: argparse.Namespace) -> None:
                 dtype=compute_dtype,
                 embedding_device="cpu",
             )
+            # Ascend ranks have ample device memory but commonly share a tighter host-memory
+            # cgroup. Move each freshly loaded model to its NPU before the next rank loads.
+            if device_type == "npu":
+                model.set_device_value_validation(False)
+                model = model.to(device)
             model.set_backbone_trainable(True)
             if args.gradient_checkpointing:
                 model.set_gradient_checkpointing(True, use_reentrant=False)
@@ -1581,12 +1639,17 @@ def _train_stage_b(args: argparse.Namespace) -> None:
             backbone_lr_scale=args.backbone_lr_scale,
             weight_decay=args.weight_decay,
         )
-        fsdp_model = wrap_stage_b_fsdp(
-            adapter,
-            device_id=device,
-            compute_dtype=compute_dtype,
-            cpu_offload=args.fsdp_cpu_offload,
-        )
+        if single_npu_stage_b:
+            training_model = wrap_npu_autocast(torch, adapter, dtype=compute_dtype)
+            gradient_clipper = None
+        else:
+            training_model = wrap_stage_b_fsdp(
+                adapter,
+                device_id=device,
+                compute_dtype=compute_dtype,
+                cpu_offload=args.fsdp_cpu_offload,
+            )
+            gradient_clipper = training_model.clip_grad_norm_
         optimizer = torch.optim.AdamW(
             optimizer_groups,
             lr=args.learning_rate,
@@ -1619,18 +1682,21 @@ def _train_stage_b(args: argparse.Namespace) -> None:
                 seed=args.seed,
             ),
             optimizer=optimizer,
-            forward_model=fsdp_model,
-            gradient_clipper=fsdp_model.clip_grad_norm_,
+            forward_model=training_model,
+            gradient_clipper=gradient_clipper,
         )
         loaded_checkpoint_metadata = None
         if args.resume:
-            loaded_checkpoint_metadata = load_stage_b_checkpoint(
-                fsdp_model,
-                optimizer,
-                trainer,
-                args.resume,
-                expected_dataset_sha256=dataset_manifest.sha256,
-            )
+            if single_npu_stage_b:
+                trainer.load_checkpoint(args.resume)
+            else:
+                loaded_checkpoint_metadata = load_stage_b_checkpoint(
+                    training_model,
+                    optimizer,
+                    trainer,
+                    args.resume,
+                    expected_dataset_sha256=dataset_manifest.sha256,
+                )
         else:
             trainer.reseed(args.seed + rank)
 
@@ -1801,34 +1867,48 @@ def _train_stage_b(args: argparse.Namespace) -> None:
                 if int(clean.item()) == 0:
                     return
 
-                checkpoint = output_dir / f"stage-b-step-{progress.optimizer_steps:08d}"
-                consumed_by_bucket = stage_b_consumed_windows_by_bucket(
-                    windows,
-                    current_epoch_shard,
-                    local_windows_seen=progress.rollout_windows_seen_in_epoch,
-                    world_size=world_size,
-                    base_consumed_by_bucket=current_base_consumed,
+                checkpoint = output_dir / (
+                    f"stage-b-step-{progress.optimizer_steps:08d}.pt"
+                    if single_npu_stage_b
+                    else f"stage-b-step-{progress.optimizer_steps:08d}"
                 )
-                save_stage_b_checkpoint(
-                    fsdp_model,
-                    optimizer,
-                    trainer,
-                    checkpoint,
-                    dataset_sha256=dataset_manifest.sha256,
-                    epoch_progress={
-                        "epoch": current_epoch,
-                        "base_consumed_by_bucket": current_base_consumed,
-                        "consumed_by_bucket": consumed_by_bucket,
-                    },
-                )
+                if single_npu_stage_b:
+                    trainer.save_checkpoint(checkpoint)
+                else:
+                    consumed_by_bucket = stage_b_consumed_windows_by_bucket(
+                        windows,
+                        current_epoch_shard,
+                        local_windows_seen=progress.rollout_windows_seen_in_epoch,
+                        world_size=world_size,
+                        base_consumed_by_bucket=current_base_consumed,
+                    )
+                    save_stage_b_checkpoint(
+                        training_model,
+                        optimizer,
+                        trainer,
+                        checkpoint,
+                        dataset_sha256=dataset_manifest.sha256,
+                        epoch_progress={
+                            "epoch": current_epoch,
+                            "base_consumed_by_bucket": current_base_consumed,
+                            "consumed_by_bucket": consumed_by_bucket,
+                        },
+                    )
                 previous = last_periodic_checkpoint
                 last_periodic_checkpoint = checkpoint
                 if rank == 0:
-                    latest = output_dir / "stage-b-latest"
+                    latest = output_dir / (
+                        "stage-b-latest.pt" if single_npu_stage_b else "stage-b-latest"
+                    )
                     latest.unlink(missing_ok=True)
-                    latest.symlink_to(checkpoint.name, target_is_directory=True)
+                    latest.symlink_to(
+                        checkpoint.name, target_is_directory=not single_npu_stage_b
+                    )
                     if previous is not None and previous != checkpoint:
-                        shutil.rmtree(previous, ignore_errors=True)
+                        if single_npu_stage_b:
+                            previous.unlink(missing_ok=True)
+                        else:
+                            shutil.rmtree(previous, ignore_errors=True)
                     print(
                         f"checkpoint stage=B optimizer_steps={progress.optimizer_steps} "
                         f"path={checkpoint}",
@@ -1852,27 +1932,41 @@ def _train_stage_b(args: argparse.Namespace) -> None:
                     float(report.transitions),
                 ],
                 device=device,
-                dtype=torch.float64,
+                dtype=torch.float32 if device_type == "npu" else torch.float64,
             )
             dist.all_reduce(aggregate)
             mean_loss = float(aggregate[0] / aggregate[2])
             raw_mean_loss = float(aggregate[1] / aggregate[2])
             transition_count = int(aggregate[2])
 
-            checkpoint = output_dir / f"stage-b-step-{trainer.state.optimizer_steps:08d}"
-            save_stage_b_checkpoint(
-                fsdp_model,
-                optimizer,
-                trainer,
-                checkpoint,
-                dataset_sha256=dataset_manifest.sha256,
+            checkpoint = output_dir / (
+                f"stage-b-step-{trainer.state.optimizer_steps:08d}.pt"
+                if single_npu_stage_b
+                else f"stage-b-step-{trainer.state.optimizer_steps:08d}"
             )
+            if single_npu_stage_b:
+                trainer.save_checkpoint(checkpoint)
+            else:
+                save_stage_b_checkpoint(
+                    training_model,
+                    optimizer,
+                    trainer,
+                    checkpoint,
+                    dataset_sha256=dataset_manifest.sha256,
+                )
             if rank == 0:
-                latest = output_dir / "stage-b-latest"
+                latest = output_dir / (
+                    "stage-b-latest.pt" if single_npu_stage_b else "stage-b-latest"
+                )
                 latest.unlink(missing_ok=True)
-                latest.symlink_to(checkpoint.name, target_is_directory=True)
+                latest.symlink_to(
+                    checkpoint.name, target_is_directory=not single_npu_stage_b
+                )
                 if last_periodic_checkpoint is not None and last_periodic_checkpoint != checkpoint:
-                    shutil.rmtree(last_periodic_checkpoint, ignore_errors=True)
+                    if single_npu_stage_b:
+                        last_periodic_checkpoint.unlink(missing_ok=True)
+                    else:
+                        shutil.rmtree(last_periodic_checkpoint, ignore_errors=True)
                     last_periodic_checkpoint = None
                 print(
                     f"epoch={epoch} transitions={transition_count} "
@@ -2289,7 +2383,7 @@ def main() -> None:
     benchmark.add_argument("--model", default="GSAI-ML/iLLaDA-8B-Base")
     benchmark.add_argument("--output", required=True)
     benchmark.add_argument("--summary-output", required=True)
-    benchmark.add_argument("--device", default="auto")
+    benchmark.add_argument("--device", choices=("auto", "cuda", "npu", "cpu"), default="auto")
     benchmark.add_argument("--dtype", choices=("bf16", "fp16", "fp32"), default="bf16")
     benchmark.add_argument("--denoising-steps", type=int, default=8)
     benchmark.add_argument("--max-steps", type=int, default=32)
@@ -2304,7 +2398,7 @@ def main() -> None:
     train.add_argument("--output-dir", required=True)
     train.add_argument("--model", default="GSAI-ML/iLLaDA-8B-Base")
     train.add_argument("--resume")
-    train.add_argument("--device", default="auto")
+    train.add_argument("--device", choices=("auto", "cuda", "npu", "cpu"), default="auto")
     train.add_argument("--dtype", choices=("bf16", "fp16", "fp32"), default="bf16")
     train.add_argument("--epochs", type=int, default=1)
     train.add_argument("--learning-rate", type=float, default=1e-4)
@@ -2342,9 +2436,9 @@ def main() -> None:
     train_full.add_argument("--model", default="GSAI-ML/iLLaDA-8B-Base")
     train_full.add_argument(
         "--device",
-        choices=("auto", "cuda", "cpu"),
+        choices=("auto", "cuda", "npu", "cpu"),
         default="auto",
-        help="Stage B compute device; auto prefers CUDA when available",
+        help="Stage B compute device; auto prefers CUDA, then Ascend NPU, then CPU",
     )
     train_full.add_argument("--resume")
     train_full.add_argument("--init-cid-checkpoint")

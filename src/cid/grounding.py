@@ -2,8 +2,9 @@ from __future__ import annotations
 
 from collections.abc import Mapping
 from dataclasses import dataclass
-from enum import StrEnum
 from typing import TYPE_CHECKING, Any
+
+from cid._compat import StrEnum
 
 if TYPE_CHECKING:
     from cid.state import CognitiveField

@@ -1,7 +1,9 @@
 from __future__ import annotations
 
+import gc
 import json
 import math
+import os
 import random
 from collections.abc import Callable, Mapping
 from dataclasses import asdict, dataclass, replace
@@ -385,15 +387,19 @@ class CIDTrainer:
             raw_loss_sum += raw_loss
             loss_sum += raw_loss * loss_weight
             transition_count += batch_size
-            rollout_states = [
-                self._rollout_state_from_prediction(
-                    sample,
-                    training_batch,
-                    output,
-                    batch_index=index,
-                )
-                for index, sample in enumerate(samples)
-            ]
+            # The predicted state is consumed only by a later transition in the same
+            # window. Skipping the terminal materialization avoids pure accelerator work,
+            # which is especially significant for compact NPU backbones.
+            if offset + 1 < next(iter(lengths)) and rollout_probability > 0.0:
+                rollout_states = [
+                    self._rollout_state_from_prediction(
+                        sample,
+                        training_batch,
+                        output,
+                        batch_index=index,
+                    )
+                    for index, sample in enumerate(samples)
+                ]
             del output, training_batch, losses, samples
         return loss_sum, raw_loss_sum, transition_count
 
@@ -2102,7 +2108,129 @@ def wrap_stage_b_fsdp(
     )
 
 
+def _ensure_stage_b_npu_sharded_tensor_compatibility() -> None:
+    """Patch the PyTorch 2.1 ShardedTensor device fallback on Ascend-only ranks."""
+
+    npu = getattr(torch, "npu", None)
+    torch_version = str(torch.__version__).split("+", 1)[0]
+    if (
+        npu is None
+        or not npu.is_available()
+        or torch.cuda.is_available()
+        or not torch_version.startswith("2.1.")
+    ):
+        return
+    try:
+        from torch.distributed._shard.sharded_tensor.api import _SHARDED_OPS, ShardedTensor
+    except ImportError:
+        return
+
+    key = torch.Tensor.device.__get__
+    current = _SHARDED_OPS.get(key)
+    if getattr(current, "_cid_npu_compatible", False):
+        return
+
+    def npu_tensor_device(types, args=(), kwargs=None, pg=None):
+        del types, kwargs
+        sharded = args[0]
+        if not isinstance(sharded, ShardedTensor):
+            raise TypeError("input needs to be a ShardedTensor")
+        if sharded._local_shards:
+            return sharded._local_shards[0].tensor.device
+        if pg and pg._get_backend_name() == "gloo":
+            return torch.device("cpu")
+        return torch.device("npu", npu.current_device())
+
+    npu_tensor_device._cid_npu_compatible = True
+    _SHARDED_OPS[key] = npu_tensor_device
+
+
+def _stage_b_dcp_save(state: Mapping[str, Any], destination: Path) -> None:
+    import torch.distributed.checkpoint as dcp
+
+    if hasattr(dcp, "save"):
+        dcp.save(state, checkpoint_id=destination)
+    else:
+        dcp.save_state_dict(
+            state,
+            storage_writer=dcp.FileSystemWriter(destination),
+        )
+
+
+def _stage_b_dcp_load(state: Mapping[str, Any], source: Path) -> None:
+    import torch.distributed.checkpoint as dcp
+
+    if hasattr(dcp, "load"):
+        dcp.load(state, checkpoint_id=source)
+    else:
+        dcp.load_state_dict(
+            state,
+            storage_reader=dcp.FileSystemReader(source),
+        )
+
+
+def _stage_b_dcp_load_optimizer_state(
+    model_state: Mapping[str, Any],
+    source: Path,
+) -> Mapping[str, Any]:
+    import torch.distributed.checkpoint as dcp
+    import torch.distributed.checkpoint.optimizer as dcp_optimizer
+
+    loader = getattr(dcp_optimizer, "load_sharded_optimizer_state_dict", None)
+    if loader is None:
+        loader = dcp.load_sharded_optimizer_state_dict
+    return loader(
+        model_state,
+        optimizer_key="optimizer",
+        storage_reader=dcp.FileSystemReader(source),
+    )["optimizer"]
+
+
+def _stage_b_use_rank_local_optimizer_checkpoint() -> bool:
+    """Use the stable same-world-size optimizer format on the Ascend PyTorch 2.1 stack."""
+
+    npu = getattr(torch, "npu", None)
+    return (
+        npu is not None
+        and npu.is_available()
+        and not torch.cuda.is_available()
+        and str(torch.__version__).split("+", 1)[0].startswith("2.1.")
+    )
+
+
+def _stage_b_move_state_to_cpu(value: Any) -> Any:
+    if isinstance(value, torch.Tensor):
+        return value.detach().cpu()
+    if isinstance(value, dict):
+        return {key: _stage_b_move_state_to_cpu(item) for key, item in value.items()}
+    if isinstance(value, list):
+        return [_stage_b_move_state_to_cpu(item) for item in value]
+    if isinstance(value, tuple):
+        return tuple(_stage_b_move_state_to_cpu(item) for item in value)
+    return value
+
+
+def _stage_b_save_rank_local_optimizer_state(
+    optimizer: torch.optim.Optimizer,
+    path: Path,
+) -> None:
+    """Persist one optimizer shard with bounded host-memory residency."""
+
+    state = _stage_b_move_state_to_cpu(optimizer.state_dict())
+    try:
+        with path.open("wb") as handle:
+            torch.save(state, handle)
+            handle.flush()
+            os.fsync(handle.fileno())
+            if hasattr(os, "posix_fadvise") and hasattr(os, "POSIX_FADV_DONTNEED"):
+                os.posix_fadvise(handle.fileno(), 0, 0, os.POSIX_FADV_DONTNEED)
+    finally:
+        del state
+        gc.collect()
+
+
 def _stage_b_sharded_state_dict_context(model: torch.nn.Module) -> Any:
+    _ensure_stage_b_npu_sharded_tensor_compatibility()
     from torch.distributed.fsdp import (
         FullyShardedDataParallel,
         ShardedOptimStateDictConfig,
@@ -2132,7 +2260,6 @@ def save_stage_b_checkpoint(
     epoch_progress: Mapping[str, Any] | None = None,
 ) -> None:
     import torch.distributed as dist
-    import torch.distributed.checkpoint as dcp
     from torch.distributed.fsdp import FullyShardedDataParallel
 
     if not dist.is_initialized():
@@ -2142,23 +2269,46 @@ def save_stage_b_checkpoint(
         destination.mkdir(parents=True, exist_ok=True)
     dist.barrier()
 
+    rank_local_optimizer = _stage_b_use_rank_local_optimizer_checkpoint()
     with _stage_b_sharded_state_dict_context(model):
         model_state = model.state_dict()
-        optimizer_state = FullyShardedDataParallel.optim_state_dict(model, optimizer)
-    dcp.save(
-        {"model": model_state, "optimizer": optimizer_state},
-        checkpoint_id=destination / "distributed",
-    )
+        optimizer_state = (
+            None
+            if rank_local_optimizer
+            else FullyShardedDataParallel.optim_state_dict(model, optimizer)
+        )
+    distributed_state = {"model": model_state}
+    if optimizer_state is not None:
+        distributed_state["optimizer"] = optimizer_state
+    _stage_b_dcp_save(distributed_state, destination / "distributed")
+
+    if rank_local_optimizer:
+        # PyTorch 2.1 + torch_npu cannot reliably round-trip the sharded optimizer
+        # through DCP. Materialize one rank at a time to stay within shared host memory.
+        del distributed_state
+        del model_state
+        gc.collect()
+        for checkpoint_rank in range(dist.get_world_size()):
+            dist.barrier()
+            if dist.get_rank() == checkpoint_rank:
+                _stage_b_save_rank_local_optimizer_state(
+                    optimizer,
+                    destination / f"optimizer-rank-{dist.get_rank():04d}.pt",
+                )
+            dist.barrier()
+
     torch.save(
         trainer.local_progress_state(),
         destination / f"rank-{dist.get_rank():04d}.pt",
     )
     if dist.get_rank() == 0:
         metadata = {
-            "format_version": 3,
+            "format_version": 2 if rank_local_optimizer else 3,
             "kind": "cid-stage-b-fsdp",
             "model_state_layout": "fsdp-sharded-dcp",
-            "optimizer_state_layout": "fsdp-sharded-dcp",
+            "optimizer_state_layout": (
+                "rank-local" if rank_local_optimizer else "fsdp-sharded-dcp"
+            ),
             "world_size": dist.get_world_size(),
             "dataset_sha256": dataset_sha256,
             "adapter_config": asdict(trainer.adapter.config),
@@ -2187,7 +2337,6 @@ def load_stage_b_checkpoint(
     expected_dataset_sha256: str | None = None,
 ) -> dict[str, Any]:
     import torch.distributed as dist
-    import torch.distributed.checkpoint as dcp
     from torch.distributed.fsdp import FullyShardedDataParallel
 
     if not dist.is_initialized():
@@ -2227,15 +2376,14 @@ def load_stage_b_checkpoint(
     with _stage_b_sharded_state_dict_context(model):
         model_state = model.state_dict()
     distributed_state = {"model": model_state}
-    dcp.load(distributed_state, checkpoint_id=source / "distributed")
+    _stage_b_dcp_load(distributed_state, source / "distributed")
     with _stage_b_sharded_state_dict_context(model):
         model.load_state_dict(distributed_state["model"])
     if version == 3:
-        optimizer_state = dcp.load_sharded_optimizer_state_dict(
+        optimizer_state = _stage_b_dcp_load_optimizer_state(
             distributed_state["model"],
-            optimizer_key="optimizer",
-            storage_reader=dcp.FileSystemReader(source / "distributed"),
-        )["optimizer"]
+            source / "distributed",
+        )
         flattened_optimizer_state = FullyShardedDataParallel.optim_state_dict_to_load(
             model,
             optimizer,
@@ -2281,7 +2429,6 @@ def load_stage_b_model_checkpoint(
     """Load only Stage B model shards for distributed inference/evaluation."""
 
     import torch.distributed as dist
-    import torch.distributed.checkpoint as dcp
 
     if not dist.is_initialized():
         raise RuntimeError("Stage B model loading requires an initialized process group")
@@ -2308,7 +2455,7 @@ def load_stage_b_model_checkpoint(
     with _stage_b_sharded_state_dict_context(model):
         model_state = model.state_dict()
     distributed_state = {"model": model_state}
-    dcp.load(distributed_state, checkpoint_id=source / "distributed")
+    _stage_b_dcp_load(distributed_state, source / "distributed")
     with _stage_b_sharded_state_dict_context(model):
         model.load_state_dict(distributed_state["model"])
     dist.barrier()

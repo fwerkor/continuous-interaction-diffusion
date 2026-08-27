@@ -120,6 +120,19 @@ The immutable prompt remains token-level conditioning rather than being flattene
 Facts. Empty TCT slots are masked as attention keys so they can query context for allocation without
 contaminating the current display.
 
+The same model loader and CID training/runtime ABI are used across CPU, NVIDIA CUDA, and Ascend NPU
+backends; backend support is not maintained as separate model forks:
+
+| CID variant | Backbone | CPU / Gloo | NVIDIA CUDA / NCCL | Ascend NPU / HCCL |
+| --- | --- | --- | --- | --- |
+| CID-v1-8B | iLLaDA-8B-Base | supported | supported | supported |
+| CID-v1-7B-A1B | LLaDA-MoE-7B-A1B-Base | supported | supported | supported |
+| CID-v1-0.4B | LFM2.5-Encoder-350M-Diffusion | supported | supported | supported |
+
+Stage A uses the same DDP path on CUDA and NPU. Stage B uses FSDP `FULL_SHARD` for multi-rank
+accelerator training; the compact 0.4B path additionally supports one-NPU BF16 full-parameter
+training without FSDP. See `docs/training.md` for device-specific launch and checkpoint details.
+
 ```python
 import torch
 

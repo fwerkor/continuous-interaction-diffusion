@@ -25,7 +25,7 @@ def pretrained_revision(model_name_or_path: str) -> str | None:
     return None
 
 
-def _backbone_model_type(model_name_or_path: str) -> str:
+def backbone_model_type(model_name_or_path: str) -> str:
     from transformers import AutoConfig
 
     kwargs: dict[str, object] = {"trust_remote_code": True}
@@ -43,7 +43,7 @@ def load_cid_adapter_from_pretrained(
     freeze_backbone: bool = False,
     **from_pretrained_kwargs: object,
 ) -> ILLaDACIDAdapter:
-    if _backbone_model_type(model_name_or_path) == "lfm2":
+    if backbone_model_type(model_name_or_path) == "lfm2":
         return LFMCIDAdapter.from_pretrained(
             model_name_or_path,
             config=config,

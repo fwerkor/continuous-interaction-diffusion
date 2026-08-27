@@ -7,14 +7,14 @@ name = "continuous-interaction-diffusion"
 version = "0.1.0"
 description = "Reference implementation of Continuous Interaction Diffusion (CID)"
 readme = "README.md"
-requires-python = ">=3.11"
+requires-python = ">=3.10"
 license = "Apache-2.0"
 license-files = ["LICENSE"]
 authors = [{name = "Yuhang Cao"}]
 dependencies = []
 
 [project.optional-dependencies]
-train = ["torch>=2.4", "transformers>=4.57.1,<5"]
+train = ["torch>=2.1", "transformers>=4.57.1,<5"]
 data = ["huggingface-hub>=0.34", "pandas>=2.2", "pyarrow>=17", "sympy>=1.14"]
 dev = ["numpy>=1.26", "pytest>=8.3", "pytest-asyncio>=0.24", "ruff>=0.9", "sympy>=1.14"]
 
@@ -35,7 +35,7 @@ asyncio_mode = "auto"
 
 [tool.ruff]
 line-length = 100
-target-version = "py311"
+target-version = "py310"
 
 [tool.ruff.lint]
 select = ["E", "F", "I", "UP", "B", "SIM"]

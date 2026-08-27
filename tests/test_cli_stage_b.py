@@ -12,6 +12,7 @@ def test_stage_b_cpu_target_uses_gloo_without_gpu_rank_minimum() -> None:
     assert cli._stage_b_execution_target(
         "cpu",
         cuda_available=True,
+        npu_available=False,
         world_size=1,
         local_rank=0,
         dtype="bf16",
@@ -20,6 +21,7 @@ def test_stage_b_cpu_target_uses_gloo_without_gpu_rank_minimum() -> None:
     assert cli._stage_b_execution_target(
         "auto",
         cuda_available=False,
+        npu_available=False,
         world_size=2,
         local_rank=1,
         dtype="bf16",
@@ -32,6 +34,7 @@ def test_stage_b_cuda_target_keeps_four_rank_minimum() -> None:
         cli._stage_b_execution_target(
             "cuda",
             cuda_available=True,
+            npu_available=False,
             world_size=2,
             local_rank=1,
             dtype="bf16",
@@ -40,6 +43,7 @@ def test_stage_b_cuda_target_keeps_four_rank_minimum() -> None:
     assert cli._stage_b_execution_target(
         "auto",
         cuda_available=True,
+        npu_available=False,
         world_size=4,
         local_rank=3,
         dtype="fp16",
@@ -47,11 +51,63 @@ def test_stage_b_cuda_target_keeps_four_rank_minimum() -> None:
     ) == ("cuda", 3, "nccl")
 
 
+def test_stage_b_npu_target_supports_single_or_four_plus_ranks() -> None:
+    assert cli._stage_b_execution_target(
+        "npu",
+        cuda_available=False,
+        npu_available=True,
+        world_size=1,
+        local_rank=0,
+        dtype="bf16",
+        cpu_offload=False,
+    ) == ("npu", 0, "hccl")
+    with pytest.raises(RuntimeError, match="one NPU rank.*at least four NPU ranks"):
+        cli._stage_b_execution_target(
+            "npu",
+            cuda_available=False,
+            npu_available=True,
+            world_size=2,
+            local_rank=1,
+            dtype="bf16",
+            cpu_offload=False,
+        )
+    assert cli._stage_b_execution_target(
+        "auto",
+        cuda_available=False,
+        npu_available=True,
+        world_size=4,
+        local_rank=2,
+        dtype="bf16",
+        cpu_offload=False,
+    ) == ("npu", 2, "hccl")
+    with pytest.raises(ValueError, match="BF16 only|--dtype bf16 only"):
+        cli._stage_b_execution_target(
+            "npu",
+            cuda_available=False,
+            npu_available=True,
+            world_size=1,
+            local_rank=0,
+            dtype="fp16",
+            cpu_offload=False,
+        )
+    with pytest.raises(ValueError, match="not used by NPU"):
+        cli._stage_b_execution_target(
+            "npu",
+            cuda_available=False,
+            npu_available=True,
+            world_size=4,
+            local_rank=0,
+            dtype="bf16",
+            cpu_offload=True,
+        )
+
+
 def test_stage_b_cpu_rejects_fp16_and_redundant_cpu_offload() -> None:
     with pytest.raises(ValueError, match="supports --dtype bf16 only"):
         cli._stage_b_execution_target(
             "cpu",
             cuda_available=False,
+            npu_available=False,
             world_size=1,
             local_rank=0,
             dtype="fp16",
@@ -61,6 +117,7 @@ def test_stage_b_cpu_rejects_fp16_and_redundant_cpu_offload() -> None:
         cli._stage_b_execution_target(
             "cpu",
             cuda_available=False,
+            npu_available=False,
             world_size=1,
             local_rank=0,
             dtype="bf16",

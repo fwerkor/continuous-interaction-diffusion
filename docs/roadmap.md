@@ -25,7 +25,8 @@ quality.
 
 ## M1 — masked-diffusion backbone adapter
 
-Status: implemented for `GSAI-ML/iLLaDA-8B-Base`.
+Status: implemented for `GSAI-ML/iLLaDA-8B-Base`, `inclusionAI/LLaDA-MoE-7B-A1B-Base`, and
+`LiquidAI/LFM2.5-Encoder-350M-Diffusion`.
 
 Implement the first real model bridge around an existing masked-diffusion LM. The adapter should:
 
