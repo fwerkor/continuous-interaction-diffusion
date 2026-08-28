@@ -188,6 +188,51 @@ def test_benchmark_catalog_and_teacher_seed_are_deterministic() -> None:
     assert thought.slot_of("c0") == 0
 
 
+def test_teacher_seed_supports_semantic_cell_ids_and_preserves_slots() -> None:
+    adapter = configured_adapter()
+    tokenizer = TinyTokenizer()
+    encoder = import_module("cid.model.encoding").ILLaDATextEncoder(adapter, tokenizer)
+    example = TrajectoryExample(
+        example_id="bench-semantic-ids",
+        prompt="Track the reasoning state.",
+        target_display="x",
+        thought_targets=(
+            ThoughtTarget(
+                step=0,
+                slot=2,
+                cell_id="scope",
+                semantic_text="Problem scope.",
+                lifecycle=CellLifecycle.STABLE,
+            ),
+            ThoughtTarget(
+                step=0,
+                slot=0,
+                cell_id="c7",
+                semantic_text="Current hypothesis.",
+                lifecycle=CellLifecycle.ACTIVE,
+            ),
+            ThoughtTarget(
+                step=0,
+                slot=3,
+                cell_id="premises",
+                semantic_text="Known premises.",
+                lifecycle=CellLifecycle.STABLE,
+            ),
+        ),
+    )
+
+    thought = teacher_seed_thought(example, adapter, encoder)
+
+    assert thought.slot_of("c7") == 0
+    assert thought.slot_of("scope") == 2
+    assert thought.slot_of("premises") == 3
+    assert thought.get("scope").lifecycle is CellLifecycle.STABLE
+    assert thought.get("premises").lifecycle is CellLifecycle.STABLE
+    advanced, allocated = thought.allocate(slot=1)
+    assert allocated == "c8"
+    assert advanced.slot_of("c8") == 1
+
+
 async def test_neural_benchmark_case_runs_replay_and_scores_display() -> None:
     adapter = configured_adapter()
     example = make_example()

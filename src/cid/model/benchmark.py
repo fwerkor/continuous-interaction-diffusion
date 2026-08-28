@@ -22,7 +22,7 @@ from cid.model.policy import (
     ILLaDANeuralPolicyConfig,
 )
 from cid.runtime.engine import RuntimeConfig
-from cid.state import CognitiveField, DisplayCanvas
+from cid.state import CognitiveCell, CognitiveField, DisplayCanvas
 
 
 @dataclass(frozen=True, slots=True)
@@ -182,35 +182,40 @@ def teacher_seed_thought(
         capacity=adapter.config.max_thought_slots,
         width=adapter.d_model,
     )
+    cells = list(field.cells)
     initial = sorted(
         (target for target in example.thought_targets if target.step == 0),
-        key=lambda target: _cell_serial(target.cell_id),
+        key=lambda target: (target.slot, target.cell_id),
     )
+    next_cell_serial = 0
     for target in initial:
+        if target.slot >= field.capacity:
+            raise ValueError(
+                f"teacher-seeded benchmark thought slot {target.slot} exceeds runtime capacity"
+            )
+        if cells[target.slot].occupied:
+            raise ValueError(
+                f"teacher-seeded benchmark has multiple step-0 cells in slot {target.slot}"
+            )
         semantic = tuple(
             float(value)
             for value in text_encoder.encode_one(target.semantic_text, detach=True).float().tolist()
         )
-        field, cell_id = field.allocate(
+        cells[target.slot] = CognitiveCell(
             semantic=semantic,
+            cell_id=target.cell_id,
             roles=dict(target.roles),
             uncertainty=target.uncertainty,
             noise=target.noise,
             lifecycle=target.lifecycle,
-            slot=target.slot,
         )
-        if cell_id != target.cell_id:
-            raise ValueError(
-                "teacher-seeded benchmark requires step-0 cell IDs to follow "
-                "runtime allocation order"
-            )
-    return field
-
-
-def _cell_serial(cell_id: str) -> int:
-    if len(cell_id) < 2 or cell_id[0] != "c" or not cell_id[1:].isdigit():
-        raise ValueError("teacher-seeded benchmark requires c<N> cell identifiers")
-    return int(cell_id[1:])
+        if len(target.cell_id) > 1 and target.cell_id[0] == "c" and target.cell_id[1:].isdigit():
+            next_cell_serial = max(next_cell_serial, int(target.cell_id[1:]) + 1)
+    return CognitiveField(
+        cells=tuple(cells),
+        step=field.step,
+        next_cell_serial=next_cell_serial,
+    )
 
 
 def _object_sort_key(ref: ObjectRef) -> tuple[str, str, tuple[int, int]]:
