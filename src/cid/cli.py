@@ -24,7 +24,7 @@ from cid.computational_training import (
 )
 from cid.contracts import FreshnessDemand, InformationNeed, ModelContext, ModelUpdate
 from cid.correction_training import CorrectionTrainingConfig, build_correction_training
-from cid.data import dump_jsonl, load_jsonl
+from cid.data import TrajectoryExample, dump_jsonl, load_jsonl
 from cid.dataset import dump_dataset_manifest, inspect_dataset
 from cid.distill import (
     TeacherScheduleConfig,
@@ -1085,6 +1085,85 @@ def _benchmark(args: argparse.Namespace) -> None:
             dist.destroy_process_group()
 
 
+def _trajectory_split(example: TrajectoryExample) -> str | None:
+    split = str(example.metadata.get("split", "")).strip().lower()
+    return split if split in {"train", "validation", "test"} else None
+
+
+def _load_train_and_validation_examples(
+    data_path: str | Path,
+    *,
+    validation_data_path: str | Path | None,
+    max_examples: int | None,
+    max_validation_examples: int | None,
+) -> tuple[tuple[TrajectoryExample, ...], tuple[TrajectoryExample, ...]]:
+    examples = load_jsonl(data_path)
+    has_split_labels = any(_trajectory_split(example) is not None for example in examples)
+    if has_split_labels:
+        training_examples = tuple(
+            example
+            for example in examples
+            if _trajectory_split(example) in {None, "train"}
+        )
+        inline_validation = tuple(
+            example for example in examples if _trajectory_split(example) == "validation"
+        )
+    else:
+        training_examples = examples
+        inline_validation = ()
+
+    if validation_data_path is not None:
+        validation_source = load_jsonl(validation_data_path)
+        validation_labels = tuple(_trajectory_split(example) for example in validation_source)
+        if any(label is not None for label in validation_labels):
+            validation_examples = tuple(
+                example
+                for example, label in zip(
+                    validation_source, validation_labels, strict=True
+                )
+                if label == "validation"
+            )
+            if not validation_examples:
+                raise ValueError(
+                    "--validation-data contains split labels but no validation examples"
+                )
+        else:
+            validation_examples = validation_source
+    else:
+        validation_examples = inline_validation
+
+    if max_examples is not None:
+        training_examples = training_examples[:max_examples]
+    if max_validation_examples is not None:
+        validation_examples = validation_examples[:max_validation_examples]
+    if not training_examples:
+        raise ValueError("training data contains no train examples")
+
+    training_ids = {example.example_id for example in training_examples}
+    overlapping_ids = training_ids.intersection(
+        example.example_id for example in validation_examples
+    )
+    if overlapping_ids:
+        sample = sorted(overlapping_ids)[:3]
+        raise ValueError(
+            "training and validation data overlap by example_id: " + ", ".join(sample)
+        )
+    return training_examples, validation_examples
+
+
+def _replace_checkpoint_alias(
+    alias: Path,
+    target: Path,
+    *,
+    target_is_directory: bool,
+) -> None:
+    if alias.is_symlink() or alias.is_file():
+        alias.unlink(missing_ok=True)
+    elif alias.exists():
+        shutil.rmtree(alias)
+    alias.symlink_to(target.name, target_is_directory=target_is_directory)
+
+
 def _train_stage_a(args: argparse.Namespace) -> None:
     import torch
     import torch.distributed as dist
@@ -1204,9 +1283,12 @@ def _train_stage_a(args: argparse.Namespace) -> None:
         if distributed:
             trainer.reseed(args.seed + rank + trainer.state.transitions_seen * 104729)
 
-        examples = load_jsonl(args.data)
-        if args.max_examples is not None:
-            examples = examples[: args.max_examples]
+        examples, validation_examples = _load_train_and_validation_examples(
+            args.data,
+            validation_data_path=args.validation_data,
+            max_examples=args.max_examples,
+            max_validation_examples=args.max_validation_examples,
+        )
         windows = balance_rollout_windows_by_semantic_task(
             trajectory_rollout_windows(
                 examples,
@@ -1215,7 +1297,29 @@ def _train_stage_a(args: argparse.Namespace) -> None:
         )
         if not windows:
             raise ValueError("training data contains no adjacent thought transitions")
+        validation_windows = balance_rollout_windows_by_semantic_task(
+            trajectory_rollout_windows(
+                validation_examples,
+                max_horizon=args.rollout_horizon,
+            )
+        )
         transition_count_total = sum(len(window.source_steps) for window in windows)
+        validation_transition_count_total = sum(
+            len(window.source_steps) for window in validation_windows
+        )
+        local_validation_windows = (
+            shard_rollout_windows(
+                validation_windows,
+                world_size=world_size,
+                rank=rank,
+                seed=args.seed,
+                epoch=0,
+                shuffle=False,
+                micro_batch_size=args.micro_batch_size,
+            )
+            if validation_windows
+            else ()
+        )
         output_dir = Path(args.output_dir)
         output_dir.mkdir(parents=True, exist_ok=True)
         metrics_path = (
@@ -1224,6 +1328,7 @@ def _train_stage_a(args: argparse.Namespace) -> None:
             else output_dir / "train_metrics.jsonl"
         )
         rank_zero_metrics_path = output_dir / "train_metrics.jsonl"
+        validation_metrics_path = output_dir / "validation_metrics.jsonl"
         if args.log_every_steps <= 0:
             raise ValueError("--log-every-steps must be positive")
         if args.checkpoint_every_steps <= 0:
@@ -1236,6 +1341,8 @@ def _train_stage_a(args: argparse.Namespace) -> None:
             print(
                 f"device={device} world_size={world_size} dtype={args.dtype} "
                 f"examples={len(examples)} transitions={transition_count_total} "
+                f"validation_examples={len(validation_examples)} "
+                f"validation_transitions={validation_transition_count_total} "
                 f"trainable_parameters={trainable} effective_batch={effective_batch} "
                 f"grouped_moe_layers={grouped_moe_layers}"
             )
@@ -1345,17 +1452,73 @@ def _train_stage_a(args: argparse.Namespace) -> None:
             mean_loss = loss_sum / transition_count
             raw_mean_loss = raw_loss_sum / transition_count
 
-            checkpoint = output_dir / f"stage-a-step-{trainer.state.optimizer_steps:08d}.pt"
+            checkpoint = output_dir / f"stage-a-epoch-{epoch:04d}.pt"
             if rank == 0:
                 trainer.save_checkpoint(checkpoint)
-                latest = output_dir / "stage-a-latest.pt"
-                latest.unlink(missing_ok=True)
-                latest.symlink_to(checkpoint.name)
+                step_alias = output_dir / f"stage-a-step-{trainer.state.optimizer_steps:08d}.pt"
+                _replace_checkpoint_alias(
+                    step_alias, checkpoint, target_is_directory=False
+                )
+                _replace_checkpoint_alias(
+                    output_dir / "stage-a-latest.pt",
+                    checkpoint,
+                    target_is_directory=False,
+                )
+            if distributed:
+                dist.barrier()
+
+            validation_mean_loss = None
+            if local_validation_windows:
+                validation_report = trainer.evaluate_rollout_windows(
+                    local_validation_windows,
+                    seed=args.seed + 1_000_003,
+                )
+                validation_aggregate = torch.tensor(
+                    [
+                        validation_report.mean_loss * validation_report.transitions,
+                        validation_report.raw_mean_loss * validation_report.transitions,
+                        float(validation_report.transitions),
+                    ],
+                    device=device,
+                    dtype=torch.float32 if device_type == "npu" else torch.float64,
+                )
+                if distributed:
+                    dist.all_reduce(validation_aggregate)
+                validation_mean_loss = float(
+                    validation_aggregate[0] / validation_aggregate[2]
+                )
+                validation_raw_mean_loss = float(
+                    validation_aggregate[1] / validation_aggregate[2]
+                )
+                validation_transitions = int(validation_aggregate[2])
+                if rank == 0:
+                    validation_record = {
+                        "timestamp": time.time(),
+                        "elapsed_seconds": time.monotonic() - run_started,
+                        "epoch": epoch,
+                        "optimizer_steps": trainer.state.optimizer_steps,
+                        "validation_examples": len(validation_examples),
+                        "validation_transitions": validation_transitions,
+                        "validation_mean_loss": validation_mean_loss,
+                        "validation_raw_mean_loss": validation_raw_mean_loss,
+                        "validation_seed": args.seed + 1_000_003,
+                        "objective": "teacher_forced_fixed_noise",
+                        "checkpoint": str(checkpoint),
+                    }
+                    with validation_metrics_path.open("a", encoding="utf-8") as handle:
+                        handle.write(json.dumps(validation_record, sort_keys=True) + "\n")
+
+            if rank == 0:
+                validation_text = (
+                    "disabled"
+                    if validation_mean_loss is None
+                    else f"{validation_mean_loss:.6f}"
+                )
                 print(
                     f"epoch={epoch} transitions={transition_count} "
-                    f"optimizer_steps={report.optimizer_steps} raw_loss={raw_mean_loss:.6f} "
-                    f"weighted_loss={mean_loss:.6f} rollout_probability={rollout_probability:.3f} "
-                    f"checkpoint={checkpoint}",
+                    f"optimizer_steps={trainer.state.optimizer_steps} raw_loss={raw_mean_loss:.6f} "
+                    f"weighted_loss={mean_loss:.6f} validation_loss={validation_text} "
+                    f"rollout_probability={rollout_probability:.3f} checkpoint={checkpoint}",
                     flush=True,
                 )
     finally:
@@ -1541,9 +1704,12 @@ def _train_stage_b(args: argparse.Namespace) -> None:
                 f"{dataset_manifest.thought_capacity_required} > {args.thought_capacity}"
             )
 
-        examples = load_jsonl(args.data)
-        if args.max_examples is not None:
-            examples = examples[: args.max_examples]
+        examples, validation_examples = _load_train_and_validation_examples(
+            args.data,
+            validation_data_path=args.validation_data,
+            max_examples=args.max_examples,
+            max_validation_examples=args.max_validation_examples,
+        )
         windows = balance_rollout_windows_by_semantic_task(
             trajectory_rollout_windows(
                 examples,
@@ -1552,7 +1718,29 @@ def _train_stage_b(args: argparse.Namespace) -> None:
         )
         if not windows:
             raise ValueError("training data contains no adjacent thought transitions")
+        validation_windows = balance_rollout_windows_by_semantic_task(
+            trajectory_rollout_windows(
+                validation_examples,
+                max_horizon=args.rollout_horizon,
+            )
+        )
         transition_count_total = sum(len(window.source_steps) for window in windows)
+        validation_transition_count_total = sum(
+            len(window.source_steps) for window in validation_windows
+        )
+        local_validation_windows = (
+            shard_rollout_windows(
+                validation_windows,
+                world_size=world_size,
+                rank=rank,
+                seed=args.seed,
+                epoch=0,
+                shuffle=False,
+                micro_batch_size=args.micro_batch_size,
+            )
+            if validation_windows
+            else ()
+        )
 
         resume_rank0_state = None
         if args.resume:
@@ -1727,6 +1915,8 @@ def _train_stage_b(args: argparse.Namespace) -> None:
             print(
                 f"stage=B device={device} world_size={world_size} dtype={args.dtype} "
                 f"optimizer=adamw examples={len(examples)} transitions={transition_count_total} "
+                f"validation_examples={len(validation_examples)} "
+                f"validation_transitions={validation_transition_count_total} "
                 f"target_global_batch={args.target_global_batch_size} "
                 f"effective_batch={effective_batch} grad_accum={gradient_accumulation_steps} "
                 f"mlp_chunk={args.mlp_chunk_size} norm_chunk={args.norm_chunk_size} "
@@ -1743,11 +1933,14 @@ def _train_stage_b(args: argparse.Namespace) -> None:
         if args.checkpoint_every_steps <= 0:
             raise ValueError("--checkpoint-every-steps must be positive")
         metrics_path = output_dir / f"train_metrics.rank-{rank:04d}.jsonl"
+        validation_metrics_path = output_dir / "validation_metrics.jsonl"
         run_started = time.monotonic()
         next_checkpoint_step = (
             trainer.state.optimizer_steps // args.checkpoint_every_steps + 1
         ) * args.checkpoint_every_steps
-        last_periodic_checkpoint = Path(args.resume) if args.resume else None
+        # Only periodic checkpoints created in this process are disposable. A resume
+        # checkpoint may be a persistent epoch snapshot and must never be deleted.
+        last_periodic_checkpoint = None
 
         if trainer.state.epochs_completed >= args.epochs:
             if rank == 0:
@@ -1940,9 +2133,9 @@ def _train_stage_b(args: argparse.Namespace) -> None:
             transition_count = int(aggregate[2])
 
             checkpoint = output_dir / (
-                f"stage-b-step-{trainer.state.optimizer_steps:08d}.pt"
+                f"stage-b-epoch-{epoch:04d}.pt"
                 if single_npu_stage_b
-                else f"stage-b-step-{trainer.state.optimizer_steps:08d}"
+                else f"stage-b-epoch-{epoch:04d}"
             )
             if single_npu_stage_b:
                 trainer.save_checkpoint(checkpoint)
@@ -1955,24 +2148,83 @@ def _train_stage_b(args: argparse.Namespace) -> None:
                     dataset_sha256=dataset_manifest.sha256,
                 )
             if rank == 0:
-                latest = output_dir / (
-                    "stage-b-latest.pt" if single_npu_stage_b else "stage-b-latest"
+                step_alias = output_dir / (
+                    f"stage-b-step-{trainer.state.optimizer_steps:08d}.pt"
+                    if single_npu_stage_b
+                    else f"stage-b-step-{trainer.state.optimizer_steps:08d}"
                 )
-                latest.unlink(missing_ok=True)
-                latest.symlink_to(
-                    checkpoint.name, target_is_directory=not single_npu_stage_b
+                _replace_checkpoint_alias(
+                    step_alias,
+                    checkpoint,
+                    target_is_directory=not single_npu_stage_b,
                 )
-                if last_periodic_checkpoint is not None and last_periodic_checkpoint != checkpoint:
+                _replace_checkpoint_alias(
+                    output_dir / (
+                        "stage-b-latest.pt" if single_npu_stage_b else "stage-b-latest"
+                    ),
+                    checkpoint,
+                    target_is_directory=not single_npu_stage_b,
+                )
+                if last_periodic_checkpoint is not None:
                     if single_npu_stage_b:
                         last_periodic_checkpoint.unlink(missing_ok=True)
                     else:
                         shutil.rmtree(last_periodic_checkpoint, ignore_errors=True)
                     last_periodic_checkpoint = None
+            dist.barrier()
+
+            validation_mean_loss = None
+            if local_validation_windows:
+                validation_report = trainer.evaluate_rollout_windows(
+                    local_validation_windows,
+                    seed=args.seed + 1_000_003,
+                )
+                validation_aggregate = torch.tensor(
+                    [
+                        validation_report.mean_loss * validation_report.transitions,
+                        validation_report.raw_mean_loss * validation_report.transitions,
+                        float(validation_report.transitions),
+                    ],
+                    device=device,
+                    dtype=torch.float32 if device_type == "npu" else torch.float64,
+                )
+                dist.all_reduce(validation_aggregate)
+                validation_mean_loss = float(
+                    validation_aggregate[0] / validation_aggregate[2]
+                )
+                validation_raw_mean_loss = float(
+                    validation_aggregate[1] / validation_aggregate[2]
+                )
+                validation_transitions = int(validation_aggregate[2])
+                if rank == 0:
+                    validation_record = {
+                        "timestamp": time.time(),
+                        "elapsed_seconds": time.monotonic() - run_started,
+                        "epoch": epoch,
+                        "optimizer_steps": trainer.state.optimizer_steps,
+                        "validation_examples": len(validation_examples),
+                        "validation_transitions": validation_transitions,
+                        "validation_mean_loss": validation_mean_loss,
+                        "validation_raw_mean_loss": validation_raw_mean_loss,
+                        "validation_seed": args.seed + 1_000_003,
+                        "objective": "teacher_forced_fixed_noise",
+                        "checkpoint": str(checkpoint),
+                    }
+                    with validation_metrics_path.open("a", encoding="utf-8") as handle:
+                        handle.write(json.dumps(validation_record, sort_keys=True) + "\n")
+
+            if rank == 0:
+                validation_text = (
+                    "disabled"
+                    if validation_mean_loss is None
+                    else f"{validation_mean_loss:.6f}"
+                )
                 print(
                     f"epoch={epoch} transitions={transition_count} "
-                    f"optimizer_steps={report.optimizer_steps} mean_loss={mean_loss:.6f} "
-                    f"raw_mean_loss={raw_mean_loss:.6f} "
-                    f"rollout_probability={rollout_probability:.3f} checkpoint={checkpoint}"
+                    f"optimizer_steps={trainer.state.optimizer_steps} mean_loss={mean_loss:.6f} "
+                    f"raw_mean_loss={raw_mean_loss:.6f} validation_loss={validation_text} "
+                    f"rollout_probability={rollout_probability:.3f} checkpoint={checkpoint}",
+                    flush=True,
                 )
     finally:
         if dist.is_initialized():
@@ -2395,6 +2647,13 @@ def main() -> None:
         help="run Stage A CID adapter training with a frozen diffusion backbone",
     )
     train.add_argument("--data", required=True)
+    train.add_argument(
+        "--validation-data",
+        help=(
+            "optional held-out trajectory JSONL; when omitted, validation examples are "
+            "taken from --data entries with metadata.split=validation"
+        ),
+    )
     train.add_argument("--output-dir", required=True)
     train.add_argument("--model", default="GSAI-ML/iLLaDA-8B-Base")
     train.add_argument("--resume")
@@ -2419,6 +2678,7 @@ def main() -> None:
     train.add_argument("--display-canvas-tokens", type=int, default=64)
     train.add_argument("--seed", type=int, default=0)
     train.add_argument("--max-examples", type=int)
+    train.add_argument("--max-validation-examples", type=int)
     train.add_argument("--no-shuffle", action="store_true")
     train.add_argument("--log-every-steps", type=int, default=100)
     train.add_argument("--checkpoint-every-steps", type=int, default=5000)
@@ -2432,6 +2692,13 @@ def main() -> None:
         help="run Stage B full-parameter diffusion-backbone training with FSDP FULL_SHARD",
     )
     train_full.add_argument("--data", required=True)
+    train_full.add_argument(
+        "--validation-data",
+        help=(
+            "optional held-out trajectory JSONL; when omitted, validation examples are "
+            "taken from --data entries with metadata.split=validation"
+        ),
+    )
     train_full.add_argument("--output-dir", required=True)
     train_full.add_argument("--model", default="GSAI-ML/iLLaDA-8B-Base")
     train_full.add_argument(
@@ -2490,6 +2757,7 @@ def main() -> None:
     train_full.add_argument("--display-canvas-tokens", type=int, default=64)
     train_full.add_argument("--seed", type=int, default=0)
     train_full.add_argument("--max-examples", type=int)
+    train_full.add_argument("--max-validation-examples", type=int)
     train_full.add_argument("--no-shuffle", action="store_true")
     train_full.add_argument("--log-every-steps", type=int, default=100)
     train_full.add_argument("--checkpoint-every-steps", type=int, default=2500)

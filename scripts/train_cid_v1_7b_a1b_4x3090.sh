@@ -4,6 +4,7 @@ set -euo pipefail
 ROOT="${ROOT:-/workspace/cid-v1-7b-a1b}"
 MODEL="${MODEL:-/workspace/models/LLaDA-MoE-7B-A1B-Base}"
 DATA="${DATA:-/workspace/cid-moe-data/release/training-trajectories.jsonl}"
+VALIDATION_DATA="${VALIDATION_DATA:-}"
 PYTHON_ENV="${PYTHON_ENV:-/workspace/cid-small-work/.venv}"
 REPO="${REPO:-/workspace/cid-moe-work}"
 
@@ -18,6 +19,10 @@ if [[ ! -f "$MODEL/config.json" ]]; then
 fi
 if [[ ! -f "$DATA" ]]; then
   echo "missing training data: $DATA" >&2
+  exit 2
+fi
+if [[ -n "$VALIDATION_DATA" && ! -f "$VALIDATION_DATA" ]]; then
+  echo "missing validation data: $VALIDATION_DATA" >&2
   exit 2
 fi
 
@@ -48,6 +53,9 @@ stage_a_args=(
   --log-every-steps 25
   --checkpoint-every-steps 1000
 )
+if [[ -n "$VALIDATION_DATA" ]]; then
+  stage_a_args+=(--validation-data "$VALIDATION_DATA")
+fi
 
 if [[ -f "$STAGE_A/stage-a-latest.pt" ]]; then
   stage_a_args+=(--resume "$STAGE_A/stage-a-latest.pt")
@@ -87,6 +95,9 @@ stage_b_args=(
   --checkpoint-every-steps 1000
   --fsdp-cpu-offload
 )
+if [[ -n "$VALIDATION_DATA" ]]; then
+  stage_b_args+=(--validation-data "$VALIDATION_DATA")
+fi
 
 if [[ -d "$STAGE_B/stage-b-latest" ]]; then
   stage_b_args+=(--resume "$STAGE_B/stage-b-latest")

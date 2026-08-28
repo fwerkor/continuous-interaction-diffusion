@@ -93,8 +93,17 @@ argument is executable, while keeping argument names/types under the runtime-own
 gradient accumulation, gradient clipping, deterministic transition shuffling, optimizer resume, and
 CID-only checkpoints. When the pretrained backbone is frozen, checkpoints contain only trainable
 CID parameters plus optimizer/progress/RNG state; the pinned pretrained backbone is reloaded
-separately.
+separately. Every completed epoch is retained as `stage-a-epoch-XXXX.pt`; `stage-a-latest.pt` and
+the epoch-end step name are compatibility symlinks to that permanent snapshot.
 `load_cid_adapter_checkpoint()` restores those CID parameters directly for runtime evaluation.
+
+Both training stages accept `--validation-data <trajectory.jsonl>`. If it is omitted and the main
+trajectory JSONL contains `metadata.split` labels, `train` examples are used for optimization,
+`validation` examples are held out, and `test` examples are excluded. Validation runs once after
+every completed epoch with a fixed diffusion RNG seed and teacher-forced inputs, so the resulting
+loss is comparable across epochs even while Stage A changes its rollout curriculum. Metrics are
+appended to `validation_metrics.jsonl`; validation never performs an optimizer step or automatic
+early stopping.
 
 `cid train` runs this path on one device. Under `torchrun`, it switches to DDP automatically. Each
 rank receives the same shuffled transition order and a padded equal-length shard so every rank
@@ -193,8 +202,10 @@ simultaneous host-memory spikes. The single-NPU compact path uses the trainer's 
 checkpoint because no FSDP sharding exists. Rank-local trainer state preserves the LR schedule,
 diffusion/shuffle RNG, transition and optimizer counts, completed epochs, and the per-rank rollout
 cursor. The default launcher logs every 100 optimizer steps and writes periodic checkpoints only at
-clean gradient-accumulation boundaries. The corresponding `stage-b-latest` (or
-`stage-b-latest.pt` for single NPU) is updated only after a checkpoint is complete.
+clean gradient-accumulation boundaries. Every completed epoch is separately retained as
+`stage-b-epoch-XXXX` for sharded training or `stage-b-epoch-XXXX.pt` on the single-NPU compact path;
+periodic checkpoint cleanup never removes these epoch snapshots. The corresponding `stage-b-latest`
+(or `stage-b-latest.pt` for single NPU) points to the newest completed epoch snapshot.
 
 A fresh Stage B run requires `--init-cid-checkpoint`; `--resume` is mutually exclusive and restores
 the complete Stage B model/optimizer state. `scripts/train_cid_v1_7b_a1b_4x3090.sh` provides a

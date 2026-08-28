@@ -887,6 +887,81 @@ def test_rollout_training_reports_interval_progress() -> None:
     assert trainer.state.rollout_windows_seen_in_epoch == 0
 
 
+def test_validation_loss_is_deterministic_and_preserves_training_state() -> None:
+    adapter = make_adapter(seed=801)
+    trainer = CIDTrainer(
+        adapter,
+        ILLaDATrajectoryTensorizer(adapter, TinyTokenizer()),
+        CIDTrainerConfig(
+            learning_rate=1e-3,
+            gradient_accumulation_steps=1,
+            rollout_horizon=2,
+            timestep_min=0.1,
+            timestep_max=0.9,
+            seed=17,
+        ),
+    )
+    windows = balance_rollout_windows_by_semantic_task(
+        trajectory_rollout_windows((make_rollout_trajectory(),), max_horizon=2)
+    )
+    state_before = trainer.state
+    generator_before = trainer.generator.get_state().clone()
+    shuffle_before = trainer.shuffle_rng.getstate()
+    parameters_before = {
+        name: parameter.detach().clone() for name, parameter in adapter.named_parameters()
+    }
+
+    first = trainer.evaluate_rollout_windows(windows, seed=12345)
+    second = trainer.evaluate_rollout_windows(windows, seed=12345)
+
+    assert first == second
+    assert first.optimizer_steps == 0
+    assert first.transitions > 0
+    assert first.mean_loss > 0.0
+    assert trainer.state == state_before
+    assert torch.equal(trainer.generator.get_state(), generator_before)
+    assert trainer.shuffle_rng.getstate() == shuffle_before
+    assert trainer.forward_model.training
+    for name, parameter in adapter.named_parameters():
+        assert torch.equal(parameter.detach(), parameters_before[name])
+
+
+def test_training_validation_split_excludes_validation_and_test(tmp_path) -> None:
+    from cid.cli import _load_train_and_validation_examples
+    from cid.data import dump_jsonl
+
+    base = make_trajectory()
+    examples = (
+        replace(
+            base,
+            example_id="split-train",
+            metadata={**base.metadata, "split": "train"},
+        ),
+        replace(
+            base,
+            example_id="split-validation",
+            metadata={**base.metadata, "split": "validation"},
+        ),
+        replace(
+            base,
+            example_id="split-test",
+            metadata={**base.metadata, "split": "test"},
+        ),
+    )
+    data = tmp_path / "mixed.jsonl"
+    dump_jsonl(examples, data)
+
+    training, validation = _load_train_and_validation_examples(
+        data,
+        validation_data_path=None,
+        max_examples=None,
+        max_validation_examples=None,
+    )
+
+    assert tuple(example.example_id for example in training) == ("split-train",)
+    assert tuple(example.example_id for example in validation) == ("split-validation",)
+
+
 def test_transition_sharding_is_balanced_deterministic_and_complete() -> None:
     examples = tuple(replace(make_trajectory(), example_id=f"train-{index}") for index in range(5))
     transitions = trajectory_transitions(examples)

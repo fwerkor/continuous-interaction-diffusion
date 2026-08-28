@@ -380,6 +380,7 @@ fusion, and prediction heads. A single A6000 can run the launcher directly:
 ```bash
 cid train \
   --data data/synthetic.jsonl \
+  --validation-data data/validation.jsonl \
   --output-dir runs/stage-a \
   --thought-capacity 128 \
   --display-canvas-tokens 64 \
@@ -430,9 +431,14 @@ transition batch is `2 × 8 × 6 = 96`; start at micro-batch 1 if the real traje
 substantially larger.
 
 Stage A checkpoints contain trainable CID parameters, optimizer state, progress, and RNG state; they
-do not duplicate the frozen 8B backbone. Resume with `--resume <checkpoint>`. For inference,
-`load_cid_adapter_checkpoint()` loads the CID-only state into an iLLaDA adapter without constructing
-a trainer.
+do not duplicate the frozen backbone. At every completed epoch, the trainer writes a permanent
+`stage-a-epoch-XXXX.pt` snapshot; `stage-a-latest.pt` and the corresponding step name are compatibility
+symlinks to that epoch snapshot. Resume with `--resume <checkpoint>`. When held-out trajectories are
+provided with `--validation-data` (or are present in `--data` with `metadata.split=validation`), the
+trainer computes a deterministic teacher-forced validation loss after every epoch and appends it to
+`validation_metrics.jsonl`. The fixed validation RNG seed makes the values comparable across epochs;
+validation does not update parameters or trigger automatic early stopping. For inference,
+`load_cid_adapter_checkpoint()` loads the CID-only state without constructing a trainer.
 
 ### Stage B full-parameter training
 
@@ -465,8 +471,9 @@ A completed Stage A CID checkpoint is required for a fresh Stage B launch:
 WORLD_SIZE=6
 torchrun --standalone --nproc-per-node=${WORLD_SIZE} -m cid.cli train-full \
   --data data/distilled.jsonl \
+  --validation-data data/validation.jsonl \
   --output-dir runs/stage-b \
-  --init-cid-checkpoint runs/stage-a/stage-a-final-epoch3.pt \
+  --init-cid-checkpoint runs/stage-a/stage-a-epoch-0003.pt \
   --thought-capacity 128 \
   --max-display-tokens 1536 \
   --display-canvas-tokens 64 \
@@ -480,11 +487,13 @@ used only for dataset transport targets and external-memory text; prompt/display
 live trainable embedding through the FSDP forward.
 
 Full-parameter checkpoints are directories written with `torch.distributed.checkpoint`; model and
-optimizer states stay sharded and are never gathered as an 8B checkpoint on rank 0. The launcher
-logs every 100 optimizer steps and writes a resumable checkpoint every 2,500 steps at the next clean
-gradient-accumulation boundary. `stage-b-latest` points at the newest completed checkpoint, and the
-previous periodic checkpoint is retained until its replacement is complete. Resume requires the
-same world size, dataset SHA-256, and resolved trainer configuration:
+optimizer states stay sharded and are never gathered as a full checkpoint on rank 0. The launcher
+logs every 100 optimizer steps and writes a resumable periodic checkpoint every 2,500 steps at the
+next clean gradient-accumulation boundary. Every completed epoch is additionally retained permanently
+as `stage-b-epoch-XXXX` (or `.pt` on the single-NPU compact path); `stage-b-latest` and the epoch-end
+step name are symlinks to that snapshot. Periodic cleanup never deletes epoch snapshots. Stage B uses
+the same deterministic per-epoch validation objective and `validation_metrics.jsonl` as Stage A.
+Resume requires the same world size, dataset SHA-256, and resolved trainer configuration:
 
 ```bash
 torchrun --standalone --nproc-per-node=${WORLD_SIZE} -m cid.cli train-full \

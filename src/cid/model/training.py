@@ -597,6 +597,89 @@ class CIDTrainer:
             raw_mean_loss=total_raw_loss / total_transitions,
         )
 
+    def evaluate_rollout_windows(
+        self,
+        windows: tuple[CIDRolloutWindow, ...],
+        *,
+        seed: int,
+    ) -> CIDTrainReport:
+        """Evaluate a stable teacher-forced diffusion objective without mutating training state.
+
+        Validation deliberately uses a fixed RNG seed and teacher-forced inputs on every epoch.
+        This makes loss values directly comparable across epochs even while Stage A changes its
+        rollout curriculum. Model/optimizer state and the trainer RNG streams are restored exactly
+        after evaluation.
+        """
+
+        if not windows:
+            raise ValueError("validation data contains no rollout windows")
+        if self._pending_accumulation:
+            raise RuntimeError("flush accumulated gradients before validation")
+
+        generator_state = self.generator.get_state().cpu()
+        shuffle_state = self.shuffle_rng.getstate()
+        was_training = self.forward_model.training
+        total_loss = 0.0
+        total_raw_loss = 0.0
+        total_transitions = 0
+        try:
+            self.generator.manual_seed(seed)
+            self.shuffle_rng.seed(seed)
+            self.forward_model.eval()
+            with torch.no_grad():
+                microbatches = self._rollout_microbatches(
+                    windows, shuffle=False, preserve_order=True
+                )
+                for microbatch in microbatches:
+                    lengths = {len(window.source_steps) for window in microbatch}
+                    if len(lengths) != 1:
+                        raise ValueError(
+                            "validation micro-batch windows must have the same length"
+                        )
+                    loss_weights = {window.loss_weight for window in microbatch}
+                    if len(loss_weights) != 1:
+                        raise ValueError(
+                            "validation micro-batch windows must have the same loss_weight"
+                        )
+                    loss_weight = next(iter(loss_weights))
+                    for offset in range(next(iter(lengths))):
+                        samples = tuple(
+                            self.tensorizer.tensorize(
+                                window.example,
+                                window.source_steps[offset],
+                                timestep=self._sample_timestep(),
+                                generator=self.generator,
+                            )
+                            for window in microbatch
+                        )
+                        training_batch = collate_training_steps(
+                            samples, pad_token_id=int(self.pad_token_id)
+                        )
+                        output = self.forward_model(training_batch.batch)
+                        losses = cid_loss(output, training_batch.targets)
+                        if not bool(torch.isfinite(losses.total)):
+                            names = ", ".join(training_batch.example_ids)
+                            raise FloatingPointError(
+                                f"non-finite CID validation loss for micro-batch: {names}"
+                            )
+                        batch_size = len(samples)
+                        raw_loss = float(losses.total.detach().float()) * batch_size
+                        total_raw_loss += raw_loss
+                        total_loss += raw_loss * loss_weight
+                        total_transitions += batch_size
+                        del output, training_batch, losses, samples
+        finally:
+            self.generator.set_state(generator_state)
+            self.shuffle_rng.setstate(shuffle_state)
+            self.forward_model.train(was_training)
+
+        return CIDTrainReport(
+            transitions=total_transitions,
+            optimizer_steps=0,
+            mean_loss=total_loss / total_transitions,
+            raw_mean_loss=total_raw_loss / total_transitions,
+        )
+
     def _rollout_microbatches(
         self,
         windows: tuple[CIDRolloutWindow, ...],
