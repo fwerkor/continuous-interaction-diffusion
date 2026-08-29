@@ -158,8 +158,7 @@ class CIDMaterializer:
             reopen_cells=reopen_cells,
             equilibrium=convergence >= self.config.convergence_threshold,
             converged=(
-                display.unresolved == 0
-                and convergence >= self.config.convergence_threshold
+                display.unresolved == 0 and convergence >= self.config.convergence_threshold
             ),
         )
 
@@ -198,14 +197,16 @@ class CIDMaterializer:
             if not cell.occupied or cell.lifecycle is CellLifecycle.RETIRED:
                 continue
             predicted_lifecycle = lifecycle_order[int(lifecycle[slot])]
-            if cell.cell_id not in previous.occupied_cell_ids:
+            if cell.cell_id not in previous.occupied_cell_ids and predicted_lifecycle not in (
+                CellLifecycle.ACTIVE,
+                CellLifecycle.WAITING,
+            ):
                 predicted_lifecycle = CellLifecycle.ACTIVE
             cells[slot] = replace(
                 cell,
                 semantic=_vector_tuple(output.thought_semantic[batch_index, slot]),
                 roles={
-                    role: float(role_probs[slot, index])
-                    for index, role in enumerate(role_order)
+                    role: float(role_probs[slot, index]) for index, role in enumerate(role_order)
                 },
                 uncertainty=float(uncertainty[slot, 0]),
                 noise=max(0.0, min(1.0, cell.noise + float(noise_delta[slot, 0]))),

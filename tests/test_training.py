@@ -1,5 +1,6 @@
 from __future__ import annotations
 
+import json
 import math
 import os
 import subprocess
@@ -55,9 +56,7 @@ wrap_stage_a_ddp = cid_model.wrap_stage_a_ddp
 wrap_stage_b_fsdp = cid_model.wrap_stage_b_fsdp
 cid_loss = cid_model.cid_loss
 chunked_illada_mlp_forward = import_module("cid.model.illada")._chunked_illada_mlp_forward
-chunked_illada_rms_norm_forward = import_module(
-    "cid.model.illada"
-)._chunked_illada_rms_norm_forward
+chunked_illada_rms_norm_forward = import_module("cid.model.illada")._chunked_illada_rms_norm_forward
 
 
 class TinyConfig:
@@ -355,9 +354,7 @@ def test_trajectory_tensorizer_always_uses_adapter_physical_tct_capacity() -> No
         ),
         freeze_backbone=True,
     )
-    tensorizer = ILLaDATrajectoryTensorizer(
-        adapter, TinyTokenizer(), minimum_thought_slots=1
-    )
+    tensorizer = ILLaDATrajectoryTensorizer(adapter, TinyTokenizer(), minimum_thought_slots=1)
 
     sample = tensorizer.tensorize(make_trajectory(), source_step=0, timestep=0.5)
 
@@ -510,9 +507,7 @@ def test_rollout_display_bucket_can_grow_but_never_shrinks() -> None:
         display_ids=torch.full((1, 16), 5, dtype=torch.long),
     )
 
-    sample = tensorizer.tensorize(
-        example, source_step=1, timestep=0.0, rollout_state=rollout
-    )
+    sample = tensorizer.tensorize(example, source_step=1, timestep=0.0, rollout_state=rollout)
 
     assert sample.batch.display_ids.shape[1] == 16
 
@@ -731,6 +726,14 @@ def test_trajectory_tensorizer_marks_waiting_snapshot_as_current_information_equ
     )
     extended = replace(
         base,
+        events=(
+            ExternalEvent(
+                source="docs",
+                value="37",
+                arrival_step=2,
+                arguments={"key": "latency_ms", "scope": "production"},
+            ),
+        ),
         thought_targets=(
             *(target for target in base.thought_targets if target.step == 0),
             *waiting_step,
@@ -790,8 +793,7 @@ def test_trajectory_tensorizer_ignores_randomized_physical_slot_placement() -> N
         base,
         example_id="train-randomized-slots",
         thought_targets=tuple(
-            replace(target, slot=(3 - target.slot))
-            for target in base.thought_targets
+            replace(target, slot=(3 - target.slot)) for target in base.thought_targets
         ),
     )
 
@@ -887,6 +889,33 @@ def test_trainer_checkpoint_restores_trainable_state_optimizer_and_progress(tmp_
     inference_parameters = dict(inference_adapter.named_parameters())
     for name in trainer.trainable_parameter_names:
         assert torch.equal(original_parameters[name], inference_parameters[name])
+
+
+def test_stage_a_checkpoint_rejects_previous_neural_contract(tmp_path) -> None:
+    adapter = make_adapter(seed=145)
+    trainer = CIDTrainer(
+        adapter,
+        ILLaDATrajectoryTensorizer(adapter, TinyTokenizer()),
+        CIDTrainerConfig(timestep_min=1.0, timestep_max=1.0),
+    )
+    path = tmp_path / "current.pt"
+    trainer.save_checkpoint(path)
+    payload = torch.load(path, map_location="cpu", weights_only=False)
+
+    payload["neural_contract_version"] = 1
+    incompatible = tmp_path / "old-contract.pt"
+    torch.save(payload, incompatible)
+
+    restored_adapter = make_adapter(seed=145)
+    restored = CIDTrainer(
+        restored_adapter,
+        ILLaDATrajectoryTensorizer(restored_adapter, TinyTokenizer()),
+        trainer.config,
+    )
+    with pytest.raises(ValueError, match="neural contract"):
+        restored.load_checkpoint(incompatible)
+    with pytest.raises(ValueError, match="neural contract"):
+        load_cid_adapter_checkpoint(restored_adapter, incompatible)
 
 
 def test_trainer_checkpoint_restores_pending_gradient_accumulation(tmp_path) -> None:
@@ -1203,6 +1232,9 @@ def test_stage_b_fsdp_runs_full_parameter_optimizer_step_on_cpu(tmp_path) -> Non
             checkpoint,
             dataset_sha256="dataset-v1",
         )
+        metadata = json.loads((checkpoint / "metadata.json").read_text(encoding="utf-8"))
+        assert metadata["format_version"] in (4, 5)
+        assert metadata["neural_contract_version"] == 2
 
         restored_adapter = make_adapter(seed=91)
         restored_adapter.set_backbone_trainable(True)
@@ -1415,7 +1447,6 @@ def test_rollout_state_replaces_teacher_input_t_and_y() -> None:
     assert sample.targets.display_ids[0, 0] != -100
 
 
-
 def test_rollout_missing_target_cell_is_supervised_for_recovery_allocation() -> None:
     adapter = make_adapter(seed=111)
     tensorizer = ILLaDATrajectoryTensorizer(adapter, TinyTokenizer())
@@ -1435,13 +1466,13 @@ def test_rollout_missing_target_cell_is_supervised_for_recovery_allocation() -> 
     rollout.role_features[0, 1].zero_()
     rollout.lifecycle_features[0, 1].zero_()
 
-    sample = tensorizer.tensorize(
-        example, source_step=1, timestep=0.25, rollout_state=rollout
-    )
+    sample = tensorizer.tensorize(example, source_step=1, timestep=0.25, rollout_state=rollout)
 
     assert sample.targets.allocation_mask[0, 1]
     assert sample.targets.allocation_targets[0, 1] == 1.0
-    assert sample.targets.lifecycle[0, 1] == -100
+    assert sample.targets.lifecycle[0, 1] == list(
+        import_module("cid.lifecycle").MODELED_LIFECYCLES
+    ).index(CellLifecycle.ACTIVE)
 
 
 def test_rollout_uses_predicted_local_noise_for_next_thought_corruption() -> None:
@@ -1512,9 +1543,7 @@ def test_rollout_extra_occupied_slot_is_supervised_to_retire() -> None:
     rollout.slot_occupancy[0, 3, 0] = 1.0
     rollout.lifecycle_features[0, 3, 0] = 1.0
 
-    sample = tensorizer.tensorize(
-        example, source_step=1, timestep=0.25, rollout_state=rollout
-    )
+    sample = tensorizer.tensorize(example, source_step=1, timestep=0.25, rollout_state=rollout)
 
     modeled = import_module("cid.lifecycle").MODELED_LIFECYCLES
     assert sample.targets.lifecycle[0, 3] == modeled.index(CellLifecycle.RETIRED)
@@ -1527,6 +1556,7 @@ def test_rollout_allocation_defaults_match_runtime_contract() -> None:
     assert trainer.rollout_allocation_threshold == materializer.allocation_threshold
     assert trainer.rollout_max_allocations_per_step == materializer.max_allocations_per_step
     assert materializer.max_allocations_per_step >= 20
+
 
 def test_self_rollout_feeds_previous_prediction_into_next_transition() -> None:
     class RecordingTensorizer(ILLaDATrajectoryTensorizer):
@@ -1590,9 +1620,7 @@ def test_self_rollout_crops_collated_padding_to_each_trajectory_capacity() -> No
         example_id="rollout-narrow",
         binding_targets=(),
         grounding_targets=(),
-        thought_targets=tuple(
-            target for target in wide.thought_targets if target.cell_id == "c0"
-        ),
+        thought_targets=tuple(target for target in wide.thought_targets if target.cell_id == "c0"),
     )
     windows = (
         CIDRolloutWindow(example=narrow, source_steps=(0, 1)),
@@ -1720,18 +1748,27 @@ def test_rollout_sharding_repeats_singleton_bucket_across_all_ranks() -> None:
 
 
 def test_stage_b_batch_resolution_is_stable_across_four_and_six_ranks() -> None:
-    assert stage_b_gradient_accumulation_steps(
-        world_size=4, micro_batch_size=1, target_global_batch_size=32
-    ) == 8
-    assert stage_b_gradient_accumulation_steps(
-        world_size=6, micro_batch_size=1, target_global_batch_size=32
-    ) == 5
-    assert stage_b_gradient_accumulation_steps(
-        world_size=6,
-        micro_batch_size=1,
-        target_global_batch_size=32,
-        explicit_steps=8,
-    ) == 8
+    assert (
+        stage_b_gradient_accumulation_steps(
+            world_size=4, micro_batch_size=1, target_global_batch_size=32
+        )
+        == 8
+    )
+    assert (
+        stage_b_gradient_accumulation_steps(
+            world_size=6, micro_batch_size=1, target_global_batch_size=32
+        )
+        == 5
+    )
+    assert (
+        stage_b_gradient_accumulation_steps(
+            world_size=6,
+            micro_batch_size=1,
+            target_global_batch_size=32,
+            explicit_steps=8,
+        )
+        == 8
+    )
 
 
 def test_stage_b_bucket_cursor_repartitions_remaining_windows_without_replay() -> None:
@@ -1761,11 +1798,7 @@ def test_stage_b_bucket_cursor_repartitions_remaining_windows_without_replay() -
         local_windows_seen=2,
         world_size=4,
     )
-    consumed_ids = {
-        window.example.example_id
-        for shard in old_shards
-        for window in shard[:2]
-    }
+    consumed_ids = {window.example.example_id for shard in old_shards for window in shard[:2]}
     new_shards = tuple(
         shard_rollout_windows(
             windows,
@@ -1778,51 +1811,47 @@ def test_stage_b_bucket_cursor_repartitions_remaining_windows_without_replay() -
         )
         for rank in range(2)
     )
-    remaining_ids = {
-        window.example.example_id
-        for shard in new_shards
-        for window in shard
-    }
+    remaining_ids = {window.example.example_id for shard in new_shards for window in shard}
 
     assert len(consumed_ids) == 8
     assert len(remaining_ids) == 2
     assert consumed_ids.isdisjoint(remaining_ids)
-    assert consumed_ids | remaining_ids == {
-        window.example.example_id for window in windows
-    }
+    assert consumed_ids | remaining_ids == {window.example.example_id for window in windows}
 
 
 def test_stage_b_optimizer_step_count_matches_bucket_padding() -> None:
     example = make_trajectory()
     windows = tuple(
-        CIDRolloutWindow(example=example, source_steps=(0, 1, 2), loss_weight=1.0)
-        for _ in range(5)
+        CIDRolloutWindow(example=example, source_steps=(0, 1, 2), loss_weight=1.0) for _ in range(5)
     ) + tuple(
-        CIDRolloutWindow(example=example, source_steps=(0,), loss_weight=2.0)
-        for _ in range(3)
+        CIDRolloutWindow(example=example, source_steps=(0,), loss_weight=2.0) for _ in range(3)
     )
 
-    assert stage_b_optimizer_steps_per_epoch(
-        windows,
-        world_size=4,
-        micro_batch_size=1,
-        gradient_accumulation_steps=2,
-    ) == 4
-    assert stage_b_optimizer_steps_per_epoch(
-        windows,
-        world_size=4,
-        micro_batch_size=2,
-        gradient_accumulation_steps=2,
-    ) == 2
+    assert (
+        stage_b_optimizer_steps_per_epoch(
+            windows,
+            world_size=4,
+            micro_batch_size=1,
+            gradient_accumulation_steps=2,
+        )
+        == 4
+    )
+    assert (
+        stage_b_optimizer_steps_per_epoch(
+            windows,
+            world_size=4,
+            micro_batch_size=2,
+            gradient_accumulation_steps=2,
+        )
+        == 2
+    )
 
 
 def test_stage_b_adamw_groups_split_backbone_cid_and_no_decay() -> None:
     adapter = make_adapter()
     adapter.set_backbone_trainable(True)
 
-    groups = stage_b_adamw_parameter_groups(
-        adapter, backbone_lr_scale=0.5, weight_decay=0.01
-    )
+    groups = stage_b_adamw_parameter_groups(adapter, backbone_lr_scale=0.5, weight_decay=0.01)
     by_name = {str(group["group_name"]): group for group in groups}
 
     assert set(by_name) == {
@@ -1843,9 +1872,7 @@ def test_stage_b_adamw_groups_split_backbone_cid_and_no_decay() -> None:
 def test_learning_rate_schedule_preserves_stage_b_group_scales() -> None:
     adapter = make_adapter()
     adapter.set_backbone_trainable(True)
-    groups = stage_b_adamw_parameter_groups(
-        adapter, backbone_lr_scale=0.5, weight_decay=0.01
-    )
+    groups = stage_b_adamw_parameter_groups(adapter, backbone_lr_scale=0.5, weight_decay=0.01)
     optimizer = torch.optim.AdamW(groups, lr=1e-3)
     trainer = CIDTrainer(
         adapter,
@@ -1943,3 +1970,65 @@ def test_rollout_curriculum_and_window_sharding_are_deterministic() -> None:
         for rank in range(3)
     )
     assert {tuple(len(window.source_steps) for window in shard) for shard in shards} == {(3, 3)}
+
+
+def test_revision_target_tracks_logical_state_change_not_sampled_diffusion_noise() -> None:
+    adapter = make_adapter(seed=144)
+    tensorizer = ILLaDATrajectoryTensorizer(adapter, TinyTokenizer())
+
+    sample = tensorizer.tensorize(make_trajectory(), source_step=0, timestep=0.1)
+
+    assert sample.targets.noise_delta[0, 0, 0] == pytest.approx(0.2)
+    assert sample.targets.revision_targets[0, 0] == int(cid_model.RevisionAction.STABILIZE)
+
+
+def test_self_rollout_applies_runtime_stable_reopen_gate() -> None:
+    adapter = make_adapter(seed=146)
+    tensorizer = ILLaDATrajectoryTensorizer(adapter, TinyTokenizer())
+    trainer = CIDTrainer(adapter, tensorizer, CIDTrainerConfig(timestep_min=0.0, timestep_max=0.0))
+    example = make_rollout_trajectory()
+    sample = tensorizer.tensorize(example, source_step=1, timestep=0.0)
+    training_batch = collate_training_steps((sample,), pad_token_id=1)
+    output = adapter(training_batch.batch)
+    stable_index = list(import_module("cid.lifecycle").MODELED_LIFECYCLES).index(
+        CellLifecycle.STABLE
+    )
+    active_index = list(import_module("cid.lifecycle").MODELED_LIFECYCLES).index(
+        CellLifecycle.ACTIVE
+    )
+
+    # c0 is STABLE at source step 1. An ACTIVE proposal without REOPEN must be blocked.
+    output.lifecycle_logits[0, 0].fill_(-10.0)
+    output.lifecycle_logits[0, 0, active_index] = 10.0
+    output.revision_logits[0, 0].fill_(-10.0)
+    output.revision_logits[0, 0, int(cid_model.RevisionAction.KEEP)] = 10.0
+    blocked = trainer._rollout_state_from_prediction(
+        sample, training_batch, output, example=example, batch_index=0
+    )
+    assert int(blocked.lifecycle_features[0, 0].argmax()) == stable_index
+
+    output.revision_logits[0, 0].fill_(-10.0)
+    output.revision_logits[0, 0, int(cid_model.RevisionAction.REOPEN)] = 10.0
+    reopened = trainer._rollout_state_from_prediction(
+        sample, training_batch, output, example=example, batch_index=0
+    )
+    assert int(reopened.lifecycle_features[0, 0].argmax()) == active_index
+
+
+def test_training_display_masks_physical_tail_after_visible_eos() -> None:
+    adapter = make_adapter(seed=147)
+    tensorizer = ILLaDATrajectoryTensorizer(adapter, TinyTokenizer())
+
+    sample = tensorizer.tensorize(make_trajectory(), source_step=0, timestep=0.0)
+
+    eos_positions = torch.nonzero(
+        sample.batch.display_ids[0] == tensorizer.eos_token_id, as_tuple=False
+    ).flatten()
+    assert eos_positions.numel() == 1
+    eos = int(eos_positions[0])
+    assert not sample.batch.display_padding_mask[0, : eos + 1].any()
+    assert sample.batch.display_padding_mask[0, eos + 1 :].all()
+    assert sample.batch.display_noise[0, eos + 1 :].eq(0).all()
+
+    collated = collate_training_steps((sample,), pad_token_id=1)
+    assert torch.equal(collated.batch.display_padding_mask[0], sample.batch.display_padding_mask[0])

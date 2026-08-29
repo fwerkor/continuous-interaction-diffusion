@@ -12,7 +12,12 @@ from cid.model.diffusion import (
     denoising_noise_level,
     denoising_reveal_fraction,
 )
-from cid.model.encoding import ILLaDATextEncoder, stable_text
+from cid.model.encoding import (
+    ILLaDATextEncoder,
+    canonical_fact_text,
+    canonical_percept_text,
+    canonical_source_text,
+)
 from cid.model.illada import ILLADA_8B_BASE, ILLaDACIDAdapter
 from cid.model.loading import pretrained_revision
 from cid.model.materialize import CIDMaterializer, ClosedWorldMaterializationCatalog
@@ -31,7 +36,7 @@ class ILLaDAContextTensorizer:
         self.adapter = adapter
         self.tokenizer = tokenizer
         self.text_encoder = text_encoder or ILLaDATextEncoder(adapter, tokenizer)
-        self.scheduler = CIDDiffusionScheduler(adapter.mask_token_id)
+        self.scheduler = CIDDiffusionScheduler(adapter.mask_token_id, adapter.eos_token_id)
         if self.text_encoder.d_model != adapter.d_model:
             raise ValueError("runtime text encoder width must match the CID adapter")
 
@@ -79,12 +84,7 @@ class ILLaDAContextTensorizer:
             dtype=dtype,
         )
         role_features = torch.tensor(
-            [
-                [
-                    [float(cell.roles.get(role, 0.0)) for role in role_order]
-                    for cell in thought.cells
-                ]
-            ],
+            [[[float(cell.roles.get(role, 0.0)) for role in role_order] for cell in thought.cells]],
             device=device,
             dtype=dtype,
         )
@@ -168,34 +168,17 @@ class ILLaDAContextTensorizer:
 
     @staticmethod
     def _fact_text(item: FactItem) -> str:
-        return " | ".join(
-            (
-                f"fact={item.key}",
-                f"source={item.source_type}",
-                f"value={stable_text(item.value)}",
-                f"version={item.version or ''}",
-            )
-        )
+        return canonical_fact_text(item)
 
     @staticmethod
     def _percept_text(item: Percept) -> str:
-        anchors = ",".join(anchor.canonical_key for anchor in item.observation.anchors)
-        target_cells = ",".join(target.identifier for target in item.target_cells)
-        target_display = ",".join(
-            f"{target.span[0]}:{target.span[1]}"
-            for target in item.target_display
-            if target.span is not None
-        )
-        return " | ".join(
-            (
-                f"percept={item.binding_id}",
-                f"source={item.source}",
-                f"value={stable_text(item.observation.value)}",
-                f"version={item.observation.version or ''}",
-                f"anchors={anchors}",
-                f"target_cells={target_cells}",
-                f"target_display={target_display}",
-            )
+        return canonical_percept_text(
+            source=item.source,
+            value=item.observation.value,
+            version=item.observation.version,
+            anchors=item.observation.anchors,
+            target_cells=item.target_cells,
+            target_display=item.target_display,
         )
 
     @staticmethod
@@ -217,20 +200,7 @@ class ILLaDAContextTensorizer:
 
     @staticmethod
     def _source_text(item: SourceDescriptor) -> str:
-        arguments = ",".join(
-            f"{argument.name}:{argument.kind}:{'required' if argument.required else 'optional'}"
-            for argument in item.arguments
-        )
-        return " | ".join(
-            (
-                f"source={item.name}",
-                f"description={item.description}",
-                f"arguments={arguments}",
-                f"dynamic={item.dynamic}",
-                f"versioned={item.versioned}",
-                f"accepts_partial_arguments={item.accepts_partial_arguments}",
-            )
-        )
+        return canonical_source_text(item)
 
 
 @dataclass(frozen=True, slots=True)
@@ -278,9 +248,7 @@ class ILLaDANeuralPolicy:
         batch = self.tensorizer(
             context,
             generator=self.generator,
-            display_noise_level=denoising_noise_level(
-                diffusion_step, self.config.denoising_steps
-            ),
+            display_noise_level=denoising_noise_level(diffusion_step, self.config.denoising_steps),
         )
         with torch.no_grad():
             output = self.forward_model(batch)
@@ -299,4 +267,3 @@ class ILLaDANeuralPolicy:
             catalog=self.catalog,
             display_token_ids=tuple(int(token) for token in display_ids[0].tolist()),
         )
-

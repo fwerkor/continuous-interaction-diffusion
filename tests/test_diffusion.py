@@ -137,9 +137,7 @@ def test_chunked_display_refinement_matches_full_softmax_reference() -> None:
         ranked = masked_positions[
             confidence[batch_index, masked_positions].argsort(descending=True)
         ]
-        expected[batch_index, ranked[:reveal_count]] = predicted[
-            batch_index, ranked[:reveal_count]
-        ]
+        expected[batch_index, ranked[:reveal_count]] = predicted[batch_index, ranked[:reveal_count]]
 
         visible_positions = torch.nonzero(tokens[batch_index] != 5, as_tuple=False).flatten()
         current_ids = tokens[batch_index, visible_positions]
@@ -149,9 +147,7 @@ def test_chunked_display_refinement_matches_full_softmax_reference() -> None:
             current_ids,
         ]
         gains = confidence[batch_index, visible_positions] - current_confidence
-        candidates = (
-            (predicted[batch_index, visible_positions] != current_ids) & (gains >= 0.05)
-        )
+        candidates = (predicted[batch_index, visible_positions] != current_ids) & (gains >= 0.05)
         candidate_positions = visible_positions[candidates]
         candidate_gains = gains[candidates]
         revision_count = min(
@@ -179,3 +175,56 @@ def test_diffusion_scheduler_validates_timestep_range() -> None:
 
     with pytest.raises(ValueError, match="timesteps"):
         scheduler.corrupt_display(torch.tensor([[1, 2]]), torch.tensor([1.2]))
+
+
+def test_display_eos_is_revealed_only_at_the_leftmost_unresolved_frontier() -> None:
+    scheduler = CIDDiffusionScheduler(mask_token_id=5, eos_token_id=2)
+    tokens = torch.tensor([[9, 5, 5, 5]])
+    logits = torch.zeros(1, 4, 16)
+    logits[..., 2] = 20.0
+    logits[..., 7] = 10.0
+
+    refined = scheduler.refine_display(
+        tokens,
+        logits,
+        reveal_fraction=1.0,
+        revision_fraction=0.0,
+        revision_margin=0.0,
+    )
+
+    assert refined.tolist() == [[9, 2, 5, 5]]
+
+
+def test_display_refinement_never_mutates_tail_after_existing_eos() -> None:
+    scheduler = CIDDiffusionScheduler(mask_token_id=5, eos_token_id=2)
+    tokens = torch.tensor([[9, 2, 5, 5]])
+    logits = torch.zeros(1, 4, 16)
+    logits[..., 7] = 20.0
+    logits[0, 1, 2] = 30.0
+
+    refined = scheduler.refine_display(
+        tokens,
+        logits,
+        reveal_fraction=1.0,
+        revision_fraction=1.0,
+        revision_margin=0.0,
+    )
+
+    assert refined.tolist() == [[7, 2, 5, 5]]
+
+
+def test_visible_replacement_corruption_never_injects_eos() -> None:
+    scheduler = CIDDiffusionScheduler(mask_token_id=5, eos_token_id=2)
+    tokens = torch.tensor([[10, 11, 12, 13]])
+
+    corruption = scheduler.corrupt_display(
+        tokens,
+        torch.tensor([1.0]),
+        vocab_size=16,
+        replacement_fraction=1.0,
+        generator=torch.Generator().manual_seed(3),
+    )
+
+    assert not corruption.token_ids.eq(2).any()
+    assert not corruption.token_ids.eq(5).any()
+    assert torch.all(corruption.token_ids != tokens)

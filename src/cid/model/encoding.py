@@ -1,12 +1,16 @@
 from __future__ import annotations
 
 import json
+from collections.abc import Mapping
 from typing import Any
 
 import torch
 from torch import Tensor, nn
 
+from cid.contracts import SourceDescriptor
+from cid.grounding import Anchor, ObjectRef
 from cid.model.illada import ILLaDACIDAdapter
+from cid.state import FactItem
 
 
 class ILLaDATextEncoder:
@@ -35,9 +39,7 @@ class ILLaDATextEncoder:
             torch.device(embedding_device) if embedding_device is not None else output_device
         )
         weight = (
-            adapter.input_embeddings.weight.detach()
-            .to(device=storage_device, dtype=dtype)
-            .clone()
+            adapter.input_embeddings.weight.detach().to(device=storage_device, dtype=dtype).clone()
         )
         snapshot._embedding = nn.Embedding.from_pretrained(weight, freeze=True)
         snapshot._output_device = output_device
@@ -101,3 +103,100 @@ class ILLaDATextEncoder:
 
 def stable_text(value: Any) -> str:
     return json.dumps(value, ensure_ascii=False, sort_keys=True, default=str, separators=(",", ":"))
+
+
+def canonical_fact_text(
+    item: FactItem | None = None,
+    *,
+    key: str | None = None,
+    value: Any = None,
+    source_type: str = "dataset",
+    version: str | None = None,
+) -> str:
+    if item is not None:
+        key = item.key
+        value = item.value
+        source_type = item.source_type
+        version = item.version
+    if key is None:
+        raise ValueError("canonical fact text requires a key")
+    return " | ".join(
+        (
+            f"fact={key}",
+            f"source={source_type}",
+            f"value={stable_text(value)}",
+            f"version={version or ''}",
+        )
+    )
+
+
+def canonical_source_text(item: SourceDescriptor | Mapping[str, Any]) -> str:
+    if isinstance(item, SourceDescriptor):
+        name = item.name
+        description = item.description
+        arguments = tuple(
+            (argument.name, argument.kind, argument.required) for argument in item.arguments
+        )
+        cacheable = item.cacheable
+        dynamic = item.dynamic
+        streamable = item.streamable
+        versioned = item.versioned
+        accepts_partial_arguments = item.accepts_partial_arguments
+    else:
+        name = str(item.get("name", ""))
+        description = str(item.get("description", ""))
+        arguments = tuple(
+            (
+                str(argument.get("name", "")),
+                str(argument.get("kind", "any")),
+                bool(argument.get("required", True)),
+            )
+            for argument in item.get("arguments", ())
+        )
+        cacheable = bool(item.get("cacheable", True))
+        dynamic = bool(item.get("dynamic", False))
+        streamable = bool(item.get("streamable", False))
+        versioned = bool(item.get("versioned", False))
+        accepts_partial_arguments = bool(item.get("accepts_partial_arguments", False))
+    argument_text = ",".join(
+        f"{argument_name}:{kind}:{'required' if required else 'optional'}"
+        for argument_name, kind, required in arguments
+    )
+    return " | ".join(
+        (
+            f"source={name}",
+            f"description={description}",
+            f"arguments={argument_text}",
+            f"cacheable={cacheable}",
+            f"dynamic={dynamic}",
+            f"streamable={streamable}",
+            f"versioned={versioned}",
+            f"accepts_partial_arguments={accepts_partial_arguments}",
+        )
+    )
+
+
+def canonical_percept_text(
+    *,
+    source: str,
+    value: Any,
+    version: str | None,
+    target_cells: tuple[ObjectRef, ...],
+    target_display: tuple[ObjectRef, ...],
+    anchors: tuple[Anchor, ...] = (),
+) -> str:
+    anchor_text = ",".join(anchor.canonical_key for anchor in anchors)
+    cell_text = ",".join(target.identifier for target in target_cells)
+    display_text = ",".join(
+        f"{target.span[0]}:{target.span[1]}" for target in target_display if target.span is not None
+    )
+    return " | ".join(
+        (
+            f"source={source}",
+            f"value={stable_text(value)}",
+            f"version={version or ''}",
+            f"anchors={anchor_text}",
+            f"target_cells={cell_text}",
+            f"target_display={display_text}",
+        )
+    )

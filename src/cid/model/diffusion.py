@@ -44,10 +44,15 @@ class ThoughtCorruption:
 class CIDDiffusionScheduler:
     """Training corruption and iterative reveal utilities for CID T/Y state."""
 
-    def __init__(self, mask_token_id: int) -> None:
+    def __init__(self, mask_token_id: int, eos_token_id: int | None = None) -> None:
         if mask_token_id < 0:
             raise ValueError("mask_token_id must be non-negative")
+        if eos_token_id is not None and eos_token_id < 0:
+            raise ValueError("eos_token_id must be non-negative when set")
+        if eos_token_id == mask_token_id:
+            raise ValueError("EOS and MASK token IDs must differ")
         self.mask_token_id = mask_token_id
+        self.eos_token_id = eos_token_id
 
     def corrupt_display(
         self,
@@ -187,17 +192,31 @@ class CIDDiffusionScheduler:
 
         confidence = torch.empty(token_ids.shape, dtype=torch.float32, device=logits.device)
         predicted = torch.empty(token_ids.shape, dtype=torch.long, device=logits.device)
-        current_confidence = torch.empty(
-            token_ids.shape, dtype=torch.float32, device=logits.device
-        )
+        current_confidence = torch.empty(token_ids.shape, dtype=torch.float32, device=logits.device)
+        mutable = torch.ones_like(token_ids, dtype=torch.bool)
+        if self.eos_token_id is not None:
+            for batch_index in range(token_ids.shape[0]):
+                eos_positions = torch.nonzero(
+                    token_ids[batch_index] == self.eos_token_id, as_tuple=False
+                ).flatten()
+                if eos_positions.numel():
+                    mutable[batch_index, int(eos_positions[0]) + 1 :] = False
+            masked = (token_ids == self.mask_token_id) & mutable
+            prior_mask_count = masked.cumsum(dim=1) - masked.to(dtype=torch.int64)
+            eos_allowed = mutable & prior_mask_count.eq(0)
+        else:
+            eos_allowed = mutable
         token_chunk_size = 32
         for start in range(0, token_ids.shape[1], token_chunk_size):
             stop = min(token_ids.shape[1], start + token_chunk_size)
             filtered_logits = logits[:, start:stop].float().clone()
             if self.mask_token_id < filtered_logits.shape[-1]:
-                filtered_logits[..., self.mask_token_id] = torch.finfo(
-                    filtered_logits.dtype
-                ).min
+                filtered_logits[..., self.mask_token_id] = torch.finfo(filtered_logits.dtype).min
+            if self.eos_token_id is not None and self.eos_token_id < filtered_logits.shape[-1]:
+                eos_logits = filtered_logits[..., self.eos_token_id]
+                eos_logits.masked_fill_(
+                    ~eos_allowed[:, start:stop], torch.finfo(filtered_logits.dtype).min
+                )
             probabilities = torch.softmax(filtered_logits, dim=-1)
             chunk_confidence, chunk_predicted = probabilities.max(dim=-1)
             confidence[:, start:stop] = chunk_confidence
@@ -210,7 +229,7 @@ class CIDDiffusionScheduler:
         result = token_ids.clone()
         for batch_index in range(token_ids.shape[0]):
             masked_positions = torch.nonzero(
-                token_ids[batch_index] == self.mask_token_id,
+                (token_ids[batch_index] == self.mask_token_id) & mutable[batch_index],
                 as_tuple=False,
             ).flatten()
             if masked_positions.numel() and reveal_fraction:
@@ -224,7 +243,7 @@ class CIDDiffusionScheduler:
             if revision_fraction == 0.0:
                 continue
             visible_positions = torch.nonzero(
-                token_ids[batch_index] != self.mask_token_id,
+                (token_ids[batch_index] != self.mask_token_id) & mutable[batch_index],
                 as_tuple=False,
             ).flatten()
             if visible_positions.numel() == 0:
@@ -232,9 +251,8 @@ class CIDDiffusionScheduler:
             current_ids = token_ids[batch_index, visible_positions]
             visible_confidence = current_confidence[batch_index, visible_positions]
             gains = confidence[batch_index, visible_positions] - visible_confidence
-            candidates = (
-                (predicted[batch_index, visible_positions] != current_ids)
-                & (gains >= revision_margin)
+            candidates = (predicted[batch_index, visible_positions] != current_ids) & (
+                gains >= revision_margin
             )
             candidate_positions = visible_positions[candidates]
             if candidate_positions.numel() == 0:
@@ -247,6 +265,14 @@ class CIDDiffusionScheduler:
             ranked = candidate_positions[candidate_gains.argsort(descending=True)]
             selected = ranked[:revision_count]
             result[batch_index, selected] = predicted[batch_index, selected]
+
+        if self.eos_token_id is not None:
+            for batch_index in range(result.shape[0]):
+                eos_positions = torch.nonzero(
+                    result[batch_index] == self.eos_token_id, as_tuple=False
+                ).flatten()
+                if eos_positions.numel():
+                    result[batch_index, int(eos_positions[0]) + 1 :] = self.mask_token_id
         return result
 
     def _replacement_tokens(
@@ -264,10 +290,13 @@ class CIDDiffusionScheduler:
             generator=generator,
         )
         replacements = (token_ids + offsets) % vocab_size
-        mask_collision = replacements == self.mask_token_id
-        replacements[mask_collision] = (replacements[mask_collision] + 1) % vocab_size
-        original_collision = replacements == token_ids
-        replacements[original_collision] = (replacements[original_collision] + 1) % vocab_size
+        for _ in range(3):
+            forbidden = (replacements == self.mask_token_id) | (replacements == token_ids)
+            if self.eos_token_id is not None:
+                forbidden |= replacements == self.eos_token_id
+            if not bool(forbidden.any()):
+                break
+            replacements[forbidden] = (replacements[forbidden] + 1) % vocab_size
         return replacements
 
     @staticmethod

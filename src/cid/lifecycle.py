@@ -50,7 +50,10 @@ class LifecycleTransitionController:
             if cell_id is None:
                 continue
             if cell_id not in previous_ids:
-                if cell.lifecycle is not CellLifecycle.ACTIVE:
+                allowed = cell.lifecycle is CellLifecycle.ACTIVE or (
+                    cell.lifecycle is CellLifecycle.WAITING and cell_id in signals.waiting_cells
+                )
+                if not allowed:
                     cells[slot] = replace(cell, lifecycle=CellLifecycle.ACTIVE)
                 continue
 

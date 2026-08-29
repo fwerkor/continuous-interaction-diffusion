@@ -58,19 +58,13 @@ class TinySparseMoE(nn.Module):
         self.norm_topk_prob = False
         self.expert_bias = None
         self.gate = nn.Linear(hidden_size, num_experts, bias=False)
-        self.experts = nn.ModuleList(
-            [TinyExpert(hidden_size) for _ in range(num_experts)]
-        )
+        self.experts = nn.ModuleList([TinyExpert(hidden_size) for _ in range(num_experts)])
 
     def forward(self, hidden_states):
         batch_size, sequence_length, hidden_dim = hidden_states.shape
         flat_hidden = hidden_states.reshape(-1, hidden_dim)
-        routing_weights = torch.softmax(
-            self.gate(flat_hidden), dim=1, dtype=torch.float32
-        )
-        routing_weights, selected_experts = torch.topk(
-            routing_weights, self.top_k, dim=-1
-        )
+        routing_weights = torch.softmax(self.gate(flat_hidden), dim=1, dtype=torch.float32)
+        routing_weights, selected_experts = torch.topk(routing_weights, self.top_k, dim=-1)
         routing_weights = routing_weights.to(flat_hidden.dtype)
         output = torch.zeros_like(flat_hidden)
         for expert_idx, expert in enumerate(self.experts):
@@ -180,6 +174,8 @@ def test_llada_moe_adapter_uses_model_tokens_and_router_auxiliary_loss() -> None
     assert adapter.is_llada_moe
     assert adapter.mask_token_id == 63
     assert adapter.eos_token_id == 62
+    assert output.need_logits.shape == (1, 2, adapter.config.max_need_slots)
+    assert output.source_logits.shape == (1, 2, adapter.config.max_need_slots, 1)
     assert backbone.decoder.last_output_router_logits
     assert output.auxiliary_loss is not None
     assert torch.isfinite(output.auxiliary_loss)

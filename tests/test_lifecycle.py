@@ -60,13 +60,9 @@ def test_waiting_requires_runtime_dependency_and_releases_on_observation() -> No
 def test_stable_cell_requires_explicit_reopen_signal() -> None:
     controller = LifecycleTransitionController()
     field, cell_id = CognitiveField.empty(capacity=2, width=3).allocate()
-    stable = controller.apply(
-        field, proposed_lifecycle(field, cell_id, CellLifecycle.STABLE)
-    )
+    stable = controller.apply(field, proposed_lifecycle(field, cell_id, CellLifecycle.STABLE))
 
-    blocked = controller.apply(
-        stable, proposed_lifecycle(stable, cell_id, CellLifecycle.ACTIVE)
-    )
+    blocked = controller.apply(stable, proposed_lifecycle(stable, cell_id, CellLifecycle.ACTIVE))
     assert blocked.get(cell_id).lifecycle is CellLifecycle.STABLE
 
     reopened = controller.apply(
@@ -80,9 +76,7 @@ def test_stable_cell_requires_explicit_reopen_signal() -> None:
 def test_retired_cell_cannot_be_reactivated_or_reclaimed_by_model() -> None:
     controller = LifecycleTransitionController()
     field, cell_id = CognitiveField.empty(capacity=2, width=3).allocate()
-    retired = controller.apply(
-        field, proposed_lifecycle(field, cell_id, CellLifecycle.RETIRED)
-    )
+    retired = controller.apply(field, proposed_lifecycle(field, cell_id, CellLifecycle.RETIRED))
 
     proposed_active = proposed_lifecycle(retired, cell_id, CellLifecycle.ACTIVE)
     remains_retired = controller.apply(retired, proposed_active)
@@ -98,3 +92,23 @@ def test_new_cells_must_start_active() -> None:
     field = CognitiveField.empty(capacity=2, width=3)
     with pytest.raises(ValueError, match="start ACTIVE"):
         field.allocate(lifecycle=CellLifecycle.WAITING)
+
+
+def test_new_cell_can_enter_waiting_when_runtime_dependency_is_already_pending() -> None:
+    controller = LifecycleTransitionController()
+    previous = CognitiveField.empty(capacity=2, width=3)
+    proposed, cell_id = previous.allocate()
+    cells = list(proposed.cells)
+    slot = proposed.slot_of(cell_id)
+    cells[slot] = replace(cells[slot], lifecycle=CellLifecycle.WAITING)
+    proposed = proposed.advance(tuple(cells))
+
+    blocked = controller.apply(previous, proposed)
+    assert blocked.get(cell_id).lifecycle is CellLifecycle.ACTIVE
+
+    waiting = controller.apply(
+        previous,
+        proposed,
+        LifecycleTransitionSignals(waiting_cells=frozenset({cell_id})),
+    )
+    assert waiting.get(cell_id).lifecycle is CellLifecycle.WAITING

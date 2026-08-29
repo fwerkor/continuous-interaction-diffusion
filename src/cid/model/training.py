@@ -18,7 +18,11 @@ from torch import Tensor
 from cid.contracts import FreshnessDemand
 from cid.data import ThoughtTarget, TrajectoryExample, training_transition_source_steps
 from cid.grounding import AnchorKind, LinkRelation, ObjectKind, ObjectRef
-from cid.lifecycle import MODELED_LIFECYCLES
+from cid.lifecycle import (
+    MODELED_LIFECYCLES,
+    LifecycleTransitionController,
+    LifecycleTransitionSignals,
+)
 from cid.model.allocation import (
     DEFAULT_MAX_ALLOCATIONS_PER_STEP,
     prefix_allocation_mask,
@@ -28,12 +32,20 @@ from cid.model.diffusion import (
     denoising_noise_level,
     denoising_reveal_fraction,
 )
-from cid.model.encoding import ILLaDATextEncoder, stable_text
+from cid.model.encoding import (
+    ILLaDATextEncoder,
+    canonical_fact_text,
+    canonical_percept_text,
+    canonical_source_text,
+    stable_text,
+)
 from cid.model.illada import ILLaDACIDAdapter
 from cid.model.losses import CIDLoss, CIDTargets, cid_loss
 from cid.model.materialize import RevisionAction
 from cid.model.tensors import CIDTensorBatch, CIDTensorOutput, build_percept_routing_masks
 from cid.state import CellLifecycle, CognitiveRole
+
+CID_NEURAL_CONTRACT_VERSION = 2
 
 
 @dataclass(slots=True)
@@ -106,6 +118,13 @@ def collate_training_steps(
         tuple(step.batch.display_ids for step in steps),
         pad_value=pad_token_id,
     )
+    for row, step in enumerate(steps):
+        mask = step.batch.display_padding_mask
+        if mask is not None:
+            width = step.batch.display_ids.shape[1]
+            display_padding_mask[row, :width] |= mask[0].to(
+                device=display_padding_mask.device, dtype=torch.bool
+            )
     display_noise, _ = _pad_3d(tuple(step.batch.display_noise for step in steps))
     fact_memory, fact_padding_mask = _pad_3d(tuple(step.batch.fact_memory for step in steps))
     percept_memory, percept_padding_mask = _pad_3d(
@@ -272,8 +291,8 @@ class CIDTrainProgress:
 
 
 class CIDTrainer:
-    CHECKPOINT_VERSION = 2
-    SUPPORTED_CHECKPOINT_VERSIONS = (1, 2)
+    CHECKPOINT_VERSION = 3
+    SUPPORTED_CHECKPOINT_VERSIONS = (3,)
 
     def __init__(
         self,
@@ -405,6 +424,7 @@ class CIDTrainer:
                         sample,
                         training_batch,
                         output,
+                        example=windows[index].example,
                         batch_index=index,
                     )
                     for index, sample in enumerate(samples)
@@ -451,6 +471,7 @@ class CIDTrainer:
         training_batch: CIDTrainingBatch,
         output: CIDTensorOutput,
         *,
+        example: TrajectoryExample,
         batch_index: int,
     ) -> CIDRolloutState:
         input_batch = training_batch.batch
@@ -461,9 +482,7 @@ class CIDTrainer:
         thought_slots = sample.batch.thought_semantic.shape[1]
         slot_slice = slice(0, thought_slots)
         occupancy = (
-            input_batch.slot_occupancy[batch_index : batch_index + 1, slot_slice]
-            .detach()
-            .bool()
+            input_batch.slot_occupancy[batch_index : batch_index + 1, slot_slice].detach().bool()
         )
         allocation = prefix_allocation_mask(
             occupancy,
@@ -476,17 +495,50 @@ class CIDTrainer:
         lifecycle_indices = output.lifecycle_logits[
             batch_index : batch_index + 1, slot_slice
         ].argmax(dim=-1)
-        lifecycle_features = torch.nn.functional.one_hot(
-            lifecycle_indices, num_classes=self.adapter.config.num_lifecycles
-        ).to(dtype=sample.batch.role_features.dtype)
-        active_index = MODELED_LIFECYCLES.index(CellLifecycle.ACTIVE)
-        newly_allocated = (~previous_occupancy & allocation).squeeze(-1)
-        if bool(newly_allocated.any()):
-            lifecycle_features[newly_allocated] = 0.0
-            lifecycle_features[..., active_index][newly_allocated] = 1.0
-        lifecycle_features = lifecycle_features * occupancy.to(
-            dtype=lifecycle_features.dtype
+        revision_indices = output.revision_logits[batch_index : batch_index + 1, slot_slice].argmax(
+            dim=-1
         )
+        input_lifecycle = input_batch.lifecycle_features[batch_index : batch_index + 1, slot_slice]
+        lifecycle_features = torch.zeros(
+            (1, thought_slots, self.adapter.config.num_lifecycles),
+            device=lifecycle_indices.device,
+            dtype=sample.batch.role_features.dtype,
+        )
+        target_snapshot = self.tensorizer._thought_snapshot(example, sample.target_step)
+        cell_id_by_slot = {target.slot: target.cell_id for target in target_snapshot}
+        waiting_cells, available_cells = self.tensorizer._binding_lifecycle_cells(
+            example, sample.target_step
+        )
+        for slot in range(thought_slots):
+            if not bool(occupancy[0, slot, 0]):
+                continue
+            cell_id = cell_id_by_slot.get(slot, f"__rollout_slot_{slot}")
+            proposed = MODELED_LIFECYCLES[int(lifecycle_indices[0, slot])]
+            if not bool(previous_occupancy[0, slot, 0]):
+                resolved = (
+                    CellLifecycle.WAITING
+                    if proposed is CellLifecycle.WAITING and cell_id in waiting_cells
+                    else CellLifecycle.ACTIVE
+                )
+            else:
+                current_features = input_lifecycle[0, slot]
+                current = (
+                    MODELED_LIFECYCLES[int(current_features.argmax())]
+                    if bool(current_features.abs().sum())
+                    else CellLifecycle.ACTIVE
+                )
+                reopen = int(revision_indices[0, slot]) == int(RevisionAction.REOPEN)
+                resolved = LifecycleTransitionController.resolve(
+                    cell_id=cell_id,
+                    current=current,
+                    proposed=proposed,
+                    signals=LifecycleTransitionSignals(
+                        waiting_cells=frozenset(waiting_cells),
+                        available_cells=frozenset(available_cells),
+                        reopen_cells=frozenset((cell_id,)) if reopen else frozenset(),
+                    ),
+                )
+            lifecycle_features[0, slot, MODELED_LIFECYCLES.index(resolved)] = 1.0
 
         input_noise = input_batch.local_noise[batch_index : batch_index + 1, slot_slice]
         base_noise = torch.where(
@@ -495,8 +547,7 @@ class CIDTrainer:
             torch.ones_like(input_noise),
         )
         local_noise = (
-            base_noise
-            + output.noise_delta[batch_index : batch_index + 1, slot_slice].detach()
+            base_noise + output.noise_delta[batch_index : batch_index + 1, slot_slice].detach()
         ).clamp(0.0, 1.0)
         local_noise = local_noise * occupancy.to(dtype=local_noise.dtype)
 
@@ -517,9 +568,7 @@ class CIDTrainer:
             role_features=torch.sigmoid(
                 output.role_logits[batch_index : batch_index + 1, slot_slice]
             ).detach(),
-            uncertainty=output.uncertainty[
-                batch_index : batch_index + 1, slot_slice
-            ].detach(),
+            uncertainty=output.uncertainty[batch_index : batch_index + 1, slot_slice].detach(),
             lifecycle_features=lifecycle_features.detach(),
             slot_occupancy=occupancy.to(dtype=sample.batch.slot_occupancy.dtype).detach(),
             local_noise=local_noise.detach(),
@@ -676,9 +725,7 @@ class CIDTrainer:
                 for microbatch in microbatches:
                     lengths = {len(window.source_steps) for window in microbatch}
                     if len(lengths) != 1:
-                        raise ValueError(
-                            "validation micro-batch windows must have the same length"
-                        )
+                        raise ValueError("validation micro-batch windows must have the same length")
                     loss_weights = {window.loss_weight for window in microbatch}
                     if len(loss_weights) != 1:
                         raise ValueError(
@@ -859,9 +906,7 @@ class CIDTrainer:
 
         saved_config = dict(state["trainer_config"])
         current_config = asdict(self.config)
-        saved_config["gradient_accumulation_steps"] = current_config[
-            "gradient_accumulation_steps"
-        ]
+        saved_config["gradient_accumulation_steps"] = current_config["gradient_accumulation_steps"]
         if saved_config != current_config:
             raise ValueError("checkpoint trainer configuration does not match this trainer")
         trainer_state = state["trainer_state"]
@@ -889,6 +934,7 @@ class CIDTrainer:
         }
         payload = {
             "format_version": self.CHECKPOINT_VERSION,
+            "neural_contract_version": CID_NEURAL_CONTRACT_VERSION,
             "trainer_config": asdict(self.config),
             "trainer_state": asdict(self.state),
             "adapter_config": asdict(self.adapter.config),
@@ -915,6 +961,8 @@ class CIDTrainer:
         checkpoint = torch.load(path, map_location="cpu", weights_only=False)
         if checkpoint.get("format_version") not in self.SUPPORTED_CHECKPOINT_VERSIONS:
             raise ValueError("unsupported CID trainer checkpoint version")
+        if checkpoint.get("neural_contract_version") != CID_NEURAL_CONTRACT_VERSION:
+            raise ValueError("CID trainer checkpoint neural contract is incompatible")
         if checkpoint["trainer_config"] != asdict(self.config):
             raise ValueError("checkpoint trainer configuration does not match this trainer")
         if checkpoint["adapter_config"] != asdict(self.adapter.config):
@@ -1028,6 +1076,8 @@ def load_cid_adapter_checkpoint(
     checkpoint = torch.load(path, map_location="cpu", weights_only=False)
     if checkpoint.get("format_version") not in CIDTrainer.SUPPORTED_CHECKPOINT_VERSIONS:
         raise ValueError("unsupported CID trainer checkpoint version")
+    if checkpoint.get("neural_contract_version") != CID_NEURAL_CONTRACT_VERSION:
+        raise ValueError("CID trainer checkpoint neural contract is incompatible")
     backbone = checkpoint["backbone"]
     if (
         int(backbone["hidden_size"]) != adapter.d_model
@@ -1088,15 +1138,13 @@ class ILLaDATrajectoryTensorizer:
         if display_canvas_tokens is None:
             display_canvas_tokens = adapter.config.display_canvas_tokens
         if not 1 < display_canvas_tokens <= adapter.config.max_display_tokens:
-            raise ValueError(
-                "display_canvas_tokens must be in [2, adapter max_display_tokens]"
-            )
+            raise ValueError("display_canvas_tokens must be in [2, adapter max_display_tokens]")
         self.display_canvas_tokens = int(display_canvas_tokens)
         eos_token_id = getattr(tokenizer, "eos_token_id", None)
-        self.eos_token_id = (
-            adapter.eos_token_id if eos_token_id is None else int(eos_token_id)
+        self.eos_token_id = adapter.eos_token_id if eos_token_id is None else int(eos_token_id)
+        self.scheduler = scheduler or CIDDiffusionScheduler(
+            adapter.mask_token_id, adapter.eos_token_id
         )
-        self.scheduler = scheduler or CIDDiffusionScheduler(adapter.mask_token_id)
 
     def tensorize(
         self,
@@ -1177,14 +1225,11 @@ class ILLaDATrajectoryTensorizer:
             rollout_state=rollout_state,
         )
         logical_length = (
-            self.adapter.config.max_thought_slots
-            + prompt_ids.shape[1]
-            + display_canvas_tokens
+            self.adapter.config.max_thought_slots + prompt_ids.shape[1] + display_canvas_tokens
         )
         if logical_length > self.adapter.max_position_embeddings:
             raise ValueError(
-                "configured TCT prefix, prompt, and display bucket exceed "
-                "backbone context capacity"
+                "configured TCT prefix, prompt, and display bucket exceed backbone context capacity"
             )
 
         target_display_ids = torch.full(
@@ -1211,9 +1256,7 @@ class ILLaDATrajectoryTensorizer:
             display_labels = display_corruption.labels
             display_noise = display_corruption.noise * display_supervision_mask.unsqueeze(-1)
         else:
-            display_input_ids = torch.full_like(
-                target_display_ids, self.adapter.mask_token_id
-            )
+            display_input_ids = torch.full_like(target_display_ids, self.adapter.mask_token_id)
             previous_display = rollout_state.display_ids.to(device=device, dtype=torch.long)
             if previous_display.shape[1] > display_input_ids.shape[1]:
                 raise ValueError("rollout display exceeds configured training display capacity")
@@ -1230,37 +1273,44 @@ class ILLaDATrajectoryTensorizer:
 
         fact_memory = self.text_encoder.encode_texts(
             tuple(
-                f"fact={key} | value={stable_text(value)}"
+                canonical_fact_text(key=str(key), value=value, source_type="dataset")
                 for key, value in example.protected_facts.items()
-            )
+            ),
+            detach=True,
         )
-        available_events = tuple(
-            event for event in example.events if event.arrival_step <= target_step
-        )
+        percept_projections = self._available_percept_projections(example, target_step)
         percept_memory = self.text_encoder.encode_texts(
             tuple(
-                " | ".join(
-                    (
-                        f"source={event.source}",
-                        f"value={stable_text(event.value)}",
-                        f"version={event.version or ''}",
-                    )
+                canonical_percept_text(
+                    source=event.source,
+                    value=event.value,
+                    version=event.version,
+                    target_cells=binding.target_cells,
+                    target_display=binding.target_display,
                 )
-                for event in available_events
-            )
+                for binding, event in percept_projections
+            ),
+            detach=True,
         )
         percept_thought_mask, percept_display_mask = self._percept_target_masks(
-            example,
-            available_events,
+            percept_projections,
             target_output_slots=target_output_slots,
-            target_step=target_step,
             display_length=display_input_ids.shape[1],
             thought_slots=capacity,
             device=device,
         )
         source_memory = self.text_encoder.encode_texts(
-            tuple(_source_text(descriptor) for descriptor in example.source_descriptors)
+            tuple(canonical_source_text(descriptor) for descriptor in example.source_descriptors),
+            detach=True,
         )
+
+        display_padding_mask = torch.zeros_like(display_input_ids, dtype=torch.bool)
+        eos_positions = torch.nonzero(
+            display_input_ids[0] == self.eos_token_id, as_tuple=False
+        ).flatten()
+        if eos_positions.numel():
+            display_padding_mask[:, int(eos_positions[0]) + 1 :] = True
+            display_noise = display_noise.masked_fill(display_padding_mask.unsqueeze(-1), 0.0)
 
         batch = CIDTensorBatch(
             thought_semantic=thought_corruption.semantic,
@@ -1277,6 +1327,7 @@ class ILLaDATrajectoryTensorizer:
             lifecycle_features=lifecycle_features,
             percept_thought_mask=percept_thought_mask,
             percept_display_mask=percept_display_mask,
+            display_padding_mask=display_padding_mask,
         )
         targets = self._targets(
             example=example,
@@ -1302,36 +1353,37 @@ class ILLaDATrajectoryTensorizer:
             targets=targets,
         )
 
+    @staticmethod
+    def _available_percept_projections(
+        example: TrajectoryExample, target_step: int
+    ) -> tuple[tuple[Any, Any], ...]:
+        projections: list[tuple[Any, Any]] = []
+        for binding in example.binding_targets:
+            if binding.first_need_step > target_step:
+                continue
+            matching = tuple(
+                event
+                for event in example.events
+                if event.arrival_step <= target_step
+                and event.source == binding.source
+                and dict(event.arguments) == dict(binding.arguments)
+            )
+            if matching:
+                projections.append((binding, max(matching, key=lambda event: event.arrival_step)))
+        return tuple(projections)
+
     def _percept_target_masks(
         self,
-        example: TrajectoryExample,
-        events: tuple[Any, ...],
+        projections: tuple[tuple[Any, Any], ...],
         *,
         target_output_slots: Mapping[str, int],
-        target_step: int,
         display_length: int,
         thought_slots: int,
         device: torch.device,
     ) -> tuple[Tensor, Tensor]:
-        cell_targets: list[tuple[ObjectRef, ...]] = []
-        display_targets: list[tuple[ObjectRef, ...]] = []
-        for event in events:
-            bindings = tuple(
-                binding
-                for binding in example.binding_targets
-                if binding.first_need_step <= target_step
-                and binding.source == event.source
-                and dict(binding.arguments) == dict(event.arguments)
-            )
-            cell_targets.append(
-                tuple(target for binding in bindings for target in binding.target_cells)
-            )
-            display_targets.append(
-                tuple(target for binding in bindings for target in binding.target_display)
-            )
         return build_percept_routing_masks(
-            tuple(cell_targets),
-            tuple(display_targets),
+            tuple(binding.target_cells for binding, _ in projections),
+            tuple(binding.target_display for binding, _ in projections),
             cell_slots=target_output_slots,
             thought_slots=thought_slots,
             display_length=display_length,
@@ -1364,7 +1416,6 @@ class ILLaDATrajectoryTensorizer:
         if not 0.0 <= state.display_noise_level <= 1.0:
             raise ValueError("rollout display noise level must be in [0, 1]")
 
-
     def _targets(
         self,
         *,
@@ -1381,7 +1432,6 @@ class ILLaDATrajectoryTensorizer:
         dtype: torch.dtype,
         device: torch.device,
     ) -> CIDTargets:
-        del source_step
         c = self.adapter.config
         n = thought_slots
         role_order = tuple(CognitiveRole)
@@ -1394,6 +1444,10 @@ class ILLaDATrajectoryTensorizer:
         waiting_equilibrium = any(
             target.lifecycle is CellLifecycle.WAITING for target in target_by_id.values()
         )
+        source_by_id = {
+            target.cell_id: target for target in self._thought_snapshot(example, source_step)
+        }
+        waiting_cells, available_cells = self._binding_lifecycle_cells(example, target_step)
 
         thought_target = torch.zeros((1, n, self.adapter.d_model), device=device, dtype=dtype)
         thought_mask = torch.zeros((1, n), device=device, dtype=torch.bool)
@@ -1409,9 +1463,7 @@ class ILLaDATrajectoryTensorizer:
         noise_delta = torch.zeros((1, n, 1), device=device, dtype=dtype)
         lifecycle = torch.full((1, n), -100, device=device, dtype=torch.long)
         need_targets = torch.zeros((1, n, c.max_need_slots), device=device, dtype=dtype)
-        source_targets = torch.full(
-            (1, n, c.max_need_slots), -100, device=device, dtype=torch.long
-        )
+        source_targets = torch.full((1, n, c.max_need_slots), -100, device=device, dtype=torch.long)
         revision_targets = torch.full((1, n), -100, device=device, dtype=torch.long)
         refresh_targets = torch.full(
             (1, n, c.max_need_slots), -100, device=device, dtype=torch.long
@@ -1469,21 +1521,53 @@ class ILLaDATrajectoryTensorizer:
             for role_index, role in enumerate(role_order):
                 role_targets[0, slot, role_index] = target.roles.get(role, 0.0)
             actually_occupied = bool(input_occupancy[0, slot, 0])
+            source_target = source_by_id.get(cell_id)
             if not actually_occupied:
-                # Allocation/lifecycle are trained against the state actually fed to the model.
-                # A scheduled-sampling miss must therefore remain recoverable on the next step.
+                # A newly allocated cell cannot become STABLE/RETIRED in the same runtime
+                # update. Train the lifecycle head on the effective hard-gated state:
+                # WAITING when an unresolved binding already targets it, otherwise ACTIVE.
                 allocation_targets[0, slot] = 1.0
                 noise_delta[0, slot, 0] = target.noise - 1.0
+                effective_lifecycle = (
+                    CellLifecycle.WAITING
+                    if target.lifecycle is CellLifecycle.WAITING and cell_id in waiting_cells
+                    else CellLifecycle.ACTIVE
+                )
+                lifecycle[0, slot] = lifecycle_order.index(effective_lifecycle)
             else:
                 lifecycle[0, slot] = lifecycle_order.index(target.lifecycle)
-                delta = target.noise - float(input_noise_level[0, slot, 0])
-                noise_delta[0, slot, 0] = delta
-                if delta > 1e-6:
-                    revision_targets[0, slot] = int(RevisionAction.REOPEN)
-                elif delta < -1e-6:
-                    revision_targets[0, slot] = int(RevisionAction.STABILIZE)
+                diffusion_delta = target.noise - float(input_noise_level[0, slot, 0])
+                noise_delta[0, slot, 0] = diffusion_delta
+                state_delta = 0.0 if source_target is None else target.noise - source_target.noise
+                if state_delta > 1e-6:
+                    revision_action = RevisionAction.REOPEN
+                elif state_delta < -1e-6:
+                    revision_action = RevisionAction.STABILIZE
                 else:
-                    revision_targets[0, slot] = int(RevisionAction.KEEP)
+                    revision_action = RevisionAction.KEEP
+                revision_targets[0, slot] = int(revision_action)
+
+                if source_target is not None:
+                    signals = LifecycleTransitionSignals(
+                        waiting_cells=frozenset(waiting_cells),
+                        available_cells=frozenset(available_cells),
+                        reopen_cells=(
+                            frozenset((cell_id,))
+                            if revision_action is RevisionAction.REOPEN
+                            else frozenset()
+                        ),
+                    )
+                    resolved = LifecycleTransitionController.resolve(
+                        cell_id=cell_id,
+                        current=source_target.lifecycle,
+                        proposed=target.lifecycle,
+                        signals=signals,
+                    )
+                    if resolved is not target.lifecycle:
+                        raise ValueError(
+                            f"trajectory lifecycle target {source_target.lifecycle.value}->"
+                            f"{target.lifecycle.value} for {cell_id!r} is blocked by runtime gates"
+                        )
 
         target_slots = set(target_output_slots.values())
         retired_index = lifecycle_order.index(CellLifecycle.RETIRED)
@@ -1616,9 +1700,26 @@ class ILLaDATrajectoryTensorizer:
         epoch_start = max(arrivals, default=0)
         return max(0, source_step - epoch_start)
 
-    def _binding_slot_schedule(
-        self, example: TrajectoryExample
-    ) -> dict[tuple[str, str], int]:
+    @staticmethod
+    def _binding_lifecycle_cells(
+        example: TrajectoryExample, target_step: int
+    ) -> tuple[set[str], set[str]]:
+        waiting: set[str] = set()
+        available: set[str] = set()
+        for binding in example.binding_targets:
+            if binding.first_need_step > target_step:
+                continue
+            observation_available = _binding_observation_available(example, binding, target_step)
+            need_is_active = not (
+                binding.freshness is FreshnessDemand.ONCE and observation_available
+            )
+            if not need_is_active:
+                continue
+            destination = available if observation_available else waiting
+            destination.update(target.identifier for target in binding.target_cells)
+        return waiting, available
+
+    def _binding_slot_schedule(self, example: TrajectoryExample) -> dict[tuple[str, str], int]:
         by_cell: dict[str, list[Any]] = {}
         for binding in example.binding_targets:
             for target in binding.target_cells:
@@ -1658,9 +1759,7 @@ class ILLaDATrajectoryTensorizer:
             )
         return maximum
 
-    def _canonical_slot_schedule(
-        self, example: TrajectoryExample
-    ) -> dict[tuple[int, str], int]:
+    def _canonical_slot_schedule(self, example: TrajectoryExample) -> dict[tuple[int, str], int]:
         capacity = self._trajectory_thought_capacity(example)
         assigned_slots: dict[str, int] = {}
         last_lifecycle: dict[str, CellLifecycle] = {}
@@ -1878,24 +1977,6 @@ def _collate_percept_masks(steps: tuple[CIDTrainingStep, ...], kind: str) -> Ten
             raise ValueError(f"{attribute} must have shape {expected}, got {tuple(mask.shape)}")
         output[row, :query_length, :percept_length] = mask[0].to(dtype=torch.bool)
     return output
-
-
-def _source_text(descriptor: Mapping[str, Any]) -> str:
-    arguments = ",".join(
-        f"{item.get('name', '')}:{item.get('kind', 'any')}"
-        for item in descriptor.get("arguments", ())
-    )
-    return " | ".join(
-        (
-            f"source={descriptor.get('name', '')}",
-            f"description={descriptor.get('description', '')}",
-            f"arguments={arguments}",
-            f"dynamic={bool(descriptor.get('dynamic', False))}",
-            f"streamable={bool(descriptor.get('streamable', False))}",
-            f"versioned={bool(descriptor.get('versioned', False))}",
-            f"accepts_partial_arguments={bool(descriptor.get('accepts_partial_arguments', False))}",
-        )
-    )
 
 
 def _object_text(ref: ObjectRef) -> str:
@@ -2130,9 +2211,7 @@ def shard_rollout_windows(
                     original[index % len(original)] for index in range(missing_local_windows)
                 )
                 for start in range(0, len(repairs), micro_batch_size):
-                    resume_repair_microbatches.append(
-                        repairs[start : start + micro_batch_size]
-                    )
+                    resume_repair_microbatches.append(repairs[start : start + micro_batch_size])
         for start in range(0, len(local_bucket), micro_batch_size):
             local_microbatches.append(tuple(local_bucket[start : start + micro_batch_size]))
     if shuffle:
@@ -2258,8 +2337,7 @@ def stage_b_adamw_parameter_groups(
                 "weight_decay": weight_decay if use_decay else 0.0,
                 "lr_scale": backbone_lr_scale if is_backbone else 1.0,
                 "group_name": (
-                    f"{'backbone' if is_backbone else 'cid'}-"
-                    f"{'decay' if use_decay else 'no-decay'}"
+                    f"{'backbone' if is_backbone else 'cid'}-{'decay' if use_decay else 'no-decay'}"
                 ),
             }
         )
@@ -2506,7 +2584,8 @@ def save_stage_b_checkpoint(
     )
     if dist.get_rank() == 0:
         metadata = {
-            "format_version": 2 if rank_local_optimizer else 3,
+            "format_version": 4 if rank_local_optimizer else 5,
+            "neural_contract_version": CID_NEURAL_CONTRACT_VERSION,
             "kind": "cid-stage-b-fsdp",
             "model_state_layout": "fsdp-sharded-dcp",
             "optimizer_state_layout": (
@@ -2547,18 +2626,20 @@ def load_stage_b_checkpoint(
     source = Path(path)
     metadata = json.loads((source / "metadata.json").read_text(encoding="utf-8"))
     version = int(metadata.get("format_version", 0))
-    if version not in (2, 3) or metadata.get("kind") != "cid-stage-b-fsdp":
+    if version not in (4, 5) or metadata.get("kind") != "cid-stage-b-fsdp":
         raise ValueError("unsupported Stage B checkpoint format")
+    if metadata.get("neural_contract_version") != CID_NEURAL_CONTRACT_VERSION:
+        raise ValueError("Stage B checkpoint neural contract is incompatible")
     if metadata.get("model_state_layout") != "fsdp-sharded-dcp":
         raise ValueError("unsupported Stage B checkpoint state layout")
     saved_world_size = int(metadata["world_size"])
     current_world_size = dist.get_world_size()
-    if version == 2 and metadata.get("optimizer_state_layout") != "rank-local":
+    if version == 4 and metadata.get("optimizer_state_layout") != "rank-local":
         raise ValueError("unsupported Stage B checkpoint state layout")
-    if version == 3 and metadata.get("optimizer_state_layout") != "fsdp-sharded-dcp":
+    if version == 5 and metadata.get("optimizer_state_layout") != "fsdp-sharded-dcp":
         raise ValueError("unsupported Stage B checkpoint state layout")
-    if version == 2 and saved_world_size != current_world_size:
-        raise ValueError("Stage B v2 resume requires the original world size")
+    if version == 4 and saved_world_size != current_world_size:
+        raise ValueError("Stage B rank-local resume requires the original world size")
     if (
         expected_dataset_sha256 is not None
         and metadata.get("dataset_sha256") != expected_dataset_sha256
@@ -2582,7 +2663,7 @@ def load_stage_b_checkpoint(
     _stage_b_dcp_load(distributed_state, source / "distributed")
     with _stage_b_sharded_state_dict_context(model):
         model.load_state_dict(distributed_state["model"])
-    if version == 3:
+    if version == 5:
         optimizer_state = _stage_b_dcp_load_optimizer_state(
             distributed_state["model"],
             source / "distributed",
@@ -2638,10 +2719,12 @@ def load_stage_b_model_checkpoint(
     source = Path(path)
     metadata = json.loads((source / "metadata.json").read_text(encoding="utf-8"))
     if (
-        int(metadata.get("format_version", 0)) not in (2, 3)
+        int(metadata.get("format_version", 0)) not in (4, 5)
         or metadata.get("kind") != "cid-stage-b-fsdp"
     ):
         raise ValueError("unsupported Stage B checkpoint format")
+    if metadata.get("neural_contract_version") != CID_NEURAL_CONTRACT_VERSION:
+        raise ValueError("Stage B checkpoint neural contract is incompatible")
     if metadata.get("model_state_layout") != "fsdp-sharded-dcp":
         raise ValueError("unsupported Stage B checkpoint model state layout")
     if metadata["adapter_config"] != asdict(adapter.config):
