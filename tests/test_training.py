@@ -1508,8 +1508,12 @@ def test_rollout_uses_predicted_local_noise_for_next_thought_corruption() -> Non
         sample.batch.local_noise[0, occupied],
         torch.ones_like(sample.batch.local_noise[0, occupied]),
     )
-    assert sample.batch.display_noise[0, :, 0].tolist() == pytest.approx(
-        [0.5] * sample.batch.display_ids.shape[1]
+    padding = sample.batch.display_padding_mask[0]
+    assert sample.batch.display_noise[0, ~padding, 0].tolist() == pytest.approx(
+        [0.5] * int((~padding).sum())
+    )
+    assert sample.batch.display_noise[0, padding, 0].tolist() == pytest.approx(
+        [0.0] * int(padding.sum())
     )
 
 
