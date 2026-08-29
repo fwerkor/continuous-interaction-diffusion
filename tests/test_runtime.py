@@ -138,6 +138,25 @@ class AnchoredSource:
         return Observation(value="evidence", anchors=(self.anchor,))
 
 
+class PromoteFactPolicy:
+    def step(self, context: ModelContext) -> ModelUpdate:
+        cell_id = context.thought.live_cell_ids[0]
+        need = InformationNeed(
+            need_id="protected-result",
+            source_scores={"source": 1.0},
+            arguments={"key": "exact"},
+            confidence=1.0,
+            target_cells=(ObjectRef.cell(cell_id),),
+            promote_to_fact=True,
+        )
+        return ModelUpdate(
+            thought=context.thought.advance(context.thought.cells),
+            display=context.display.advance(context.display.token_ids),
+            needs=(need,),
+            converged=bool(context.percepts),
+        )
+
+
 class AlwaysRefreshPolicy:
     def step(self, context: ModelContext) -> ModelUpdate:
         time.sleep(0.003)
@@ -343,6 +362,26 @@ async def test_model_compute_overlaps_source_wait() -> None:
     assert metrics.mean_tool_concurrency > 0
     assert metrics.peak_tool_concurrency == 1
     assert metrics.mean_ready_to_bind_s >= 0
+
+
+async def test_promoted_observation_enters_runtime_owned_fact_channel() -> None:
+    source = CountingSource()
+    registry = SourceRegistry()
+    registry.register(source)
+    runtime = CIDRuntime(registry, RuntimeConfig(max_steps=20))
+
+    result = await runtime.run(
+        PromoteFactPolicy(),
+        thought=seeded_thought(1),
+        display=DisplayCanvas.masked(1, -1),
+    )
+
+    assert result.converged
+    assert len(result.facts) == 1
+    fact = result.facts[0]
+    assert fact.value == "exact"
+    assert fact.source_type == "source"
+    assert fact.version == "1"
 
 
 async def test_dynamic_source_refreshes_without_cache_reuse() -> None:

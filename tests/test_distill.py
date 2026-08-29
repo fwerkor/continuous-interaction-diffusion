@@ -204,6 +204,22 @@ def test_teacher_compiler_separates_semantics_from_event_timing(tmp_path) -> Non
     assert load_jsonl(path) == (trajectory,)
 
 
+def test_teacher_compiler_preserves_one_need_with_multiple_affected_cells() -> None:
+    task, plan = make_teacher_task_and_plan()
+    need = replace(plan.needs[0], affected_cell_ids=("plan",))
+    plan = replace(plan, needs=(need,))
+
+    (trajectory,) = compile_teacher_plans(
+        (task,),
+        (plan,),
+        TeacherScheduleConfig(thought_capacity=6, min_delay_steps=1, max_delay_steps=1, seed=19),
+    )
+
+    binding = trajectory.binding_targets[0]
+    assert binding.owner_cell_id == "need"
+    assert binding.target_cells == (ObjectRef.cell("need"), ObjectRef.cell("plan"))
+
+
 def test_teacher_compiler_expands_counterfactual_schedule_variants() -> None:
     task, plan = make_teacher_task_and_plan()
     trajectories = compile_teacher_plans(

@@ -633,6 +633,30 @@ def test_one_shot_need_is_supervised_before_but_not_after_its_observation() -> N
     assert refresh.targets.source_targets[0, 0, 0] == 0
 
 
+def test_trajectory_tensorizer_supervises_one_need_owner_with_multi_region_routes() -> None:
+    base = make_trajectory()
+    binding = replace(
+        base.binding_targets[0],
+        owner_cell_id="c1",
+        target_cells=(ObjectRef.cell("c1"), ObjectRef.cell("c0")),
+        target_display=(ObjectRef.display_span(0, 1),),
+    )
+    example = replace(base, binding_targets=(binding,))
+    adapter = make_adapter(seed=126)
+    tensorizer = ILLaDATrajectoryTensorizer(adapter, TinyTokenizer())
+
+    sample = tensorizer.tensorize(example, source_step=0, timestep=1.0)
+
+    assert sample.targets.need_targets[0, 1, 0] == 1
+    assert sample.targets.need_targets[0, 0].sum() == 0
+    assert sample.targets.need_target_cell_targets[0, 1, 0, 0] == 1
+    assert sample.targets.need_target_cell_targets[0, 1, 0, 1] == 1
+    assert sample.targets.need_target_cell_mask[0, 1, 0, :2].all()
+    assert sample.targets.need_target_display_targets[0, 1, 0, 0] == 1
+    assert sample.targets.need_target_display_targets[0, 1, 0, 1:].sum() == 0
+    assert sample.targets.need_target_display_mask[0, 1, 0, :3].all()
+
+
 def test_trajectory_tensorizer_keeps_multiple_bindings_on_one_cell_distinct() -> None:
     base = make_trajectory()
     first = replace(
@@ -902,7 +926,7 @@ def test_stage_a_checkpoint_rejects_previous_neural_contract(tmp_path) -> None:
     trainer.save_checkpoint(path)
     payload = torch.load(path, map_location="cpu", weights_only=False)
 
-    payload["neural_contract_version"] = 1
+    payload["neural_contract_version"] = 2
     incompatible = tmp_path / "old-contract.pt"
     torch.save(payload, incompatible)
 
@@ -1234,7 +1258,7 @@ def test_stage_b_fsdp_runs_full_parameter_optimizer_step_on_cpu(tmp_path) -> Non
         )
         metadata = json.loads((checkpoint / "metadata.json").read_text(encoding="utf-8"))
         assert metadata["format_version"] in (4, 5)
-        assert metadata["neural_contract_version"] == 2
+        assert metadata["neural_contract_version"] == 3
 
         restored_adapter = make_adapter(seed=91)
         restored_adapter.set_backbone_trainable(True)

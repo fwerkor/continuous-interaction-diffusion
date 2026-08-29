@@ -42,6 +42,7 @@ def test_trajectory_jsonl_round_trip(tmp_path) -> None:
                 argument_steps={"key": 2},
                 target_cells=(ObjectRef.cell("c0"),),
                 target_display=(ObjectRef.display_span(2, 4),),
+                owner_cell_id="c0",
             ),
         ),
         grounding_catalog=(GroundingEntry(anchor=model_anchor, aliases=("model-a",)),),

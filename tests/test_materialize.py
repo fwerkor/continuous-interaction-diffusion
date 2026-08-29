@@ -43,6 +43,8 @@ def make_output(*, d_model: int = 4) -> CIDTensorOutput:
             [[[10.0, -10.0], [-10.0, -10.0], [-10.0, -10.0]]]
         ),
         source_logits=torch.zeros(batch, slots, need_slots, sources),
+        need_target_cell_logits=torch.full((batch, slots, need_slots, slots), -10.0),
+        need_target_display_logits=torch.full((batch, slots, need_slots, display), -10.0),
         argument_presence_logits=torch.full((batch, slots, need_slots, 4), -10.0),
         argument_query=torch.zeros(batch, slots, need_slots, 4, d_model),
         anchor_query=torch.zeros(batch, slots, 4, d_model),
@@ -195,6 +197,39 @@ def test_materializer_emits_multiple_bindings_from_one_cognitive_cell() -> None:
         f"need:{first}:1",
     )
     assert all(need.target_cells == (ObjectRef.cell(first),) for need in update.needs)
+
+
+def test_materializer_routes_one_need_to_multiple_cells_and_display_spans() -> None:
+    field = CognitiveField.empty(capacity=3, width=4)
+    field, owner = field.allocate(semantic=(1.0, 0.0, 0.0, 0.0))
+    field, affected = field.allocate(semantic=(0.0, 1.0, 0.0, 0.0))
+    context = ModelContext(
+        facts=FactStore().snapshot(),
+        thought=field,
+        display=DisplayCanvas.masked(length=3, mask_token_id=5),
+        sources=(
+            SourceDescriptor(
+                name="lookup",
+                description="protected lookup",
+                promote_results_to_fact=True,
+            ),
+        ),
+        percepts=(),
+        step=0,
+    )
+    output = make_output()
+    output.allocation_logits.fill_(-10.0)
+    output.need_target_cell_logits[0, 0, 0, 1] = 10.0
+    output.need_target_display_logits[0, 0, 0, 1:] = 10.0
+
+    update = CIDMaterializer(
+        CIDMaterializerConfig(need_threshold=0.8)
+    ).materialize(output, context)
+
+    assert update.needs[0].need_id == f"need:{owner}:0"
+    assert update.needs[0].target_cells == (ObjectRef.cell(owner), ObjectRef.cell(affected))
+    assert update.needs[0].target_display == (ObjectRef.display_span(1, 3),)
+    assert update.needs[0].promote_to_fact
 
 
 def test_materializer_rejects_runtime_model_geometry_mismatch() -> None:

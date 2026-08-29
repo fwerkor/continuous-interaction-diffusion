@@ -96,6 +96,8 @@ def test_lfm_adapter_uses_native_bidirectional_hidden_backbone() -> None:
     assert output.display_logits.shape == (1, 4, TinyLFMConfig.vocab_size)
     assert output.need_logits.shape == (1, 2, adapter.config.max_need_slots)
     assert output.source_logits.shape == (1, 2, adapter.config.max_need_slots, 0)
+    assert output.need_target_cell_logits.shape == (1, 2, adapter.config.max_need_slots, 2)
+    assert output.need_target_display_logits.shape == (1, 2, adapter.config.max_need_slots, 4)
     assert backbone.lfm2.last_attention_mask.shape == (1, 9)
     assert backbone.lfm2.last_attention_mask[0].tolist() == [
         True,

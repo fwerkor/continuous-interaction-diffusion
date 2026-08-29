@@ -176,6 +176,8 @@ def test_llada_moe_adapter_uses_model_tokens_and_router_auxiliary_loss() -> None
     assert adapter.eos_token_id == 62
     assert output.need_logits.shape == (1, 2, adapter.config.max_need_slots)
     assert output.source_logits.shape == (1, 2, adapter.config.max_need_slots, 1)
+    assert output.need_target_cell_logits.shape == (1, 2, adapter.config.max_need_slots, 2)
+    assert output.need_target_display_logits.shape == (1, 2, adapter.config.max_need_slots, 4)
     assert backbone.decoder.last_output_router_logits
     assert output.auxiliary_loss is not None
     assert torch.isfinite(output.auxiliary_loss)

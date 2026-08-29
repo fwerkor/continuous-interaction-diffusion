@@ -73,6 +73,12 @@ def test_torch_core_shapes_and_backward() -> None:
     assert output.source_logits.shape == (
         batch_size, thought_slots, config.max_need_slots, source_count
     )
+    assert output.need_target_cell_logits.shape == (
+        batch_size, thought_slots, config.max_need_slots, thought_slots
+    )
+    assert output.need_target_display_logits.shape == (
+        batch_size, thought_slots, config.max_need_slots, display_length
+    )
     assert output.argument_presence_logits.shape == (
         batch_size,
         thought_slots,
@@ -179,6 +185,14 @@ def test_torch_core_shapes_and_backward() -> None:
             source_count,
             (batch_size, thought_slots, config.max_need_slots),
             dtype=torch.long,
+        ),
+        need_target_cell_targets=torch.rand_like(output.need_target_cell_logits),
+        need_target_cell_mask=occupied[:, :, None, None].expand_as(
+            output.need_target_cell_logits
+        ),
+        need_target_display_targets=torch.rand_like(output.need_target_display_logits),
+        need_target_display_mask=occupied[:, :, None, None].expand_as(
+            output.need_target_display_logits
         ),
         argument_presence_targets=torch.zeros(
             batch_size, thought_slots, config.max_need_slots, config.max_argument_slots

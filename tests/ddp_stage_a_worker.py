@@ -83,6 +83,8 @@ def output_loss(output: object) -> torch.Tensor:
         "display_logits",
         "need_logits",
         "source_logits",
+        "need_target_cell_logits",
+        "need_target_display_logits",
         "argument_presence_logits",
         "argument_query",
         "anchor_query",

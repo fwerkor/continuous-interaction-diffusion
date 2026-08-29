@@ -110,6 +110,8 @@ def test_illada_adapter_uses_shared_bidirectional_sequence_and_native_lm_head() 
     assert output.link_target_query.shape == (2, 4, 8, TinyILLaDAConfig.hidden_size)
     assert output.need_logits.shape == (2, 4, adapter.config.max_need_slots)
     assert output.source_logits.shape == (2, 4, adapter.config.max_need_slots, 2)
+    assert output.need_target_cell_logits.shape == (2, 4, adapter.config.max_need_slots, 4)
+    assert output.need_target_display_logits.shape == (2, 4, adapter.config.max_need_slots, 6)
     assert adapter.output_embeddings is backbone.lm_head
     assert backbone.decoder.last_attention_mask.shape == (2, 12)
     assert torch.equal(
