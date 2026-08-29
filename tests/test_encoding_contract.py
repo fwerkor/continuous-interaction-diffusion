@@ -1,3 +1,7 @@
+import pytest
+
+pytest.importorskip("torch")
+
 from cid.contracts import ArgumentDescriptor, SourceDescriptor
 from cid.grounding import ObjectRef
 from cid.model.encoding import (
