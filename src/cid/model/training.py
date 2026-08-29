@@ -445,17 +445,27 @@ class CIDTrainer:
         batch_index: int,
     ) -> CIDRolloutState:
         input_batch = training_batch.batch
-        occupancy = input_batch.slot_occupancy[batch_index : batch_index + 1].detach().bool()
+        # ``collate_training_steps`` pads every example to the widest thought
+        # capacity in the micro-batch.  A rollout state belongs to one example,
+        # so carrying the padded width into its next transition can make a
+        # smaller-capacity trajectory fail tensorizer geometry validation.
+        thought_slots = sample.batch.thought_semantic.shape[1]
+        slot_slice = slice(0, thought_slots)
+        occupancy = (
+            input_batch.slot_occupancy[batch_index : batch_index + 1, slot_slice]
+            .detach()
+            .bool()
+        )
         allocation = prefix_allocation_mask(
             occupancy,
-            output.allocation_logits[batch_index : batch_index + 1].detach(),
+            output.allocation_logits[batch_index : batch_index + 1, slot_slice].detach(),
             threshold=self.config.rollout_allocation_threshold,
             max_allocations=self.config.rollout_max_allocations_per_step,
         ).unsqueeze(-1)
         previous_occupancy = occupancy
         occupancy = occupancy | (~occupancy & allocation)
         lifecycle_indices = output.lifecycle_logits[
-            batch_index : batch_index + 1
+            batch_index : batch_index + 1, slot_slice
         ].argmax(dim=-1)
         lifecycle_features = torch.nn.functional.one_hot(
             lifecycle_indices, num_classes=self.adapter.config.num_lifecycles
@@ -478,9 +488,15 @@ class CIDTrainer:
             revision_margin=self.config.rollout_display_revision_margin,
         )
         return CIDRolloutState(
-            thought_semantic=output.thought_semantic[batch_index : batch_index + 1].detach(),
-            role_features=torch.sigmoid(output.role_logits[batch_index : batch_index + 1]).detach(),
-            uncertainty=output.uncertainty[batch_index : batch_index + 1].detach(),
+            thought_semantic=output.thought_semantic[
+                batch_index : batch_index + 1, slot_slice
+            ].detach(),
+            role_features=torch.sigmoid(
+                output.role_logits[batch_index : batch_index + 1, slot_slice]
+            ).detach(),
+            uncertainty=output.uncertainty[
+                batch_index : batch_index + 1, slot_slice
+            ].detach(),
             lifecycle_features=lifecycle_features.detach(),
             slot_occupancy=occupancy.to(dtype=sample.batch.slot_occupancy.dtype).detach(),
             display_ids=display_ids.detach(),
@@ -1983,6 +1999,7 @@ def shard_rollout_windows(
     shuffle: bool = True,
     micro_batch_size: int = 1,
     consumed_windows_by_bucket: Mapping[str, int] | None = None,
+    legacy_resume_padding: bool = False,
 ) -> tuple[CIDRolloutWindow, ...]:
     if world_size <= 0:
         raise ValueError("world_size must be positive")
@@ -1993,6 +2010,7 @@ def shard_rollout_windows(
     if not windows:
         return ()
     local_microbatches: list[tuple[CIDRolloutWindow, ...]] = []
+    resume_repair_microbatches: list[tuple[CIDRolloutWindow, ...]] = []
     keys = sorted({(len(window.source_steps), window.loss_weight) for window in windows})
     for bucket_index, key in enumerate(keys):
         length, loss_weight = key
@@ -2013,12 +2031,35 @@ def shard_rollout_windows(
             continue
         padding = (-len(bucket)) % world_size
         if padding:
-            bucket.extend(bucket[:padding])
+            original = tuple(bucket)
+            if legacy_resume_padding:
+                # Older Stage-A checkpoints were produced with ``bucket[:padding]``.
+                # For buckets smaller than the requested padding that under-filled
+                # the global shard, so some ranks finished the epoch early.  Keep
+                # the old shuffled prefix intact for an in-flight checkpoint and
+                # append only the missing duplicate windows after the legacy
+                # micro-batch shuffle below.
+                bucket.extend(original[:padding])
+            else:
+                bucket.extend(original[index % len(original)] for index in range(padding))
         local_bucket = bucket[rank::world_size]
+        if legacy_resume_padding:
+            target_local_windows = math.ceil(len(original) / world_size)
+            missing_local_windows = target_local_windows - len(local_bucket)
+            if missing_local_windows > 0:
+                repairs = tuple(
+                    original[index % len(original)] for index in range(missing_local_windows)
+                )
+                for start in range(0, len(repairs), micro_batch_size):
+                    resume_repair_microbatches.append(
+                        repairs[start : start + micro_batch_size]
+                    )
         for start in range(0, len(local_bucket), micro_batch_size):
             local_microbatches.append(tuple(local_bucket[start : start + micro_batch_size]))
     if shuffle:
         random.Random(seed + epoch * 1_000_003 + 97).shuffle(local_microbatches)
+    if resume_repair_microbatches:
+        local_microbatches.extend(resume_repair_microbatches)
     return tuple(window for microbatch in local_microbatches for window in microbatch)
 
 

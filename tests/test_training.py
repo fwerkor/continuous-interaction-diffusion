@@ -1,5 +1,6 @@
 from __future__ import annotations
 
+import math
 import os
 import subprocess
 import sys
@@ -1443,6 +1444,51 @@ def test_self_rollout_feeds_previous_prediction_into_next_transition() -> None:
     assert trainer.state.epochs_completed == 1
 
 
+def test_self_rollout_crops_collated_padding_to_each_trajectory_capacity() -> None:
+    adapter = make_adapter(seed=114)
+    tensorizer = ILLaDATrajectoryTensorizer(
+        adapter,
+        TinyTokenizer(),
+        minimum_thought_slots=1,
+    )
+    trainer = CIDTrainer(
+        adapter,
+        tensorizer,
+        CIDTrainerConfig(
+            learning_rate=1e-3,
+            micro_batch_size=2,
+            rollout_horizon=2,
+            teacher_forcing_epochs=0,
+            rollout_ramp_epochs=0,
+            timestep_min=0.0,
+            timestep_max=0.0,
+        ),
+    )
+    wide = make_rollout_trajectory()
+    narrow = replace(
+        wide,
+        example_id="rollout-narrow",
+        binding_targets=(),
+        grounding_targets=(),
+        thought_targets=tuple(
+            target for target in wide.thought_targets if target.cell_id == "c0"
+        ),
+    )
+    windows = (
+        CIDRolloutWindow(example=narrow, source_steps=(0, 1)),
+        CIDRolloutWindow(example=wide, source_steps=(0, 1)),
+    )
+
+    loss_sum, raw_loss_sum, transitions = trainer.train_rollout_microbatch(
+        windows,
+        rollout_probability=1.0,
+    )
+
+    assert transitions == 4
+    assert math.isfinite(loss_sum)
+    assert math.isfinite(raw_loss_sum)
+
+
 def test_semantic_task_balancing_equalizes_total_transition_loss_mass() -> None:
     short = replace(
         make_trajectory(),
@@ -1526,6 +1572,31 @@ def test_rollout_sharding_globally_mixes_weighted_microbatches() -> None:
     sequence = chunk_weight_sequences[0]
     assert sequence != tuple(sorted(sequence))
     assert sum(left != right for left, right in zip(sequence, sequence[1:], strict=False)) >= 2
+
+
+def test_rollout_sharding_repeats_singleton_bucket_across_all_ranks() -> None:
+    window = CIDRolloutWindow(
+        example=replace(make_trajectory(), example_id="singleton"),
+        source_steps=(0,),
+        loss_weight=1.0,
+    )
+
+    for legacy_resume_padding in (False, True):
+        shards = tuple(
+            shard_rollout_windows(
+                (window,),
+                world_size=4,
+                rank=rank,
+                seed=13,
+                epoch=1,
+                micro_batch_size=1,
+                legacy_resume_padding=legacy_resume_padding,
+            )
+            for rank in range(4)
+        )
+
+        assert tuple(len(shard) for shard in shards) == (1, 1, 1, 1)
+        assert all(shard[0].example.example_id == "singleton" for shard in shards)
 
 
 def test_stage_b_batch_resolution_is_stable_across_four_and_six_ranks() -> None:

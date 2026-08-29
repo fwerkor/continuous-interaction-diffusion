@@ -1172,6 +1172,7 @@ def _train_stage_a(args: argparse.Namespace) -> None:
     from cid.model import (
         CIDTrainer,
         CIDTrainerConfig,
+        CIDTrainerState,
         CIDTrainProgress,
         ILLaDACIDAdapter,
         ILLaDACIDConfig,
@@ -1352,7 +1353,12 @@ def _train_stage_a(args: argparse.Namespace) -> None:
         next_checkpoint_step = (
             trainer.state.optimizer_steps // args.checkpoint_every_steps + 1
         ) * args.checkpoint_every_steps
-        for epoch in range(first_epoch, first_epoch + args.epochs):
+        for epoch in range(first_epoch, args.epochs + 1):
+            legacy_partial_resume = bool(
+                args.resume
+                and epoch == first_epoch
+                and trainer.state.rollout_windows_seen_in_epoch
+            )
             local_windows = shard_rollout_windows(
                 windows,
                 world_size=world_size,
@@ -1361,15 +1367,63 @@ def _train_stage_a(args: argparse.Namespace) -> None:
                 epoch=epoch,
                 shuffle=not args.no_shuffle,
                 micro_batch_size=args.micro_batch_size,
+                legacy_resume_padding=legacy_partial_resume,
             )
             total_local_windows = len(local_windows)
             resumed_windows = trainer.state.rollout_windows_seen_in_epoch
+            if legacy_partial_resume and distributed and metrics_path.exists():
+                rank_cursor = None
+                with metrics_path.open("r", encoding="utf-8") as handle:
+                    for line in handle:
+                        try:
+                            record = json.loads(line)
+                        except json.JSONDecodeError:
+                            continue
+                        if (
+                            int(record.get("epoch", -1)) == epoch
+                            and int(record.get("optimizer_steps", -1))
+                            == trainer.state.optimizer_steps
+                        ):
+                            rank_cursor = int(record["windows_seen_in_epoch"])
+                if rank_cursor is not None and rank_cursor != resumed_windows:
+                    resumed_windows = rank_cursor
+                    trainer.state = CIDTrainerState(
+                        transitions_seen=trainer.state.transitions_seen,
+                        optimizer_steps=trainer.state.optimizer_steps,
+                        epochs_completed=trainer.state.epochs_completed,
+                        rollout_windows_seen_in_epoch=resumed_windows,
+                    )
             if resumed_windows:
                 if resumed_windows >= total_local_windows:
                     raise ValueError(
                         "checkpoint rollout position is outside the current epoch shard"
                     )
                 local_windows = local_windows[resumed_windows:]
+                if legacy_partial_resume and distributed:
+                    # Legacy Stage-A padding could leave some ranks one micro-batch
+                    # further ahead than others at a checkpoint.  The repaired shard
+                    # lengths are equal, but the rank-local cursors intentionally
+                    # preserve that historical offset.  Pad only the *remaining*
+                    # continuation so every rank executes the same number and sizes of
+                    # DDP backward calls; otherwise the shorter ranks enter the epoch
+                    # barrier while the longer ranks are still reducing gradients.
+                    remaining = torch.tensor(
+                        [len(local_windows)], device=device, dtype=torch.int64
+                    )
+                    dist.all_reduce(remaining, op=dist.ReduceOp.MAX)
+                    target_remaining = int(remaining.item())
+                    missing = target_remaining - len(local_windows)
+                    if missing:
+                        repair_source = local_windows
+                        if not repair_source:
+                            raise RuntimeError(
+                                "cannot repair an empty legacy Stage-A resume shard"
+                            )
+                        local_windows = local_windows + tuple(
+                            repair_source[index % len(repair_source)]
+                            for index in range(missing)
+                        )
+                        total_local_windows = resumed_windows + len(local_windows)
                 if rank == 0:
                     print(
                         f"resume epoch={epoch} optimizer_steps={trainer.state.optimizer_steps} "
