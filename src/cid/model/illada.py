@@ -351,6 +351,7 @@ class ILLaDACIDConfig:
     num_link_relations: int = len(LinkRelation)
     num_object_kinds: int = len(ObjectKind)
     num_refresh_actions: int = 3
+    max_need_slots: int = 4
     max_argument_slots: int = 4
     max_anchor_slots: int = 4
     max_link_slots: int = 8
@@ -373,6 +374,8 @@ class ILLaDACIDConfig:
             raise ValueError("num_link_relations must match the typed grounding ABI")
         if self.num_object_kinds != len(ObjectKind):
             raise ValueError("num_object_kinds must match the typed grounding ABI")
+        if self.max_need_slots <= 0:
+            raise ValueError("information-need slot capacity must be positive")
         if self.max_argument_slots <= 0:
             raise ValueError("argument slot capacity must be positive")
         if self.max_anchor_slots <= 0 or self.max_link_slots <= 0:
@@ -466,6 +469,7 @@ class ILLaDACIDAdapter(nn.Module):
             num_link_relations=self.config.num_link_relations,
             num_object_kinds=self.config.num_object_kinds,
             num_refresh_actions=self.config.num_refresh_actions,
+            max_need_slots=self.config.max_need_slots,
             max_argument_slots=self.config.max_argument_slots,
             max_anchor_slots=self.config.max_anchor_slots,
             max_link_slots=self.config.max_link_slots,

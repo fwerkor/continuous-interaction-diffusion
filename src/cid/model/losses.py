@@ -155,7 +155,7 @@ def cid_loss(
     intent = _masked_binary_cross_entropy(
         output.need_logits,
         targets.need_targets,
-        targets.thought_mask,
+        targets.thought_mask.unsqueeze(-1).expand_as(output.need_logits),
     )
     source = _masked_cross_entropy(
         output.source_logits,

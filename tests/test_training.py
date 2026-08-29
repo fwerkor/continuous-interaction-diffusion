@@ -369,9 +369,9 @@ def test_trajectory_tensorizer_runs_full_optimizer_step() -> None:
     assert sample.targets.allocation_targets[0, 1] == 1
     assert sample.targets.allocation_mask[0, 1]
     assert sample.targets.thought_mask[0, :2].all()
-    assert sample.targets.source_targets[0, 1] == 0
-    assert sample.targets.argument_presence_targets[0, 1, 0] == 1
-    assert sample.targets.argument_presence_targets[0, 1, 1] == 0
+    assert sample.targets.source_targets[0, 1, 0] == 0
+    assert sample.targets.argument_presence_targets[0, 1, 0, 0] == 1
+    assert sample.targets.argument_presence_targets[0, 1, 0, 1] == 0
     assert sample.targets.anchor_mask[0, 1, 0]
     assert sample.targets.link_mask[0, 1, 0]
 
@@ -573,18 +573,46 @@ def test_one_shot_need_is_supervised_before_but_not_after_its_observation() -> N
     bootstrap = tensorizer.tensorize(example, source_step=-1, timestep=1.0)
     assimilate = tensorizer.tensorize(example, source_step=0, timestep=1.0)
 
-    assert bootstrap.targets.need_targets[0, 0] == 1
-    assert bootstrap.targets.source_targets[0, 0] == 0
-    assert assimilate.targets.need_targets[0, 0] == 0
-    assert assimilate.targets.source_targets[0, 0] == -100
+    assert bootstrap.targets.need_targets[0, 0, 0] == 1
+    assert bootstrap.targets.source_targets[0, 0, 0] == 0
+    assert assimilate.targets.need_targets[0, 0, 0] == 0
+    assert assimilate.targets.source_targets[0, 0, 0] == -100
 
     persistent = replace(
         example,
         binding_targets=(replace(example.binding_targets[0], freshness=FreshnessDemand.ALWAYS),),
     )
     refresh = tensorizer.tensorize(persistent, source_step=0, timestep=1.0)
-    assert refresh.targets.need_targets[0, 0] == 1
-    assert refresh.targets.source_targets[0, 0] == 0
+    assert refresh.targets.need_targets[0, 0, 0] == 1
+    assert refresh.targets.source_targets[0, 0, 0] == 0
+
+
+def test_trajectory_tensorizer_keeps_multiple_bindings_on_one_cell_distinct() -> None:
+    base = make_trajectory()
+    first = replace(
+        base.binding_targets[0],
+        need_id="latency-primary",
+        first_need_step=1,
+        executable_step=1,
+        argument_steps={"key": 1, "scope": 1},
+        arguments={"key": "latency_ms", "scope": "production"},
+    )
+    second = replace(
+        first,
+        need_id="latency-secondary",
+        arguments={"key": "latency_p95", "scope": "production"},
+    )
+    example = replace(base, binding_targets=(first, second))
+    tensorizer = ILLaDATrajectoryTensorizer(make_adapter(seed=126), TinyTokenizer())
+
+    sample = tensorizer.tensorize(example, source_step=0, timestep=1.0)
+
+    assert sample.targets.need_targets[0, 1, :2].tolist() == [1.0, 1.0]
+    assert sample.targets.source_targets[0, 1, :2].tolist() == [0, 0]
+    assert sample.targets.argument_presence_targets[0, 1, 0, :2].tolist() == [1.0, 1.0]
+    assert sample.targets.argument_presence_targets[0, 1, 1, :2].tolist() == [1.0, 1.0]
+    assert sample.targets.argument_mask[0, 1, 0, :2].all()
+    assert sample.targets.argument_mask[0, 1, 1, :2].all()
 
 
 def test_frozen_text_encoder_snapshot_is_independent_from_live_backbone() -> None:

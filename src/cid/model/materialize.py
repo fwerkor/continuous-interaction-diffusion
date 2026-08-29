@@ -324,47 +324,48 @@ class CIDMaterializer:
         for slot, cell in enumerate(thought.cells):
             if not cell.live or cell.cell_id is None:
                 continue
-            confidence = float(need_probs[slot])
-            if confidence < self.config.need_threshold:
-                continue
-            scores = {
-                descriptor.name: float(source_probs[slot, source_index])
-                for source_index, descriptor in enumerate(context.sources)
-            }
-            selected_index = int(source_probs[slot].argmax())
-            source = context.sources[selected_index]
-            arguments: dict[str, Any] = {}
-            for argument_slot, descriptor in enumerate(source.arguments):
-                if argument_slot >= output.argument_query.shape[2]:
-                    break
-                if (
-                    float(argument_presence[slot, argument_slot])
-                    < self.config.argument_presence_threshold
-                ):
+            for need_slot in range(need_probs.shape[-1]):
+                confidence = float(need_probs[slot, need_slot])
+                if confidence < self.config.need_threshold:
                     continue
-                value = catalog.resolve_argument(
-                    source.name,
-                    descriptor.name,
-                    output.argument_query[batch_index, slot, argument_slot],
-                    min_similarity=self.config.retrieval_similarity_threshold,
-                )
-                if value is not None:
-                    arguments[descriptor.name] = value
+                scores = {
+                    descriptor.name: float(source_probs[slot, need_slot, source_index])
+                    for source_index, descriptor in enumerate(context.sources)
+                }
+                selected_index = int(source_probs[slot, need_slot].argmax())
+                source = context.sources[selected_index]
+                arguments: dict[str, Any] = {}
+                for argument_slot, descriptor in enumerate(source.arguments):
+                    if argument_slot >= output.argument_query.shape[3]:
+                        break
+                    if (
+                        float(argument_presence[slot, need_slot, argument_slot])
+                        < self.config.argument_presence_threshold
+                    ):
+                        continue
+                    value = catalog.resolve_argument(
+                        source.name,
+                        descriptor.name,
+                        output.argument_query[batch_index, slot, need_slot, argument_slot],
+                        min_similarity=self.config.retrieval_similarity_threshold,
+                    )
+                    if value is not None:
+                        arguments[descriptor.name] = value
 
-            freshness = freshness_order[int(refresh_actions[slot])]
-            needs.append(
-                InformationNeed(
-                    need_id=f"need:{cell.cell_id}",
-                    source_scores=scores,
-                    arguments=arguments,
-                    confidence=confidence,
-                    freshness=freshness,
-                    max_age_s=self.config.max_age_s
-                    if freshness is FreshnessDemand.MAX_AGE
-                    else None,
-                    target_cells=(ObjectRef.cell(cell.cell_id),),
+                freshness = freshness_order[int(refresh_actions[slot, need_slot])]
+                needs.append(
+                    InformationNeed(
+                        need_id=f"need:{cell.cell_id}:{need_slot}",
+                        source_scores=scores,
+                        arguments=arguments,
+                        confidence=confidence,
+                        freshness=freshness,
+                        max_age_s=self.config.max_age_s
+                        if freshness is FreshnessDemand.MAX_AGE
+                        else None,
+                        target_cells=(ObjectRef.cell(cell.cell_id),),
+                    )
                 )
-            )
         return tuple(needs)
 
     @staticmethod

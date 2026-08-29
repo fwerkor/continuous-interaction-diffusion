@@ -25,6 +25,7 @@ def make_output(*, d_model: int = 4) -> CIDTensorOutput:
     slots = 3
     display = 3
     sources = 1
+    need_slots = 2
     return CIDTensorOutput(
         thought_semantic=torch.tensor(
             [[[1.0, 0.0, 0.0, 0.0], [0.0, 1.0, 0.0, 0.0], [0.0, 0.0, 0.0, 0.0]]]
@@ -38,12 +39,12 @@ def make_output(*, d_model: int = 4) -> CIDTensorOutput:
             [[[10.0, 0.0, 0.0, 0.0], [10.0, 0.0, 0.0, 0.0], [10.0, 0.0, 0.0, 0.0]]]
         ),
         display_logits=torch.zeros(batch, display, 16),
-        need_logits=torch.tensor([[10.0, -10.0, -10.0]]),
-        source_logits=torch.zeros(batch, slots, sources),
-        argument_presence_logits=torch.tensor(
-            [[[10.0, -10.0, -10.0, -10.0]] * slots]
+        need_logits=torch.tensor(
+            [[[10.0, -10.0], [-10.0, -10.0], [-10.0, -10.0]]]
         ),
-        argument_query=torch.zeros(batch, slots, 4, d_model),
+        source_logits=torch.zeros(batch, slots, need_slots, sources),
+        argument_presence_logits=torch.full((batch, slots, need_slots, 4), -10.0),
+        argument_query=torch.zeros(batch, slots, need_slots, 4, d_model),
         anchor_query=torch.zeros(batch, slots, 4, d_model),
         anchor_presence_logits=torch.full((batch, slots, 4), -10.0),
         anchor_kind_logits=torch.zeros(batch, slots, 4, len(AnchorKind)),
@@ -52,7 +53,7 @@ def make_output(*, d_model: int = 4) -> CIDTensorOutput:
         link_target_kind_logits=torch.zeros(batch, slots, 8, len(ObjectKind)),
         link_target_query=torch.zeros(batch, slots, 8, d_model),
         revision_logits=torch.zeros(batch, slots, 3),
-        refresh_logits=torch.zeros(batch, slots, 3),
+        refresh_logits=torch.zeros(batch, slots, need_slots, 3),
     )
 
 
@@ -75,7 +76,8 @@ def test_materializer_creates_cells_arguments_anchors_links_and_revisions() -> N
     )
     output = make_output()
     argument_embedding = torch.tensor([0.0, 1.0, 0.0, 0.0])
-    output.argument_query[0, 0, 0] = argument_embedding
+    output.argument_presence_logits[0, 0, 0, 0] = 10.0
+    output.argument_query[0, 0, 0, 0] = argument_embedding
     anchor = Anchor(
         anchor_id="a:model-a",
         kind=AnchorKind.ENTITY,
@@ -135,7 +137,7 @@ def test_materializer_creates_cells_arguments_anchors_links_and_revisions() -> N
             target=ObjectRef.cell(second),
         ),
     )
-    assert update.needs[0].need_id == f"need:{first}"
+    assert update.needs[0].need_id == f"need:{first}:0"
     assert update.needs[0].arguments == {"key": "latency_ms"}
     assert update.needs[0].selected_source() == "lookup"
     assert update.needs[0].target_cells == (ObjectRef.cell(first),)
@@ -165,9 +167,34 @@ def test_materializer_leaves_need_latent_until_required_argument_resolves() -> N
 
     update = CIDMaterializer().materialize(output, context)
 
-    assert update.needs[0].need_id == f"need:{first}"
+    assert update.needs[0].need_id == f"need:{first}:0"
     assert update.needs[0].arguments == {}
     assert not update.converged
+
+
+def test_materializer_emits_multiple_bindings_from_one_cognitive_cell() -> None:
+    field = CognitiveField.empty(capacity=3, width=4)
+    field, first = field.allocate(semantic=(1.0, 0.0, 0.0, 0.0))
+    context = ModelContext(
+        facts=FactStore().snapshot(),
+        thought=field,
+        display=DisplayCanvas.masked(length=3, mask_token_id=5),
+        sources=(SourceDescriptor(name="lookup", description="lookup"),),
+        percepts=(),
+        step=0,
+    )
+    output = make_output()
+    output.need_logits[0, 0, 1] = 10.0
+
+    update = CIDMaterializer(
+        CIDMaterializerConfig(need_threshold=0.8)
+    ).materialize(output, context)
+
+    assert tuple(need.need_id for need in update.needs) == (
+        f"need:{first}:0",
+        f"need:{first}:1",
+    )
+    assert all(need.target_cells == (ObjectRef.cell(first),) for need in update.needs)
 
 
 def test_materializer_rejects_runtime_model_geometry_mismatch() -> None:
@@ -197,7 +224,7 @@ def test_materializer_requires_learned_convergence_even_when_display_is_filled()
     )
     output = make_output()
     output.convergence_logits[0] = -10.0
-    output.source_logits = torch.empty(1, 3, 0)
+    output.source_logits = torch.empty(1, 3, 2, 0)
 
     update = CIDMaterializer().materialize(
         output,

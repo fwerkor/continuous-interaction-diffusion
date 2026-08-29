@@ -69,19 +69,26 @@ def test_torch_core_shapes_and_backward() -> None:
         config.num_lifecycles,
     )
     assert output.display_logits.shape == (batch_size, display_length, config.vocab_size)
-    assert output.source_logits.shape == (batch_size, thought_slots, source_count)
+    assert output.need_logits.shape == (batch_size, thought_slots, config.max_need_slots)
+    assert output.source_logits.shape == (
+        batch_size, thought_slots, config.max_need_slots, source_count
+    )
     assert output.argument_presence_logits.shape == (
         batch_size,
         thought_slots,
+        config.max_need_slots,
         config.max_argument_slots,
     )
     assert output.argument_query.shape == (
         batch_size,
         thought_slots,
+        config.max_need_slots,
         config.max_argument_slots,
         config.d_model,
     )
-    assert output.refresh_logits.shape == (batch_size, thought_slots, config.num_refresh_actions)
+    assert output.refresh_logits.shape == (
+        batch_size, thought_slots, config.max_need_slots, config.num_refresh_actions
+    )
     assert output.anchor_query.shape == (
         batch_size,
         thought_slots,
@@ -166,23 +173,33 @@ def test_torch_core_shapes_and_backward() -> None:
         uncertainty=torch.rand_like(output.uncertainty),
         noise_delta=torch.rand_like(output.noise_delta) * 2.0 - 1.0,
         lifecycle=lifecycle_targets,
-        need_targets=torch.rand(batch_size, thought_slots),
+        need_targets=torch.rand(batch_size, thought_slots, config.max_need_slots),
         source_targets=torch.randint(
-            0, source_count, (batch_size, thought_slots), dtype=torch.long
+            0,
+            source_count,
+            (batch_size, thought_slots, config.max_need_slots),
+            dtype=torch.long,
         ),
         argument_presence_targets=torch.zeros(
-            batch_size, thought_slots, config.max_argument_slots
+            batch_size, thought_slots, config.max_need_slots, config.max_argument_slots
         ),
-        argument_presence_mask=occupied[:, :, None].expand(
-            -1, -1, config.max_argument_slots
+        argument_presence_mask=occupied[:, :, None, None].expand(
+            -1, -1, config.max_need_slots, config.max_argument_slots
         ),
         argument_embeddings=torch.randn_like(output.argument_query),
         argument_mask=torch.zeros(
-            batch_size, thought_slots, config.max_argument_slots, dtype=torch.bool
+            batch_size,
+            thought_slots,
+            config.max_need_slots,
+            config.max_argument_slots,
+            dtype=torch.bool,
         ),
         revision_targets=torch.randint(0, 3, (batch_size, thought_slots), dtype=torch.long),
         refresh_targets=torch.randint(
-            0, config.num_refresh_actions, (batch_size, thought_slots), dtype=torch.long
+            0,
+            config.num_refresh_actions,
+            (batch_size, thought_slots, config.max_need_slots),
+            dtype=torch.long,
         ),
         anchor_presence_targets=anchor_presence_targets,
         anchor_presence_mask=anchor_presence_mask,
@@ -270,7 +287,7 @@ def test_torch_core_accepts_empty_external_memory_and_no_sources() -> None:
 
     assert torch.isfinite(output.thought_semantic).all()
     assert torch.isfinite(output.display_logits).all()
-    assert output.source_logits.shape == (1, 2, 0)
+    assert output.source_logits.shape == (1, 2, config.max_need_slots, 0)
 
 
 def test_external_fusion_keeps_mixed_empty_memory_rows_finite() -> None:

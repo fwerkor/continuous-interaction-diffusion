@@ -1370,21 +1370,33 @@ class ILLaDATrajectoryTensorizer:
         uncertainty = torch.ones((1, n, 1), device=device, dtype=dtype)
         noise_delta = torch.zeros((1, n, 1), device=device, dtype=dtype)
         lifecycle = torch.full((1, n), -100, device=device, dtype=torch.long)
-        need_targets = torch.zeros((1, n), device=device, dtype=dtype)
-        source_targets = torch.full((1, n), -100, device=device, dtype=torch.long)
+        need_targets = torch.zeros((1, n, c.max_need_slots), device=device, dtype=dtype)
+        source_targets = torch.full(
+            (1, n, c.max_need_slots), -100, device=device, dtype=torch.long
+        )
         revision_targets = torch.full((1, n), -100, device=device, dtype=torch.long)
-        refresh_targets = torch.full((1, n), -100, device=device, dtype=torch.long)
+        refresh_targets = torch.full(
+            (1, n, c.max_need_slots), -100, device=device, dtype=torch.long
+        )
 
         argument_presence_targets = torch.zeros(
-            (1, n, c.max_argument_slots), device=device, dtype=dtype
+            (1, n, c.max_need_slots, c.max_argument_slots), device=device, dtype=dtype
         )
         argument_presence_mask = torch.zeros(
-            (1, n, c.max_argument_slots), device=device, dtype=torch.bool
+            (1, n, c.max_need_slots, c.max_argument_slots),
+            device=device,
+            dtype=torch.bool,
         )
         argument_embeddings = torch.zeros(
-            (1, n, c.max_argument_slots, self.adapter.d_model), device=device, dtype=dtype
+            (1, n, c.max_need_slots, c.max_argument_slots, self.adapter.d_model),
+            device=device,
+            dtype=dtype,
         )
-        argument_mask = torch.zeros((1, n, c.max_argument_slots), device=device, dtype=torch.bool)
+        argument_mask = torch.zeros(
+            (1, n, c.max_need_slots, c.max_argument_slots),
+            device=device,
+            dtype=torch.bool,
+        )
         anchor_presence_targets = torch.zeros(
             (1, n, c.max_anchor_slots), device=device, dtype=dtype
         )
@@ -1444,6 +1456,7 @@ class ILLaDATrajectoryTensorizer:
                 lifecycle[0, slot] = retired_index
 
         source_names = tuple(str(item.get("name", "")) for item in example.source_descriptors)
+        binding_slots = self._binding_slot_schedule(example)
         bindings = tuple(
             binding for binding in example.binding_targets if binding.first_need_step <= target_step
         )
@@ -1465,13 +1478,14 @@ class ILLaDATrajectoryTensorizer:
                     # A one-shot request is complete once its matching observation is visible.
                     # The explicit zero need target remains supervised for this occupied slot.
                     continue
-                need_targets[0, slot] = binding.confidence
-                source_targets[0, slot] = source_index
-                refresh_targets[0, slot] = freshness_order.index(binding.freshness)
+                need_slot = binding_slots[(cell_ref.identifier, binding.need_id)]
+                need_targets[0, slot, need_slot] = binding.confidence
+                source_targets[0, slot, need_slot] = source_index
+                refresh_targets[0, slot, need_slot] = freshness_order.index(binding.freshness)
                 for argument_slot, argument in enumerate(
                     declared_arguments[: c.max_argument_slots]
                 ):
-                    argument_presence_mask[0, slot, argument_slot] = True
+                    argument_presence_mask[0, slot, need_slot, argument_slot] = True
                     name = str(argument.get("name", ""))
                     available_step = binding.argument_steps.get(
                         name,
@@ -1483,11 +1497,13 @@ class ILLaDATrajectoryTensorizer:
                         and name in binding.arguments
                     )
                     if executable:
-                        argument_presence_targets[0, slot, argument_slot] = 1.0
-                        argument_embeddings[0, slot, argument_slot] = self.text_encoder.encode_one(
-                            stable_text(binding.arguments[name]), detach=True
+                        argument_presence_targets[0, slot, need_slot, argument_slot] = 1.0
+                        argument_embeddings[0, slot, need_slot, argument_slot] = (
+                            self.text_encoder.encode_one(
+                                stable_text(binding.arguments[name]), detach=True
+                            )
                         )
-                        argument_mask[0, slot, argument_slot] = True
+                        argument_mask[0, slot, need_slot, argument_slot] = True
 
         grounding_by_cell = {
             item.cell_id: item for item in example.grounding_targets if item.step == target_step
@@ -1551,6 +1567,26 @@ class ILLaDATrajectoryTensorizer:
             link_target_embeddings=link_target_embeddings,
             link_mask=link_mask,
         )
+
+    def _binding_slot_schedule(
+        self, example: TrajectoryExample
+    ) -> dict[tuple[str, str], int]:
+        by_cell: dict[str, list[Any]] = {}
+        for binding in example.binding_targets:
+            for target in binding.target_cells:
+                by_cell.setdefault(target.identifier, []).append(binding)
+
+        schedule: dict[tuple[str, str], int] = {}
+        for cell_id, bindings in by_cell.items():
+            ordered = sorted(bindings, key=lambda item: (item.first_need_step, item.need_id))
+            if len(ordered) > self.adapter.config.max_need_slots:
+                raise ValueError(
+                    f"cell {cell_id!r} requires {len(ordered)} information-need slots but "
+                    f"adapter supports {self.adapter.config.max_need_slots}"
+                )
+            for need_slot, binding in enumerate(ordered):
+                schedule[(cell_id, binding.need_id)] = need_slot
+        return schedule
 
     def _thought_snapshot(self, example: TrajectoryExample, step: int) -> tuple[ThoughtTarget, ...]:
         canonical = self._canonical_slot_schedule(example)

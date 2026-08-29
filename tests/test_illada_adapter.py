@@ -108,7 +108,8 @@ def test_illada_adapter_uses_shared_bidirectional_sequence_and_native_lm_head() 
     assert output.display_logits.shape == (2, 6, TinyILLaDAConfig.vocab_size)
     assert output.anchor_query.shape == (2, 4, 4, TinyILLaDAConfig.hidden_size)
     assert output.link_target_query.shape == (2, 4, 8, TinyILLaDAConfig.hidden_size)
-    assert output.source_logits.shape == (2, 4, 2)
+    assert output.need_logits.shape == (2, 4, adapter.config.max_need_slots)
+    assert output.source_logits.shape == (2, 4, adapter.config.max_need_slots, 2)
     assert adapter.output_embeddings is backbone.lm_head
     assert backbone.decoder.last_attention_mask.shape == (2, 12)
     assert torch.equal(
@@ -151,7 +152,7 @@ def test_illada_adapter_accepts_empty_external_memory() -> None:
     output = adapter(batch)
 
     assert torch.isfinite(output.display_logits).all()
-    assert output.source_logits.shape == (1, 2, 0)
+    assert output.source_logits.shape == (1, 2, adapter.config.max_need_slots, 0)
 
 
 def test_illada_adapter_position_ids_ignore_batch_padding_width() -> None:

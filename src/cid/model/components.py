@@ -246,6 +246,7 @@ class CIDOutputHeads(nn.Module):
         num_link_relations: int,
         num_object_kinds: int,
         num_refresh_actions: int,
+        max_need_slots: int,
         max_argument_slots: int,
         max_anchor_slots: int,
         max_link_slots: int,
@@ -255,6 +256,7 @@ class CIDOutputHeads(nn.Module):
         self.num_anchor_kinds = num_anchor_kinds
         self.num_link_relations = num_link_relations
         self.num_object_kinds = num_object_kinds
+        self.max_need_slots = max_need_slots
         self.max_argument_slots = max_argument_slots
         self.max_anchor_slots = max_anchor_slots
         self.max_link_slots = max_link_slots
@@ -266,10 +268,14 @@ class CIDOutputHeads(nn.Module):
         self.uncertainty_head = nn.Linear(d_model, 1)
         self.noise_head = nn.Linear(d_model, 1)
         self.lifecycle_head = nn.Linear(d_model, num_lifecycles)
-        self.need_head = nn.Linear(d_model, 1)
-        self.source_query = nn.Linear(d_model, d_model, bias=False)
-        self.argument_presence_head = nn.Linear(d_model, max_argument_slots)
-        self.argument_query = nn.Linear(d_model, max_argument_slots * d_model, bias=False)
+        self.need_head = nn.Linear(d_model, max_need_slots)
+        self.source_query = nn.Linear(d_model, max_need_slots * d_model, bias=False)
+        self.argument_presence_head = nn.Linear(
+            d_model, max_need_slots * max_argument_slots
+        )
+        self.argument_query = nn.Linear(
+            d_model, max_need_slots * max_argument_slots * d_model, bias=False
+        )
         self.anchor_query = nn.Linear(d_model, max_anchor_slots * d_model, bias=False)
         self.anchor_presence_head = nn.Linear(d_model, max_anchor_slots)
         self.anchor_kind_head = nn.Linear(d_model, max_anchor_slots * num_anchor_kinds)
@@ -278,7 +284,8 @@ class CIDOutputHeads(nn.Module):
         self.link_target_kind_head = nn.Linear(d_model, max_link_slots * num_object_kinds)
         self.link_target_query = nn.Linear(d_model, max_link_slots * d_model, bias=False)
         self.revision_head = nn.Linear(d_model, 3)
-        self.refresh_head = nn.Linear(d_model, num_refresh_actions)
+        self.refresh_head = nn.Linear(d_model, max_need_slots * num_refresh_actions)
+        self.num_refresh_actions = num_refresh_actions
 
     def forward(
         self,
@@ -301,20 +308,30 @@ class CIDOutputHeads(nn.Module):
             occupied_summary,
             fallback_summary,
         )
-        source_query = F.normalize(self.source_query(thought_hidden), dim=-1)
+        source_query = self.source_query(thought_hidden).view(
+            batch_size, thought_slots, self.max_need_slots, self.d_model
+        )
+        source_query = F.normalize(source_query, dim=-1)
         normalized_sources = F.normalize(source_memory, dim=-1)
-        source_logits = torch.einsum("bnd,bsd->bns", source_query, normalized_sources)
+        source_logits = torch.einsum("bnkd,bsd->bnks", source_query, normalized_sources)
         if source_padding_mask is not None:
             source_logits = source_logits.masked_fill(
-                source_padding_mask[:, None, :],
+                source_padding_mask[:, None, None, :],
                 torch.finfo(source_logits.dtype).min,
             )
 
+        argument_presence_logits = self.argument_presence_head(thought_hidden).view(
+            batch_size, thought_slots, self.max_need_slots, self.max_argument_slots
+        )
         argument_query = self.argument_query(thought_hidden).view(
             batch_size,
             thought_slots,
+            self.max_need_slots,
             self.max_argument_slots,
             self.d_model,
+        )
+        refresh_logits = self.refresh_head(thought_hidden).view(
+            batch_size, thought_slots, self.max_need_slots, self.num_refresh_actions
         )
 
         anchor_query = self.anchor_query(thought_hidden).view(
@@ -357,9 +374,9 @@ class CIDOutputHeads(nn.Module):
             noise_delta=torch.tanh(self.noise_head(thought_hidden)),
             lifecycle_logits=self.lifecycle_head(thought_hidden),
             display_logits=display_logits,
-            need_logits=self.need_head(thought_hidden).squeeze(-1),
+            need_logits=self.need_head(thought_hidden),
             source_logits=source_logits,
-            argument_presence_logits=self.argument_presence_head(thought_hidden),
+            argument_presence_logits=argument_presence_logits,
             argument_query=argument_query,
             anchor_query=anchor_query,
             anchor_presence_logits=self.anchor_presence_head(thought_hidden),
@@ -369,5 +386,5 @@ class CIDOutputHeads(nn.Module):
             link_target_kind_logits=link_target_kind_logits,
             link_target_query=link_target_query,
             revision_logits=self.revision_head(thought_hidden),
-            refresh_logits=self.refresh_head(thought_hidden),
+            refresh_logits=refresh_logits,
         )
