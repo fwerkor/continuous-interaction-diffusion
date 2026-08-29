@@ -364,20 +364,39 @@ zero rejects, missing responses, or soft warnings, and all 10,000 plans pass bot
 the local-correction audit. Exact hashes are pinned by
 `data/correction-teacher-v1.reference-manifest.json`.
 
-The latest semantic mixture, published as `manifests/training-semantic-mixture-v14.json` on Hugging
-Face, contains **192,297 semantic tasks** across 19 components. Relative to v13 it adds 51,500
-independent train-only natural public tasks from Natural Questions Open, OASST1, MultiDoc2Dial, and
-QASPER. Their original user-facing prompts are preserved rather than wrapped in CID-specific
-causality instructions. The existing 4,000-task compositional OOD probe remains excluded from
-training.
+The latest semantic mixture remains the v14 mixture published as
+`manifests/training-semantic-mixture-v14.json` on Hugging Face: **192,297 semantic tasks** across 19
+components. Relative to v13 it added 51,500 independent train-only natural public tasks from Natural
+Questions Open, OASST1, MultiDoc2Dial, and QASPER. Their original user-facing prompts are preserved
+rather than wrapped in CID-specific causality instructions. The existing 4,000-task compositional OOD
+probe remains excluded from training.
 
 Schedule variants and trajectory length are first balanced at semantic-task granularity; explicit
 component `training_weight` is then applied. v14 assigns about **49.0%** of effective semantic loss
 mass to natural source/augmentation supervision and **39.0%** to natural tool interaction while
 retaining the existing mechanism, symbolic, correction, long-horizon, compositional, and restraint
-curricula. These are weights, not claims of independent source examples. The corresponding Hugging
-Face trajectory specification is `manifests/training-trajectory-mixture-v14.json`:
-**421,798 trajectories and 3,011,462 training transitions**, with maximum TCT capacity 128.
+curricula. These are weights, not claims of independent source examples. The corresponding v14
+trajectory specification contains **421,798 trajectories and 3,011,462 training transitions**, with
+maximum TCT capacity 128.
+
+**Dataset release v15** rematerializes that exact v14 semantic/trajectory mixture for neural contract
+v3; it does not add, remove, or regenerate semantic tasks. `cid migrate-dataset-contract-v3` makes the
+stable information-need owner explicit, derives conservative multi-label affected-cell supervision
+from cells that are already live when the need is emitted and whose supervised state changes by the
+matching observation, and preserves any existing explicit targets. Because the shared dataset cannot
+know the token boundaries of every supported backbone, a display change contributes only the
+backbone-independent first display position as a conservative positive route rather than pretending
+to annotate the full answer span. Source-level protected-result promotion is also materialized as a
+runtime-owned policy. Prompts, answers, external events, thought/display targets, schedules, example
+multiplicity, and the 3,011,462-transition training mass are unchanged from v14. Exact v15 hashes and
+routing counts are pinned by `release/materialized-manifest.json` in the dataset repository.
+
+The accompanying `evaluation/validation-v3/validation-512.jsonl` is intentionally mixed rather than
+no-tool-only: 416 examples are deterministically sampled from the disjoint compositional/OOD probe and
+96 are disjoint synthetic tool-required interactions. The 18.75% tool slice is large enough for
+per-epoch validation to exercise source selection, binding, observation assimilation, and v3
+multi-region routing while leaving OOD reasoning as the majority. This file is for training/runtime
+validation and does not replace the formal benchmark suite.
 
 The four v14 natural sources contribute 51,500 new independent semantic tasks; together with the
 16,102 existing public-source tasks, the release contains **67,602 public-source semantic tasks**

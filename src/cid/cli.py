@@ -794,6 +794,36 @@ def _dataset_manifest(args: argparse.Namespace) -> None:
     )
 
 
+def _migrate_dataset_contract_v3(args: argparse.Namespace) -> None:
+    from cid.dataset_contract_v3 import migrate_dataset_contract_v3
+
+    manifest = migrate_dataset_contract_v3(args.data, args.output, args.manifest_output)
+    print(
+        f"examples={manifest['examples']} bindings={manifest['bindings']} "
+        f"multi_cell={manifest['multi_cell_bindings']} "
+        f"display_routed={manifest['display_routed_bindings']} "
+        f"sha256={manifest['sha256']} path={args.output}"
+    )
+
+
+def _build_contract_v3_validation(args: argparse.Namespace) -> None:
+    from cid.validation_dataset import build_contract_v3_validation
+
+    manifest = build_contract_v3_validation(
+        args.reasoning_source,
+        args.output,
+        args.manifest_output,
+        total_examples=args.examples,
+        tool_examples=args.tool_examples,
+        seed=args.seed,
+    )
+    print(
+        f"examples={manifest['examples']} tool_examples={manifest['tool_examples']} "
+        f"tool_fraction={manifest['tool_fraction']:.4f} sha256={manifest['sha256']} "
+        f"path={args.output}"
+    )
+
+
 def _materialize_trajectory_mixture(args: argparse.Namespace) -> None:
     from cid.trajectory_mixture import materialize_trajectory_mixture
 
@@ -2588,6 +2618,23 @@ def main() -> None:
     )
     manifest.add_argument("--data", required=True)
     manifest.add_argument("--output", required=True)
+    migrate_v3 = subparsers.add_parser(
+        "migrate-dataset-contract-v3",
+        help="stream a trajectory JSONL into the neural-contract-v3 data ABI",
+    )
+    migrate_v3.add_argument("--data", required=True)
+    migrate_v3.add_argument("--output", required=True)
+    migrate_v3.add_argument("--manifest-output", required=True)
+    validation_v3 = subparsers.add_parser(
+        "build-contract-v3-validation",
+        help="build a validation mix with OOD reasoning plus held-out synthetic tool interactions",
+    )
+    validation_v3.add_argument("--reasoning-source", required=True)
+    validation_v3.add_argument("--output", required=True)
+    validation_v3.add_argument("--manifest-output", required=True)
+    validation_v3.add_argument("--examples", type=int, default=512)
+    validation_v3.add_argument("--tool-examples", type=int, default=96)
+    validation_v3.add_argument("--seed", type=int, default=20260829)
     trajectory_mixture = subparsers.add_parser(
         "materialize-trajectory-mixture",
         help="verify and concatenate pinned CID trajectory components into one training JSONL",
@@ -2869,6 +2916,10 @@ def main() -> None:
         _review_distillation(args)
     elif args.command == "dataset-manifest":
         _dataset_manifest(args)
+    elif args.command == "migrate-dataset-contract-v3":
+        _migrate_dataset_contract_v3(args)
+    elif args.command == "build-contract-v3-validation":
+        _build_contract_v3_validation(args)
     elif args.command == "materialize-trajectory-mixture":
         _materialize_trajectory_mixture(args)
     elif args.command == "audit-training-data":

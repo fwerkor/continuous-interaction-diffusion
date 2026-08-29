@@ -30,12 +30,19 @@ class SyntheticConfig:
     count_per_family: int = 32
     seed: int = 0
     thought_capacity: int = 8
+    index_offset: int = 0
+    id_prefix: str = ""
+    split: str | None = None
 
     def __post_init__(self) -> None:
         if self.count_per_family <= 0:
             raise ValueError("count_per_family must be positive")
         if self.thought_capacity < 4:
             raise ValueError("thought_capacity must be at least 4")
+        if self.index_offset < 0:
+            raise ValueError("index_offset must be non-negative")
+        if self.split is not None and self.split not in {"train", "validation", "test"}:
+            raise ValueError("synthetic split must be train, validation, or test")
 
 
 def generate_synthetic(config: SyntheticConfig | None = None) -> tuple[TrajectoryExample, ...]:
@@ -50,7 +57,8 @@ def generate_synthetic(config: SyntheticConfig | None = None) -> tuple[Trajector
     }
     examples: list[TrajectoryExample] = []
     for family, generator in generators.items():
-        for index in range(config.count_per_family):
+        for relative_index in range(config.count_per_family):
+            index = config.index_offset + relative_index
             examples.append(generator(rng, config, family, index))
     rng.shuffle(examples)
     return tuple(examples)
@@ -72,7 +80,7 @@ def _static_copy(
     key_anchor = _text_anchor(f"{family}-{index}-key", key)
     value_anchor = _number_anchor(f"{family}-{index}-value", value, unit="ms")
     return TrajectoryExample(
-        example_id=_example_id(family, index),
+        example_id=_example_id(config, family, index),
         prompt=f"Read {key} from the documentation and return the value exactly.",
         target_display=f"{value} ms",
         protected_facts={"output_rule": "return the documented value exactly"},
@@ -94,7 +102,9 @@ def _static_copy(
                 executable_step=1,
                 arguments={"key": key},
                 argument_steps={"key": 1},
-                target_cells=(ObjectRef.cell("c1"),),
+                target_cells=(ObjectRef.cell("c1"), ObjectRef.cell("c0")),
+                target_display=(ObjectRef.display_span(0, 1),),
+                owner_cell_id="c1",
             ),
         ),
         grounding_catalog=(
@@ -160,7 +170,7 @@ def _static_copy(
             DisplayTarget(step=1, text="pending"),
             DisplayTarget(step=2, text=f"{value} ms"),
         ),
-        metadata={"family": family.value},
+        metadata=_metadata(config, family),
     )
 
 
@@ -176,7 +186,7 @@ def _delayed_retrieval(
     key_anchor = _text_anchor(f"{family}-{index}-key", key)
     value_anchor = _text_anchor(f"{family}-{index}-value", value)
     return TrajectoryExample(
-        example_id=_example_id(family, index),
+        example_id=_example_id(config, family, index),
         prompt=f"Find the release tag for {key}. Continue reasoning while the lookup is delayed.",
         target_display=value,
         source_descriptors=(_mapping_source("registry"),),
@@ -196,7 +206,9 @@ def _delayed_retrieval(
                 first_need_step=1,
                 executable_step=1,
                 arguments={"key": key},
-                target_cells=(ObjectRef.cell("c1"),),
+                target_cells=(ObjectRef.cell("c1"), ObjectRef.cell("c0")),
+                target_display=(ObjectRef.display_span(0, 1),),
+                owner_cell_id="c1",
             ),
         ),
         grounding_catalog=(GroundingEntry(key_anchor), GroundingEntry(value_anchor)),
@@ -261,7 +273,7 @@ def _delayed_retrieval(
             DisplayTarget(2, "pending"),
             DisplayTarget(3, value),
         ),
-        metadata={"family": family.value, "delay_steps": 2},
+        metadata={**_metadata(config, family), "delay_steps": 2},
     )
 
 
@@ -281,7 +293,7 @@ def _dynamic_state(
     first_anchor = _number_anchor(f"{family}-{index}-first", first)
     second_anchor = _number_anchor(f"{family}-{index}-second", second)
     return TrajectoryExample(
-        example_id=_example_id(family, index),
+        example_id=_example_id(config, family, index),
         prompt="Track the live counter and return the newest observed value.",
         target_display=str(second),
         source_descriptors=(
@@ -292,6 +304,7 @@ def _dynamic_state(
                 "cacheable": False,
                 "dynamic": True,
                 "versioned": True,
+                "promote_results_to_fact": False,
             },
         ),
         events=(
@@ -305,7 +318,9 @@ def _dynamic_state(
                 first_need_step=1,
                 executable_step=1,
                 freshness=FreshnessDemand.ALWAYS,
-                target_cells=(ObjectRef.cell("c1"),),
+                target_cells=(ObjectRef.cell("c1"), ObjectRef.cell("c0")),
+                target_display=(ObjectRef.display_span(0, 1),),
+                owner_cell_id="c1",
             ),
         ),
         grounding_catalog=(GroundingEntry(first_anchor), GroundingEntry(second_anchor)),
@@ -385,7 +400,7 @@ def _dynamic_state(
             DisplayTarget(3, str(first)),
             DisplayTarget(4, str(second)),
         ),
-        metadata={"family": family.value},
+        metadata=_metadata(config, family),
     )
 
 
@@ -400,7 +415,7 @@ def _streaming_evidence(
     first = f"evidence-{rng.randrange(100, 999)}"
     second = f"evidence-{rng.randrange(100, 999)}"
     return TrajectoryExample(
-        example_id=_example_id(family, index),
+        example_id=_example_id(config, family, index),
         prompt=f"Collect the streaming evidence for {topic} and report both pieces in order.",
         target_display=f"{first} {second}",
         source_descriptors=(
@@ -412,6 +427,7 @@ def _streaming_evidence(
                 "dynamic": True,
                 "streamable": True,
                 "versioned": True,
+                "promote_results_to_fact": False,
             },
         ),
         events=(
@@ -426,7 +442,9 @@ def _streaming_evidence(
                 executable_step=1,
                 arguments={"topic": topic},
                 freshness=FreshnessDemand.ALWAYS,
-                target_cells=(ObjectRef.cell("c1"),),
+                target_cells=(ObjectRef.cell("c1"), ObjectRef.cell("c0")),
+                target_display=(ObjectRef.display_span(0, 1),),
+                owner_cell_id="c1",
             ),
         ),
         thought_targets=(
@@ -472,7 +490,7 @@ def _streaming_evidence(
             DisplayTarget(2, f"{first} ..."),
             DisplayTarget(3, f"{first} {second}"),
         ),
-        metadata={"family": family.value},
+        metadata=_metadata(config, family),
     )
 
 
@@ -489,7 +507,7 @@ def _competing_sources(
     primary_value = rng.randrange(50, 100)
     secondary_value = primary_value + rng.choice((-7, -5, 5, 7))
     return TrajectoryExample(
-        example_id=_example_id(family, index),
+        example_id=_example_id(config, family, index),
         prompt=(
             f"Compare primary and secondary values for {key}; "
             "prefer primary when they conflict."
@@ -508,7 +526,9 @@ def _competing_sources(
                 1,
                 1,
                 arguments={"key": key},
-                target_cells=(ObjectRef.cell("c1"),),
+                target_cells=(ObjectRef.cell("c1"), ObjectRef.cell("c0")),
+                target_display=(ObjectRef.display_span(0, 1),),
+                owner_cell_id="c1",
             ),
             BindingTarget(
                 "secondary-need",
@@ -516,7 +536,9 @@ def _competing_sources(
                 1,
                 1,
                 arguments={"key": key},
-                target_cells=(ObjectRef.cell("c2"),),
+                target_cells=(ObjectRef.cell("c2"), ObjectRef.cell("c0")),
+                target_display=(ObjectRef.display_span(0, 1),),
+                owner_cell_id="c2",
             ),
         ),
         grounding_targets=(
@@ -599,7 +621,7 @@ def _competing_sources(
             DisplayTarget(2, "conflict"),
             DisplayTarget(3, str(primary_value)),
         ),
-        metadata={"family": family.value},
+        metadata=_metadata(config, family),
     )
 
 
@@ -646,5 +668,13 @@ def _number_anchor(anchor_id: str, value: int, *, unit: str | None = None) -> An
     return Anchor(anchor_id=anchor_id, kind=AnchorKind.NUMBER, value=value, unit=unit)
 
 
-def _example_id(family: SyntheticFamily, index: int) -> str:
-    return f"{family.value}-{index:06d}"
+def _metadata(config: SyntheticConfig, family: SyntheticFamily) -> dict[str, object]:
+    metadata: dict[str, object] = {"family": family.value}
+    if config.split is not None:
+        metadata["split"] = config.split
+    return metadata
+
+
+def _example_id(config: SyntheticConfig, family: SyntheticFamily, index: int) -> str:
+    prefix = f"{config.id_prefix}-" if config.id_prefix else ""
+    return f"{prefix}{family.value}-{index:06d}"

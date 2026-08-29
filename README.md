@@ -207,17 +207,23 @@ cid prepare-public-distillation
 
 Released CID datasets are published on Hugging Face at `fwerkor/CID-Dataset`; the GitHub
 repository intentionally does not track release data or release manifests. The local `data/` tree is
-a gitignored build/training workspace. **v12, v13, and v14 are preserved as complete releases** so
-training artifacts do not skip a version.
+a gitignored build/training workspace. **v12, v13, v14, and v15 are preserved as complete releases**
+so training artifacts do not skip a version.
 
 - **v12:** 132,122 semantic tasks, 305,948 trajectories, 2,303,169 training transitions;
   materialized SHA-256 `2f2da01e3963b4ac758e023dcb8659afc2d81999c88fd9df361ec058112f3478`.
 - **v13:** 140,797 semantic tasks, 323,298 trajectories, 2,485,228 training transitions;
   materialized SHA-256 `fcda158c66f911b9521e37ffcbdba038710bde607a4762f498b0e70bd99f5de2`.
-- **v14 (current):** 192,297 semantic tasks, 421,798 trajectories, 3,011,462 training transitions.
-  Its materialized SHA-256 is pinned by the Hugging Face release manifest.
+- **v14:** 192,297 semantic tasks, 421,798 trajectories, 3,011,462 training transitions. It is the
+  last release using the pre-v3 need-routing data ABI.
+- **v15 (current):** keeps the exact v14 semantic tasks, schedules, trajectories, prompts, answers,
+  evidence, and transition count, while rematerializing them for neural contract v3. Every binding
+  has an explicit stable owner; affected-cell supervision is conservatively derived from live state
+  changes around the matching observation; display routing receives a tokenizer-independent first-
+  position positive when the displayed answer changes; and protected-result promotion is an explicit
+  source-owned policy. Exact v15 bytes and hashes are pinned by the Hugging Face release manifest.
 
-v14 adds **51,500 independent train-only natural public tasks**: 30,000 Natural Questions Open
+v14 introduced **51,500 independent train-only natural public tasks**: 30,000 Natural Questions Open
 queries, 15,000 MultiDoc2Dial document-grounded dialogue turns, 4,500 high-quality human OASST1
 instruction/response examples, and 2,000 QASPER paper-grounded questions. Together with the existing
 public components this raises independent public-source supervision to 67,602 semantic tasks. The
@@ -230,18 +236,24 @@ about 49.0% of effective semantic loss mass and natural tool interaction about 3
 mechanism, symbolic, correction, long-horizon, compositional, and restraint curricula remain in the
 mixture rather than being replaced by the new natural data.
 
-Download a pinned release into the local gitignored workspace before training, for example:
+Download the current pinned release into the local gitignored workspace before training, for
+example:
 
 ```bash
 hf download fwerkor/CID-Dataset \
-  data/generated/training-trajectories-v14.jsonl \
-  manifests/training-trajectories-v14.materialized.json \
-  --repo-type dataset --local-dir .cid/hf-v14
+  release/training-trajectories.jsonl \
+  release/materialized-manifest.json \
+  evaluation/validation-v3/validation-512.jsonl \
+  evaluation/validation-v3/validation-512.manifest.json \
+  --repo-type dataset --local-dir .cid/hf-v15
 ```
 
-You may train directly from the downloaded materialized JSONL, or download the component directories
-and `manifests/training-trajectory-mixture-v14.json` if you want to reproduce materialization with
-`cid materialize-trajectory-mixture`.
+v15 is reproducible from the verified v14 materialization with `cid migrate-dataset-contract-v3`.
+This migration does not relabel task answers or regenerate semantic teacher plans. The separate
+512-example validation set keeps 416 held-out compositional/OOD reasoning trajectories and adds 96
+held-out synthetic tool interactions (18.75%) so per-epoch validation exercises source selection,
+binding, observation assimilation, and the v3 affected-region ABI instead of measuring only no-tool
+reasoning. It is a training/runtime validation set, not a replacement for the formal benchmark.
 
 The materializer verifies every component SHA/count and global `example_id` uniqueness before
 writing the combined file. Training shuffles rollout windows per epoch unless `--no-shuffle` is
