@@ -270,6 +270,10 @@ class CIDOutputHeads(nn.Module):
         self.lifecycle_head = nn.Linear(d_model, num_lifecycles)
         self.need_head = nn.Linear(d_model, max_need_slots)
         self.source_query = nn.Linear(d_model, max_need_slots * d_model, bias=False)
+        self.need_cell_route_scale = nn.Parameter(torch.full((max_need_slots,), 4.0))
+        self.need_cell_route_bias = nn.Parameter(torch.full((max_need_slots,), -2.0))
+        self.need_display_route_scale = nn.Parameter(torch.full((max_need_slots,), 4.0))
+        self.need_display_route_bias = nn.Parameter(torch.full((max_need_slots,), -2.0))
         self.argument_presence_head = nn.Linear(
             d_model, max_need_slots * max_argument_slots
         )
@@ -293,6 +297,7 @@ class CIDOutputHeads(nn.Module):
         base_thought: Tensor,
         thought_hidden: Tensor,
         thought_occupancy: Tensor,
+        display_hidden: Tensor,
         display_logits: Tensor,
         source_memory: Tensor,
         source_padding_mask: Tensor | None = None,
@@ -308,12 +313,28 @@ class CIDOutputHeads(nn.Module):
             occupied_summary,
             fallback_summary,
         )
-        source_query = self.source_query(thought_hidden).view(
+        need_query = self.source_query(thought_hidden).view(
             batch_size, thought_slots, self.max_need_slots, self.d_model
         )
-        source_query = F.normalize(source_query, dim=-1)
+        need_query = F.normalize(need_query, dim=-1)
         normalized_sources = F.normalize(source_memory, dim=-1)
-        source_logits = torch.einsum("bnkd,bsd->bnks", source_query, normalized_sources)
+        source_logits = torch.einsum("bnkd,bsd->bnks", need_query, normalized_sources)
+        normalized_thought = F.normalize(thought_hidden, dim=-1)
+        need_target_cell_logits = torch.einsum(
+            "bnkd,bmd->bnkm", need_query, normalized_thought
+        )
+        need_target_cell_logits = (
+            need_target_cell_logits * self.need_cell_route_scale[None, None, :, None]
+            + self.need_cell_route_bias[None, None, :, None]
+        )
+        normalized_display = F.normalize(display_hidden, dim=-1)
+        need_target_display_logits = torch.einsum(
+            "bnkd,bld->bnkl", need_query, normalized_display
+        )
+        need_target_display_logits = (
+            need_target_display_logits * self.need_display_route_scale[None, None, :, None]
+            + self.need_display_route_bias[None, None, :, None]
+        )
         if source_padding_mask is not None:
             source_logits = source_logits.masked_fill(
                 source_padding_mask[:, None, None, :],
@@ -376,6 +397,8 @@ class CIDOutputHeads(nn.Module):
             display_logits=display_logits,
             need_logits=self.need_head(thought_hidden),
             source_logits=source_logits,
+            need_target_cell_logits=need_target_cell_logits,
+            need_target_display_logits=need_target_display_logits,
             argument_presence_logits=argument_presence_logits,
             argument_query=argument_query,
             anchor_query=anchor_query,

@@ -21,6 +21,8 @@ class CIDLossWeights:
     lifecycle: float = 0.1
     intent: float = 0.5
     source: float = 0.5
+    need_cell_route: float = 0.2
+    need_display_route: float = 0.2
     argument_presence: float = 0.1
     argument_ground: float = 0.2
     revision: float = 0.2
@@ -48,6 +50,10 @@ class CIDTargets:
     lifecycle: Tensor
     need_targets: Tensor
     source_targets: Tensor
+    need_target_cell_targets: Tensor
+    need_target_cell_mask: Tensor
+    need_target_display_targets: Tensor
+    need_target_display_mask: Tensor
     argument_presence_targets: Tensor
     argument_presence_mask: Tensor
     argument_embeddings: Tensor
@@ -80,6 +86,8 @@ class CIDLoss:
     lifecycle: Tensor
     intent: Tensor
     source: Tensor
+    need_cell_route: Tensor
+    need_display_route: Tensor
     argument_presence: Tensor
     argument_ground: Tensor
     revision: Tensor
@@ -162,6 +170,16 @@ def cid_loss(
         targets.source_targets,
         targets.source_targets != -100,
     )
+    need_cell_route = _masked_binary_cross_entropy(
+        output.need_target_cell_logits,
+        targets.need_target_cell_targets,
+        targets.need_target_cell_mask,
+    )
+    need_display_route = _masked_binary_cross_entropy(
+        output.need_target_display_logits,
+        targets.need_target_display_targets,
+        targets.need_target_display_mask,
+    )
     argument_presence = _masked_binary_cross_entropy(
         output.argument_presence_logits,
         targets.argument_presence_targets,
@@ -233,6 +251,8 @@ def cid_loss(
         + w.lifecycle * lifecycle
         + w.intent * intent
         + w.source * source
+        + w.need_cell_route * need_cell_route
+        + w.need_display_route * need_display_route
         + w.argument_presence * argument_presence
         + w.argument_ground * argument_ground
         + w.revision * revision
@@ -258,6 +278,8 @@ def cid_loss(
         lifecycle=lifecycle,
         intent=intent,
         source=source,
+        need_cell_route=need_cell_route,
+        need_display_route=need_display_route,
         argument_presence=argument_presence,
         argument_ground=argument_ground,
         revision=revision,

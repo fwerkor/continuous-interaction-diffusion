@@ -45,7 +45,7 @@ from cid.model.materialize import RevisionAction
 from cid.model.tensors import CIDTensorBatch, CIDTensorOutput, build_percept_routing_masks
 from cid.state import CellLifecycle, CognitiveRole
 
-CID_NEURAL_CONTRACT_VERSION = 2
+CID_NEURAL_CONTRACT_VERSION = 3
 
 
 @dataclass(slots=True)
@@ -176,6 +176,14 @@ def collate_training_steps(
         lifecycle=_pad_slot_targets(steps, "lifecycle", pad_value=-100),
         need_targets=_pad_slot_targets(steps, "need_targets"),
         source_targets=_pad_slot_targets(steps, "source_targets", pad_value=-100),
+        need_target_cell_targets=_pad_slot_targets(steps, "need_target_cell_targets"),
+        need_target_cell_mask=_pad_slot_targets(steps, "need_target_cell_mask"),
+        need_target_display_targets=_pad_need_display_targets(
+            steps, "need_target_display_targets"
+        ),
+        need_target_display_mask=_pad_need_display_targets(
+            steps, "need_target_display_mask"
+        ),
         argument_presence_targets=_pad_slot_targets(steps, "argument_presence_targets"),
         argument_presence_mask=_pad_slot_targets(steps, "argument_presence_mask"),
         argument_embeddings=_pad_slot_targets(steps, "argument_embeddings"),
@@ -1337,6 +1345,7 @@ class ILLaDATrajectoryTensorizer:
             target_output_slots=target_output_slots,
             target_vectors=target_vectors,
             display_labels=display_labels,
+            display_supervision_mask=display_supervision_mask,
             input_occupancy=occupancy,
             input_noise_level=thought_corruption.noise,
             thought_slots=capacity,
@@ -1426,6 +1435,7 @@ class ILLaDATrajectoryTensorizer:
         target_output_slots: Mapping[str, int],
         target_vectors: Mapping[str, Tensor],
         display_labels: Tensor,
+        display_supervision_mask: Tensor,
         input_occupancy: Tensor,
         input_noise_level: Tensor,
         thought_slots: int,
@@ -1464,6 +1474,19 @@ class ILLaDATrajectoryTensorizer:
         lifecycle = torch.full((1, n), -100, device=device, dtype=torch.long)
         need_targets = torch.zeros((1, n, c.max_need_slots), device=device, dtype=dtype)
         source_targets = torch.full((1, n, c.max_need_slots), -100, device=device, dtype=torch.long)
+        need_target_cell_targets = torch.zeros(
+            (1, n, c.max_need_slots, n), device=device, dtype=dtype
+        )
+        need_target_cell_mask = torch.zeros(
+            (1, n, c.max_need_slots, n), device=device, dtype=torch.bool
+        )
+        display_width = display_labels.shape[1]
+        need_target_display_targets = torch.zeros(
+            (1, n, c.max_need_slots, display_width), device=device, dtype=dtype
+        )
+        need_target_display_mask = torch.zeros(
+            (1, n, c.max_need_slots, display_width), device=device, dtype=torch.bool
+        )
         revision_targets = torch.full((1, n), -100, device=device, dtype=torch.long)
         refresh_targets = torch.full(
             (1, n, c.max_need_slots), -100, device=device, dtype=torch.long
@@ -1592,40 +1615,54 @@ class ILLaDATrajectoryTensorizer:
                 binding.freshness is FreshnessDemand.ONCE
                 and _binding_observation_available(example, binding, target_step)
             )
+            owner = binding.owner_cell
+            if owner is None:
+                continue
+            slot = target_output_slots.get(owner.identifier)
+            if slot is None or not need_is_active:
+                continue
+            need_slot = binding_slots[(owner.identifier, binding.need_id)]
+            need_targets[0, slot, need_slot] = binding.confidence
+            source_targets[0, slot, need_slot] = source_index
+            refresh_targets[0, slot, need_slot] = freshness_order.index(binding.freshness)
+            need_target_cell_mask[0, slot, need_slot] = (
+                thought_mask[0] | input_occupancy[0, :, 0].bool()
+            )
+            need_target_cell_targets[0, slot, need_slot, slot] = 1.0
             for cell_ref in binding.target_cells:
-                slot = target_output_slots.get(cell_ref.identifier)
-                if slot is None:
+                target_slot = target_output_slots.get(cell_ref.identifier)
+                if target_slot is not None:
+                    need_target_cell_targets[0, slot, need_slot, target_slot] = 1.0
+            need_target_display_mask[0, slot, need_slot] = display_supervision_mask[0]
+            for display_ref in binding.target_display:
+                if display_ref.span is None:
                     continue
-                if not need_is_active:
-                    # A one-shot request is complete once its matching observation is visible.
-                    # The explicit zero need target remains supervised for this occupied slot.
-                    continue
-                need_slot = binding_slots[(cell_ref.identifier, binding.need_id)]
-                need_targets[0, slot, need_slot] = binding.confidence
-                source_targets[0, slot, need_slot] = source_index
-                refresh_targets[0, slot, need_slot] = freshness_order.index(binding.freshness)
-                for argument_slot, argument in enumerate(
-                    declared_arguments[: c.max_argument_slots]
-                ):
-                    argument_presence_mask[0, slot, need_slot, argument_slot] = True
-                    name = str(argument.get("name", ""))
-                    available_step = binding.argument_steps.get(
-                        name,
-                        binding.executable_step,
-                    )
-                    executable = (
-                        available_step is not None
-                        and target_step >= available_step
-                        and name in binding.arguments
-                    )
-                    if executable:
-                        argument_presence_targets[0, slot, need_slot, argument_slot] = 1.0
-                        argument_embeddings[0, slot, need_slot, argument_slot] = (
-                            self.text_encoder.encode_one(
-                                stable_text(binding.arguments[name]), detach=True
-                            )
+                start, end = display_ref.span
+                start = max(0, min(start, display_width))
+                end = max(start, min(end, display_width))
+                need_target_display_targets[0, slot, need_slot, start:end] = 1.0
+            for argument_slot, argument in enumerate(
+                declared_arguments[: c.max_argument_slots]
+            ):
+                argument_presence_mask[0, slot, need_slot, argument_slot] = True
+                name = str(argument.get("name", ""))
+                available_step = binding.argument_steps.get(
+                    name,
+                    binding.executable_step,
+                )
+                executable = (
+                    available_step is not None
+                    and target_step >= available_step
+                    and name in binding.arguments
+                )
+                if executable:
+                    argument_presence_targets[0, slot, need_slot, argument_slot] = 1.0
+                    argument_embeddings[0, slot, need_slot, argument_slot] = (
+                        self.text_encoder.encode_one(
+                            stable_text(binding.arguments[name]), detach=True
                         )
-                        argument_mask[0, slot, need_slot, argument_slot] = True
+                    )
+                    argument_mask[0, slot, need_slot, argument_slot] = True
 
         grounding_by_cell = {
             item.cell_id: item for item in example.grounding_targets if item.step == target_step
@@ -1671,6 +1708,10 @@ class ILLaDATrajectoryTensorizer:
             lifecycle=lifecycle,
             need_targets=need_targets,
             source_targets=source_targets,
+            need_target_cell_targets=need_target_cell_targets,
+            need_target_cell_mask=need_target_cell_mask,
+            need_target_display_targets=need_target_display_targets,
+            need_target_display_mask=need_target_display_mask,
             argument_presence_targets=argument_presence_targets,
             argument_presence_mask=argument_presence_mask,
             argument_embeddings=argument_embeddings,
@@ -1722,8 +1763,9 @@ class ILLaDATrajectoryTensorizer:
     def _binding_slot_schedule(self, example: TrajectoryExample) -> dict[tuple[str, str], int]:
         by_cell: dict[str, list[Any]] = {}
         for binding in example.binding_targets:
-            for target in binding.target_cells:
-                by_cell.setdefault(target.identifier, []).append(binding)
+            owner = binding.owner_cell
+            if owner is not None:
+                by_cell.setdefault(owner.identifier, []).append(binding)
 
         schedule: dict[tuple[str, str], int] = {}
         for cell_id, bindings in by_cell.items():
@@ -1904,6 +1946,24 @@ def _pad_slot_targets(
         tuple(getattr(step.targets, name) for step in steps),
         pad_value=pad_value,
     )
+
+
+def _pad_need_display_targets(
+    steps: tuple[CIDTrainingStep, ...],
+    name: str,
+) -> Tensor:
+    tensors = tuple(getattr(step.targets, name) for step in steps)
+    if any(tensor.ndim != 4 or tensor.shape[0] != 1 for tensor in tensors):
+        raise ValueError("need-display targets must have shape [1, slots, need_slots, display]")
+    max_slots = max(tensor.shape[1] for tensor in tensors)
+    need_slots = tensors[0].shape[2]
+    if any(tensor.shape[2] != need_slots for tensor in tensors):
+        raise ValueError("need-display targets in one batch must share need-slot capacity")
+    max_display = max(tensor.shape[3] for tensor in tensors)
+    output = tensors[0].new_zeros((len(tensors), max_slots, need_slots, max_display))
+    for row, tensor in enumerate(tensors):
+        output[row, : tensor.shape[1], :, : tensor.shape[3]] = tensor[0]
+    return output
 
 
 def _pad_2d(

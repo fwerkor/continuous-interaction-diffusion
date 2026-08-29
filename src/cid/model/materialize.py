@@ -101,6 +101,8 @@ class CIDMaterializerConfig:
     allocation_threshold: float = 0.8
     convergence_threshold: float = 0.5
     need_threshold: float = 0.6
+    need_target_cell_threshold: float = 0.5
+    need_target_display_threshold: float = 0.5
     argument_presence_threshold: float = 0.5
     anchor_presence_threshold: float = 0.5
     link_presence_threshold: float = 0.5
@@ -113,6 +115,8 @@ class CIDMaterializerConfig:
             "allocation_threshold",
             "convergence_threshold",
             "need_threshold",
+            "need_target_cell_threshold",
+            "need_target_display_threshold",
             "argument_presence_threshold",
             "anchor_presence_threshold",
             "link_presence_threshold",
@@ -147,7 +151,9 @@ class CIDMaterializer:
         thought = self._materialize_cells(output, context.thought, batch_index)
         thought = self._materialize_grounding(output, thought, catalog, batch_index)
         display = self._materialize_display(context.display, display_token_ids)
-        needs = self._materialize_needs(output, context, thought, catalog, batch_index)
+        needs = self._materialize_needs(
+            output, context, thought, display, catalog, batch_index
+        )
         reopen_cells = self._materialize_revisions(output, thought, batch_index)
         convergence = float(torch.sigmoid(output.convergence_logits[batch_index]).detach())
 
@@ -310,6 +316,7 @@ class CIDMaterializer:
         output: CIDTensorOutput,
         context: ModelContext,
         thought: CognitiveField,
+        display: DisplayCanvas,
         catalog: ClosedWorldMaterializationCatalog,
         batch_index: int,
     ) -> tuple[InformationNeed, ...]:
@@ -354,6 +361,12 @@ class CIDMaterializer:
                         arguments[descriptor.name] = value
 
                 freshness = freshness_order[int(refresh_actions[slot, need_slot])]
+                target_cells = self._need_target_cells(
+                    output, thought, slot=slot, need_slot=need_slot, batch_index=batch_index
+                )
+                target_display = self._need_target_display(
+                    output, display, slot=slot, need_slot=need_slot, batch_index=batch_index
+                )
                 needs.append(
                     InformationNeed(
                         need_id=f"need:{cell.cell_id}:{need_slot}",
@@ -364,10 +377,67 @@ class CIDMaterializer:
                         max_age_s=self.config.max_age_s
                         if freshness is FreshnessDemand.MAX_AGE
                         else None,
-                        target_cells=(ObjectRef.cell(cell.cell_id),),
+                        target_cells=target_cells,
+                        target_display=target_display,
+                        promote_to_fact=source.promote_results_to_fact,
                     )
                 )
         return tuple(needs)
+
+    def _need_target_cells(
+        self,
+        output: CIDTensorOutput,
+        thought: CognitiveField,
+        *,
+        slot: int,
+        need_slot: int,
+        batch_index: int,
+    ) -> tuple[ObjectRef, ...]:
+        owner = thought.cells[slot]
+        if not owner.live or owner.cell_id is None:
+            return ()
+        probabilities = torch.sigmoid(
+            output.need_target_cell_logits[batch_index, slot, need_slot]
+        ).detach()
+        targets = [ObjectRef.cell(owner.cell_id)]
+        for target_slot, target_cell in enumerate(thought.cells):
+            if (
+                not target_cell.live
+                or target_cell.cell_id is None
+                or target_cell.cell_id == owner.cell_id
+                or float(probabilities[target_slot]) < self.config.need_target_cell_threshold
+            ):
+                continue
+            targets.append(ObjectRef.cell(target_cell.cell_id))
+        return tuple(targets)
+
+    def _need_target_display(
+        self,
+        output: CIDTensorOutput,
+        display: DisplayCanvas,
+        *,
+        slot: int,
+        need_slot: int,
+        batch_index: int,
+    ) -> tuple[ObjectRef, ...]:
+        probabilities = torch.sigmoid(
+            output.need_target_display_logits[batch_index, slot, need_slot]
+        ).detach()
+        selected = (
+            probabilities[: display.active_span_length]
+            >= self.config.need_target_display_threshold
+        )
+        spans: list[ObjectRef] = []
+        start: int | None = None
+        for index, active in enumerate(selected.tolist()):
+            if active and start is None:
+                start = index
+            elif not active and start is not None:
+                spans.append(ObjectRef.display_span(start, index))
+                start = None
+        if start is not None:
+            spans.append(ObjectRef.display_span(start, int(selected.numel())))
+        return tuple(spans)
 
     @staticmethod
     def _materialize_revisions(
@@ -409,6 +479,20 @@ class CIDMaterializer:
             raise ValueError("model display length does not match runtime display canvas")
         if output.source_logits.shape[-1] != len(context.sources):
             raise ValueError("model source count does not match runtime source descriptors")
+        batch_size = output.thought_semantic.shape[0]
+        thought_slots = context.thought.capacity
+        if output.need_target_cell_logits.shape[:2] != (batch_size, thought_slots):
+            raise ValueError("need-to-cell routing must match runtime TCT geometry")
+        if output.need_target_cell_logits.shape[-1] != thought_slots:
+            raise ValueError("need-to-cell routing target width must match runtime TCT capacity")
+        if output.need_target_display_logits.shape[:2] != (batch_size, thought_slots):
+            raise ValueError("need-to-display routing must match runtime TCT geometry")
+        if output.need_target_display_logits.shape[-1] != len(context.display.token_ids):
+            raise ValueError("need-to-display routing must match runtime display capacity")
+        if output.need_target_cell_logits.shape[2] != output.need_logits.shape[-1]:
+            raise ValueError("need-to-cell routing must match information-need slot capacity")
+        if output.need_target_display_logits.shape[2] != output.need_logits.shape[-1]:
+            raise ValueError("need-to-display routing must match information-need slot capacity")
 
 
 def _nearest_value(

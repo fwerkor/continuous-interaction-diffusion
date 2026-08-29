@@ -204,6 +204,7 @@ class TorchCIDCore(nn.Module):
             base_thought=thought,
             thought_hidden=t_hidden,
             thought_occupancy=neural_occupancy,
+            display_hidden=y_hidden,
             display_logits=self.display_head(y_hidden),
             source_memory=batch.source_memory,
             source_padding_mask=batch.source_padding_mask,

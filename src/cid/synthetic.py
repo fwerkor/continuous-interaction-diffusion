@@ -76,7 +76,7 @@ def _static_copy(
         prompt=f"Read {key} from the documentation and return the value exactly.",
         target_display=f"{value} ms",
         protected_facts={"output_rule": "return the documented value exactly"},
-        source_descriptors=(_mapping_source("docs"),),
+        source_descriptors=(_mapping_source("docs", promote_results_to_fact=True),),
         events=(
             ExternalEvent(
                 source="docs",
@@ -626,7 +626,7 @@ def _thought(
     )
 
 
-def _mapping_source(name: str) -> dict[str, object]:
+def _mapping_source(name: str, *, promote_results_to_fact: bool = False) -> dict[str, object]:
     return {
         "name": name,
         "description": "read a keyed value",
@@ -634,6 +634,7 @@ def _mapping_source(name: str) -> dict[str, object]:
         "cacheable": True,
         "dynamic": False,
         "versioned": True,
+        "promote_results_to_fact": promote_results_to_fact,
     }
 
 

@@ -142,6 +142,7 @@ def canonical_source_text(item: SourceDescriptor | Mapping[str, Any]) -> str:
         streamable = item.streamable
         versioned = item.versioned
         accepts_partial_arguments = item.accepts_partial_arguments
+        promote_results_to_fact = item.promote_results_to_fact
     else:
         name = str(item.get("name", ""))
         description = str(item.get("description", ""))
@@ -158,6 +159,7 @@ def canonical_source_text(item: SourceDescriptor | Mapping[str, Any]) -> str:
         streamable = bool(item.get("streamable", False))
         versioned = bool(item.get("versioned", False))
         accepts_partial_arguments = bool(item.get("accepts_partial_arguments", False))
+        promote_results_to_fact = bool(item.get("promote_results_to_fact", False))
     argument_text = ",".join(
         f"{argument_name}:{kind}:{'required' if required else 'optional'}"
         for argument_name, kind, required in arguments
@@ -172,6 +174,7 @@ def canonical_source_text(item: SourceDescriptor | Mapping[str, Any]) -> str:
             f"streamable={streamable}",
             f"versioned={versioned}",
             f"accepts_partial_arguments={accepts_partial_arguments}",
+            f"promote_results_to_fact={promote_results_to_fact}",
         )
     )
 

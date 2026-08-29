@@ -40,6 +40,7 @@ class BindingTarget:
     max_age_s: float | None = None
     target_cells: tuple[ObjectRef, ...] = ()
     target_display: tuple[ObjectRef, ...] = ()
+    owner_cell_id: str | None = None
 
     def __post_init__(self) -> None:
         if self.first_need_step < 0:
@@ -60,6 +61,19 @@ class BindingTarget:
             raise ValueError("binding target_cells must contain cell references")
         if any(target.kind is not ObjectKind.DISPLAY_SPAN for target in self.target_display):
             raise ValueError("binding target_display must contain display-span references")
+        if self.owner_cell_id is not None:
+            if not self.owner_cell_id:
+                raise ValueError("binding owner_cell_id must be non-empty when set")
+            if self.target_cells and self.owner_cell_id not in {
+                target.identifier for target in self.target_cells
+            }:
+                raise ValueError("binding owner cell must be included in target_cells")
+
+    @property
+    def owner_cell(self) -> ObjectRef | None:
+        if self.owner_cell_id is not None:
+            return ObjectRef.cell(self.owner_cell_id)
+        return self.target_cells[0] if self.target_cells else None
 
 
 @dataclass(frozen=True, slots=True)
@@ -184,6 +198,11 @@ class TrajectoryExample:
                 target_display=tuple(
                     ObjectRef.from_dict(item) for item in target.get("target_display", ())
                 ),
+                owner_cell_id=(
+                    None
+                    if target.get("owner_cell_id") is None
+                    else str(target["owner_cell_id"])
+                ),
             )
             for target in raw.get("binding_targets", ())
         )
@@ -283,6 +302,7 @@ def trajectory_to_dict(example: TrajectoryExample) -> dict[str, Any]:
                 "max_age_s": target.max_age_s,
                 "target_cells": [item.to_dict() for item in target.target_cells],
                 "target_display": [item.to_dict() for item in target.target_display],
+                "owner_cell_id": target.owner_cell_id,
             }
             for target in example.binding_targets
         ],

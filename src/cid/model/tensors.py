@@ -46,6 +46,8 @@ class CIDTensorOutput:
     display_logits: Tensor
     need_logits: Tensor
     source_logits: Tensor
+    need_target_cell_logits: Tensor
+    need_target_display_logits: Tensor
     argument_presence_logits: Tensor
     argument_query: Tensor
     anchor_query: Tensor

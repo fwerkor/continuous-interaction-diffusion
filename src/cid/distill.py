@@ -246,6 +246,7 @@ class TeacherNeed:
     phase: str
     source: str
     arguments: Mapping[str, Any] = field(default_factory=dict)
+    affected_cell_ids: tuple[str, ...] = ()
     confidence: float = 1.0
     freshness: FreshnessDemand = FreshnessDemand.ONCE
     max_age_s: float | None = None
@@ -255,6 +256,12 @@ class TeacherNeed:
             raise ValueError("teacher need identifiers/source/phase must be non-empty")
         if not 0.0 <= self.confidence <= 1.0:
             raise ValueError("teacher need confidence must be in [0, 1]")
+        if any(not cell_id for cell_id in self.affected_cell_ids):
+            raise ValueError("teacher need affected cell IDs must be non-empty")
+        if len(set(self.affected_cell_ids)) != len(self.affected_cell_ids):
+            raise ValueError("teacher need affected cell IDs must be unique")
+        if self.cell_id in self.affected_cell_ids:
+            raise ValueError("teacher need owner must not be repeated in affected_cell_ids")
         if self.freshness is FreshnessDemand.MAX_AGE and self.max_age_s is None:
             raise ValueError("MAX_AGE teacher needs require max_age_s")
 
@@ -269,6 +276,7 @@ class TeacherNeed:
                 "phase",
                 "source",
                 "arguments",
+                "affected_cell_ids",
                 "confidence",
                 "freshness",
                 "max_age_s",
@@ -282,6 +290,7 @@ class TeacherNeed:
             phase=str(raw["phase"]),
             source=str(raw["source"]),
             arguments=dict(raw.get("arguments", {})),
+            affected_cell_ids=tuple(str(item) for item in raw.get("affected_cell_ids", ())),
             confidence=float(raw.get("confidence", 1.0)),
             freshness=FreshnessDemand(str(raw.get("freshness", FreshnessDemand.ONCE))),
             max_age_s=None if raw.get("max_age_s") is None else float(raw["max_age_s"]),
@@ -295,6 +304,7 @@ class TeacherNeed:
             "phase": self.phase,
             "source": self.source,
             "arguments": dict(self.arguments),
+            "affected_cell_ids": list(self.affected_cell_ids),
             "confidence": self.confidence,
             "freshness": self.freshness.value,
         }
@@ -409,7 +419,8 @@ Output schema:
   "needs": [
     {{
       "need_id":"...", "cell_id":"...", "evidence_id":"...", "phase":"pre",
-      "source":"...", "arguments":{{}}, "confidence":1.0, "freshness":"once"
+      "source":"...", "arguments":{{}}, "affected_cell_ids":[],
+      "confidence":1.0, "freshness":"once"
     }}
   ]
 }}
@@ -435,6 +446,8 @@ Rules:
 - A final frame is optional; if present it comes after all evidence frames.
 - Pre-evidence frames must not reveal values that have not arrived yet.
 - Needs refer to evidence IDs and source schemas supplied below.
+- `cell_id` is the stable owner of the information need. `affected_cell_ids` may name additional
+  cells in the same activation phase whose cognition should be directly conditioned by the result.
 - Keep cognition compact; create only cells that serve a distinct cognitive role.
 - Solve the task yourself. No gold/reference answer is included in TASK.
 
@@ -926,7 +939,11 @@ def _binding_target(
         confidence=need.confidence,
         freshness=need.freshness,
         max_age_s=need.max_age_s,
-        target_cells=(ObjectRef.cell(need.cell_id),),
+        target_cells=tuple(
+            ObjectRef.cell(cell_id)
+            for cell_id in dict.fromkeys((need.cell_id, *need.affected_cell_ids))
+        ),
+        owner_cell_id=need.cell_id,
     )
 
 
@@ -948,7 +965,13 @@ def _validate_need_contract(
             raise ValueError(f"teacher need references unknown phase {need.phase!r}")
         cells = {cell.cell_id for cell in frame_by_phase[need.phase].cells}
         if need.cell_id not in cells:
-            raise ValueError("teacher need target cell must exist in its activation phase")
+            raise ValueError("teacher need owner cell must exist in its activation phase")
+        unknown_affected = set(need.affected_cell_ids) - cells
+        if unknown_affected:
+            raise ValueError(
+                "teacher need affected cells must exist in its activation phase: "
+                f"{sorted(unknown_affected)}"
+            )
 
 
 def _validate_monotonic_cells(frames: list[TeacherFrame]) -> None:

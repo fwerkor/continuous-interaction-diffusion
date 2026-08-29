@@ -363,6 +363,7 @@ def _source_descriptor(raw: Mapping[str, Any]) -> SourceDescriptor:
         streamable=bool(raw.get("streamable", False)),
         versioned=bool(raw.get("versioned", False)),
         accepts_partial_arguments=bool(raw.get("accepts_partial_arguments", False)),
+        promote_results_to_fact=bool(raw.get("promote_results_to_fact", False)),
     )
 
 

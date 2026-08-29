@@ -39,6 +39,7 @@ class SourceDescriptor:
     streamable: bool = False
     versioned: bool = False
     accepts_partial_arguments: bool = False
+    promote_results_to_fact: bool = False
 
     @property
     def required_arguments(self) -> tuple[str, ...]:
