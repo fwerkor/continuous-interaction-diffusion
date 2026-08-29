@@ -34,10 +34,10 @@ under the upstream LFM Open License v1.0.
 
 - TCT slot projection and role heads;
 - empty-slot allocation and occupied-cell lifecycle heads;
-- source/need confidence heads;
+- source/need confidence heads plus learned need-to-cell/display routing;
 - argument and typed grounding heads;
 - percept encoder/cross-attention adapters;
-- local support/conflict and lifecycle heads.
+- local revision/noise and lifecycle heads.
 
 The first trainable data path is `ILLaDATrajectoryTensorizer`. It turns adjacent supervised
 trajectory snapshots into a model input and `CIDTargets`: current TCT occupancy is retained,
@@ -104,9 +104,11 @@ CID parameters plus optimizer/progress/RNG state; the pinned pretrained backbone
 separately. Every completed epoch is retained as `stage-a-epoch-XXXX.pt`; `stage-a-latest.pt` and
 the epoch-end step name are compatibility symlinks to that permanent snapshot.
 `load_cid_adapter_checkpoint()` restores those CID parameters directly for runtime evaluation.
-Checkpoint metadata also carries a neural-contract version. Changes to tensor geometry or
-train/runtime semantics intentionally bump this contract and reject older checkpoints rather than
-silently loading weights trained against a different ABI.
+Checkpoint metadata also carries a neural-contract version. Contract v3 adds learned
+need-to-cell/display routing and source-declared protected-result promotion on top of the unified
+diffusion-state contract. Changes to tensor geometry or train/runtime semantics intentionally bump
+this contract and reject older checkpoints rather than silently loading weights trained against a
+different ABI.
 
 Both training stages accept `--validation-data <trajectory.jsonl>`. If it is omitted and the main
 trajectory JSONL contains `metadata.split` labels, `train` examples are used for optimization,

@@ -160,7 +160,11 @@ canvas positions after the first EOS remain masked and inactive.
 Materialization turns allocation/lifecycle logits into TCT proposals, retrieves typed anchors and
 link targets from a trajectory-local catalog, decodes schema-positioned argument slots, emits
 persistent `InformationNeed` objects, and converts revision predictions into typed reopen
-references. A separate convergence head predicts current-information equilibrium. Materialization
+references. Each stable need slot also reuses its latent need query to score live TCT cells and
+display positions. Thresholded scores materialize `target_cells` and contiguous `target_display`
+spans; the need-owning cell is always retained as a target. This makes the paper's affected-region
+link $\chi$ an explicit learned neural/runtime contract instead of a runtime-only field. A separate
+convergence head predicts current-information equilibrium. Materialization
 exposes that signal separately from terminal convergence: a fully resolved display plus equilibrium
 forms a terminal candidate, while equilibrium with an unresolved required binding allows the runtime
 to quiesce. Runtime lifecycle/binding and freshness gates remain authoritative after materialization.
@@ -215,16 +219,20 @@ queued updates have been drained.
 
 ## 7. Local reopening
 
-The neural core predicts support/conflict evidence per cognitive slot. Training converts those
-signals into local editability targets. Runtime-facing policies may also increase local noise for
-cells linked to a newly conflicting percept and emit typed cell references through `reopen_cells`.
+The neural core directly predicts each cognitive slot's local-noise delta and a
+`KEEP / REOPEN / STABILIZE` revision action. Training derives these targets from the teacher state's
+change in local editability, so support and conflict affect the same explicit local-control path
+without requiring a separate support/conflict score head. Runtime-facing policies may also increase
+local noise for cells linked to a newly conflicting percept and emit typed cell references through
+`reopen_cells`.
 The transition controller is the gate that permits `STABLE -> ACTIVE`. We keep this mechanism
 explicit instead of hiding it inside a global remasking schedule so RQ4/RQ5 ablations are possible.
 
 ## 8. Source scope
 
 v0 sources are read-only. A source descriptor declares cacheability, dynamism, streaming/version
-properties, required arguments, and whether partial selectors are executable. Version-aware sources
+properties, required arguments, whether partial selectors are executable, and whether returned
+observations must be promoted into the runtime-owned protected fact channel. Version-aware sources
 can expose a cheap `version()` probe so `ALWAYS`/`MAX_AGE` freshness checks avoid a full read when the
 source is unchanged. Streamable sources expose an async observation stream; the runtime keeps one
 subscription per canonical work key and delivers queued observations one per denoising step so
