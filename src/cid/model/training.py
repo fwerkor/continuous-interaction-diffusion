@@ -1558,7 +1558,6 @@ class ILLaDATrajectoryTensorizer:
                 )
                 lifecycle[0, slot] = lifecycle_order.index(effective_lifecycle)
             else:
-                lifecycle[0, slot] = lifecycle_order.index(target.lifecycle)
                 diffusion_delta = target.noise - float(input_noise_level[0, slot, 0])
                 noise_delta[0, slot, 0] = diffusion_delta
                 state_delta = 0.0 if source_target is None else target.noise - source_target.noise
@@ -1570,6 +1569,7 @@ class ILLaDATrajectoryTensorizer:
                     revision_action = RevisionAction.KEEP
                 revision_targets[0, slot] = int(revision_action)
 
+                effective_lifecycle = target.lifecycle
                 if source_target is not None:
                     signals = LifecycleTransitionSignals(
                         waiting_cells=frozenset(waiting_cells),
@@ -1580,17 +1580,18 @@ class ILLaDATrajectoryTensorizer:
                             else frozenset()
                         ),
                     )
-                    resolved = LifecycleTransitionController.resolve(
+                    # Train the lifecycle head on the same hard-gated state that the
+                    # runtime will actually materialize.  Dataset snapshots may skip an
+                    # internal gate state (for example WAITING -> STABLE when an
+                    # observation arrives); the runtime necessarily exposes ACTIVE for
+                    # that update before a later stabilization.
+                    effective_lifecycle = LifecycleTransitionController.resolve(
                         cell_id=cell_id,
                         current=source_target.lifecycle,
                         proposed=target.lifecycle,
                         signals=signals,
                     )
-                    if resolved is not target.lifecycle:
-                        raise ValueError(
-                            f"trajectory lifecycle target {source_target.lifecycle.value}->"
-                            f"{target.lifecycle.value} for {cell_id!r} is blocked by runtime gates"
-                        )
+                lifecycle[0, slot] = lifecycle_order.index(effective_lifecycle)
 
         target_slots = set(target_output_slots.values())
         retired_index = lifecycle_order.index(CellLifecycle.RETIRED)
@@ -1751,13 +1752,14 @@ class ILLaDATrajectoryTensorizer:
             if binding.first_need_step > target_step:
                 continue
             observation_available = _binding_observation_available(example, binding, target_step)
-            need_is_active = not (
-                binding.freshness is FreshnessDemand.ONCE and observation_available
-            )
-            if not need_is_active:
+            # A visible observation resolves the external need but must still mark its
+            # target cells as available so the runtime lifecycle gate can release
+            # WAITING -> ACTIVE on this transition.  Only unresolved needs contribute
+            # waiting targets.
+            if observation_available:
+                available.update(target.identifier for target in binding.target_cells)
                 continue
-            destination = available if observation_available else waiting
-            destination.update(target.identifier for target in binding.target_cells)
+            waiting.update(target.identifier for target in binding.target_cells)
         return waiting, available
 
     def _binding_slot_schedule(self, example: TrajectoryExample) -> dict[tuple[str, str], int]:

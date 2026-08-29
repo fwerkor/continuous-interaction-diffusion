@@ -770,6 +770,12 @@ def test_trajectory_tensorizer_marks_waiting_snapshot_as_current_information_equ
 
     assert waiting.targets.convergence_targets.item() == 1.0
     assert final.targets.convergence_targets.item() == 1.0
+    from cid.lifecycle import MODELED_LIFECYCLES
+
+    c1_slot = next(target.slot for target in waiting_step if target.cell_id == "c1")
+    assert final.targets.lifecycle[0, c1_slot].item() == MODELED_LIFECYCLES.index(
+        CellLifecycle.ACTIVE
+    )
 
 
 def test_training_collator_pads_variable_sequences_and_external_memory() -> None:
@@ -2060,3 +2066,36 @@ def test_training_display_masks_physical_tail_after_visible_eos() -> None:
 
     collated = collate_training_steps((sample,), pad_token_id=1)
     assert torch.equal(collated.batch.display_padding_mask[0], sample.batch.display_padding_mask[0])
+
+
+def test_binding_lifecycle_cells_marks_once_observation_targets_available() -> None:
+    from cid.contracts import FreshnessDemand
+    from cid.data import BindingTarget, ExternalEvent, TrajectoryExample
+    from cid.grounding import ObjectRef
+    from cid.model.training import ILLaDATrajectoryTensorizer
+
+    binding = BindingTarget(
+        need_id="need:lookup",
+        source="lookup",
+        first_need_step=0,
+        executable_step=0,
+        arguments={"key": "x"},
+        argument_steps={"key": 0},
+        confidence=1.0,
+        freshness=FreshnessDemand.ONCE,
+        max_age_s=None,
+        target_cells=(ObjectRef.cell("answer"),),
+        target_display=(),
+        owner_cell_id="answer",
+    )
+    example = TrajectoryExample(
+        example_id="lifecycle-available-once",
+        prompt="p",
+        target_display="a",
+        source_descriptors=(),
+        events=(ExternalEvent(source="lookup", value="v", arrival_step=2, arguments={"key": "x"}),),
+        binding_targets=(binding,),
+    )
+    waiting, available = ILLaDATrajectoryTensorizer._binding_lifecycle_cells(example, 2)
+    assert waiting == set()
+    assert available == {"answer"}
