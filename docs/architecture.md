@@ -29,9 +29,10 @@ slot contains:
 - sparse anchors and links carried by the runtime/data layer.
 
 `EMPTY` is a physical-storage state, not a neural lifecycle class. The allocation head is evaluated
-for empty slots and creates a new logical cell in `ACTIVE`. Existing cells use a separate lifecycle
-head over `ACTIVE / WAITING / STABLE / RETIRED`. `RETIRED` preserves identity and lineage until the
-runtime explicitly reclaims the storage back to `EMPTY`.
+for empty slots. A new logical cell normally enters `ACTIVE`; if an unresolved binding already
+targets that new cell in the same update, the runtime may hard-gate it directly to `WAITING`.
+Lifecycle proposals use `ACTIVE / WAITING / STABLE / RETIRED`. `RETIRED` preserves identity and
+lineage until the runtime explicitly reclaims the storage back to `EMPTY`.
 
 This gives the model a fixed tensor shape
 
@@ -41,8 +42,10 @@ This gives the model a fixed tensor shape
 
 for efficient batching and distributed training while allowing actual cognitive occupancy to
 grow and shrink with task complexity. The PyTorch reference core receives an occupancy feature for
-every physical slot. Its allocation logits are trained only on currently empty slots; lifecycle
-logits are trained only for existing cells.
+every physical slot. Its allocation logits are trained only on currently empty slots. Lifecycle
+supervision follows the runtime hard gate: existing cells learn their legal target transition, while
+a newly allocated cell learns `WAITING` only when an unresolved binding already targets it and
+otherwise learns `ACTIVE`.
 
 Bindings, fact links, and cognitive edges never store physical slot indices. They reference stable
 `cell_id` values, so compaction can move a cell from one physical slot to another without changing
@@ -151,7 +154,9 @@ close to the pretrained display behavior.
 The runtime-facing `ILLaDANeuralPolicy` tensorizes `ModelContext`, executes the adapter, refines the
 display canvas, and passes neural outputs through `CIDMaterializer`. Masked display positions are
 revealed progressively; already-visible positions may also be rewritten when a different token has
-sufficient probability advantage, which is the display-side path for post-arrival correction.
+sufficient probability advantage, which is the display-side path for post-arrival correction. EOS
+is a left-to-right frontier: it cannot be emitted behind an earlier unresolved MASK, and physical
+canvas positions after the first EOS remain masked and inactive.
 Materialization turns allocation/lifecycle logits into TCT proposals, retrieves typed anchors and
 link targets from a trajectory-local catalog, decodes schema-positioned argument slots, emits
 persistent `InformationNeed` objects, and converts revision predictions into typed reopen
@@ -163,12 +168,13 @@ to quiesce. Runtime lifecycle/binding and freshness gates remain authoritative a
 ## 4. Information need before executable call
 
 A runtime-visible need has a stable `need_id`, source probabilities, partially bound arguments,
-confidence, freshness demand, and typed cell/display targets. Need confidence and source selection
-are sufficient to create a binding when the selected source declares that it accepts progressive
-selectors. The binding records whether required arguments are complete; ordinary sources still wait
-for all required arguments before external execution. When a progressive selector is refined, the
-old in-flight work is cancelled or discarded and the persistent binding launches the more specific
-request.
+confidence, freshness demand, and typed cell/display targets. Each TCT cell owns a fixed-capacity
+set of stable neural need slots, so several independent needs may coexist on the same cell instead
+of overwriting one another. Need confidence and source selection are sufficient to create a binding
+when the selected source declares that it accepts progressive selectors. The binding records whether
+required arguments are complete; ordinary sources still wait for all required arguments before
+external execution. When a progressive selector is refined, the old in-flight work is cancelled or
+discarded and the persistent binding launches the more specific request.
 
 The training model exposes argument presence and one retrieval query for each source-schema argument
 position. An information need can therefore start useful I/O before all required argument slots are
@@ -183,8 +189,10 @@ in-flight or cached external observation.
 Every denoising step with an available active binding emits a fresh `Percept` object to the model.
 No external call is required for this cognitive refresh. `target_cells` and `target_display` are
 materialized into query-specific cross-attention masks, so an explicitly routed percept conditions
-only the linked TCT cells and display spans; an unscoped percept retains the global fallback. Dynamic
-refresh is controlled separately by binding policy.
+only the linked TCT cells and display spans; an unscoped percept retains the global fallback. Facts,
+source descriptors, and percepts use the same canonical text representation in training and runtime;
+runtime-only binding serials are not part of neural conditioning. Dynamic refresh is controlled
+separately by binding policy.
 
 ## 6. Async execution
 

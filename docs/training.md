@@ -43,24 +43,30 @@ The first trainable data path is `ILLaDATrajectoryTensorizer`. It turns adjacent
 trajectory snapshots into a model input and `CIDTargets`: current TCT occupancy is retained,
 continuous cognition is corrupted, the next display target is masked with the diffusion schedule,
 and allocation/lifecycle targets are derived from stable cell identity across the transition.
-New cells train allocation on previously empty slots; existing cells train lifecycle on their
-logical identity even if later compaction moves their physical storage.
+New cells train allocation on previously empty slots and a hard-gated initial lifecycle: `WAITING`
+only when an unresolved binding already targets that cell, otherwise `ACTIVE`. Existing cells train
+only lifecycle transitions that the runtime controller can actually commit. Revision targets come
+from logical teacher-state noise changes, while diffusion `noise_delta` remains relative to the
+sampled corruption level.
 
 Display corruption also includes visible replacement noise. Some selected target tokens are
 replaced with wrong non-mask vocabulary tokens while the clean token remains the supervision
-target. This teaches the display head to correct already-visible stale text after new evidence
-arrives, rather than learning only MASK-to-token completion. At inference, masked positions are
-revealed by confidence and a bounded fraction of visible positions may be rewritten when the best
-alternative exceeds the current token probability by a configured margin. The mask token itself is
+target. Synthetic replacements never inject EOS. This teaches the display head to correct
+already-visible stale text after new evidence arrives, rather than learning only MASK-to-token
+completion. At inference, masked positions are revealed by confidence and a bounded fraction of
+visible positions may be rewritten when the best alternative exceeds the current token probability
+by a configured margin. EOS is emitted only at the leftmost unresolved frontier; positions after
+the first EOS remain masked and outside the active display span. The mask token itself is
 excluded from output candidates.
 
 Teacher trajectories should contain pre-arrival and post-arrival states, not only final answers.
 They should also supervise cell creation, retirement, optional split/merge lineage, and stable cell
 identity across physical compaction. Arrival time, source freshness, cache availability, and
 physical slot placement are randomized so a model cannot assign permanent semantics to slot index.
-Allocation loss is masked to slots that are `EMPTY` at the current step. Lifecycle cross-entropy is
-masked to existing cells and has four classes: `ACTIVE`, `WAITING`, `STABLE`, and `RETIRED`.
-Runtime-gated transitions remain hard constraints during both training rollouts and inference.
+Allocation loss is masked to slots that are `EMPTY` at the current step. Lifecycle cross-entropy
+has four classes: `ACTIVE`, `WAITING`, `STABLE`, and `RETIRED`; existing cells learn their legal
+transition, while newly allocated cells learn the effective runtime-gated initial state. Runtime
+gates remain hard constraints during both training rollouts and inference.
 Every transition also has a trajectory-level equilibrium target for the learned convergence head.
 Ordinary intermediate states supervise zero; the final supervised state and snapshots containing
 required `WAITING` cognition supervise one. At inference this signal means that no further useful
@@ -82,7 +88,9 @@ slots, so the model cannot exploit an arbitrary teacher-side ordering convention
 training stage uses trajectory-local closed-world catalogs so grounding quality can be measured
 without requiring open-world entity linking.
 
-Source arguments use a separate fixed-capacity slot set keyed by the selected source schema.
+Each cell has a fixed-capacity set of stable information-need slots. This lets multiple independent
+bindings target the same cognitive cell without one need overwriting another. Within each need slot,
+source arguments use a separate fixed-capacity slot set keyed by the selected source schema.
 Argument slot `k` corresponds to the `k`th declared argument of that source and predicts both
 presence and a retrieval query. This permits an information need to emerge before every required
 argument is executable, while keeping argument names/types under the runtime-owned source schema.
@@ -96,6 +104,9 @@ CID parameters plus optimizer/progress/RNG state; the pinned pretrained backbone
 separately. Every completed epoch is retained as `stage-a-epoch-XXXX.pt`; `stage-a-latest.pt` and
 the epoch-end step name are compatibility symlinks to that permanent snapshot.
 `load_cid_adapter_checkpoint()` restores those CID parameters directly for runtime evaluation.
+Checkpoint metadata also carries a neural-contract version. Changes to tensor geometry or
+train/runtime semantics intentionally bump this contract and reject older checkpoints rather than
+silently loading weights trained against a different ABI.
 
 Both training stages accept `--validation-data <trajectory.jsonl>`. If it is omitted and the main
 trajectory JSONL contains `metadata.split` labels, `train` examples are used for optimization,
@@ -112,9 +123,11 @@ DDP initialization synchronization, while trainable CID parameters are synchroni
 is serialized across local ranks to avoid staging six simultaneous 8B CPU copies before transfer to
 the GPUs.
 
-`CIDTrainingStep` remains a single-example representation. `collate_training_steps()` pads prompt,
-display, fact, percept, and source dimensions into a variable-length micro-batch and supplies the
-corresponding attention/padding masks. `CIDTrainerConfig.micro_batch_size` controls this local batch;
+`CIDTrainingStep` remains a single-example representation. The TCT physical width is always the
+adapter's configured `max_thought_slots`; occupancy is dynamic but tensor geometry does not shrink
+per trajectory. `collate_training_steps()` pads prompt, display, fact, percept, and source dimensions
+into a variable-length micro-batch and supplies the corresponding attention/padding masks.
+`CIDTrainerConfig.micro_batch_size` controls this local batch;
 gradient accumulation then scales the effective batch independently. Accumulated gradients are
 normalized by the number of examples rather than by the number of micro-batches, so a smaller final
 micro-batch is not overweighted. Native backbone gradient checkpointing is enabled by the launcher
@@ -201,7 +214,8 @@ rank-local AdamW state at a time, avoiding both unsupported sharded-optimizer be
 simultaneous host-memory spikes. The single-NPU compact path uses the trainer's ordinary `.pt`
 checkpoint because no FSDP sharding exists. Rank-local trainer state preserves the LR schedule,
 diffusion/shuffle RNG, transition and optimizer counts, completed epochs, and the per-rank rollout
-cursor. The default launcher logs every 100 optimizer steps and writes periodic checkpoints only at
+cursor. Stage B metadata carries the same neural-contract version as Stage A; incompatible older
+model/optimizer shards fail before loading. The default launcher logs every 100 optimizer steps and writes periodic checkpoints only at
 clean gradient-accumulation boundaries. Every completed epoch is separately retained as
 `stage-b-epoch-XXXX` for sharded training or `stage-b-epoch-XXXX.pt` on the single-NPU compact path;
 periodic checkpoint cleanup never removes these epoch snapshots. The corresponding `stage-b-latest`
