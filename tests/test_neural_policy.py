@@ -129,6 +129,45 @@ def test_runtime_tensorizer_preserves_current_lifecycle_as_one_hot() -> None:
     assert batch.lifecycle_features[0, 1].sum() == 0.0
 
 
+def test_runtime_tensorizer_corrupts_clean_state_from_local_noise_and_schedule() -> None:
+    adapter = ILLaDACIDAdapter(TinyBackbone(), freeze_backbone=True)
+    tensorizer = ILLaDAContextTensorizer(adapter, TinyTokenizer())
+    thought = CognitiveField.empty(capacity=2, width=TinyConfig.hidden_size)
+    thought, first = thought.allocate(
+        semantic=(1.0,) * TinyConfig.hidden_size, noise=0.0
+    )
+    thought, second = thought.allocate(
+        semantic=(1.0,) * TinyConfig.hidden_size, noise=1.0
+    )
+    context = ModelContext(
+        facts=FactStore().snapshot(),
+        thought=thought,
+        display=DisplayCanvas.masked(length=3, mask_token_id=5),
+        sources=(),
+        percepts=(),
+        step=0,
+        prompt="status",
+    )
+
+    batch = tensorizer(
+        context,
+        generator=torch.Generator().manual_seed(23),
+        display_noise_level=0.625,
+    )
+
+    assert torch.equal(
+        batch.thought_semantic[0, thought.slot_of(first)],
+        torch.ones(TinyConfig.hidden_size),
+    )
+    assert not torch.equal(
+        batch.thought_semantic[0, thought.slot_of(second)],
+        torch.ones(TinyConfig.hidden_size),
+    )
+    assert batch.local_noise[0, thought.slot_of(first), 0] == 0.0
+    assert batch.local_noise[0, thought.slot_of(second), 0] == 1.0
+    assert batch.display_noise[0, :, 0].tolist() == pytest.approx([0.625] * 3)
+
+
 async def test_neural_policy_runs_tiny_illada_inside_async_runtime() -> None:
     adapter = ILLaDACIDAdapter(TinyBackbone(), freeze_backbone=True)
     with torch.no_grad():

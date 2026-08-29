@@ -456,6 +456,7 @@ def test_rollout_display_bucket_can_grow_but_never_shrinks() -> None:
         uncertainty=teacher.batch.uncertainty.clone(),
         lifecycle_features=teacher.batch.lifecycle_features.clone(),
         slot_occupancy=teacher.batch.slot_occupancy.clone(),
+        local_noise=torch.zeros_like(teacher.batch.local_noise),
         display_ids=torch.full((1, 16), 5, dtype=torch.long),
     )
 
@@ -1344,6 +1345,7 @@ def test_rollout_state_replaces_teacher_input_t_and_y() -> None:
             num_classes=adapter.config.num_lifecycles,
         ).to(torch.float32),
         slot_occupancy=torch.ones((1, slots, 1)),
+        local_noise=torch.zeros((1, slots, 1)),
         display_ids=torch.tensor([[17, *([5] * (tensorizer.display_canvas_tokens - 1))]]),
     )
 
@@ -1375,6 +1377,7 @@ def test_rollout_missing_target_cell_is_supervised_for_recovery_allocation() -> 
         uncertainty=teacher.batch.uncertainty.clone(),
         lifecycle_features=teacher.batch.lifecycle_features.clone(),
         slot_occupancy=teacher.batch.slot_occupancy.clone(),
+        local_noise=torch.zeros_like(teacher.batch.local_noise),
         display_ids=teacher.batch.display_ids.clone(),
     )
     rollout.slot_occupancy[0, 1, 0] = 0.0
@@ -1389,6 +1392,44 @@ def test_rollout_missing_target_cell_is_supervised_for_recovery_allocation() -> 
     assert sample.targets.allocation_mask[0, 1]
     assert sample.targets.allocation_targets[0, 1] == 1.0
     assert sample.targets.lifecycle[0, 1] == -100
+
+
+def test_rollout_uses_predicted_local_noise_for_next_thought_corruption() -> None:
+    adapter = make_adapter(seed=127)
+    tensorizer = ILLaDATrajectoryTensorizer(adapter, TinyTokenizer())
+    example = make_rollout_trajectory()
+    teacher = tensorizer.tensorize(example, source_step=1, timestep=0.0)
+    rollout = CIDRolloutState(
+        thought_semantic=torch.ones_like(teacher.batch.thought_semantic),
+        role_features=teacher.batch.role_features.clone(),
+        uncertainty=teacher.batch.uncertainty.clone(),
+        lifecycle_features=teacher.batch.lifecycle_features.clone(),
+        slot_occupancy=teacher.batch.slot_occupancy.clone(),
+        local_noise=torch.ones_like(teacher.batch.local_noise),
+        display_ids=teacher.batch.display_ids.clone(),
+        display_noise_level=0.5,
+    )
+
+    sample = tensorizer.tensorize(
+        example,
+        source_step=1,
+        timestep=0.0,
+        rollout_state=rollout,
+        generator=torch.Generator().manual_seed(31),
+    )
+
+    occupied = rollout.slot_occupancy[0, :, 0].bool()
+    assert not torch.equal(
+        sample.batch.thought_semantic[0, occupied],
+        rollout.thought_semantic[0, occupied],
+    )
+    assert torch.equal(
+        sample.batch.local_noise[0, occupied],
+        torch.ones_like(sample.batch.local_noise[0, occupied]),
+    )
+    assert sample.batch.display_noise[0, :, 0].tolist() == pytest.approx(
+        [0.5] * sample.batch.display_ids.shape[1]
+    )
 
 
 def test_existing_cell_noise_delta_uses_model_visible_corruption_level() -> None:
@@ -1415,6 +1456,7 @@ def test_rollout_extra_occupied_slot_is_supervised_to_retire() -> None:
         uncertainty=teacher.batch.uncertainty.clone(),
         lifecycle_features=teacher.batch.lifecycle_features.clone(),
         slot_occupancy=teacher.batch.slot_occupancy.clone(),
+        local_noise=torch.zeros_like(teacher.batch.local_noise),
         display_ids=teacher.batch.display_ids.clone(),
     )
     rollout.slot_occupancy[0, 3, 0] = 1.0

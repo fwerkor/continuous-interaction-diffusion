@@ -208,6 +208,7 @@ class CIDRuntime:
                     percepts=percepts,
                     step=step,
                     prompt=prompt,
+                    diffusion_step=epoch_steps,
                 )
 
                 self.trace.emit(

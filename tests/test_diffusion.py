@@ -61,6 +61,24 @@ def test_thought_corruption_preserves_empty_slots() -> None:
     assert corruption.noise[0, 1, 0] == 0.0
 
 
+def test_thought_corruption_supports_per_slot_diffusion_levels() -> None:
+    scheduler = CIDDiffusionScheduler(mask_token_id=5)
+    semantic = torch.ones(1, 3, 4)
+    occupancy = torch.ones(1, 3, 1)
+
+    corruption = scheduler.corrupt_thought(
+        semantic,
+        torch.tensor([[0.0, 0.5, 1.0]]),
+        occupancy,
+        generator=torch.Generator().manual_seed(17),
+    )
+
+    assert torch.equal(corruption.semantic[0, 0], semantic[0, 0])
+    assert not torch.equal(corruption.semantic[0, 1], semantic[0, 1])
+    assert not torch.equal(corruption.semantic[0, 2], semantic[0, 2])
+    assert corruption.noise[0, :, 0].tolist() == pytest.approx([0.0, 0.5, 1.0])
+
+
 def test_display_reveal_commits_highest_confidence_masked_tokens_first() -> None:
     scheduler = CIDDiffusionScheduler(mask_token_id=5)
     tokens = torch.tensor([[5, 5, 9, 5]])

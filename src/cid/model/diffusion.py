@@ -7,6 +7,24 @@ import torch
 from torch import Tensor
 
 
+def denoising_reveal_fraction(step: int, total_steps: int) -> float:
+    if total_steps <= 0:
+        raise ValueError("total_steps must be positive")
+    if step < 0:
+        raise ValueError("denoising step must be non-negative")
+    remaining = max(1, total_steps - min(step, total_steps - 1))
+    return 1.0 / remaining
+
+
+def denoising_noise_level(step: int, total_steps: int) -> float:
+    if total_steps <= 0:
+        raise ValueError("total_steps must be positive")
+    if step < 0:
+        raise ValueError("denoising step must be non-negative")
+    remaining = max(1, total_steps - min(step, total_steps - 1))
+    return remaining / total_steps
+
+
 @dataclass(frozen=True, slots=True)
 class DisplayCorruption:
     token_ids: Tensor
@@ -105,13 +123,10 @@ class CIDDiffusionScheduler:
             raise ValueError("semantic must have shape [batch, slots, hidden]")
         if occupancy.shape != (*semantic.shape[:2], 1):
             raise ValueError("occupancy must have shape [batch, slots, 1]")
-        timestep = self._batch_timesteps(semantic.shape[0], timesteps, semantic.device)
-        alpha = (
-            torch.cos(timestep * (math.pi / 2))
-            .square()
-            .to(dtype=semantic.dtype)
-            .view(-1, 1, 1)
+        timestep = self._thought_timesteps(
+            semantic.shape[0], semantic.shape[1], timesteps, semantic.device
         )
+        alpha = torch.cos(timestep * (math.pi / 2)).square().to(dtype=semantic.dtype).unsqueeze(-1)
         epsilon = torch.randn(
             semantic.shape,
             dtype=semantic.dtype,
@@ -122,11 +137,7 @@ class CIDDiffusionScheduler:
         occupied = occupancy.bool()
         corrupted = torch.where(occupied, corrupted, torch.zeros_like(corrupted))
         epsilon = torch.where(occupied, epsilon, torch.zeros_like(epsilon))
-        local_noise = (
-            timestep.to(dtype=semantic.dtype)
-            .view(-1, 1, 1)
-            .expand(-1, semantic.shape[1], -1)
-        )
+        local_noise = timestep.to(dtype=semantic.dtype).unsqueeze(-1)
         local_noise = torch.where(occupied, local_noise, torch.zeros_like(local_noise))
         return ThoughtCorruption(semantic=corrupted, noise=local_noise, epsilon=epsilon)
 
@@ -258,6 +269,20 @@ class CIDDiffusionScheduler:
         original_collision = replacements == token_ids
         replacements[original_collision] = (replacements[original_collision] + 1) % vocab_size
         return replacements
+
+    @staticmethod
+    def _thought_timesteps(
+        batch_size: int, thought_slots: int, timesteps: Tensor, device: torch.device
+    ) -> Tensor:
+        if timesteps.ndim == 1:
+            timestep = CIDDiffusionScheduler._batch_timesteps(batch_size, timesteps, device)
+            return timestep[:, None].expand(-1, thought_slots)
+        if timesteps.ndim != 2 or timesteps.shape != (batch_size, thought_slots):
+            raise ValueError("thought timesteps must have shape [batch] or [batch, slots]")
+        timestep = timesteps.to(device=device, dtype=torch.float32)
+        if bool(((timestep < 0.0) | (timestep > 1.0)).any()):
+            raise ValueError("timesteps must be in [0, 1]")
+        return timestep
 
     @staticmethod
     def _batch_timesteps(batch_size: int, timesteps: Tensor, device: torch.device) -> Tensor:

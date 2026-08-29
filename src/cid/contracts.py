@@ -111,6 +111,7 @@ class ModelContext:
     percepts: tuple[Percept, ...]
     step: int
     prompt: str = ""
+    diffusion_step: int = 0
 
 
 @dataclass(frozen=True, slots=True)

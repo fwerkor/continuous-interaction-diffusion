@@ -7,7 +7,11 @@ import torch
 
 from cid.contracts import ModelContext, ModelUpdate, Percept, SourceDescriptor
 from cid.lifecycle import MODELED_LIFECYCLES
-from cid.model.diffusion import CIDDiffusionScheduler
+from cid.model.diffusion import (
+    CIDDiffusionScheduler,
+    denoising_noise_level,
+    denoising_reveal_fraction,
+)
 from cid.model.encoding import ILLaDATextEncoder, stable_text
 from cid.model.illada import ILLADA_8B_BASE, ILLaDACIDAdapter
 from cid.model.loading import pretrained_revision
@@ -27,6 +31,7 @@ class ILLaDAContextTensorizer:
         self.adapter = adapter
         self.tokenizer = tokenizer
         self.text_encoder = text_encoder or ILLaDATextEncoder(adapter, tokenizer)
+        self.scheduler = CIDDiffusionScheduler(adapter.mask_token_id)
         if self.text_encoder.d_model != adapter.d_model:
             raise ValueError("runtime text encoder width must match the CID adapter")
 
@@ -46,7 +51,13 @@ class ILLaDAContextTensorizer:
         tokenizer = AutoTokenizer.from_pretrained(model_name_or_path, **tokenizer_kwargs)
         return cls(adapter, tokenizer)
 
-    def __call__(self, context: ModelContext) -> CIDTensorBatch:
+    def __call__(
+        self,
+        context: ModelContext,
+        *,
+        generator: torch.Generator | None = None,
+        display_noise_level: float = 1.0,
+    ) -> CIDTensorBatch:
         device = self.text_encoder.device
         dtype = self.text_encoder.dtype
         thought = context.thought
@@ -98,6 +109,12 @@ class ILLaDAContextTensorizer:
             device=device,
             dtype=dtype,
         )
+        thought_corruption = self.scheduler.corrupt_thought(
+            thought_semantic,
+            local_noise.squeeze(-1),
+            slot_occupancy,
+            generator=generator,
+        )
         display_ids = torch.tensor(
             [context.display.token_ids],
             device=device,
@@ -105,7 +122,11 @@ class ILLaDAContextTensorizer:
         )
         if bool(((display_ids < 0) | (display_ids >= self.adapter.vocab_size)).any()):
             raise ValueError("display canvas contains token IDs outside the backbone vocabulary")
-        display_noise = (display_ids == context.display.mask_token_id).to(dtype).unsqueeze(-1)
+        if not 0.0 <= display_noise_level <= 1.0:
+            raise ValueError("display_noise_level must be in [0, 1]")
+        display_noise = torch.full(
+            (*display_ids.shape, 1), display_noise_level, device=device, dtype=dtype
+        )
         display_padding_mask = torch.zeros_like(display_ids, dtype=torch.bool)
         if context.display.active_span_length < len(context.display.token_ids):
             display_padding_mask[:, context.display.active_span_length :] = True
@@ -128,10 +149,10 @@ class ILLaDAContextTensorizer:
             detach=True,
         )
         return CIDTensorBatch(
-            thought_semantic=thought_semantic,
+            thought_semantic=thought_corruption.semantic,
             role_features=role_features,
             uncertainty=uncertainty,
-            local_noise=local_noise,
+            local_noise=thought_corruption.noise,
             slot_occupancy=slot_occupancy,
             prompt_ids=prompt_ids,
             display_ids=display_ids,
@@ -217,6 +238,7 @@ class ILLaDANeuralPolicyConfig:
     denoising_steps: int = 8
     display_revision_fraction: float = 0.125
     display_revision_margin: float = 0.15
+    seed: int = 0
 
     def __post_init__(self) -> None:
         if self.denoising_steps <= 0:
@@ -245,18 +267,29 @@ class ILLaDANeuralPolicy:
         self.tensorizer = tensorizer
         self.materializer = materializer or CIDMaterializer()
         self.catalog = catalog or ClosedWorldMaterializationCatalog()
-        self.scheduler = scheduler or CIDDiffusionScheduler(adapter.mask_token_id)
+        self.scheduler = scheduler or tensorizer.scheduler
         self.config = config or ILLaDANeuralPolicyConfig()
         self.forward_model = forward_model or adapter
+        self.generator = torch.Generator(device=self.tensorizer.text_encoder.device)
+        self.generator.manual_seed(self.config.seed)
 
     def step(self, context: ModelContext) -> ModelUpdate:
-        batch = self.tensorizer(context)
+        diffusion_step = context.diffusion_step
+        batch = self.tensorizer(
+            context,
+            generator=self.generator,
+            display_noise_level=denoising_noise_level(
+                diffusion_step, self.config.denoising_steps
+            ),
+        )
         with torch.no_grad():
             output = self.forward_model(batch)
             display_ids = self.scheduler.refine_display(
                 batch.display_ids,
                 output.display_logits,
-                reveal_fraction=self._reveal_fraction(context.step),
+                reveal_fraction=denoising_reveal_fraction(
+                    diffusion_step, self.config.denoising_steps
+                ),
                 revision_fraction=self.config.display_revision_fraction,
                 revision_margin=self.config.display_revision_margin,
             )
@@ -267,6 +300,3 @@ class ILLaDANeuralPolicy:
             display_token_ids=tuple(int(token) for token in display_ids[0].tolist()),
         )
 
-    def _reveal_fraction(self, step: int) -> float:
-        remaining = max(1, self.config.denoising_steps - min(step, self.config.denoising_steps - 1))
-        return 1.0 / remaining

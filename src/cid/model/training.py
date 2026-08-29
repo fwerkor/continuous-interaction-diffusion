@@ -23,7 +23,11 @@ from cid.model.allocation import (
     DEFAULT_MAX_ALLOCATIONS_PER_STEP,
     prefix_allocation_mask,
 )
-from cid.model.diffusion import CIDDiffusionScheduler
+from cid.model.diffusion import (
+    CIDDiffusionScheduler,
+    denoising_noise_level,
+    denoising_reveal_fraction,
+)
 from cid.model.encoding import ILLaDATextEncoder, stable_text
 from cid.model.illada import ILLaDACIDAdapter
 from cid.model.losses import CIDLoss, CIDTargets, cid_loss
@@ -37,6 +41,8 @@ class CIDTrainingStep:
     example_id: str
     source_step: int
     target_step: int
+    diffusion_step: int
+    next_diffusion_step: int
     batch: CIDTensorBatch
     targets: CIDTargets
 
@@ -59,7 +65,9 @@ class CIDRolloutState:
     uncertainty: Tensor
     lifecycle_features: Tensor
     slot_occupancy: Tensor
+    local_noise: Tensor
     display_ids: Tensor
+    display_noise_level: float = 1.0
 
 
 @dataclass(frozen=True, slots=True)
@@ -195,9 +203,9 @@ class CIDTrainerConfig:
     rollout_ramp_epochs: int = 2
     rollout_allocation_threshold: float = 0.8
     rollout_max_allocations_per_step: int = DEFAULT_MAX_ALLOCATIONS_PER_STEP
-    rollout_display_reveal_fraction: float = 1.0
-    rollout_display_revision_fraction: float = 0.25
-    rollout_display_revision_margin: float = 0.05
+    rollout_denoising_steps: int = 8
+    rollout_display_revision_fraction: float = 0.125
+    rollout_display_revision_margin: float = 0.15
     seed: int = 0
 
     def __post_init__(self) -> None:
@@ -225,13 +233,14 @@ class CIDTrainerConfig:
             raise ValueError("rollout curriculum epoch counts must be non-negative")
         for name in (
             "rollout_allocation_threshold",
-            "rollout_display_reveal_fraction",
             "rollout_display_revision_fraction",
         ):
             if not 0.0 <= getattr(self, name) <= 1.0:
                 raise ValueError(f"{name} must be in [0, 1]")
         if self.rollout_max_allocations_per_step <= 0:
             raise ValueError("rollout_max_allocations_per_step must be positive")
+        if self.rollout_denoising_steps <= 0:
+            raise ValueError("rollout_denoising_steps must be positive")
         if self.rollout_display_revision_margin < 0.0:
             raise ValueError("rollout_display_revision_margin must be non-negative")
 
@@ -479,11 +488,25 @@ class CIDTrainer:
             dtype=lifecycle_features.dtype
         )
 
+        input_noise = input_batch.local_noise[batch_index : batch_index + 1, slot_slice]
+        base_noise = torch.where(
+            previous_occupancy,
+            input_noise,
+            torch.ones_like(input_noise),
+        )
+        local_noise = (
+            base_noise
+            + output.noise_delta[batch_index : batch_index + 1, slot_slice].detach()
+        ).clamp(0.0, 1.0)
+        local_noise = local_noise * occupancy.to(dtype=local_noise.dtype)
+
         display_length = sample.batch.display_ids.shape[1]
         display_ids = self.tensorizer.scheduler.refine_display(
             input_batch.display_ids[batch_index : batch_index + 1, :display_length],
             output.display_logits[batch_index : batch_index + 1, :display_length],
-            reveal_fraction=self.config.rollout_display_reveal_fraction,
+            reveal_fraction=denoising_reveal_fraction(
+                sample.diffusion_step, self.config.rollout_denoising_steps
+            ),
             revision_fraction=self.config.rollout_display_revision_fraction,
             revision_margin=self.config.rollout_display_revision_margin,
         )
@@ -499,7 +522,11 @@ class CIDTrainer:
             ].detach(),
             lifecycle_features=lifecycle_features.detach(),
             slot_occupancy=occupancy.to(dtype=sample.batch.slot_occupancy.dtype).detach(),
+            local_noise=local_noise.detach(),
             display_ids=display_ids.detach(),
+            display_noise_level=denoising_noise_level(
+                sample.next_diffusion_step, self.config.rollout_denoising_steps
+            ),
         )
 
     def train_examples(
@@ -1129,9 +1156,14 @@ class ILLaDATrajectoryTensorizer:
             occupancy.copy_(rollout_state.slot_occupancy.to(device=device, dtype=dtype))
 
         timestep_tensor = torch.tensor([timestep], device=device)
+        thought_timesteps = (
+            timestep_tensor
+            if rollout_state is None
+            else rollout_state.local_noise.to(device=device, dtype=torch.float32).squeeze(-1)
+        )
         thought_corruption = self.scheduler.corrupt_thought(
             thought_semantic,
-            timestep_tensor,
+            thought_timesteps,
             occupancy,
             generator=generator,
         )
@@ -1189,11 +1221,11 @@ class ILLaDATrajectoryTensorizer:
             display_labels = target_display_ids.clone()
             display_labels[~display_supervision_mask] = -100
             display_labels[display_input_ids == target_display_ids] = -100
-            display_noise = (
-                (display_input_ids == self.adapter.mask_token_id)
-                .to(dtype=dtype)
-                .unsqueeze(-1)
-                * display_supervision_mask.unsqueeze(-1)
+            display_noise = torch.full(
+                (*display_input_ids.shape, 1),
+                rollout_state.display_noise_level,
+                device=device,
+                dtype=dtype,
             )
 
         fact_memory = self.text_encoder.encode_texts(
@@ -1255,7 +1287,7 @@ class ILLaDATrajectoryTensorizer:
             target_vectors=target_vectors,
             display_labels=display_labels,
             input_occupancy=occupancy,
-            input_noise_level=timestep,
+            input_noise_level=thought_corruption.noise,
             thought_slots=capacity,
             dtype=dtype,
             device=device,
@@ -1264,6 +1296,8 @@ class ILLaDATrajectoryTensorizer:
             example_id=example.example_id,
             source_step=source_step,
             target_step=target_step,
+            diffusion_step=self._runtime_diffusion_step(example, source_step),
+            next_diffusion_step=self._runtime_diffusion_step(example, target_step),
             batch=batch,
             targets=targets,
         )
@@ -1323,8 +1357,12 @@ class ILLaDATrajectoryTensorizer:
             raise ValueError("rollout lifecycle feature shape does not match adapter geometry")
         if tuple(state.slot_occupancy.shape) != expected_scalar:
             raise ValueError("rollout occupancy shape does not match adapter geometry")
+        if tuple(state.local_noise.shape) != expected_scalar:
+            raise ValueError("rollout local-noise shape does not match adapter geometry")
         if state.display_ids.ndim != 2 or state.display_ids.shape[0] != 1:
             raise ValueError("rollout display IDs must have shape [1, tokens]")
+        if not 0.0 <= state.display_noise_level <= 1.0:
+            raise ValueError("rollout display noise level must be in [0, 1]")
 
 
     def _targets(
@@ -1338,7 +1376,7 @@ class ILLaDATrajectoryTensorizer:
         target_vectors: Mapping[str, Tensor],
         display_labels: Tensor,
         input_occupancy: Tensor,
-        input_noise_level: float,
+        input_noise_level: Tensor,
         thought_slots: int,
         dtype: torch.dtype,
         device: torch.device,
@@ -1438,7 +1476,7 @@ class ILLaDATrajectoryTensorizer:
                 noise_delta[0, slot, 0] = target.noise - 1.0
             else:
                 lifecycle[0, slot] = lifecycle_order.index(target.lifecycle)
-                delta = target.noise - input_noise_level
+                delta = target.noise - float(input_noise_level[0, slot, 0])
                 noise_delta[0, slot, 0] = delta
                 if delta > 1e-6:
                     revision_targets[0, slot] = int(RevisionAction.REOPEN)
@@ -1567,6 +1605,16 @@ class ILLaDATrajectoryTensorizer:
             link_target_embeddings=link_target_embeddings,
             link_mask=link_mask,
         )
+
+    @staticmethod
+    def _runtime_diffusion_step(example: TrajectoryExample, source_step: int) -> int:
+        if source_step <= 0:
+            return 0
+        arrivals = [
+            event.arrival_step for event in example.events if event.arrival_step <= source_step
+        ]
+        epoch_start = max(arrivals, default=0)
+        return max(0, source_step - epoch_start)
 
     def _binding_slot_schedule(
         self, example: TrajectoryExample
