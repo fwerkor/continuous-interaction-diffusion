@@ -34,11 +34,13 @@ class TinyLFMHidden(nn.Module):
         self.projection = nn.Linear(hidden_size, hidden_size, bias=False)
         self.last_attention_mask = None
         self.last_position_ids = None
+        self.last_inputs_embeds = None
 
     def forward(self, *, inputs_embeds, attention_mask, position_ids, return_dict):
         assert return_dict
         self.last_attention_mask = attention_mask.detach().clone()
         self.last_position_ids = position_ids.detach().clone()
+        self.last_inputs_embeds = inputs_embeds.detach().clone()
         weights = attention_mask.to(inputs_embeds.dtype).unsqueeze(-1)
         context = (inputs_embeds * weights).sum(dim=1, keepdim=True)
         context = context / weights.sum(dim=1, keepdim=True).clamp_min(1.0)
@@ -105,6 +107,31 @@ def test_lfm_adapter_uses_native_bidirectional_hidden_backbone() -> None:
         True,
     ]
     assert backbone.lfm2.last_position_ids[0].tolist() == [0, 1, 8, 9, 10, 11, 12, 13, 14]
+
+
+def test_lfm_retired_slots_are_neurally_equivalent_to_empty_slots() -> None:
+    backbone = TinyLFMBackbone()
+    adapter = LFMCIDAdapter(
+        backbone,
+        ILLaDACIDConfig(max_thought_slots=8, max_display_tokens=16),
+    )
+    empty = make_batch()
+    adapter(empty)
+    empty_seed = backbone.lfm2.last_inputs_embeds[:, 1].clone()
+
+    retired = make_batch()
+    retired.slot_occupancy[0, 1, 0] = 1.0
+    retired.thought_semantic[0, 1] = 100.0
+    retired.role_features[0, 1] = 1.0
+    retired.uncertainty[0, 1, 0] = 0.25
+    retired.local_noise[0, 1, 0] = 0.75
+    retired.lifecycle_features = torch.zeros(1, 2, adapter.config.num_lifecycles)
+    retired.lifecycle_features[0, 1, 3] = 1.0
+    adapter(retired)
+    retired_seed = backbone.lfm2.last_inputs_embeds[:, 1]
+
+    assert torch.equal(empty_seed, retired_seed)
+    assert not backbone.lfm2.last_attention_mask[0, 1]
 
 
 def test_lfm_adapter_skips_illada_specific_chunk_patches() -> None:

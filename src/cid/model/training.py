@@ -1656,26 +1656,19 @@ class ILLaDATrajectoryTensorizer:
                 f"trajectory requires {required} simultaneous thought slots but adapter "
                 f"supports {maximum}"
             )
-        return max(self.minimum_thought_slots, required)
+        return maximum
 
     def _canonical_slot_schedule(
         self, example: TrajectoryExample
     ) -> dict[tuple[int, str], int]:
         capacity = self._trajectory_thought_capacity(example)
-        active_slots: dict[str, int] = {}
-        release_before_next: set[str] = set()
+        assigned_slots: dict[str, int] = {}
+        last_lifecycle: dict[str, CellLifecycle] = {}
+        used_slots: set[int] = set()
         schedule: dict[tuple[int, str], int] = {}
         steps = sorted({target.step for target in example.thought_targets})
 
         for step in steps:
-            reserved_reclaimed_slots = {
-                active_slots[cell_id]
-                for cell_id in release_before_next
-                if cell_id in active_slots
-            }
-            for cell_id in release_before_next:
-                active_slots.pop(cell_id, None)
-            release_before_next = set()
             snapshot = tuple(
                 sorted(
                     (target for target in example.thought_targets if target.step == step),
@@ -1683,25 +1676,27 @@ class ILLaDATrajectoryTensorizer:
                 )
             )
             snapshot_ids = {target.cell_id for target in snapshot}
-            stale = set(active_slots) - snapshot_ids
+            stale = {
+                cell_id
+                for cell_id, lifecycle in last_lifecycle.items()
+                if cell_id not in snapshot_ids and lifecycle is not CellLifecycle.RETIRED
+            }
             if stale:
                 names = ", ".join(sorted(stale))
                 raise ValueError(f"thought trajectory removed cells without retirement: {names}")
 
-            used = set(active_slots.values()) | reserved_reclaimed_slots
             for target in snapshot:
-                if target.cell_id not in active_slots:
+                if target.cell_id not in assigned_slots:
                     try:
-                        slot = next(slot for slot in range(capacity) if slot not in used)
+                        slot = next(slot for slot in range(capacity) if slot not in used_slots)
                     except StopIteration as exc:
                         raise ValueError(
                             "thought trajectory exceeds canonical slot capacity"
                         ) from exc
-                    active_slots[target.cell_id] = slot
-                    used.add(slot)
-                schedule[(step, target.cell_id)] = active_slots[target.cell_id]
-                if target.lifecycle is CellLifecycle.RETIRED:
-                    release_before_next.add(target.cell_id)
+                    assigned_slots[target.cell_id] = slot
+                    used_slots.add(slot)
+                schedule[(step, target.cell_id)] = assigned_slots[target.cell_id]
+                last_lifecycle[target.cell_id] = target.lifecycle
 
         return schedule
 

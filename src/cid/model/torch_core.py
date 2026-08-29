@@ -8,7 +8,7 @@ from torch import nn
 from cid.grounding import AnchorKind, LinkRelation, ObjectKind
 from cid.lifecycle import MODELED_LIFECYCLES
 from cid.model.components import CIDExternalFusion, CIDOutputHeads
-from cid.model.tensors import CIDTensorBatch, CIDTensorOutput
+from cid.model.tensors import CIDTensorBatch, CIDTensorOutput, live_slot_occupancy
 
 
 @dataclass(frozen=True, slots=True)
@@ -145,16 +145,16 @@ class TorchCIDCore(nn.Module):
             if batch.lifecycle_features is None
             else batch.lifecycle_features.to(dtype=thought.dtype)
         )
+        neural_occupancy = live_slot_occupancy(batch.slot_occupancy, lifecycle_features)
         t_scalars = torch.cat((batch.uncertainty, batch.local_noise), dim=-1)
-        thought_hidden = (
+        thought_content = (
             thought
             + self.role_projection(batch.role_features)
             + self.lifecycle_projection(lifecycle_features)
             + self.scalar_projection(t_scalars)
-            + self.occupancy_projection(batch.slot_occupancy)
-            + t_pos
-            + t_channel
+            + self.occupancy_projection(neural_occupancy)
         )
+        thought_hidden = thought_content * neural_occupancy + t_pos + t_channel
         prompt_hidden = self.token_embedding(batch.prompt_ids) + p_pos + p_channel
         display_hidden = (
             self.token_embedding(batch.display_ids)
@@ -163,7 +163,7 @@ class TorchCIDCore(nn.Module):
             + y_channel
         )
         seed_hidden = torch.cat((thought_hidden, prompt_hidden, display_hidden), dim=1)
-        thought_weight = batch.slot_occupancy.clamp(0.0, 1.0)
+        thought_weight = neural_occupancy
         prompt_keys = self._valid_keys(
             batch.prompt_padding_mask,
             batch_size=batch_size,
@@ -182,7 +182,7 @@ class TorchCIDCore(nn.Module):
 
         key_padding_mask = torch.cat(
             (
-                ~batch.slot_occupancy.squeeze(-1).bool(),
+                ~neural_occupancy.squeeze(-1).bool(),
                 ~prompt_keys,
                 ~display_keys,
             ),
@@ -203,7 +203,7 @@ class TorchCIDCore(nn.Module):
         return self.output_heads(
             base_thought=thought,
             thought_hidden=t_hidden,
-            thought_occupancy=batch.slot_occupancy,
+            thought_occupancy=neural_occupancy,
             display_logits=self.display_head(y_hidden),
             source_memory=batch.source_memory,
             source_padding_mask=batch.source_padding_mask,

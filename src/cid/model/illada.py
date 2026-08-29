@@ -9,7 +9,7 @@ from torch import nn
 from cid.grounding import AnchorKind, LinkRelation, ObjectKind
 from cid.lifecycle import MODELED_LIFECYCLES
 from cid.model.components import CIDExternalFusion, CIDOutputHeads
-from cid.model.tensors import CIDTensorBatch, CIDTensorOutput
+from cid.model.tensors import CIDTensorBatch, CIDTensorOutput, live_slot_occupancy
 
 ILLADA_8B_BASE = "GSAI-ML/iLLaDA-8B-Base"
 ILLADA_8B_BASE_REVISION = "a1b5b5f8a31a3854a46205ee584178c04b45ec9a"
@@ -643,13 +643,17 @@ class ILLaDACIDAdapter(nn.Module):
         percept_memory = batch.percept_memory.to(dtype=model_dtype)
         source_memory = batch.source_memory.to(dtype=model_dtype)
 
+        neural_occupancy = live_slot_occupancy(slot_occupancy, lifecycle_features)
         t_scalars = torch.cat((uncertainty, local_noise), dim=-1)
-        thought_hidden = (
+        thought_content = (
             thought
             + self.role_projection(role_features)
             + self.lifecycle_projection(lifecycle_features)
             + self.scalar_projection(t_scalars)
-            + self.occupancy_projection(slot_occupancy)
+            + self.occupancy_projection(neural_occupancy)
+        )
+        thought_hidden = (
+            thought_content * neural_occupancy
             + self.channel_embedding.weight[0][None, None, :]
         )
         prompt_hidden = (
@@ -676,7 +680,7 @@ class ILLaDACIDAdapter(nn.Module):
             device=batch.display_ids.device,
         )
         attention_mask = torch.cat(
-            (slot_occupancy.squeeze(-1).bool(), prompt_keys, display_keys),
+            (neural_occupancy.squeeze(-1).bool(), prompt_keys, display_keys),
             dim=1,
         )
         position_ids = self._logical_position_ids(
@@ -699,7 +703,7 @@ class ILLaDACIDAdapter(nn.Module):
         )
         hidden = decoder_output.last_hidden_state
 
-        thought_weight = slot_occupancy.clamp(0.0, 1.0)
+        thought_weight = neural_occupancy
         prompt_weight = prompt_keys.to(dtype=thought_weight.dtype).unsqueeze(-1)
         display_weight = display_keys.to(dtype=thought_weight.dtype).unsqueeze(-1)
         hidden = self.external_fusion(
@@ -723,7 +727,7 @@ class ILLaDACIDAdapter(nn.Module):
         output = self.output_heads(
             base_thought=thought,
             thought_hidden=t_hidden,
-            thought_occupancy=slot_occupancy,
+            thought_occupancy=neural_occupancy,
             display_logits=self.output_embeddings(y_hidden),
             source_memory=source_memory,
             source_padding_mask=batch.source_padding_mask,

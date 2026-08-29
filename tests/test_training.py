@@ -316,6 +316,56 @@ def test_trajectory_tensorizer_recycles_retired_source_slot() -> None:
     assert sample.targets.thought_mask[0, 1]
 
 
+def test_trajectory_tensorizer_never_reuses_retired_slot_within_trajectory() -> None:
+    adapter = make_adapter()
+    tensorizer = ILLaDATrajectoryTensorizer(adapter, TinyTokenizer())
+    trajectory = replace(
+        make_trajectory(),
+        binding_targets=(),
+        grounding_targets=(),
+        source_descriptors=(),
+        thought_targets=(
+            ThoughtTarget(
+                step=0,
+                slot=0,
+                cell_id="retired",
+                semantic_text="Old state.",
+                lifecycle=CellLifecycle.RETIRED,
+            ),
+            ThoughtTarget(step=1, slot=0, cell_id="next", semantic_text="Next state."),
+            ThoughtTarget(step=2, slot=0, cell_id="next", semantic_text="Next state updated."),
+            ThoughtTarget(step=2, slot=1, cell_id="later", semantic_text="Later state."),
+        ),
+    )
+
+    sample = tensorizer.tensorize(trajectory, source_step=1, timestep=1.0)
+
+    assert sample.targets.allocation_targets[0, 2] == 1.0
+    assert sample.targets.allocation_targets[0, 0] == 0.0
+    assert sample.targets.thought_mask[0, 2]
+
+
+def test_trajectory_tensorizer_always_uses_adapter_physical_tct_capacity() -> None:
+    adapter = ILLaDACIDAdapter(
+        TinyBackbone(),
+        ILLaDACIDConfig(
+            max_thought_slots=8,
+            max_display_tokens=16,
+            display_canvas_tokens=8,
+        ),
+        freeze_backbone=True,
+    )
+    tensorizer = ILLaDATrajectoryTensorizer(
+        adapter, TinyTokenizer(), minimum_thought_slots=1
+    )
+
+    sample = tensorizer.tensorize(make_trajectory(), source_step=0, timestep=0.5)
+
+    assert sample.batch.thought_semantic.shape[1] == 8
+    assert sample.batch.slot_occupancy.shape[1] == 8
+    assert sample.targets.allocation_targets.shape[1] == 8
+
+
 def test_trajectory_tensorizer_rejects_reuse_of_live_source_slot() -> None:
     adapter = make_adapter()
     tensorizer = ILLaDATrajectoryTensorizer(adapter, TinyTokenizer())

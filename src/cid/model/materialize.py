@@ -195,7 +195,7 @@ class CIDMaterializer:
         lifecycle = output.lifecycle_logits[batch_index].argmax(dim=-1).detach()
 
         for slot, cell in enumerate(cells):
-            if not cell.occupied:
+            if not cell.occupied or cell.lifecycle is CellLifecycle.RETIRED:
                 continue
             predicted_lifecycle = lifecycle_order[int(lifecycle[slot])]
             if cell.cell_id not in previous.occupied_cell_ids:

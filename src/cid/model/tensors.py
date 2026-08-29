@@ -7,6 +7,8 @@ import torch
 from torch import Tensor
 
 from cid.grounding import ObjectRef
+from cid.lifecycle import MODELED_LIFECYCLES
+from cid.state import CellLifecycle
 
 
 @dataclass(slots=True)
@@ -56,6 +58,19 @@ class CIDTensorOutput:
     revision_logits: Tensor
     refresh_logits: Tensor
     auxiliary_loss: Tensor | None = None
+
+
+def live_slot_occupancy(
+    slot_occupancy: Tensor, lifecycle_features: Tensor | None
+) -> Tensor:
+    """Return neural occupancy while keeping RETIRED slots physically reserved."""
+
+    occupancy = slot_occupancy.clamp(0.0, 1.0)
+    if lifecycle_features is None:
+        return occupancy
+    retired_index = MODELED_LIFECYCLES.index(CellLifecycle.RETIRED)
+    retired = lifecycle_features[..., retired_index : retired_index + 1].clamp(0.0, 1.0)
+    return occupancy * (1.0 - retired)
 
 
 def build_percept_routing_masks(
