@@ -416,16 +416,19 @@ torchrun --standalone --nproc-per-node=6 -m cid.cli train \
 
 Each rank loads the pinned 8B backbone serially before moving it to its GPU, avoiding six concurrent
 CPU copies during startup. DDP synchronizes only trainable CID state; frozen backbone parameters and
-buffers are excluded from initialization sync. Consecutive trajectory transitions are grouped into
-rollout windows, bucketed by window length, padded to equal rank counts, and sharded before training.
+buffers are excluded from initialization sync. Consecutive trajectory transitions are grouped into full contiguous rollout windows, bucketed by
+window length, padded to equal rank counts, and sharded before training. Rollout state is detached
+after every transition, so preserving a long window does not retain a long BPTT graph.
 
 Training uses scheduled sampling instead of remaining permanently teacher-forced. By default the
-first epoch uses teacher T/Y inputs, the next two epochs linearly ramp the probability of feeding the
-model's own detached prediction into the following transition, and later epochs use self-rollout.
-The default rollout horizon is three transitions. Configure this with
-`--rollout-horizon`, `--teacher-forcing-epochs`, and `--rollout-ramp-epochs`. Teacher trajectories
-continue to provide the next-step supervision and event schedule; predicted T/Y replaces only the
-input state, preventing incorrect rollouts from becoming self-generated labels.
+first epoch uses teacher inputs, the next two epochs linearly ramp the probability of feeding the
+model's own detached state into the following transition, and later epochs use self-rollout. A
+`--rollout-horizon` value of 1 disables multi-step self-rollout; values greater than 1 preserve the
+full contiguous trajectory rather than injecting periodic teacher resets. The carried rollout state
+includes TCT/display state plus predicted tool bindings, executable-argument state, observations,
+and promoted facts. Teacher trajectories still define next-step supervision and the external event
+schedule, but an event can enter a self-rollout only after the model has produced a matching
+executable binding.
 
 The trainer pads variable-length prompt and external-memory sequences inside each micro-batch.
 `--thought-capacity` is an upper bound: trajectory tensorization canonicalizes dataset schedule slots
@@ -442,7 +445,10 @@ and can be disabled with `--no-gradient-checkpointing`. With the six-GPU example
 transition batch is `2 × 8 × 6 = 96`; start at micro-batch 1 if the real trajectory lengths are
 substantially larger.
 
-Stage A checkpoints contain trainable CID parameters, optimizer state, progress, and RNG state; they
+Stage A keeps the frozen backbone in the requested BF16/FP16 storage precision but keeps trainable
+CID modules and AdamW state in FP32; autocast supplies low-precision forward compute without losing
+sub-ULP optimizer updates. Stage A checkpoints contain trainable CID parameters, optimizer state,
+progress, RNG state, and the training-dataset SHA-256; they
 do not duplicate the frozen backbone. At every completed epoch, the trainer writes a permanent
 `stage-a-epoch-XXXX.pt` snapshot; `stage-a-latest.pt` and the corresponding step name are compatibility
 symlinks to that epoch snapshot. Resume with `--resume <checkpoint>`. When held-out trajectories are

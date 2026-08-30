@@ -139,13 +139,22 @@ constructs per-sample position IDs from valid prompt and
 display lengths. Padding introduced by another sample therefore does not alter the logical
 positions of a trajectory's display tokens.
 
-Adjacent transitions are also grouped into bounded `CIDRolloutWindow` sequences. Training starts
-with teacher-forced T/Y inputs, then scheduled sampling linearly increases the chance that the
-previous detached model prediction replaces the next transition's source state, and finally reaches
-self-rollout. The teacher trajectory continues to define the correct next-state targets and external
-event schedule. Predicted cognition therefore changes the model's input distribution without being
-reused as its own label. Allocation masking follows the actually fed occupancy state, including
-rollout errors, while runtime lifecycle legality remains outside the learned transition head.
+Adjacent transitions are grouped into full contiguous `CIDRolloutWindow` sequences. Training starts
+with teacher-forced inputs, then scheduled sampling linearly increases the chance that the previous
+detached model/runtime state replaces the next transition's source state, and finally reaches
+self-rollout. Detaching after each transition keeps memory bounded without resetting long trajectories
+back to teacher state. The carried state includes TCT/display tensors, predicted binding/executable
+state, and promoted facts. External events are still supplied by the teacher schedule, but during
+self-rollout they are exposed only when the preceding model output produced the matching executable
+binding. ONCE observations retire from percept memory after consumption, while source-owned promoted
+facts persist. Allocation, revision, lifecycle, and ONCE-need targets are resolved against the state
+actually fed to the model so rollout errors receive recovery supervision instead of contradictory
+teacher-state labels.
+
+Stage A stores the frozen backbone at the requested low precision but recasts trainable CID-only
+modules to FP32 and runs the forward pass under autocast. AdamW therefore maintains FP32 parameters
+and moments, avoiding BF16 update quantization for initialized gates and routing scales. Stage A
+checkpoints also bind resume cursors to the exact training JSONL SHA-256.
 
 This DDP path is for the frozen-backbone Stage A phase.
 

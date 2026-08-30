@@ -45,6 +45,7 @@ stage_a_args=(
   --gradient-accumulation-steps 24
   --max-grad-norm 1.0
   --rollout-horizon 3
+  --semantic-pooling order-aware-v2
   --teacher-forcing-epochs 1
   --rollout-ramp-epochs 2
   --thought-capacity 128
@@ -86,6 +87,7 @@ stage_b_args=(
   --warmup-ratio 0.03
   --min-learning-rate-ratio 0.1
   --rollout-horizon 3
+  --semantic-pooling order-aware-v2
   --teacher-forcing-epochs 0
   --rollout-ramp-epochs 0
   --thought-capacity 128
