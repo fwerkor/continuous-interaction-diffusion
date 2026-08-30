@@ -22,6 +22,7 @@ class ILLaDATextEncoder:
     """
 
     ENCODING_VERSION = 2
+    FROZEN_SNAPSHOT_FORMAT_VERSION = 1
     ORDER_MOMENT_SCALE = 0.25
 
     def __init__(
@@ -39,6 +40,7 @@ class ILLaDATextEncoder:
         self.tokenizer = tokenizer
         self.d_model = adapter.d_model
         self.pooling_mode = pooling_mode
+        self._is_frozen_snapshot = False
 
     @classmethod
     def from_frozen_snapshot(
@@ -67,7 +69,66 @@ class ILLaDATextEncoder:
         snapshot.tokenizer = tokenizer
         snapshot.d_model = adapter.d_model
         snapshot.pooling_mode = pooling_mode
+        snapshot._is_frozen_snapshot = True
         return snapshot
+
+    @classmethod
+    def from_frozen_snapshot_state(
+        cls,
+        adapter: ILLaDACIDAdapter,
+        tokenizer: Any,
+        state: Mapping[str, Any],
+        *,
+        device: torch.device | str,
+        embedding_device: torch.device | str | None = None,
+    ) -> ILLaDATextEncoder:
+        if int(state.get("format_version", 0)) != cls.FROZEN_SNAPSHOT_FORMAT_VERSION:
+            raise ValueError("unsupported frozen semantic embedding snapshot format")
+        if int(state.get("encoding_version", 0)) != cls.ENCODING_VERSION:
+            raise ValueError("frozen semantic embedding snapshot encoding version is incompatible")
+        pooling_mode = str(state.get("pooling_mode", ""))
+        if pooling_mode not in {"mean-v1", "order-aware-v2"}:
+            raise ValueError("frozen semantic embedding snapshot pooling mode is invalid")
+        weight = state.get("weight")
+        if not isinstance(weight, Tensor) or weight.ndim != 2:
+            raise ValueError("frozen semantic embedding snapshot weight is invalid")
+        expected_shape = (adapter.vocab_size, adapter.d_model)
+        if tuple(weight.shape) != expected_shape:
+            raise ValueError(
+                "frozen semantic embedding snapshot geometry does not match CID adapter"
+            )
+        if int(state.get("d_model", -1)) != adapter.d_model:
+            raise ValueError("frozen semantic embedding snapshot width does not match CID adapter")
+
+        snapshot = cls.__new__(cls)
+        output_device = torch.device(device)
+        storage_device = (
+            torch.device(embedding_device) if embedding_device is not None else output_device
+        )
+        stored_weight = weight.detach().to(device=storage_device)
+        snapshot._embedding = nn.Embedding.from_pretrained(stored_weight, freeze=True)
+        snapshot._output_device = output_device
+        snapshot._output_dtype = stored_weight.dtype
+        snapshot.tokenizer = tokenizer
+        snapshot.d_model = adapter.d_model
+        snapshot.pooling_mode = pooling_mode
+        snapshot._is_frozen_snapshot = True
+        return snapshot
+
+    @property
+    def is_frozen_snapshot(self) -> bool:
+        return self._is_frozen_snapshot
+
+    def frozen_snapshot_state(self) -> dict[str, Any]:
+        if not self.is_frozen_snapshot:
+            raise ValueError("semantic encoder is not an independent frozen snapshot")
+        return {
+            "format_version": self.FROZEN_SNAPSHOT_FORMAT_VERSION,
+            "encoding_version": self.ENCODING_VERSION,
+            "pooling_mode": self.pooling_mode,
+            "d_model": self.d_model,
+            "weight": self._embedding.weight.detach().cpu(),
+        }
 
     @property
     def device(self) -> torch.device:

@@ -211,6 +211,11 @@ would train the full model on an easier distribution than the one used at infere
 target-total count: resuming a partially completed one-epoch run with `--epochs 1` finishes that
 same epoch instead of scheduling a second one.
 
+Closed-loop state continuity is independent of optimizer accumulation. A long trajectory may carry
+its detached predicted T/Y state across many transitions, but AdamW steps as soon as the configured
+transition micro-batch accumulation is reached. The target global batch therefore remains meaningful
+even for trajectories much longer than `--rollout-horizon`, without reintroducing teacher resets.
+
 The adapter is initially loaded as FP32 on CPU. A frozen BF16 snapshot of the input embedding is
 placed on the compute device for dataset semantic transport targets and external-memory text. CUDA
 and multi-rank NPU then use FSDP `device_id` to move/shard trainable wrap units; on NPU the freshly
@@ -226,7 +231,11 @@ simultaneous host-memory spikes. The single-NPU compact path uses the trainer's 
 checkpoint because no FSDP sharding exists. Rank-local trainer state preserves the LR schedule,
 diffusion/shuffle RNG, transition and optimizer counts, completed epochs, and the per-rank rollout
 cursor. Stage B metadata carries the same neural-contract version as Stage A; incompatible older
-model/optimizer shards fail before loading. The default launcher logs every 100 optimizer steps and writes periodic checkpoints only at
+model/optimizer shards fail before loading. New sharded Stage B checkpoints also store the exact
+frozen semantic embedding as `semantic-embedding.pt`; ordinary single-NPU Stage B checkpoints embed
+the same snapshot in the `.pt` payload. Resume and format-6 inference restore this saved snapshot
+rather than rebuilding semantic transport from the already fine-tuned live embedding. The default
+launcher logs every 100 optimizer steps and writes periodic checkpoints only at
 clean gradient-accumulation boundaries. Every completed epoch is separately retained as
 `stage-b-epoch-XXXX` for sharded training or `stage-b-epoch-XXXX.pt` on the single-NPU compact path;
 periodic checkpoint cleanup never removes these epoch snapshots. The corresponding `stage-b-latest`

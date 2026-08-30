@@ -954,6 +954,7 @@ def _benchmark(args: argparse.Namespace) -> None:
         load_cid_adapter_checkpoint,
         load_cid_adapter_from_pretrained,
         load_stage_b_model_checkpoint,
+        load_stage_b_semantic_encoder,
         wrap_stage_b_fsdp,
     )
     from cid.model.benchmark import run_neural_benchmark_case
@@ -1028,12 +1029,21 @@ def _benchmark(args: argparse.Namespace) -> None:
             raise RuntimeError("failed to load benchmark CID adapter")
 
         if stage_b:
-            text_encoder = ILLaDATextEncoder.from_frozen_snapshot(
-                adapter,
-                tokenizer,
-                device=device,
-                dtype=dtype,
-                pooling_mode=semantic_pooling,
+            has_saved_semantic_snapshot = (
+                isinstance(metadata.get("semantic_embedding_snapshot"), dict)
+                if stage_b_sharded
+                else "semantic_embedding_snapshot" in raw
+            )
+            legacy_text_encoder = (
+                None
+                if has_saved_semantic_snapshot
+                else ILLaDATextEncoder.from_frozen_snapshot(
+                    adapter,
+                    tokenizer,
+                    device=device,
+                    dtype=dtype,
+                    pooling_mode=semantic_pooling,
+                )
             )
             adapter.set_backbone_trainable(True)
             if device_type == "npu":
@@ -1044,8 +1054,30 @@ def _benchmark(args: argparse.Namespace) -> None:
                     device_id=device,
                     compute_dtype=dtype,
                 )
-                load_stage_b_model_checkpoint(forward_model, adapter, checkpoint)
+                saved_text_encoder = load_stage_b_model_checkpoint(
+                    forward_model,
+                    adapter,
+                    checkpoint,
+                    tokenizer=tokenizer,
+                    semantic_device=device,
+                    semantic_embedding_device="cpu",
+                )
+                text_encoder = saved_text_encoder or legacy_text_encoder
             else:
+                text_encoder = (
+                    load_stage_b_semantic_encoder(
+                        adapter,
+                        tokenizer,
+                        checkpoint,
+                        device=device,
+                        embedding_device="cpu",
+                    )
+                    if "semantic_embedding_snapshot" in raw
+                    else legacy_text_encoder
+                )
+            if text_encoder is None:
+                raise RuntimeError("failed to restore Stage B semantic encoder")
+            if not stage_b_sharded:
                 load_cid_adapter_checkpoint(adapter, checkpoint)
                 forward_model = (
                     wrap_npu_autocast(torch, adapter, dtype=dtype)

@@ -43,6 +43,7 @@ collate_training_steps = cid_model.collate_training_steps
 load_cid_adapter_checkpoint = cid_model.load_cid_adapter_checkpoint
 load_stage_b_checkpoint = cid_model.load_stage_b_checkpoint
 load_stage_b_model_checkpoint = cid_model.load_stage_b_model_checkpoint
+load_stage_b_semantic_encoder = cid_model.load_stage_b_semantic_encoder
 save_stage_b_checkpoint = cid_model.save_stage_b_checkpoint
 shard_rollout_windows = cid_model.shard_rollout_windows
 shard_transitions = cid_model.shard_transitions
@@ -724,8 +725,17 @@ def test_frozen_text_encoder_snapshot_is_independent_from_live_backbone() -> Non
 
     after = snapshot.encode_one("stable target", detach=True)
     live = ILLaDATextEncoder(adapter, tokenizer).encode_one("stable target", detach=True)
+    restored = ILLaDATextEncoder.from_frozen_snapshot_state(
+        adapter,
+        tokenizer,
+        snapshot.frozen_snapshot_state(),
+        device="cpu",
+    )
     assert torch.equal(before, after)
+    assert torch.equal(before, restored.encode_one("stable target", detach=True))
     assert not torch.allclose(after.float(), live.float())
+    assert snapshot.is_frozen_snapshot
+    assert restored.is_frozen_snapshot
     assert snapshot.dtype is torch.bfloat16
     assert all(not parameter.requires_grad for parameter in snapshot._embedding.parameters())
 
@@ -1024,6 +1034,64 @@ def test_legacy_checkpoint_without_semantic_pooling_resumes_as_mean_v1(tmp_path)
     )
     restored.load_checkpoint(legacy)
     assert restored.config.semantic_pooling == "mean-v1"
+
+
+def test_stage_b_ordinary_checkpoint_persists_and_restores_frozen_semantic_snapshot(
+    tmp_path,
+) -> None:
+    adapter = make_adapter(seed=160)
+    tokenizer = TinyTokenizer()
+    snapshot = ILLaDATextEncoder.from_frozen_snapshot(
+        adapter,
+        tokenizer,
+        device="cpu",
+        dtype=torch.bfloat16,
+    )
+    expected = snapshot.encode_one("stable target", detach=True).clone()
+    adapter.set_backbone_trainable(True)
+    trainer = CIDTrainer(
+        adapter,
+        ILLaDATrajectoryTensorizer(adapter, tokenizer, text_encoder=snapshot),
+        CIDTrainerConfig(timestep_min=1.0, timestep_max=1.0),
+    )
+    checkpoint = tmp_path / "stage-b.pt"
+    trainer.save_checkpoint(checkpoint)
+
+    payload = torch.load(checkpoint, map_location="cpu", weights_only=False)
+    assert "semantic_embedding_snapshot" in payload
+
+    restored_adapter = make_adapter(seed=161)
+    restored_tokenizer = TinyTokenizer()
+    loaded_encoder = load_stage_b_semantic_encoder(
+        restored_adapter,
+        restored_tokenizer,
+        checkpoint,
+        device="cpu",
+        embedding_device="cpu",
+    )
+    assert torch.equal(expected, loaded_encoder.encode_one("stable target", detach=True))
+
+    wrong_snapshot = ILLaDATextEncoder.from_frozen_snapshot(
+        restored_adapter,
+        restored_tokenizer,
+        device="cpu",
+        dtype=torch.bfloat16,
+    )
+    restored_adapter.set_backbone_trainable(True)
+    restored = CIDTrainer(
+        restored_adapter,
+        ILLaDATrajectoryTensorizer(
+            restored_adapter,
+            restored_tokenizer,
+            text_encoder=wrong_snapshot,
+        ),
+        trainer.config,
+    )
+    restored.load_checkpoint(checkpoint)
+    assert torch.equal(
+        expected,
+        restored.tensorizer.text_encoder.encode_one("stable target", detach=True),
+    )
 
 
 def test_stage_b_init_rejects_semantic_pooling_mismatch(tmp_path) -> None:
@@ -1401,8 +1469,9 @@ def test_stage_b_fsdp_runs_full_parameter_optimizer_step_on_cpu(tmp_path) -> Non
             dataset_sha256="dataset-v1",
         )
         metadata = json.loads((checkpoint / "metadata.json").read_text(encoding="utf-8"))
-        assert metadata["format_version"] in (4, 5)
+        assert metadata["format_version"] == 6
         assert metadata["neural_contract_version"] == 3
+        assert metadata["semantic_embedding_snapshot"]["file"] == "semantic-embedding.pt"
 
         restored_adapter = make_adapter(seed=91)
         restored_adapter.set_backbone_trainable(True)
@@ -1466,12 +1535,25 @@ def test_stage_b_fsdp_runs_full_parameter_optimizer_step_on_cpu(tmp_path) -> Non
             device_id=torch.device("cpu"),
             compute_dtype=torch.bfloat16,
         )
-        load_stage_b_model_checkpoint(inference_fsdp, inference_adapter, checkpoint)
+        inference_encoder = load_stage_b_model_checkpoint(
+            inference_fsdp,
+            inference_adapter,
+            checkpoint,
+            tokenizer=TinyTokenizer(),
+            semantic_device="cpu",
+            semantic_embedding_device="cpu",
+        )
+        assert inference_encoder is not None
+        assert torch.equal(
+            snapshot.encode_one("stable target", detach=True),
+            inference_encoder.encode_one("stable target", detach=True),
+        )
         assert torch.equal(
             saved_weight,
             inference_adapter.backbone.get_decoder().layers[0].projection.weight,
         )
         assert (checkpoint / "metadata.json").is_file()
+        assert (checkpoint / "semantic-embedding.pt").is_file()
         assert (checkpoint / "rank-0000.pt").is_file()
         assert (checkpoint / "distributed" / ".metadata").is_file()
         assert not (checkpoint / "optimizer-rank-0000.pt").exists()
@@ -1762,11 +1844,12 @@ def test_self_rollout_feeds_previous_prediction_into_next_transition() -> None:
     report = trainer.train_rollout_windows(windows, epochs=1, shuffle=False)
 
     assert report.transitions == 3
+    assert report.optimizer_steps == 3
     assert tensorizer.rollout_flags == [False, True, True]
     assert trainer.state.epochs_completed == 1
 
 
-def test_self_rollout_defers_optimizer_step_until_window_boundary() -> None:
+def test_self_rollout_steps_inside_window_without_resetting_closed_loop_state() -> None:
     adapter = make_adapter(seed=154)
     trainer = CIDTrainer(
         adapter,
@@ -1786,8 +1869,8 @@ def test_self_rollout_defers_optimizer_step_until_window_boundary() -> None:
     report = trainer.train_rollout_windows(windows, epochs=1, shuffle=False)
 
     assert report.transitions == 3
-    assert report.optimizer_steps == 1
-    assert trainer.state.optimizer_steps == 1
+    assert report.optimizer_steps == 3
+    assert trainer.state.optimizer_steps == 3
 
 
 def test_rollout_observation_requires_an_executable_predicted_binding() -> None:
@@ -2202,7 +2285,7 @@ def test_stage_b_optimizer_step_count_matches_bucket_padding() -> None:
             micro_batch_size=1,
             gradient_accumulation_steps=2,
         )
-        == 2
+        == 4
     )
     assert (
         stage_b_optimizer_steps_per_epoch(

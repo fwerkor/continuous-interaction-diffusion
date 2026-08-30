@@ -19,6 +19,7 @@ from cid.model import (
     stage_b_adamw_parameter_groups,
     wrap_stage_b_fsdp,
 )
+from cid.model.encoding import ILLaDATextEncoder
 
 
 class TinyConfig:
@@ -82,10 +83,28 @@ class TinyBackbone(nn.Module):
 
 
 class TinyTrainer:
-    def __init__(self, adapter: ILLaDACIDAdapter, marker: int = 0) -> None:
+    def __init__(
+        self,
+        adapter: ILLaDACIDAdapter,
+        marker: int = 0,
+        *,
+        tokenizer: object | None = None,
+        text_encoder: ILLaDATextEncoder | None = None,
+    ) -> None:
         self.adapter = adapter
         self.marker = marker
-        self.config = SimpleNamespace(seed=19)
+        tokenizer = tokenizer or object()
+        text_encoder = text_encoder or ILLaDATextEncoder.from_frozen_snapshot(
+            adapter,
+            tokenizer,
+            device="cpu",
+            dtype=torch.bfloat16,
+        )
+        self.tensorizer = SimpleNamespace(
+            tokenizer=tokenizer,
+            text_encoder=text_encoder,
+        )
+        self.config = SimpleNamespace(seed=19, semantic_pooling="order-aware-v2")
         self.portable_seed: int | None = None
 
     def local_progress_state(self) -> dict[str, object]:
@@ -134,6 +153,13 @@ def main() -> None:
             ILLaDACIDConfig(max_thought_slots=4, max_display_tokens=16),
             freeze_backbone=False,
         )
+        tokenizer = object()
+        semantic_encoder = ILLaDATextEncoder.from_frozen_snapshot(
+            adapter,
+            tokenizer,
+            device="cpu",
+            dtype=torch.bfloat16,
+        )
         optimizer_groups = stage_b_adamw_parameter_groups(
             adapter, backbone_lr_scale=0.5, weight_decay=0.01
         )
@@ -155,7 +181,12 @@ def main() -> None:
         optimizer.zero_grad(set_to_none=True)
 
         checkpoint = Path(os.environ["CID_FSDP_SMOKE_DIR"])
-        trainer = TinyTrainer(adapter, marker=dist.get_rank() + 10)
+        trainer = TinyTrainer(
+            adapter,
+            marker=dist.get_rank() + 10,
+            tokenizer=tokenizer,
+            text_encoder=semantic_encoder,
+        )
         save_stage_b_checkpoint(
             fsdp,
             optimizer,
@@ -171,6 +202,13 @@ def main() -> None:
             ILLaDACIDConfig(max_thought_slots=4, max_display_tokens=16),
             freeze_backbone=False,
         )
+        restored_tokenizer = object()
+        restored_semantic_encoder = ILLaDATextEncoder.from_frozen_snapshot(
+            restored_adapter,
+            restored_tokenizer,
+            device="cpu",
+            dtype=torch.bfloat16,
+        )
         restored_optimizer_groups = stage_b_adamw_parameter_groups(
             restored_adapter, backbone_lr_scale=0.5, weight_decay=0.01
         )
@@ -180,7 +218,11 @@ def main() -> None:
             compute_dtype=torch.bfloat16,
         )
         restored_optimizer = torch.optim.AdamW(restored_optimizer_groups, lr=1e-3)
-        restored_trainer = TinyTrainer(restored_adapter)
+        restored_trainer = TinyTrainer(
+            restored_adapter,
+            tokenizer=restored_tokenizer,
+            text_encoder=restored_semantic_encoder,
+        )
         load_stage_b_checkpoint(
             restored,
             restored_optimizer,
@@ -209,7 +251,15 @@ def main() -> None:
             device_id=torch.device("cpu"),
             compute_dtype=torch.bfloat16,
         )
-        load_stage_b_model_checkpoint(inference, inference_adapter, checkpoint)
+        inference_encoder = load_stage_b_model_checkpoint(
+            inference,
+            inference_adapter,
+            checkpoint,
+            tokenizer=object(),
+            semantic_device="cpu",
+            semantic_embedding_device="cpu",
+        )
+        assert inference_encoder is not None
         inference(make_batch())
     finally:
         dist.destroy_process_group()

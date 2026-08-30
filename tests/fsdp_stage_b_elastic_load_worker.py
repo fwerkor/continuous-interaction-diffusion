@@ -14,6 +14,7 @@ from cid.model import (
     stage_b_adamw_parameter_groups,
     wrap_stage_b_fsdp,
 )
+from cid.model.encoding import ILLaDATextEncoder
 
 
 def main() -> None:
@@ -25,6 +26,13 @@ def main() -> None:
             ILLaDACIDConfig(max_thought_slots=4, max_display_tokens=16),
             freeze_backbone=False,
         )
+        tokenizer = object()
+        semantic_encoder = ILLaDATextEncoder.from_frozen_snapshot(
+            adapter,
+            tokenizer,
+            device="cpu",
+            dtype=torch.bfloat16,
+        )
         optimizer_groups = stage_b_adamw_parameter_groups(
             adapter, backbone_lr_scale=0.5, weight_decay=0.01
         )
@@ -34,7 +42,11 @@ def main() -> None:
             compute_dtype=torch.bfloat16,
         )
         optimizer = torch.optim.AdamW(optimizer_groups, lr=1e-3)
-        trainer = TinyTrainer(adapter)
+        trainer = TinyTrainer(
+            adapter,
+            tokenizer=tokenizer,
+            text_encoder=semantic_encoder,
+        )
         checkpoint = Path(os.environ["CID_FSDP_SMOKE_DIR"])
 
         metadata = load_stage_b_checkpoint(

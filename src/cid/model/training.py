@@ -50,6 +50,30 @@ from cid.model.tensors import CIDTensorBatch, CIDTensorOutput, build_percept_rou
 from cid.state import CellLifecycle, CognitiveRole
 
 CID_NEURAL_CONTRACT_VERSION = 3
+STAGE_B_SEMANTIC_SNAPSHOT_FILENAME = "semantic-embedding.pt"
+
+
+def _trainer_frozen_semantic_snapshot(trainer: Any) -> dict[str, Any] | None:
+    tensorizer = getattr(trainer, "tensorizer", None)
+    encoder = getattr(tensorizer, "text_encoder", None)
+    if not isinstance(encoder, ILLaDATextEncoder) or not encoder.is_frozen_snapshot:
+        return None
+    return encoder.frozen_snapshot_state()
+
+
+def _semantic_snapshot_metadata(state: Mapping[str, Any]) -> dict[str, Any]:
+    weight = state.get("weight")
+    if not isinstance(weight, Tensor) or weight.ndim != 2:
+        raise ValueError("frozen semantic embedding snapshot weight is invalid")
+    return {
+        "file": STAGE_B_SEMANTIC_SNAPSHOT_FILENAME,
+        "format_version": int(state["format_version"]),
+        "encoding_version": int(state["encoding_version"]),
+        "pooling_mode": str(state["pooling_mode"]),
+        "d_model": int(state["d_model"]),
+        "vocab_size": int(weight.shape[0]),
+        "dtype": str(weight.dtype),
+    }
 
 
 @dataclass(slots=True)
@@ -591,7 +615,7 @@ class CIDTrainer:
                 tuple(samples),
                 loss_scale=loss_weight,
                 sample_mask=sample_mask,
-                allow_optimizer_step=False,
+                allow_optimizer_step=True,
             )
             raw_loss = float(losses.total.detach().float()) * effective_batch_size
             raw_loss_sum += raw_loss
@@ -617,8 +641,6 @@ class CIDTrainer:
                     for index, sample in enumerate(samples)
                 ]
             del output, training_batch, losses, samples
-        if self._pending_accumulation >= self.config.gradient_accumulation_steps:
-            self._optimizer_step()
         return loss_sum, raw_loss_sum, transition_count, component_sums
 
     def _forward_backward(
@@ -1290,6 +1312,9 @@ class CIDTrainer:
             "data_order_version": self.data_order_version,
             "dataset_sha256": dataset_sha256,
         }
+        semantic_snapshot = _trainer_frozen_semantic_snapshot(self)
+        if semantic_snapshot is not None:
+            payload["semantic_embedding_snapshot"] = semantic_snapshot
         temporary = destination.with_name(f".{destination.name}.tmp")
         torch.save(payload, temporary)
         temporary.replace(destination)
@@ -1364,6 +1389,21 @@ class CIDTrainer:
                     saved_state[name].to(device=parameter.device, dtype=parameter.dtype)
                 )
         self.optimizer.load_state_dict(checkpoint["optimizer_state"])
+        semantic_snapshot = checkpoint.get("semantic_embedding_snapshot")
+        if semantic_snapshot is not None:
+            current_encoder = self.tensorizer.text_encoder
+            restored_encoder = ILLaDATextEncoder.from_frozen_snapshot_state(
+                self.adapter,
+                self.tensorizer.tokenizer,
+                semantic_snapshot,
+                device=current_encoder.device,
+                embedding_device=current_encoder.embedding_device,
+            )
+            if restored_encoder.pooling_mode != self.config.semantic_pooling:
+                raise ValueError(
+                    "checkpoint frozen semantic snapshot pooling does not match trainer configuration"
+                )
+            self.tensorizer.text_encoder = restored_encoder
         self.generator.set_state(checkpoint["generator_state"])
         self.shuffle_rng.setstate(checkpoint["shuffle_state"])
         self.data_order_version = int(checkpoint.get("data_order_version", 1))
@@ -1507,6 +1547,53 @@ def load_cid_adapter_checkpoint(
         epochs_completed=int(state.get("epochs_completed", 0)),
         rollout_windows_seen_in_epoch=int(state.get("rollout_windows_seen_in_epoch", 0)),
     )
+
+
+def load_stage_b_semantic_encoder(
+    adapter: ILLaDACIDAdapter,
+    tokenizer: Any,
+    path: str | Path,
+    *,
+    device: torch.device | str,
+    embedding_device: torch.device | str | None = None,
+) -> ILLaDATextEncoder:
+    """Restore the exact frozen semantic embedding snapshot used by Stage B training."""
+
+    source = Path(path)
+    if source.is_dir():
+        metadata = json.loads((source / "metadata.json").read_text(encoding="utf-8"))
+        snapshot_metadata = metadata.get("semantic_embedding_snapshot")
+        if not isinstance(snapshot_metadata, Mapping):
+            raise ValueError("Stage B checkpoint does not contain a frozen semantic snapshot")
+        filename = str(snapshot_metadata.get("file", ""))
+        if not filename:
+            raise ValueError("Stage B semantic snapshot metadata is missing its file")
+        snapshot_path = source / filename
+        state = torch.load(snapshot_path, map_location="cpu", weights_only=False)
+    else:
+        checkpoint = torch.load(source, map_location="cpu", weights_only=False)
+        state = checkpoint.get("semantic_embedding_snapshot")
+        if not isinstance(state, Mapping):
+            raise ValueError("Stage B checkpoint does not contain a frozen semantic snapshot")
+
+    encoder = ILLaDATextEncoder.from_frozen_snapshot_state(
+        adapter,
+        tokenizer,
+        state,
+        device=device,
+        embedding_device=embedding_device,
+    )
+    if source.is_dir():
+        if encoder.pooling_mode != str(snapshot_metadata.get("pooling_mode", "")):
+            raise ValueError("Stage B semantic snapshot pooling metadata is inconsistent")
+        if encoder.d_model != int(snapshot_metadata.get("d_model", -1)):
+            raise ValueError("Stage B semantic snapshot width metadata is inconsistent")
+        weight = state.get("weight")
+        if not isinstance(weight, Tensor) or int(weight.shape[0]) != int(
+            snapshot_metadata.get("vocab_size", -1)
+        ):
+            raise ValueError("Stage B semantic snapshot vocabulary metadata is inconsistent")
+    return encoder
 
 
 class ILLaDATrajectoryTensorizer:
@@ -3094,7 +3181,7 @@ def stage_b_optimizer_steps_per_epoch(
     shuffle: bool = True,
     length_aware: bool = True,
 ) -> int:
-    """Return optimizer steps for the exact Stage B shard/window-boundary schedule."""
+    """Return optimizer steps for the exact Stage B transition-level accumulation schedule."""
 
     if world_size <= 0 or micro_batch_size <= 0 or gradient_accumulation_steps <= 0:
         raise ValueError("Stage B optimizer-step dimensions must be positive")
@@ -3121,10 +3208,12 @@ def stage_b_optimizer_steps_per_epoch(
         nonlocal pending, optimizer_steps
         if key is None:
             return
+        # Every transition inside a rollout window performs one backward call. Optimizer
+        # boundaries are independent of window boundaries so long closed-loop trajectories
+        # retain state continuity without silently inflating the effective batch size.
         pending += key[0]
-        if pending >= gradient_accumulation_steps:
-            optimizer_steps += 1
-            pending = 0
+        completed, pending = divmod(pending, gradient_accumulation_steps)
+        optimizer_steps += completed
 
     for window in local_windows:
         key = (len(window.source_steps), window.loss_weight)
@@ -3397,6 +3486,19 @@ def save_stage_b_checkpoint(
         destination.mkdir(parents=True, exist_ok=True)
     dist.barrier()
 
+    semantic_snapshot = None
+    if dist.get_rank() == 0:
+        semantic_snapshot = _trainer_frozen_semantic_snapshot(trainer)
+        if semantic_snapshot is None:
+            raise ValueError(
+                "Stage B checkpointing requires the independent frozen semantic encoder snapshot"
+            )
+        snapshot_path = destination / STAGE_B_SEMANTIC_SNAPSHOT_FILENAME
+        temporary_snapshot = snapshot_path.with_name(f".{snapshot_path.name}.tmp")
+        torch.save(semantic_snapshot, temporary_snapshot)
+        temporary_snapshot.replace(snapshot_path)
+    dist.barrier()
+
     rank_local_optimizer = _stage_b_use_rank_local_optimizer_checkpoint()
     with _stage_b_sharded_state_dict_context(model):
         model_state = model.state_dict()
@@ -3430,8 +3532,9 @@ def save_stage_b_checkpoint(
         destination / f"rank-{dist.get_rank():04d}.pt",
     )
     if dist.get_rank() == 0:
+        assert semantic_snapshot is not None
         metadata = {
-            "format_version": 4 if rank_local_optimizer else 5,
+            "format_version": 6,
             "neural_contract_version": CID_NEURAL_CONTRACT_VERSION,
             "kind": "cid-stage-b-fsdp",
             "model_state_layout": "fsdp-sharded-dcp",
@@ -3441,6 +3544,7 @@ def save_stage_b_checkpoint(
             "world_size": dist.get_world_size(),
             "dataset_sha256": dataset_sha256,
             "semantic_pooling": getattr(trainer.config, "semantic_pooling", "mean-v1"),
+            "semantic_embedding_snapshot": _semantic_snapshot_metadata(semantic_snapshot),
             "adapter_config": asdict(trainer.adapter.config),
             "backbone": {
                 "model_type": str(trainer.adapter.backbone.config.model_type),
@@ -3474,7 +3578,7 @@ def load_stage_b_checkpoint(
     source = Path(path)
     metadata = json.loads((source / "metadata.json").read_text(encoding="utf-8"))
     version = int(metadata.get("format_version", 0))
-    if version not in (4, 5) or metadata.get("kind") != "cid-stage-b-fsdp":
+    if version not in (4, 5, 6) or metadata.get("kind") != "cid-stage-b-fsdp":
         raise ValueError("unsupported Stage B checkpoint format")
     if metadata.get("neural_contract_version") != CID_NEURAL_CONTRACT_VERSION:
         raise ValueError("Stage B checkpoint neural contract is incompatible")
@@ -3482,12 +3586,17 @@ def load_stage_b_checkpoint(
         raise ValueError("unsupported Stage B checkpoint state layout")
     saved_world_size = int(metadata["world_size"])
     current_world_size = dist.get_world_size()
-    if version == 4 and metadata.get("optimizer_state_layout") != "rank-local":
+    optimizer_layout = metadata.get("optimizer_state_layout")
+    if version == 4 and optimizer_layout != "rank-local":
         raise ValueError("unsupported Stage B checkpoint state layout")
-    if version == 5 and metadata.get("optimizer_state_layout") != "fsdp-sharded-dcp":
+    if version == 5 and optimizer_layout != "fsdp-sharded-dcp":
         raise ValueError("unsupported Stage B checkpoint state layout")
-    if version == 4 and saved_world_size != current_world_size:
+    if version == 6 and optimizer_layout not in {"rank-local", "fsdp-sharded-dcp"}:
+        raise ValueError("unsupported Stage B checkpoint state layout")
+    if optimizer_layout == "rank-local" and saved_world_size != current_world_size:
         raise ValueError("Stage B rank-local resume requires the original world size")
+    if version == 6 and not isinstance(metadata.get("semantic_embedding_snapshot"), Mapping):
+        raise ValueError("Stage B checkpoint is missing its frozen semantic embedding snapshot")
     if (
         expected_dataset_sha256 is not None
         and metadata.get("dataset_sha256") != expected_dataset_sha256
@@ -3511,7 +3620,7 @@ def load_stage_b_checkpoint(
     _stage_b_dcp_load(distributed_state, source / "distributed")
     with _stage_b_sharded_state_dict_context(model):
         model.load_state_dict(distributed_state["model"])
-    if version == 5:
+    if optimizer_layout == "fsdp-sharded-dcp":
         optimizer_state = _stage_b_dcp_load_optimizer_state(
             distributed_state["model"],
             source / "distributed",
@@ -3530,6 +3639,21 @@ def load_stage_b_checkpoint(
                 weights_only=False,
             )
         )
+
+    if version == 6:
+        current_encoder = trainer.tensorizer.text_encoder
+        restored_encoder = load_stage_b_semantic_encoder(
+            trainer.adapter,
+            trainer.tensorizer.tokenizer,
+            source,
+            device=current_encoder.device,
+            embedding_device=current_encoder.embedding_device,
+        )
+        if restored_encoder.pooling_mode != trainer.config.semantic_pooling:
+            raise ValueError(
+                "Stage B frozen semantic snapshot pooling does not match trainer configuration"
+            )
+        trainer.tensorizer.text_encoder = restored_encoder
 
     if saved_world_size == current_world_size:
         local_state_path = source / f"rank-{dist.get_rank():04d}.pt"
@@ -3557,8 +3681,12 @@ def load_stage_b_model_checkpoint(
     model: torch.nn.Module,
     adapter: ILLaDACIDAdapter,
     path: str | Path,
-) -> None:
-    """Load only Stage B model shards for distributed inference/evaluation."""
+    *,
+    tokenizer: Any | None = None,
+    semantic_device: torch.device | str | None = None,
+    semantic_embedding_device: torch.device | str | None = None,
+) -> ILLaDATextEncoder | None:
+    """Load Stage B model shards and, for new checkpoints, their exact semantic snapshot."""
 
     import torch.distributed as dist
 
@@ -3566,8 +3694,9 @@ def load_stage_b_model_checkpoint(
         raise RuntimeError("Stage B model loading requires an initialized process group")
     source = Path(path)
     metadata = json.loads((source / "metadata.json").read_text(encoding="utf-8"))
+    version = int(metadata.get("format_version", 0))
     if (
-        int(metadata.get("format_version", 0)) not in (4, 5)
+        version not in (4, 5, 6)
         or metadata.get("kind") != "cid-stage-b-fsdp"
     ):
         raise ValueError("unsupported Stage B checkpoint format")
@@ -3586,6 +3715,23 @@ def load_stage_b_model_checkpoint(
     ):
         raise ValueError("Stage B checkpoint backbone geometry does not match")
 
+    semantic_encoder = None
+    if version == 6:
+        if tokenizer is None or semantic_device is None:
+            raise ValueError(
+                "Stage B format-6 inference requires tokenizer and semantic_device so the "
+                "saved frozen semantic snapshot cannot be silently replaced by live embeddings"
+            )
+        semantic_encoder = load_stage_b_semantic_encoder(
+            adapter,
+            tokenizer,
+            source,
+            device=semantic_device,
+            embedding_device=semantic_embedding_device,
+        )
+        if semantic_encoder.pooling_mode != str(metadata.get("semantic_pooling", "")):
+            raise ValueError("Stage B semantic snapshot pooling does not match checkpoint metadata")
+
     with _stage_b_sharded_state_dict_context(model):
         model_state = model.state_dict()
     distributed_state = {"model": model_state}
@@ -3593,3 +3739,4 @@ def load_stage_b_model_checkpoint(
     with _stage_b_sharded_state_dict_context(model):
         model.load_state_dict(distributed_state["model"])
     dist.barrier()
+    return semantic_encoder
