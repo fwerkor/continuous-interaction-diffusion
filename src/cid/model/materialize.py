@@ -154,7 +154,12 @@ class CIDMaterializer:
         needs = self._materialize_needs(
             output, context, thought, display, catalog, batch_index
         )
-        reopen_cells = self._materialize_revisions(output, thought, batch_index)
+        reopen_cells = self._materialize_revisions(
+            output,
+            previous=context.thought,
+            thought=thought,
+            batch_index=batch_index,
+        )
         convergence = float(torch.sigmoid(output.convergence_logits[batch_index]).detach())
 
         return ModelUpdate(
@@ -442,15 +447,18 @@ class CIDMaterializer:
     @staticmethod
     def _materialize_revisions(
         output: CIDTensorOutput,
+        previous: CognitiveField,
         thought: CognitiveField,
         batch_index: int,
     ) -> tuple[ObjectRef, ...]:
         actions = output.revision_logits[batch_index].argmax(dim=-1).detach()
+        previous_live = set(previous.live_cell_ids)
         return tuple(
             ObjectRef.cell(cell.cell_id)
             for slot, cell in enumerate(thought.cells)
             if cell.live
             and cell.cell_id is not None
+            and cell.cell_id in previous_live
             and int(actions[slot]) == int(RevisionAction.REOPEN)
         )
 

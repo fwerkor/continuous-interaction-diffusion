@@ -83,6 +83,32 @@ def wrap_npu_autocast(torch_module: Any, module: Any, *, dtype: Any) -> Any:
     return NPUAutocastForward(module)
 
 
+def wrap_torch_autocast(
+    torch_module: Any,
+    module: Any,
+    *,
+    device_type: str,
+    dtype: Any,
+) -> Any:
+    """Run a module under low-precision autocast while keeping FP32 trainable weights."""
+
+    if device_type == "npu":
+        return wrap_npu_autocast(torch_module, module, dtype=dtype)
+    if device_type not in {"cuda", "cpu"}:
+        raise ValueError(f"unsupported autocast device type {device_type!r}")
+
+    class TorchAutocastForward(torch_module.nn.Module):
+        def __init__(self, wrapped: Any) -> None:
+            super().__init__()
+            self.module = wrapped
+
+        def forward(self, *args, **kwargs):
+            with torch_module.autocast(device_type=device_type, dtype=dtype):
+                return self.module(*args, **kwargs)
+
+    return TorchAutocastForward(module)
+
+
 def _configure_npu_runtime(torch_module: Any, local_rank: int) -> None:
     torch_npu = importlib.import_module("torch_npu")
     npu = getattr(torch_module, "npu", None)

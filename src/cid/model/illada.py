@@ -510,6 +510,12 @@ class ILLaDACIDAdapter(nn.Module):
             parameter.requires_grad_(trainable)
         self._router_aux_loss_enabled = self.is_llada_moe and trainable
 
+    def set_cid_modules_dtype(self, dtype: torch.dtype) -> None:
+        """Change CID-only module precision without recasting the backbone."""
+
+        for module in self._cid_modules():
+            module.to(dtype=dtype)
+
     def set_device_value_validation(self, enabled: bool) -> None:
         """Enable value checks that synchronize accelerator tensors with the host."""
         self.validate_device_values = bool(enabled)
@@ -933,9 +939,8 @@ class ILLaDACIDAdapter(nn.Module):
         )
         return torch.cat((thought_positions, prompt_positions, display_positions), dim=1)
 
-    def _place_cid_modules_with_embeddings(self) -> None:
-        weight = self.input_embeddings.weight
-        modules = (
+    def _cid_modules(self) -> tuple[nn.Module, ...]:
+        return (
             self.channel_embedding,
             self.role_projection,
             self.lifecycle_projection,
@@ -945,5 +950,8 @@ class ILLaDACIDAdapter(nn.Module):
             self.external_fusion,
             self.output_heads,
         )
-        for module in modules:
+
+    def _place_cid_modules_with_embeddings(self) -> None:
+        weight = self.input_embeddings.weight
+        for module in self._cid_modules():
             module.to(device=weight.device, dtype=weight.dtype)

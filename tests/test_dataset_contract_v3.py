@@ -7,7 +7,7 @@ from cid.synthetic import SyntheticConfig, generate_synthetic
 from cid.validation_dataset import build_contract_v3_validation
 
 
-def test_contract_v3_annotation_adds_owner_multi_cell_display_and_fact_policy() -> None:
+def test_contract_v3_annotation_adds_owner_multi_cell_and_fact_policy() -> None:
     examples = generate_synthetic(
         SyntheticConfig(count_per_family=1, seed=17, thought_capacity=8)
     )
@@ -19,12 +19,10 @@ def test_contract_v3_annotation_adds_owner_multi_cell_display_and_fact_policy() 
     binding = annotated["binding_targets"][0]
     assert binding["owner_cell_id"] == "c1"
     assert [item["identifier"] for item in binding["target_cells"]] == ["c1", "c0"]
-    assert binding["target_display"] == [
-        {"kind": "display_span", "identifier": "display", "span": [0, 1]}
-    ]
+    assert binding["target_display"] == []
     assert annotated["source_descriptors"][0]["promote_results_to_fact"]
     assert stats["multi_cell_bindings"] == 1
-    assert stats["display_routed_bindings"] == 1
+    assert stats["display_routed_bindings"] == 0
 
 
 def test_contract_v3_migration_is_streaming_and_preserves_example_count(tmp_path: Path) -> None:
@@ -43,7 +41,7 @@ def test_contract_v3_migration_is_streaming_and_preserves_example_count(tmp_path
     assert result["bindings"] == 6
     assert result["owner_bindings"] == 6
     assert result["multi_cell_bindings"] == 6
-    assert result["display_routed_bindings"] == 6
+    assert result["display_routed_bindings"] == 0
     assert result["neural_contract_version"] == 3
     assert len(rows) == len(examples)
     assert all(

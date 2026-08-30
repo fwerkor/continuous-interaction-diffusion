@@ -29,7 +29,7 @@ class ILLaDATextEncoder:
         adapter: ILLaDACIDAdapter,
         tokenizer: Any,
         *,
-        pooling_mode: str = "mean-v1",
+        pooling_mode: str = "order-aware-v2",
     ) -> None:
         if pooling_mode not in {"mean-v1", "order-aware-v2"}:
             raise ValueError(f"unsupported semantic pooling mode: {pooling_mode}")
@@ -49,7 +49,7 @@ class ILLaDATextEncoder:
         device: torch.device | str,
         dtype: torch.dtype = torch.bfloat16,
         embedding_device: torch.device | str | None = None,
-        pooling_mode: str = "mean-v1",
+        pooling_mode: str = "order-aware-v2",
     ) -> ILLaDATextEncoder:
         if pooling_mode not in {"mean-v1", "order-aware-v2"}:
             raise ValueError(f"unsupported semantic pooling mode: {pooling_mode}")

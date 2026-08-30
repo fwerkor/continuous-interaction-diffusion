@@ -700,6 +700,14 @@ def test_order_aware_text_encoder_distinguishes_reversed_token_order() -> None:
     assert not torch.allclose(ordered_ab, ordered_ba)
 
 
+def test_fresh_semantic_pooling_defaults_to_order_aware_v2() -> None:
+    adapter = make_adapter(seed=151)
+    tokenizer = TinyTokenizer()
+
+    assert ILLaDATextEncoder(adapter, tokenizer).pooling_mode == "order-aware-v2"
+    assert CIDTrainerConfig().semantic_pooling == "order-aware-v2"
+
+
 def test_frozen_text_encoder_snapshot_is_independent_from_live_backbone() -> None:
     adapter = make_adapter()
     tokenizer = TinyTokenizer()
@@ -938,10 +946,19 @@ def test_trainer_checkpoint_restores_trainable_state_optimizer_and_progress(tmp_
 
 def test_legacy_checkpoint_without_semantic_pooling_resumes_as_mean_v1(tmp_path) -> None:
     adapter = make_adapter(seed=146)
-    config = CIDTrainerConfig(timestep_min=1.0, timestep_max=1.0)
+    config = CIDTrainerConfig(
+        timestep_min=1.0,
+        timestep_max=1.0,
+        semantic_pooling="mean-v1",
+    )
+    tokenizer = TinyTokenizer()
     trainer = CIDTrainer(
         adapter,
-        ILLaDATrajectoryTensorizer(adapter, TinyTokenizer()),
+        ILLaDATrajectoryTensorizer(
+            adapter,
+            tokenizer,
+            text_encoder=ILLaDATextEncoder(adapter, tokenizer, pooling_mode="mean-v1"),
+        ),
         config,
     )
     path = tmp_path / "current.pt"
@@ -952,13 +969,45 @@ def test_legacy_checkpoint_without_semantic_pooling_resumes_as_mean_v1(tmp_path)
     torch.save(payload, legacy)
 
     restored_adapter = make_adapter(seed=146)
+    restored_tokenizer = TinyTokenizer()
     restored = CIDTrainer(
         restored_adapter,
-        ILLaDATrajectoryTensorizer(restored_adapter, TinyTokenizer()),
+        ILLaDATrajectoryTensorizer(
+            restored_adapter,
+            restored_tokenizer,
+            text_encoder=ILLaDATextEncoder(
+                restored_adapter,
+                restored_tokenizer,
+                pooling_mode="mean-v1",
+            ),
+        ),
         config,
     )
     restored.load_checkpoint(legacy)
     assert restored.config.semantic_pooling == "mean-v1"
+
+
+def test_stage_b_init_rejects_semantic_pooling_mismatch(tmp_path) -> None:
+    adapter = make_adapter(seed=152)
+    tokenizer = TinyTokenizer()
+    trainer = CIDTrainer(
+        adapter,
+        ILLaDATrajectoryTensorizer(
+            adapter,
+            tokenizer,
+            text_encoder=ILLaDATextEncoder(adapter, tokenizer, pooling_mode="mean-v1"),
+        ),
+        CIDTrainerConfig(semantic_pooling="mean-v1"),
+    )
+    checkpoint = tmp_path / "stage-a-mean.pt"
+    trainer.save_checkpoint(checkpoint)
+
+    with pytest.raises(ValueError, match="semantic pooling"):
+        load_cid_adapter_checkpoint(
+            make_adapter(seed=152),
+            checkpoint,
+            expected_semantic_pooling="order-aware-v2",
+        )
 
 
 def test_stage_a_checkpoint_rejects_previous_neural_contract(tmp_path) -> None:
@@ -1674,8 +1723,113 @@ def test_self_rollout_feeds_previous_prediction_into_next_transition() -> None:
     report = trainer.train_rollout_windows(windows, epochs=1, shuffle=False)
 
     assert report.transitions == 3
-    assert tensorizer.rollout_flags == [False, False, True]
+    assert tensorizer.rollout_flags == [False, True, True]
     assert trainer.state.epochs_completed == 1
+
+
+def test_rollout_observation_requires_an_executable_predicted_binding() -> None:
+    adapter = make_adapter(seed=148)
+    tensorizer = ILLaDATrajectoryTensorizer(adapter, TinyTokenizer())
+    example = replace(
+        make_rollout_trajectory(),
+        events=(
+            ExternalEvent(
+                source="docs",
+                value="37",
+                arrival_step=2,
+                arguments={"key": "latency_ms", "scope": "production"},
+            ),
+        ),
+    )
+
+    teacher = tensorizer.tensorize(example, source_step=1, timestep=0.0)
+    assert teacher.batch.percept_memory.shape[1] == 1
+    assert teacher.targets.need_targets.sum() == 0
+
+    rollout = CIDRolloutState(
+        thought_semantic=teacher.batch.thought_semantic.clone(),
+        role_features=teacher.batch.role_features.clone(),
+        uncertainty=teacher.batch.uncertainty.clone(),
+        lifecycle_features=teacher.batch.lifecycle_features.clone(),
+        slot_occupancy=teacher.batch.slot_occupancy.clone(),
+        local_noise=torch.zeros_like(teacher.batch.local_noise),
+        display_ids=teacher.batch.display_ids.clone(),
+        executable_binding_ids=(),
+    )
+    closed_loop = tensorizer.tensorize(
+        example,
+        source_step=1,
+        timestep=0.0,
+        rollout_state=rollout,
+    )
+
+    assert closed_loop.batch.percept_memory.shape[1] == 0
+    assert closed_loop.targets.need_targets.sum() > 0
+
+
+def test_partial_argument_binding_does_not_unlock_full_teacher_observation() -> None:
+    adapter = make_adapter(seed=151)
+    base = make_trajectory()
+    descriptor = dict(base.source_descriptors[0])
+    descriptor["accepts_partial_arguments"] = True
+    example = replace(base, source_descriptors=(descriptor,))
+    tensorizer = ILLaDATrajectoryTensorizer(adapter, TinyTokenizer())
+    sample = tensorizer.tensorize(example, source_step=0, timestep=0.0)
+    output = adapter(sample.batch)
+
+    binding = example.binding_targets[0]
+    current = tensorizer._thought_snapshot(example, 0)
+    target = tensorizer._thought_snapshot(example, 1)
+    slots = tensorizer._target_output_slots(current, target, sample.batch.thought_semantic.shape[1])
+    owner_slot = slots[binding.owner_cell.identifier]
+    output.need_logits[0, owner_slot, 0].fill_(10.0)
+    output.argument_presence_logits[0, owner_slot, 0].fill_(-10.0)
+    output.argument_presence_logits[0, owner_slot, 0, 0] = 10.0
+    output.argument_query[0, owner_slot, 0, 0] = tensorizer.text_encoder.encode_one(
+        json.dumps(binding.arguments["key"], separators=(",", ":")), detach=True
+    )
+
+    active, executable = tensorizer.predicted_binding_state(
+        example,
+        1,
+        target_output_slots=slots,
+        output=output,
+        batch_index=0,
+    )
+
+    assert binding.need_id in active
+    assert binding.need_id not in executable
+
+
+def test_stage_a_fp32_cid_modules_keep_low_precision_backbone_frozen() -> None:
+    adapter = make_adapter(seed=149).to(dtype=torch.bfloat16)
+    adapter.set_backbone_trainable(False)
+    adapter.set_cid_modules_dtype(torch.float32)
+
+    assert {parameter.dtype for parameter in adapter.backbone.parameters()} == {torch.bfloat16}
+    trainable = tuple(parameter for parameter in adapter.parameters() if parameter.requires_grad)
+    assert trainable
+    assert {parameter.dtype for parameter in trainable} == {torch.float32}
+
+
+def test_stage_a_checkpoint_rejects_different_dataset_identity(tmp_path) -> None:
+    adapter = make_adapter(seed=150)
+    trainer = CIDTrainer(
+        adapter,
+        ILLaDATrajectoryTensorizer(adapter, TinyTokenizer()),
+        CIDTrainerConfig(),
+    )
+    checkpoint = tmp_path / "stage-a.pt"
+    trainer.save_checkpoint(checkpoint, dataset_sha256="dataset-a")
+
+    restored_adapter = make_adapter(seed=150)
+    restored = CIDTrainer(
+        restored_adapter,
+        ILLaDATrajectoryTensorizer(restored_adapter, TinyTokenizer()),
+        CIDTrainerConfig(),
+    )
+    with pytest.raises(ValueError, match="dataset SHA-256"):
+        restored.load_checkpoint(checkpoint, expected_dataset_sha256="dataset-b")
 
 
 def test_self_rollout_crops_collated_padding_to_each_trajectory_capacity() -> None:

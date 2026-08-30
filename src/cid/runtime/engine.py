@@ -432,6 +432,11 @@ class CIDRuntime:
         for binding in self.bindings.active():
             work_key = binding.work_key
             source = self.sources.get(binding.source)
+            if (
+                not binding.arguments_complete
+                and not source.descriptor.accepts_partial_arguments
+            ):
+                continue
 
             if (
                 binding.observation is None
@@ -707,7 +712,7 @@ class CIDRuntime:
         timestamp = observation.observed_at or time.monotonic()
         self.facts.publish(
             FactItem(
-                key=f"binding:{binding.binding_id}",
+                key=f"binding:{binding.need_id}",
                 value=observation.value,
                 source_type=binding.source,
                 timestamp=timestamp,

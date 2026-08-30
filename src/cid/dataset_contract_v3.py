@@ -83,7 +83,7 @@ def migrate_dataset_contract_v3(
         "max_target_cells": max_target_cells,
         "neural_contract_version": 3,
         "routing_annotation": "observation-aligned-live-state-delta-v1",
-        "display_annotation": "first-display-position-on-observation-visible-change-v1",
+        "display_annotation": "global-display-fallback-when-token-span-unknown-v2",
         "fact_policy": (
             "source-owned; explicit values preserved; absent values default false"
         ),
@@ -108,7 +108,6 @@ def annotate_trajectory_contract_v3(
     sources = [dict(item) for item in output.get("source_descriptors", ())]
     events = tuple(output.get("events", ()))
     thought_targets = tuple(output.get("thought_targets", ()))
-    display_targets = tuple(output.get("display_targets", ()))
 
     timelines: dict[str, list[Mapping[str, Any]]] = defaultdict(list)
     for item in thought_targets:
@@ -116,7 +115,6 @@ def annotate_trajectory_contract_v3(
     for values in timelines.values():
         values.sort(key=lambda item: int(item["step"]))
 
-    display_timeline = sorted(display_targets, key=lambda item: int(item["step"]))
 
     owner_bindings = 0
     multi_cell_bindings = 0
@@ -165,20 +163,20 @@ def annotate_trajectory_contract_v3(
         multi_cell_bindings += int(len(affected_ids) > 1)
 
         existing_display = [dict(item) for item in binding.get("target_display", ())]
+        if (
+            len(existing_display) == 1
+            and existing_display[0].get("kind") == "display_span"
+            and existing_display[0].get("span") == [0, 1]
+        ):
+            # v3 previously used [0, 1] as a tokenizer-independent placeholder.
+            # Normalize that legacy sentinel to the global-display fallback.
+            existing_display = []
         if not existing_display:
-            before_display = _display_at_or_before(display_timeline, first_need_step)
-            after_display = _display_at_or_before(display_timeline, arrival_step)
-            if (
-                before_display is not None
-                and after_display is not None
-                and before_display != after_display
-            ):
-                # A common dataset cannot know each backbone tokenizer's full answer span.  The
-                # first visible position is tokenizer-independent and provides a conservative
-                # positive route without pretending to know the remaining token boundaries.
-                existing_display = [
-                    {"kind": "display_span", "identifier": "display", "span": [0, 1]}
-                ]
+            # Empty target_display deliberately means "route to the whole display" in
+            # build_percept_routing_masks(). A tokenizer-independent migration cannot know
+            # the true answer-token span, and hard-routing every unknown span to token 0
+            # prevents the rest of the display from directly attending to the observation.
+            existing_display = []
         binding["target_display"] = existing_display
         display_routed_bindings += int(bool(existing_display))
 
@@ -235,17 +233,6 @@ def _state_at_or_before(
         if int(item["step"]) > step:
             break
         candidate = item
-    return candidate
-
-
-def _display_at_or_before(
-    timeline: list[Mapping[str, Any]], step: int
-) -> str | None:
-    candidate = None
-    for item in timeline:
-        if int(item["step"]) > step:
-            break
-        candidate = str(item.get("text", ""))
     return candidate
 
 

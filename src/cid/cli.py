@@ -16,6 +16,7 @@ from cid.accelerator import (
     resolve_torch_device_type,
     torch_device_available,
     wrap_npu_autocast,
+    wrap_torch_autocast,
 )
 from cid.composed_training import ComposedTrainingConfig, build_composed_distillation
 from cid.computational_training import (
@@ -1314,6 +1315,7 @@ def _train_stage_a(args: argparse.Namespace) -> None:
         "fp16": torch.float16,
         "fp32": torch.float32,
     }[args.dtype]
+    dataset_manifest = inspect_dataset(args.data)
     world_size = int(os.environ.get("WORLD_SIZE", "1"))
     distributed = world_size > 1
     rank = int(os.environ.get("RANK", "0"))
@@ -1346,6 +1348,10 @@ def _train_stage_a(args: argparse.Namespace) -> None:
                 freeze_backbone=True,
                 torch_dtype=dtype,
             )
+            # Stage A freezes the low-precision backbone, so keep only the trainable
+            # CID modules in FP32. Autocast below preserves low-precision compute while
+            # AdamW updates and moments remain FP32 instead of being quantized away.
+            model.set_cid_modules_dtype(torch.float32)
             return model.to(device)
 
         adapter = None
@@ -1387,6 +1393,13 @@ def _train_stage_a(args: argparse.Namespace) -> None:
             if distributed
             else adapter
         )
+        if dtype is not torch.float32:
+            forward_model = wrap_torch_autocast(
+                torch,
+                forward_model,
+                device_type=device_type,
+                dtype=dtype,
+            )
         trainer = CIDTrainer(
             adapter,
             tensorizer,
@@ -1410,7 +1423,10 @@ def _train_stage_a(args: argparse.Namespace) -> None:
             forward_model=forward_model,
         )
         if args.resume:
-            trainer.load_checkpoint(args.resume)
+            trainer.load_checkpoint(
+                args.resume,
+                expected_dataset_sha256=dataset_manifest.sha256,
+            )
         if distributed:
             trainer.reseed(args.seed + rank + trainer.state.transitions_seen * 104729)
 
@@ -1614,7 +1630,10 @@ def _train_stage_a(args: argparse.Namespace) -> None:
                 if checkpoint_due and windows_seen < current_total_windows:
                     if rank == 0:
                         checkpoint = output_dir / "stage-a-latest.pt"
-                        trainer.save_checkpoint(checkpoint)
+                        trainer.save_checkpoint(
+                            checkpoint,
+                            dataset_sha256=dataset_manifest.sha256,
+                        )
                         print(
                             f"checkpoint optimizer_steps={progress.optimizer_steps} "
                             f"path={checkpoint}",
@@ -1642,7 +1661,10 @@ def _train_stage_a(args: argparse.Namespace) -> None:
             if trainer.data_order_version < 2:
                 trainer.data_order_version = 2
             if rank == 0:
-                trainer.save_checkpoint(checkpoint)
+                trainer.save_checkpoint(
+                    checkpoint,
+                    dataset_sha256=dataset_manifest.sha256,
+                )
                 step_alias = output_dir / f"stage-a-step-{trainer.state.optimizer_steps:08d}.pt"
                 _replace_checkpoint_alias(
                     step_alias, checkpoint, target_is_directory=False
@@ -1990,7 +2012,11 @@ def _train_stage_b(args: argparse.Namespace) -> None:
                 low_cpu_mem_usage=True,
             )
             if args.init_cid_checkpoint:
-                load_cid_adapter_checkpoint(model, args.init_cid_checkpoint)
+                load_cid_adapter_checkpoint(
+                    model,
+                    args.init_cid_checkpoint,
+                    expected_semantic_pooling=args.semantic_pooling,
+                )
             snapshot = ILLaDATextEncoder.from_frozen_snapshot(
                 model,
                 tokenizer,
@@ -2075,7 +2101,10 @@ def _train_stage_b(args: argparse.Namespace) -> None:
         loaded_checkpoint_metadata = None
         if args.resume:
             if single_npu_stage_b:
-                trainer.load_checkpoint(args.resume)
+                trainer.load_checkpoint(
+                    args.resume,
+                    expected_dataset_sha256=dataset_manifest.sha256,
+                )
             else:
                 loaded_checkpoint_metadata = load_stage_b_checkpoint(
                     training_model,
@@ -2267,7 +2296,10 @@ def _train_stage_b(args: argparse.Namespace) -> None:
                     else f"stage-b-step-{progress.optimizer_steps:08d}"
                 )
                 if single_npu_stage_b:
-                    trainer.save_checkpoint(checkpoint)
+                    trainer.save_checkpoint(
+                        checkpoint,
+                        dataset_sha256=dataset_manifest.sha256,
+                    )
                 else:
                     consumed_by_bucket = stage_b_consumed_windows_by_bucket(
                         windows,
@@ -2339,7 +2371,10 @@ def _train_stage_b(args: argparse.Namespace) -> None:
                 else f"stage-b-epoch-{epoch:04d}"
             )
             if single_npu_stage_b:
-                trainer.save_checkpoint(checkpoint)
+                trainer.save_checkpoint(
+                    checkpoint,
+                    dataset_sha256=dataset_manifest.sha256,
+                )
             else:
                 save_stage_b_checkpoint(
                     training_model,
@@ -2902,7 +2937,7 @@ def main() -> None:
     train.add_argument(
         "--semantic-pooling",
         choices=("mean-v1", "order-aware-v2"),
-        default="mean-v1",
+        default="order-aware-v2",
         help="TCT semantic pooling contract; order-aware-v2 preserves token order",
     )
     train.add_argument("--teacher-forcing-epochs", type=int, default=1)
@@ -2992,7 +3027,7 @@ def main() -> None:
     train_full.add_argument(
         "--semantic-pooling",
         choices=("mean-v1", "order-aware-v2"),
-        default="mean-v1",
+        default="order-aware-v2",
         help="must match the Stage A checkpoint semantic pooling contract",
     )
     train_full.add_argument("--teacher-forcing-epochs", type=int, default=0)

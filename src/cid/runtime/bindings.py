@@ -60,7 +60,9 @@ class Binding:
         if arguments_changed:
             self.observation = None
             self.last_refresh_at = None
-            self.status = BindingStatus.ACTIVE
+            self.status = (
+                BindingStatus.ACTIVE if arguments_complete else BindingStatus.CANDIDATE
+            )
         if self.status is BindingStatus.RETIRED:
             self.status = BindingStatus.ACTIVE
 
@@ -127,9 +129,6 @@ class BindingTable:
             arguments_complete = all(
                 name in need.arguments for name in descriptor.required_arguments
             )
-            if not arguments_complete and not descriptor.accepts_partial_arguments:
-                continue
-
             seen.add(need.need_id)
             binding = self._by_need.get(need.need_id)
             if binding is None or binding.source != source:
@@ -148,12 +147,18 @@ class BindingTable:
                     target_display=need.target_display,
                     promote_to_fact=need.promote_to_fact,
                     arguments_complete=arguments_complete,
-                    status=BindingStatus.ACTIVE,
+                    status=(
+                        BindingStatus.ACTIVE
+                        if arguments_complete or descriptor.accepts_partial_arguments
+                        else BindingStatus.CANDIDATE
+                    ),
                 )
                 self._by_need[need.need_id] = binding
             else:
                 binding.update_from_need(need, arguments_complete=arguments_complete)
-                if binding.status is BindingStatus.CANDIDATE:
+                if not arguments_complete and not descriptor.accepts_partial_arguments:
+                    binding.status = BindingStatus.CANDIDATE
+                elif binding.status is BindingStatus.CANDIDATE:
                     binding.status = BindingStatus.ACTIVE
             touched.append(binding)
 

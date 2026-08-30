@@ -96,6 +96,9 @@ def test_materializer_creates_cells_arguments_anchors_links_and_revisions() -> N
     output.link_target_kind_logits[0, 0, 0, list(ObjectKind).index(ObjectKind.CELL)] = 10.0
     output.link_target_query[0, 0, 0] = torch.tensor([0.0, 1.0, 0.0, 0.0])
     output.revision_logits[0, 0, int(RevisionAction.REOPEN)] = 10.0
+    # A newly allocated cell may emit arbitrary revision logits before it has ever
+    # existed in runtime state. Those logits must not become an illegal REOPEN request.
+    output.revision_logits[0, 1, int(RevisionAction.REOPEN)] = 10.0
 
     catalog = ClosedWorldMaterializationCatalog(
         arguments=(

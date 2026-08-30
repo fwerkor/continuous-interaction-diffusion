@@ -41,7 +41,7 @@ from cid.model.encoding import (
 )
 from cid.model.illada import ILLaDACIDAdapter
 from cid.model.losses import CIDLoss, CIDTargets, cid_loss
-from cid.model.materialize import RevisionAction
+from cid.model.materialize import CIDMaterializerConfig, RevisionAction
 from cid.model.tensors import CIDTensorBatch, CIDTensorOutput, build_percept_routing_masks
 from cid.state import CellLifecycle, CognitiveRole
 
@@ -57,6 +57,8 @@ class CIDTrainingStep:
     next_diffusion_step: int
     batch: CIDTensorBatch
     targets: CIDTargets
+    promoted_fact_texts: tuple[str, ...] = ()
+    observed_binding_ids: tuple[str, ...] = ()
 
 
 @dataclass(slots=True)
@@ -70,7 +72,7 @@ class CIDTrainingBatch:
 
 @dataclass(frozen=True, slots=True)
 class CIDRolloutState:
-    """Detached model state that may replace the next teacher-forced T/Y input."""
+    """Detached model/runtime state consumed by a later rollout transition."""
 
     thought_semantic: Tensor
     role_features: Tensor
@@ -80,6 +82,9 @@ class CIDRolloutState:
     local_noise: Tensor
     display_ids: Tensor
     display_noise_level: float = 1.0
+    active_binding_ids: tuple[str, ...] = ()
+    executable_binding_ids: tuple[str, ...] = ()
+    promoted_fact_texts: tuple[str, ...] = ()
 
 
 @dataclass(frozen=True, slots=True)
@@ -233,7 +238,7 @@ class CIDTrainerConfig:
     rollout_denoising_steps: int = 8
     rollout_display_revision_fraction: float = 0.125
     rollout_display_revision_margin: float = 0.15
-    semantic_pooling: str = "mean-v1"
+    semantic_pooling: str = "order-aware-v2"
     seed: int = 0
 
     def __post_init__(self) -> None:
@@ -654,11 +659,30 @@ class CIDTrainer:
             device=lifecycle_indices.device,
             dtype=sample.batch.role_features.dtype,
         )
+        source_snapshot = self.tensorizer._thought_snapshot(example, sample.source_step)
         target_snapshot = self.tensorizer._thought_snapshot(example, sample.target_step)
-        cell_id_by_slot = {target.slot: target.cell_id for target in target_snapshot}
-        waiting_cells, available_cells = self.tensorizer._binding_lifecycle_cells(
-            example, sample.target_step
+        target_output_slots = self.tensorizer._target_output_slots(
+            source_snapshot, target_snapshot, thought_slots
         )
+        cell_id_by_slot = {slot: cell_id for cell_id, slot in target_output_slots.items()}
+        active_binding_ids, executable_binding_ids = self.tensorizer.predicted_binding_state(
+            example,
+            sample.target_step,
+            target_output_slots=target_output_slots,
+            output=output,
+            batch_index=batch_index,
+        )
+        observed_binding_ids = set(sample.observed_binding_ids)
+        waiting_cells: set[str] = set()
+        available_cells: set[str] = set()
+        active_set = set(active_binding_ids)
+        for binding in example.binding_targets:
+            if binding.need_id not in active_set:
+                continue
+            destination = (
+                available_cells if binding.need_id in observed_binding_ids else waiting_cells
+            )
+            destination.update(target.identifier for target in binding.target_cells)
         for slot in range(thought_slots):
             if not bool(occupancy[0, slot, 0]):
                 continue
@@ -726,6 +750,9 @@ class CIDTrainer:
             display_noise_level=denoising_noise_level(
                 sample.next_diffusion_step, self.config.rollout_denoising_steps
             ),
+            active_binding_ids=active_binding_ids,
+            executable_binding_ids=executable_binding_ids,
+            promoted_fact_texts=sample.promoted_fact_texts,
         )
 
     def train_examples(
@@ -1140,7 +1167,12 @@ class CIDTrainer:
         self.optimizer.zero_grad(set_to_none=True)
         self.reseed(seed)
 
-    def save_checkpoint(self, path: str | Path) -> None:
+    def save_checkpoint(
+        self,
+        path: str | Path,
+        *,
+        dataset_sha256: str | None = None,
+    ) -> None:
         destination = Path(path)
         destination.parent.mkdir(parents=True, exist_ok=True)
         trainable_state = {
@@ -1172,17 +1204,28 @@ class CIDTrainer:
             "pending_accumulation": self._pending_accumulation,
             "pending_examples": self._pending_examples,
             "data_order_version": self.data_order_version,
+            "dataset_sha256": dataset_sha256,
         }
         temporary = destination.with_name(f".{destination.name}.tmp")
         torch.save(payload, temporary)
         temporary.replace(destination)
 
-    def load_checkpoint(self, path: str | Path) -> None:
+    def load_checkpoint(
+        self,
+        path: str | Path,
+        *,
+        expected_dataset_sha256: str | None = None,
+    ) -> None:
         checkpoint = torch.load(path, map_location="cpu", weights_only=False)
         if checkpoint.get("format_version") not in self.SUPPORTED_CHECKPOINT_VERSIONS:
             raise ValueError("unsupported CID trainer checkpoint version")
         if checkpoint.get("neural_contract_version") != CID_NEURAL_CONTRACT_VERSION:
             raise ValueError("CID trainer checkpoint neural contract is incompatible")
+        if (
+            expected_dataset_sha256 is not None
+            and checkpoint.get("dataset_sha256") != expected_dataset_sha256
+        ):
+            raise ValueError("CID trainer checkpoint dataset SHA-256 does not match training data")
         saved_trainer_config = dict(checkpoint["trainer_config"])
         saved_trainer_config.setdefault("semantic_pooling", "mean-v1")
         current_trainer_config = asdict(self.config)
@@ -1322,6 +1365,8 @@ class CIDTrainer:
 def load_cid_adapter_checkpoint(
     adapter: ILLaDACIDAdapter,
     path: str | Path,
+    *,
+    expected_semantic_pooling: str | None = None,
 ) -> CIDTrainerState:
     """Load the CID model state from a trainer checkpoint without restoring an optimizer."""
 
@@ -1330,6 +1375,13 @@ def load_cid_adapter_checkpoint(
         raise ValueError("unsupported CID trainer checkpoint version")
     if checkpoint.get("neural_contract_version") != CID_NEURAL_CONTRACT_VERSION:
         raise ValueError("CID trainer checkpoint neural contract is incompatible")
+    saved_trainer_config = dict(checkpoint.get("trainer_config", {}))
+    saved_pooling = str(saved_trainer_config.get("semantic_pooling", "mean-v1"))
+    if expected_semantic_pooling is not None and saved_pooling != expected_semantic_pooling:
+        raise ValueError(
+            "checkpoint semantic pooling does not match requested training contract: "
+            f"{saved_pooling!r} != {expected_semantic_pooling!r}"
+        )
     backbone = checkpoint["backbone"]
     if (
         int(backbone["hidden_size"]) != adapter.d_model
@@ -1434,6 +1486,7 @@ class ILLaDATrajectoryTensorizer:
         )
         uncertainty = torch.ones((1, capacity, 1), device=device, dtype=dtype)
         occupancy = torch.zeros((1, capacity, 1), device=device, dtype=dtype)
+        state_noise = torch.ones((1, capacity, 1), device=device, dtype=dtype)
         role_order = tuple(CognitiveRole)
         lifecycle_order = MODELED_LIFECYCLES
 
@@ -1442,6 +1495,7 @@ class ILLaDATrajectoryTensorizer:
                 thought_semantic[0, cell.slot] = current_vectors[cell.cell_id]
                 occupancy[0, cell.slot, 0] = 1.0
                 uncertainty[0, cell.slot, 0] = cell.uncertainty
+                state_noise[0, cell.slot, 0] = cell.noise
                 lifecycle_features[0, cell.slot, lifecycle_order.index(cell.lifecycle)] = 1.0
                 for role_index, role in enumerate(role_order):
                     role_features[0, cell.slot, role_index] = cell.roles.get(role, 0.0)
@@ -1454,6 +1508,7 @@ class ILLaDATrajectoryTensorizer:
                 rollout_state.lifecycle_features.to(device=device, dtype=dtype)
             )
             occupancy.copy_(rollout_state.slot_occupancy.to(device=device, dtype=dtype))
+            state_noise.copy_(rollout_state.local_noise.to(device=device, dtype=dtype))
 
         timestep_tensor = torch.tensor([timestep], device=device)
         thought_timesteps = (
@@ -1523,14 +1578,35 @@ class ILLaDATrajectoryTensorizer:
                 dtype=dtype,
             )
 
+        percept_projections = self._available_percept_projections(
+            example,
+            target_step,
+            allowed_binding_ids=(
+                None
+                if rollout_state is None
+                else frozenset(rollout_state.executable_binding_ids)
+            ),
+        )
+        promoted_fact_texts = self._promoted_fact_texts(
+            example,
+            target_step,
+            carried=() if rollout_state is None else rollout_state.promoted_fact_texts,
+            allowed_binding_ids=(
+                None
+                if rollout_state is None
+                else frozenset(rollout_state.executable_binding_ids)
+            ),
+        )
         fact_memory = self.text_encoder.encode_texts(
-            tuple(
-                canonical_fact_text(key=str(key), value=value, source_type="dataset")
-                for key, value in example.protected_facts.items()
+            (
+                *(
+                    canonical_fact_text(key=str(key), value=value, source_type="dataset")
+                    for key, value in example.protected_facts.items()
+                ),
+                *promoted_fact_texts,
             ),
             detach=True,
         )
-        percept_projections = self._available_percept_projections(example, target_step)
         percept_memory = self.text_encoder.encode_texts(
             tuple(
                 canonical_percept_text(
@@ -1581,6 +1657,9 @@ class ILLaDATrajectoryTensorizer:
             percept_display_mask=percept_display_mask,
             display_padding_mask=display_padding_mask,
         )
+        observed_binding_ids = frozenset(
+            binding.need_id for binding, _ in percept_projections
+        )
         targets = self._targets(
             example=example,
             source_step=source_step,
@@ -1591,7 +1670,10 @@ class ILLaDATrajectoryTensorizer:
             display_labels=display_labels,
             display_supervision_mask=display_supervision_mask,
             input_occupancy=occupancy,
+            input_lifecycle_features=lifecycle_features,
             input_noise_level=thought_corruption.noise,
+            input_state_noise=state_noise,
+            observed_binding_ids=(observed_binding_ids if rollout_state is not None else None),
             thought_slots=capacity,
             dtype=dtype,
             device=device,
@@ -1604,15 +1686,22 @@ class ILLaDATrajectoryTensorizer:
             next_diffusion_step=self._runtime_diffusion_step(example, target_step),
             batch=batch,
             targets=targets,
+            promoted_fact_texts=promoted_fact_texts,
+            observed_binding_ids=tuple(observed_binding_ids),
         )
 
     @staticmethod
     def _available_percept_projections(
-        example: TrajectoryExample, target_step: int
+        example: TrajectoryExample,
+        target_step: int,
+        *,
+        allowed_binding_ids: frozenset[str] | None = None,
     ) -> tuple[tuple[Any, Any], ...]:
         projections: list[tuple[Any, Any]] = []
         for binding in example.binding_targets:
             if binding.first_need_step > target_step:
+                continue
+            if allowed_binding_ids is not None and binding.need_id not in allowed_binding_ids:
                 continue
             matching = tuple(
                 event
@@ -1622,8 +1711,55 @@ class ILLaDATrajectoryTensorizer:
                 and dict(event.arguments) == dict(binding.arguments)
             )
             if matching:
-                projections.append((binding, max(matching, key=lambda event: event.arrival_step)))
+                latest = max(matching, key=lambda event: event.arrival_step)
+                if (
+                    allowed_binding_ids is None
+                    and binding.freshness is FreshnessDemand.ONCE
+                    and latest.arrival_step < target_step
+                ):
+                    continue
+                projections.append((binding, latest))
         return tuple(projections)
+
+    @staticmethod
+    def _promoted_fact_texts(
+        example: TrajectoryExample,
+        target_step: int,
+        *,
+        carried: tuple[str, ...],
+        allowed_binding_ids: frozenset[str] | None,
+    ) -> tuple[str, ...]:
+        texts = list(carried)
+        seen = set(texts)
+        descriptors = {
+            str(item.get("name", "")): item for item in example.source_descriptors
+        }
+        for binding in example.binding_targets:
+            if allowed_binding_ids is not None and binding.need_id not in allowed_binding_ids:
+                continue
+            descriptor = descriptors.get(binding.source)
+            if descriptor is None or not bool(descriptor.get("promote_results_to_fact", False)):
+                continue
+            matching = tuple(
+                event
+                for event in example.events
+                if event.arrival_step <= target_step
+                and event.source == binding.source
+                and dict(event.arguments) == dict(binding.arguments)
+            )
+            if not matching:
+                continue
+            event = max(matching, key=lambda item: item.arrival_step)
+            text = canonical_fact_text(
+                key=f"binding:{binding.need_id}",
+                value=event.value,
+                source_type=binding.source,
+                version=event.version,
+            )
+            if text not in seen:
+                texts.append(text)
+                seen.add(text)
+        return tuple(texts)
 
     def _percept_target_masks(
         self,
@@ -1642,6 +1778,115 @@ class ILLaDATrajectoryTensorizer:
             display_length=display_length,
             device=device,
         )
+
+    def predicted_binding_state(
+        self,
+        example: TrajectoryExample,
+        target_step: int,
+        *,
+        target_output_slots: Mapping[str, int],
+        output: CIDTensorOutput,
+        batch_index: int,
+    ) -> tuple[tuple[str, ...], tuple[str, ...]]:
+        """Decode teacher-addressable bindings from model outputs for closed-loop rollout."""
+
+        thresholds = CIDMaterializerConfig()
+        source_names = tuple(str(item.get("name", "")) for item in example.source_descriptors)
+        schedule = self._binding_slot_schedule(example)
+        active: list[str] = []
+        executable: list[str] = []
+        for binding in example.binding_targets:
+            if binding.first_need_step > target_step:
+                continue
+            owner = binding.owner_cell
+            if owner is None:
+                continue
+            slot = target_output_slots.get(owner.identifier)
+            if slot is None or binding.source not in source_names:
+                continue
+            need_slot = schedule[(owner.identifier, binding.need_id)]
+            confidence = float(
+                torch.sigmoid(output.need_logits[batch_index, slot, need_slot].detach())
+            )
+            if confidence < thresholds.need_threshold:
+                continue
+            source_index = int(
+                output.source_logits[batch_index, slot, need_slot].detach().argmax()
+            )
+            if source_names[source_index] != binding.source:
+                continue
+            active.append(binding.need_id)
+
+            descriptor = example.source_descriptors[source_index]
+            required = tuple(
+                (argument_index, str(argument.get("name", "")))
+                for argument_index, argument in enumerate(descriptor.get("arguments", ()))
+                if bool(argument.get("required", True))
+            )
+            arguments_ok = True
+            for argument_index, name in required:
+                if (
+                    argument_index >= output.argument_query.shape[3]
+                    or name not in binding.arguments
+                ):
+                    arguments_ok = False
+                    break
+                presence = float(
+                    torch.sigmoid(
+                        output.argument_presence_logits[
+                            batch_index, slot, need_slot, argument_index
+                        ].detach()
+                    )
+                )
+                if presence < thresholds.argument_presence_threshold:
+                    arguments_ok = False
+                    break
+                query = output.argument_query[
+                    batch_index, slot, need_slot, argument_index
+                ].detach().float()
+                candidates: list[tuple[str, Tensor]] = []
+                seen_values: set[str] = set()
+                for candidate_binding in example.binding_targets:
+                    if (
+                        candidate_binding.source != binding.source
+                        or name not in candidate_binding.arguments
+                    ):
+                        continue
+                    encoded = stable_text(candidate_binding.arguments[name])
+                    if encoded in seen_values:
+                        continue
+                    seen_values.add(encoded)
+                    candidates.append(
+                        (
+                            encoded,
+                            self.text_encoder.encode_one(encoded, detach=True).to(
+                                device=query.device, dtype=torch.float32
+                            ),
+                        )
+                    )
+                if not candidates:
+                    arguments_ok = False
+                    break
+                candidate_embeddings = torch.stack(
+                    [embedding for _, embedding in candidates], dim=0
+                )
+                similarities = torch.nn.functional.cosine_similarity(
+                    query.unsqueeze(0), candidate_embeddings, dim=-1
+                )
+                best_similarity, best_index = similarities.max(dim=0)
+                if (
+                    float(best_similarity) < thresholds.retrieval_similarity_threshold
+                    or candidates[int(best_index)][0] != stable_text(binding.arguments[name])
+                ):
+                    arguments_ok = False
+                    break
+            # Partial-argument sources may start speculative I/O at runtime, but the
+            # dataset event represents the binding's fully resolved observation. Do not
+            # inject that teacher observation until all required arguments resolve to the
+            # same closed-world values the runtime would use.
+            if arguments_ok:
+                executable.append(binding.need_id)
+        return tuple(active), tuple(executable)
 
     def _validate_rollout_state(self, state: CIDRolloutState, thought_slots: int) -> None:
         expected_thought = (1, thought_slots, self.adapter.d_model)
@@ -1681,7 +1926,10 @@ class ILLaDATrajectoryTensorizer:
         display_labels: Tensor,
         display_supervision_mask: Tensor,
         input_occupancy: Tensor,
+        input_lifecycle_features: Tensor,
         input_noise_level: Tensor,
+        input_state_noise: Tensor,
+        observed_binding_ids: frozenset[str] | None,
         thought_slots: int,
         dtype: torch.dtype,
         device: torch.device,
@@ -1698,10 +1946,20 @@ class ILLaDATrajectoryTensorizer:
         waiting_equilibrium = any(
             target.lifecycle is CellLifecycle.WAITING for target in target_by_id.values()
         )
-        source_by_id = {
-            target.cell_id: target for target in self._thought_snapshot(example, source_step)
-        }
-        waiting_cells, available_cells = self._binding_lifecycle_cells(example, target_step)
+        if observed_binding_ids is None:
+            waiting_cells, available_cells = self._binding_lifecycle_cells(example, target_step)
+        else:
+            waiting_cells = set()
+            available_cells = set()
+            for binding in example.binding_targets:
+                if binding.first_need_step > target_step:
+                    continue
+                destination = (
+                    available_cells
+                    if binding.need_id in observed_binding_ids
+                    else waiting_cells
+                )
+                destination.update(target.identifier for target in binding.target_cells)
 
         thought_target = torch.zeros((1, n, self.adapter.d_model), device=device, dtype=dtype)
         thought_mask = torch.zeros((1, n), device=device, dtype=torch.bool)
@@ -1788,7 +2046,6 @@ class ILLaDATrajectoryTensorizer:
             for role_index, role in enumerate(role_order):
                 role_targets[0, slot, role_index] = target.roles.get(role, 0.0)
             actually_occupied = bool(input_occupancy[0, slot, 0])
-            source_target = source_by_id.get(cell_id)
             if not actually_occupied:
                 # A newly allocated cell cannot become STABLE/RETIRED in the same runtime
                 # update. Train the lifecycle head on the effective hard-gated state:
@@ -1801,10 +2058,11 @@ class ILLaDATrajectoryTensorizer:
                     else CellLifecycle.ACTIVE
                 )
                 lifecycle[0, slot] = lifecycle_order.index(effective_lifecycle)
+                revision_targets[0, slot] = int(RevisionAction.KEEP)
             else:
                 diffusion_delta = target.noise - float(input_noise_level[0, slot, 0])
                 noise_delta[0, slot, 0] = diffusion_delta
-                state_delta = 0.0 if source_target is None else target.noise - source_target.noise
+                state_delta = target.noise - float(input_state_noise[0, slot, 0])
                 if state_delta > 1e-6:
                     revision_action = RevisionAction.REOPEN
                 elif state_delta < -1e-6:
@@ -1813,28 +2071,30 @@ class ILLaDATrajectoryTensorizer:
                     revision_action = RevisionAction.KEEP
                 revision_targets[0, slot] = int(revision_action)
 
-                effective_lifecycle = target.lifecycle
-                if source_target is not None:
-                    signals = LifecycleTransitionSignals(
-                        waiting_cells=frozenset(waiting_cells),
-                        available_cells=frozenset(available_cells),
-                        reopen_cells=(
-                            frozenset((cell_id,))
-                            if revision_action is RevisionAction.REOPEN
-                            else frozenset()
-                        ),
-                    )
-                    # Train the lifecycle head on the same hard-gated state that the
-                    # runtime will actually materialize.  Dataset snapshots may skip an
-                    # internal gate state (for example WAITING -> STABLE when an
-                    # observation arrives); the runtime necessarily exposes ACTIVE for
-                    # that update before a later stabilization.
-                    effective_lifecycle = LifecycleTransitionController.resolve(
-                        cell_id=cell_id,
-                        current=source_target.lifecycle,
-                        proposed=target.lifecycle,
-                        signals=signals,
-                    )
+                current_features = input_lifecycle_features[0, slot]
+                current_lifecycle = (
+                    lifecycle_order[int(current_features.argmax())]
+                    if bool(current_features.abs().sum())
+                    else CellLifecycle.ACTIVE
+                )
+                signals = LifecycleTransitionSignals(
+                    waiting_cells=frozenset(waiting_cells),
+                    available_cells=frozenset(available_cells),
+                    reopen_cells=(
+                        frozenset((cell_id,))
+                        if revision_action is RevisionAction.REOPEN
+                        else frozenset()
+                    ),
+                )
+                # Resolve against the state actually presented to the model. During
+                # self-rollout this may differ from the teacher snapshot, and using the
+                # teacher lifecycle here creates contradictory closed-loop labels.
+                effective_lifecycle = LifecycleTransitionController.resolve(
+                    cell_id=cell_id,
+                    current=current_lifecycle,
+                    proposed=target.lifecycle,
+                    signals=signals,
+                )
                 lifecycle[0, slot] = lifecycle_order.index(effective_lifecycle)
 
         target_slots = set(target_output_slots.values())
@@ -1858,7 +2118,11 @@ class ILLaDATrajectoryTensorizer:
             declared_arguments = tuple(descriptor.get("arguments", ()))
             need_is_active = not (
                 binding.freshness is FreshnessDemand.ONCE
-                and _binding_observation_available(example, binding, target_step)
+                and (
+                    binding.need_id in observed_binding_ids
+                    if observed_binding_ids is not None
+                    else _binding_observation_available(example, binding, target_step)
+                )
             )
             owner = binding.owner_cell
             if owner is None:
@@ -2324,13 +2588,16 @@ def trajectory_rollout_windows(
                 run = [step]
         runs.append(tuple(run))
         for contiguous in runs:
-            for start in range(0, len(contiguous), max_horizon):
-                windows.append(
-                    CIDRolloutWindow(
-                        example=example,
-                        source_steps=contiguous[start : start + max_horizon],
-                    )
+            if max_horizon == 1:
+                windows.extend(
+                    CIDRolloutWindow(example=example, source_steps=(step,))
+                    for step in contiguous
                 )
+            else:
+                # Rollout states are detached after every transition, so carrying them
+                # through a long trajectory does not retain a BPTT graph. Splitting a
+                # trajectory here only injected artificial teacher resets every N steps.
+                windows.append(CIDRolloutWindow(example=example, source_steps=contiguous))
     return tuple(windows)
 
 
