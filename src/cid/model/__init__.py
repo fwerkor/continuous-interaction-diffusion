@@ -44,6 +44,7 @@ from cid.model.policy import (
 from cid.model.tensors import CIDTensorBatch, CIDTensorOutput
 from cid.model.torch_core import TorchCIDConfig, TorchCIDCore
 from cid.model.training import (
+    CIDRolloutBindingRoute,
     CIDRolloutState,
     CIDRolloutWindow,
     CIDTrainer,
@@ -75,6 +76,7 @@ from cid.model.training import (
 __all__ = [
     "CIDLoss",
     "CIDLossWeights",
+    "CIDRolloutBindingRoute",
     "CIDRolloutState",
     "CIDRolloutWindow",
     "CIDDiffusionScheduler",

@@ -132,6 +132,30 @@ class CIDMaterializerConfig:
             raise ValueError("max_age_s must be non-negative")
 
 
+def decode_need_target_display(
+    probabilities: Tensor,
+    *,
+    active_length: int,
+    threshold: float,
+) -> tuple[ObjectRef, ...]:
+    if probabilities.ndim != 1:
+        raise ValueError("need display-route probabilities must be one-dimensional")
+    if active_length < 0:
+        raise ValueError("need display-route active length must be non-negative")
+    selected = probabilities[:active_length] >= threshold
+    spans: list[ObjectRef] = []
+    start: int | None = None
+    for index, active in enumerate(selected.tolist()):
+        if active and start is None:
+            start = index
+        elif not active and start is not None:
+            spans.append(ObjectRef.display_span(start, index))
+            start = None
+    if start is not None:
+        spans.append(ObjectRef.display_span(start, int(selected.numel())))
+    return tuple(spans)
+
+
 class CIDMaterializer:
     def __init__(self, config: CIDMaterializerConfig | None = None) -> None:
         self.config = config or CIDMaterializerConfig()
@@ -428,21 +452,11 @@ class CIDMaterializer:
         probabilities = torch.sigmoid(
             output.need_target_display_logits[batch_index, slot, need_slot]
         ).detach()
-        selected = (
-            probabilities[: display.active_span_length]
-            >= self.config.need_target_display_threshold
+        return decode_need_target_display(
+            probabilities,
+            active_length=display.active_span_length,
+            threshold=self.config.need_target_display_threshold,
         )
-        spans: list[ObjectRef] = []
-        start: int | None = None
-        for index, active in enumerate(selected.tolist()):
-            if active and start is None:
-                start = index
-            elif not active and start is not None:
-                spans.append(ObjectRef.display_span(start, index))
-                start = None
-        if start is not None:
-            spans.append(ObjectRef.display_span(start, int(selected.numel())))
-        return tuple(spans)
 
     @staticmethod
     def _materialize_revisions(

@@ -393,10 +393,11 @@ v3; it does not add, remove, or regenerate semantic tasks. `cid migrate-dataset-
 stable information-need owner explicit, derives conservative multi-label affected-cell supervision
 from cells that are already live when the need is emitted and whose supervised state changes by the
 matching observation, and preserves any existing explicit targets. Because the shared dataset cannot
-know the token boundaries of every supported backbone, a display change contributes only the
-backbone-independent first display position as a conservative positive route rather than pretending
-to annotate the full answer span. Source-level protected-result promotion is also materialized as a
-runtime-owned policy. Prompts, answers, external events, thought/display targets, schedules, example
+know the token boundaries of every supported backbone, an unknown display span uses the contract's
+empty-`target_display` global-display fallback. The runtime and training attention mask both interpret
+that value as routing the observation to the whole active display; explicit token spans are preserved
+only when the source data can identify them reliably. Source-level protected-result promotion is also
+materialized as a runtime-owned policy. Prompts, answers, external events, thought/display targets, schedules, example
 multiplicity, and the 3,011,462-transition training mass are unchanged from v14. Exact v15 hashes and
 routing counts are pinned by `release/materialized-manifest.json` in the dataset repository.
 

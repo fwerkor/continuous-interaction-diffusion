@@ -35,6 +35,7 @@ def migrate_dataset_contract_v3(
     owner_bindings = 0
     multi_cell_bindings = 0
     display_routed_bindings = 0
+    global_display_fallback_bindings = 0
     promoted_sources = 0
     tool_examples = 0
     max_target_cells = 0
@@ -57,6 +58,9 @@ def migrate_dataset_contract_v3(
             owner_bindings += stats["owner_bindings"]
             multi_cell_bindings += stats["multi_cell_bindings"]
             display_routed_bindings += stats["display_routed_bindings"]
+            global_display_fallback_bindings += stats[
+                "global_display_fallback_bindings"
+            ]
             promoted_sources += stats["promoted_sources"]
             tool_examples += int(stats["bindings"] > 0)
             max_target_cells = max(max_target_cells, stats["max_target_cells"])
@@ -78,6 +82,7 @@ def migrate_dataset_contract_v3(
         "owner_bindings": owner_bindings,
         "multi_cell_bindings": multi_cell_bindings,
         "display_routed_bindings": display_routed_bindings,
+        "global_display_fallback_bindings": global_display_fallback_bindings,
         "promoted_sources": promoted_sources,
         "tool_examples": tool_examples,
         "max_target_cells": max_target_cells,
@@ -119,6 +124,7 @@ def annotate_trajectory_contract_v3(
     owner_bindings = 0
     multi_cell_bindings = 0
     display_routed_bindings = 0
+    global_display_fallback_bindings = 0
     max_target_cells = 0
     for binding in bindings:
         targets = [dict(item) for item in binding.get("target_cells", ())]
@@ -179,6 +185,7 @@ def annotate_trajectory_contract_v3(
             existing_display = []
         binding["target_display"] = existing_display
         display_routed_bindings += int(bool(existing_display))
+        global_display_fallback_bindings += int(not existing_display)
 
     promoted_sources = 0
     static_copy = str(metadata.get("family", "")) == "static_copy"
@@ -195,6 +202,7 @@ def annotate_trajectory_contract_v3(
         "owner_bindings": owner_bindings,
         "multi_cell_bindings": multi_cell_bindings,
         "display_routed_bindings": display_routed_bindings,
+        "global_display_fallback_bindings": global_display_fallback_bindings,
         "promoted_sources": promoted_sources,
         "max_target_cells": max_target_cells,
     }

@@ -42,6 +42,7 @@ def test_contract_v3_migration_is_streaming_and_preserves_example_count(tmp_path
     assert result["owner_bindings"] == 6
     assert result["multi_cell_bindings"] == 6
     assert result["display_routed_bindings"] == 0
+    assert result["global_display_fallback_bindings"] == 6
     assert result["neural_contract_version"] == 3
     assert len(rows) == len(examples)
     assert all(

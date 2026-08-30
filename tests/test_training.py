@@ -801,6 +801,45 @@ def test_trajectory_tensorizer_marks_waiting_snapshot_as_current_information_equ
     )
 
 
+def test_closed_loop_missing_binding_does_not_inherit_teacher_waiting_equilibrium() -> None:
+    adapter = make_adapter(seed=152)
+    tensorizer = ILLaDATrajectoryTensorizer(adapter, TinyTokenizer())
+    base = make_rollout_trajectory()
+    example = replace(
+        base,
+        thought_targets=tuple(
+            replace(
+                target,
+                lifecycle=(
+                    CellLifecycle.WAITING
+                    if target.step == 1 and target.cell_id == "c1"
+                    else target.lifecycle
+                ),
+            )
+            for target in base.thought_targets
+        ),
+    )
+    teacher = tensorizer.tensorize(example, source_step=0, timestep=0.0)
+    assert teacher.targets.convergence_targets.item() == 1.0
+
+    rollout = CIDRolloutState(
+        thought_semantic=teacher.batch.thought_semantic.clone(),
+        role_features=teacher.batch.role_features.clone(),
+        uncertainty=teacher.batch.uncertainty.clone(),
+        lifecycle_features=teacher.batch.lifecycle_features.clone(),
+        slot_occupancy=teacher.batch.slot_occupancy.clone(),
+        local_noise=teacher.batch.local_noise.clone(),
+        display_ids=teacher.batch.display_ids.clone(),
+        active_binding_ids=(),
+        executable_binding_ids=(),
+    )
+    closed_loop = tensorizer.tensorize(
+        example, source_step=0, timestep=0.0, rollout_state=rollout
+    )
+
+    assert closed_loop.targets.convergence_targets.item() == 0.0
+
+
 def test_training_collator_pads_variable_sequences_and_external_memory() -> None:
     adapter = make_adapter()
     tensorizer = ILLaDATrajectoryTensorizer(adapter, TinyTokenizer())
@@ -1727,6 +1766,30 @@ def test_self_rollout_feeds_previous_prediction_into_next_transition() -> None:
     assert trainer.state.epochs_completed == 1
 
 
+def test_self_rollout_defers_optimizer_step_until_window_boundary() -> None:
+    adapter = make_adapter(seed=154)
+    trainer = CIDTrainer(
+        adapter,
+        ILLaDATrajectoryTensorizer(adapter, TinyTokenizer()),
+        CIDTrainerConfig(
+            learning_rate=1e-3,
+            gradient_accumulation_steps=1,
+            rollout_horizon=2,
+            teacher_forcing_epochs=0,
+            rollout_ramp_epochs=0,
+            timestep_min=0.0,
+            timestep_max=0.0,
+        ),
+    )
+    windows = trajectory_rollout_windows((make_rollout_trajectory(),), max_horizon=2)
+
+    report = trainer.train_rollout_windows(windows, epochs=1, shuffle=False)
+
+    assert report.transitions == 3
+    assert report.optimizer_steps == 1
+    assert trainer.state.optimizer_steps == 1
+
+
 def test_rollout_observation_requires_an_executable_predicted_binding() -> None:
     adapter = make_adapter(seed=148)
     tensorizer = ILLaDATrajectoryTensorizer(adapter, TinyTokenizer())
@@ -1789,16 +1852,79 @@ def test_partial_argument_binding_does_not_unlock_full_teacher_observation() -> 
         json.dumps(binding.arguments["key"], separators=(",", ":")), detach=True
     )
 
-    active, executable = tensorizer.predicted_binding_state(
+    active, executable, _ = tensorizer.predicted_binding_state(
         example,
         1,
         target_output_slots=slots,
+        live_slots=torch.ones(sample.batch.thought_semantic.shape[1], dtype=torch.bool),
+        display_active_length=sample.batch.display_ids.shape[1],
         output=output,
         batch_index=0,
     )
 
     assert binding.need_id in active
     assert binding.need_id not in executable
+
+
+def test_predicted_binding_requires_live_owner_and_carries_predicted_routes() -> None:
+    adapter = make_adapter(seed=153)
+    tensorizer = ILLaDATrajectoryTensorizer(adapter, TinyTokenizer())
+    base = make_trajectory()
+    binding = replace(
+        base.binding_targets[0],
+        target_cells=(ObjectRef.cell("c1"), ObjectRef.cell("c0")),
+        target_display=(ObjectRef.display_span(0, 1),),
+        owner_cell_id="c1",
+    )
+    example = replace(base, binding_targets=(binding,))
+    sample = tensorizer.tensorize(example, source_step=0, timestep=0.0)
+    output = adapter(sample.batch)
+    current = tensorizer._thought_snapshot(example, 0)
+    target = tensorizer._thought_snapshot(example, 1)
+    slots = tensorizer._target_output_slots(current, target, sample.batch.thought_semantic.shape[1])
+    owner_slot = slots["c1"]
+    other_slot = slots["c0"]
+    output.need_logits[0, owner_slot, 0].fill_(10.0)
+    output.need_target_cell_logits[0, owner_slot, 0].fill_(-10.0)
+    output.need_target_cell_logits[0, owner_slot, 0, other_slot] = 10.0
+    output.need_target_display_logits[0, owner_slot, 0].fill_(-10.0)
+    output.need_target_display_logits[0, owner_slot, 0, 1:3] = 10.0
+    output.argument_presence_logits[0, owner_slot, 0].fill_(10.0)
+    for argument_index, name in enumerate(("key", "scope")):
+        output.argument_query[0, owner_slot, 0, argument_index] = (
+            tensorizer.text_encoder.encode_one(
+                json.dumps(binding.arguments[name], separators=(",", ":")), detach=True
+            )
+        )
+    live = torch.zeros(sample.batch.thought_semantic.shape[1], dtype=torch.bool)
+    live[owner_slot] = True
+    live[other_slot] = True
+
+    active, executable, routes = tensorizer.predicted_binding_state(
+        example,
+        1,
+        target_output_slots=slots,
+        live_slots=live,
+        display_active_length=sample.batch.display_ids.shape[1],
+        output=output,
+        batch_index=0,
+    )
+    assert active == (binding.need_id,)
+    assert executable == (binding.need_id,)
+    assert routes[0].target_cells == (ObjectRef.cell("c1"), ObjectRef.cell("c0"))
+    assert routes[0].target_display == (ObjectRef.display_span(1, 3),)
+
+    live[owner_slot] = False
+    active, executable, routes = tensorizer.predicted_binding_state(
+        example,
+        1,
+        target_output_slots=slots,
+        live_slots=live,
+        display_active_length=sample.batch.display_ids.shape[1],
+        output=output,
+        batch_index=0,
+    )
+    assert active == executable == routes == ()
 
 
 def test_stage_a_fp32_cid_modules_keep_low_precision_backbone_frozen() -> None:
@@ -1983,6 +2109,10 @@ def test_rollout_sharding_repeats_singleton_bucket_across_all_ranks() -> None:
 
         assert tuple(len(shard) for shard in shards) == (1, 1, 1, 1)
         assert all(shard[0].example.example_id == "singleton" for shard in shards)
+        if legacy_resume_padding:
+            assert not any(shard[0].is_padding for shard in shards)
+        else:
+            assert sum(not shard[0].is_padding for shard in shards) == 1
 
 
 def test_stage_b_batch_resolution_is_stable_across_four_and_six_ranks() -> None:
@@ -2072,7 +2202,7 @@ def test_stage_b_optimizer_step_count_matches_bucket_padding() -> None:
             micro_batch_size=1,
             gradient_accumulation_steps=2,
         )
-        == 4
+        == 2
     )
     assert (
         stage_b_optimizer_steps_per_epoch(

@@ -196,6 +196,18 @@ def test_llada_moe_stage_a_skips_router_auxiliary_loss() -> None:
     adapter.set_mlp_chunk_size(16)
 
 
+def test_llada_moe_router_auxiliary_loss_ignores_padding_only_rows() -> None:
+    backbone = TinyLLaDAMoEBackbone()
+    adapter = ILLaDACIDAdapter(backbone)
+    batch = _batch()
+    batch.sample_mask = torch.tensor([False])
+
+    output = adapter(batch)
+
+    assert output.auxiliary_loss is not None
+    assert output.auxiliary_loss.item() == pytest.approx(0.0)
+
+
 def test_llada_moe_grouped_experts_match_reference_outputs_and_input_gradients() -> None:
     backbone = TinyLLaDAMoEBackbone()
     adapter = ILLaDACIDAdapter(backbone, freeze_backbone=True)

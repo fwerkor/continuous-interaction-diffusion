@@ -740,11 +740,19 @@ class ILLaDACIDAdapter(nn.Module):
             source_padding_mask=batch.source_padding_mask,
         )
         if self._router_aux_loss_enabled:
+            router_attention_mask = attention_mask
+            if batch.sample_mask is not None:
+                if batch.sample_mask.shape != (attention_mask.shape[0],):
+                    raise ValueError("CID sample mask must have shape [batch]")
+                router_attention_mask = attention_mask * batch.sample_mask[:, None].to(
+                    device=attention_mask.device,
+                    dtype=attention_mask.dtype,
+                )
             raw_router_loss = _moe_load_balancing_loss(
                 getattr(decoder_output, "router_logits", None),
                 num_experts=int(self.backbone.config.num_experts),
                 top_k=int(self.backbone.config.num_experts_per_tok),
-                attention_mask=attention_mask,
+                attention_mask=router_attention_mask,
             )
             if raw_router_loss is not None:
                 output.auxiliary_loss = raw_router_loss * self.router_aux_loss_coef

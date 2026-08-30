@@ -26,7 +26,7 @@ from cid.computational_training import (
 from cid.contracts import FreshnessDemand, InformationNeed, ModelContext, ModelUpdate
 from cid.correction_training import CorrectionTrainingConfig, build_correction_training
 from cid.data import TrajectoryExample, dump_jsonl, load_jsonl
-from cid.dataset import dump_dataset_manifest, inspect_dataset
+from cid.dataset import dump_dataset_manifest, inspect_dataset, validate_neural_training_contract
 from cid.distill import (
     TeacherScheduleConfig,
     compile_teacher_plans,
@@ -1316,6 +1316,7 @@ def _train_stage_a(args: argparse.Namespace) -> None:
         "fp32": torch.float32,
     }[args.dtype]
     dataset_manifest = inspect_dataset(args.data)
+    validate_neural_training_contract(dataset_manifest)
     world_size = int(os.environ.get("WORLD_SIZE", "1"))
     distributed = world_size > 1
     rank = int(os.environ.get("RANK", "0"))
@@ -1515,6 +1516,7 @@ def _train_stage_a(args: argparse.Namespace) -> None:
                 micro_batch_size=args.micro_batch_size,
                 legacy_resume_padding=legacy_partial_resume,
                 length_aware=trainer.data_order_version >= 2,
+                zero_gradient_padding=trainer.data_order_version >= 3,
             )
             total_local_windows = len(local_windows)
             resumed_windows = trainer.state.rollout_windows_seen_in_epoch
@@ -1917,6 +1919,7 @@ def _train_stage_b(args: argparse.Namespace) -> None:
 
     try:
         dataset_manifest = inspect_dataset(args.data)
+        validate_neural_training_contract(dataset_manifest)
         if dataset_manifest.thought_capacity_required > args.thought_capacity:
             raise ValueError(
                 "training data requires a larger TCT capacity: "
@@ -1973,13 +1976,22 @@ def _train_stage_b(args: argparse.Namespace) -> None:
                 weights_only=False,
             )
 
-        optimizer_steps_per_epoch = stage_b_optimizer_steps_per_epoch(
-            windows,
-            world_size=world_size,
-            micro_batch_size=args.micro_batch_size,
-            gradient_accumulation_steps=gradient_accumulation_steps,
+        lr_decay_steps = max(
+            1,
+            sum(
+                stage_b_optimizer_steps_per_epoch(
+                    windows,
+                    world_size=world_size,
+                    micro_batch_size=args.micro_batch_size,
+                    gradient_accumulation_steps=gradient_accumulation_steps,
+                    seed=args.seed,
+                    epoch=epoch,
+                    shuffle=not args.no_shuffle,
+                    length_aware=True,
+                )
+                for epoch in range(1, args.epochs + 1)
+            ),
         )
-        lr_decay_steps = max(1, optimizer_steps_per_epoch * args.epochs)
         warmup_steps = (
             max(1, round(lr_decay_steps * args.warmup_ratio))
             if args.warmup_ratio > 0.0
@@ -2202,6 +2214,7 @@ def _train_stage_b(args: argparse.Namespace) -> None:
                 micro_batch_size=args.micro_batch_size,
                 consumed_windows_by_bucket=epoch_base_consumed,
                 length_aware=trainer.data_order_version >= 2,
+                zero_gradient_padding=trainer.data_order_version >= 3,
             )
             total_local_windows = len(epoch_shard)
             resumed_windows = trainer.state.rollout_windows_seen_in_epoch

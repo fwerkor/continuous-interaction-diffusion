@@ -32,6 +32,7 @@ class CIDTensorBatch:
     fact_padding_mask: Tensor | None = None
     percept_padding_mask: Tensor | None = None
     source_padding_mask: Tensor | None = None
+    sample_mask: Tensor | None = None
 
 
 @dataclass(slots=True)
