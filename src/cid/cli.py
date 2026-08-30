@@ -981,6 +981,7 @@ def _benchmark(args: argparse.Namespace) -> None:
         device = torch.device(device_type, local_rank)
         metadata = json.loads((checkpoint / "metadata.json").read_text(encoding="utf-8"))
         adapter_config = ILLaDACIDConfig(**metadata["adapter_config"])
+        semantic_pooling = str(metadata.get("semantic_pooling", "mean-v1"))
     else:
         if world_size > 1:
             raise RuntimeError("unsharded benchmark checkpoints are single-process; omit torchrun")
@@ -988,6 +989,9 @@ def _benchmark(args: argparse.Namespace) -> None:
         device = torch.device(device_type)
         raw = torch.load(checkpoint, map_location="cpu", weights_only=False)
         adapter_config = ILLaDACIDConfig(**raw["adapter_config"])
+        semantic_pooling = str(
+            raw.get("trainer_config", {}).get("semantic_pooling", "mean-v1")
+        )
 
     dtype = {
         "bf16": torch.bfloat16,
@@ -1028,6 +1032,7 @@ def _benchmark(args: argparse.Namespace) -> None:
                 tokenizer,
                 device=device,
                 dtype=dtype,
+                pooling_mode=semantic_pooling,
             )
             adapter.set_backbone_trainable(True)
             if device_type == "npu":
@@ -1048,7 +1053,9 @@ def _benchmark(args: argparse.Namespace) -> None:
                 )
         else:
             load_cid_adapter_checkpoint(adapter, checkpoint)
-            text_encoder = ILLaDATextEncoder(adapter, tokenizer)
+            text_encoder = ILLaDATextEncoder(
+                adapter, tokenizer, pooling_mode=semantic_pooling
+            )
             forward_model = adapter
 
         adapter.eval()
@@ -1181,6 +1188,92 @@ def _load_train_and_validation_examples(
     return training_examples, validation_examples
 
 
+def _aggregate_validation_report(
+    report,
+    *,
+    torch_module,
+    dist_module,
+    device,
+    device_type: str,
+    distributed: bool,
+) -> dict[str, object]:
+    component_names = tuple(sorted(report.component_mean_losses))
+    behavior_names = tuple(sorted(report.behavior_counts))
+    values = [
+        report.mean_loss * report.transitions,
+        report.raw_mean_loss * report.transitions,
+        float(report.transitions),
+    ]
+    values.extend(
+        report.component_mean_losses[name] * report.transitions
+        for name in component_names
+    )
+    values.extend(report.behavior_counts[name] for name in behavior_names)
+    aggregate = torch_module.tensor(
+        values,
+        device=device,
+        dtype=torch_module.float32 if device_type == "npu" else torch_module.float64,
+    )
+    if distributed:
+        dist_module.all_reduce(aggregate)
+    transition_count = int(aggregate[2])
+    component_offset = 3
+    behavior_offset = component_offset + len(component_names)
+    component_losses = {
+        name: float(aggregate[component_offset + index] / aggregate[2])
+        for index, name in enumerate(component_names)
+    }
+    behavior_counts = {
+        name: float(aggregate[behavior_offset + index])
+        for index, name in enumerate(behavior_names)
+    }
+
+    def safe_ratio(numerator: float, denominator: float) -> float | None:
+        return numerator / denominator if denominator > 0.0 else None
+
+    tp = behavior_counts.get("need_tp", 0.0)
+    fp = behavior_counts.get("need_fp", 0.0)
+    fn = behavior_counts.get("need_fn", 0.0)
+    tn = behavior_counts.get("need_tn", 0.0)
+    precision = safe_ratio(tp, tp + fp)
+    recall = safe_ratio(tp, tp + fn)
+    f1 = (
+        2.0 * precision * recall / (precision + recall)
+        if precision is not None and recall is not None and precision + recall > 0.0
+        else None
+    )
+    behavior_metrics = {
+        "need_precision": precision,
+        "need_recall": recall,
+        "need_f1": f1,
+        "need_false_positive_rate": safe_ratio(fp, fp + tn),
+        "source_accuracy": safe_ratio(
+            behavior_counts.get("source_correct", 0.0),
+            behavior_counts.get("source_total", 0.0),
+        ),
+        "convergence_accuracy": safe_ratio(
+            behavior_counts.get("convergence_correct", 0.0),
+            behavior_counts.get("convergence_total", 0.0),
+        ),
+        "lifecycle_accuracy": safe_ratio(
+            behavior_counts.get("lifecycle_correct", 0.0),
+            behavior_counts.get("lifecycle_total", 0.0),
+        ),
+        "display_token_accuracy": safe_ratio(
+            behavior_counts.get("display_token_correct", 0.0),
+            behavior_counts.get("display_token_total", 0.0),
+        ),
+    }
+    return {
+        "mean_loss": float(aggregate[0] / aggregate[2]),
+        "raw_mean_loss": float(aggregate[1] / aggregate[2]),
+        "transitions": transition_count,
+        "component_losses": component_losses,
+        "behavior_counts": behavior_counts,
+        "behavior_metrics": behavior_metrics,
+    }
+
+
 def _replace_checkpoint_alias(
     alias: Path,
     target: Path,
@@ -1213,6 +1306,7 @@ def _train_stage_a(args: argparse.Namespace) -> None:
         trajectory_rollout_windows,
         wrap_stage_a_ddp,
     )
+    from cid.model.encoding import ILLaDATextEncoder
     from cid.model.loading import pretrained_revision
 
     dtype = {
@@ -1275,7 +1369,12 @@ def _train_stage_a(args: argparse.Namespace) -> None:
         if revision is not None:
             tokenizer_kwargs["revision"] = revision
         tokenizer = AutoTokenizer.from_pretrained(args.model, **tokenizer_kwargs)
-        tensorizer = ILLaDATrajectoryTensorizer(adapter, tokenizer)
+        text_encoder = ILLaDATextEncoder(
+            adapter, tokenizer, pooling_mode=args.semantic_pooling
+        )
+        tensorizer = ILLaDATrajectoryTensorizer(
+            adapter, tokenizer, text_encoder=text_encoder
+        )
         forward_model = (
             wrap_stage_a_ddp(
                 adapter,
@@ -1305,6 +1404,7 @@ def _train_stage_a(args: argparse.Namespace) -> None:
                 rollout_horizon=args.rollout_horizon,
                 teacher_forcing_epochs=args.teacher_forcing_epochs,
                 rollout_ramp_epochs=args.rollout_ramp_epochs,
+                semantic_pooling=args.semantic_pooling,
                 seed=args.seed,
             ),
             forward_model=forward_model,
@@ -1489,6 +1589,7 @@ def _train_stage_a(args: argparse.Namespace) -> None:
                     "mean_loss": mean_loss,
                     "weighted_mean_loss": mean_loss,
                     "raw_mean_loss": raw_mean_loss,
+                    "component_losses": progress.component_mean_losses,
                     "learning_rate": progress.learning_rate,
                     "rollout_probability": current_rollout_probability,
                     "windows_seen_in_epoch": windows_seen,
@@ -1556,28 +1657,35 @@ def _train_stage_a(args: argparse.Namespace) -> None:
 
             validation_mean_loss = None
             if local_validation_windows:
-                validation_report = trainer.evaluate_rollout_windows(
+                teacher_forced_report = trainer.evaluate_rollout_windows(
                     local_validation_windows,
                     seed=args.seed + 1_000_003,
+                    rollout_probability=0.0,
                 )
-                validation_aggregate = torch.tensor(
-                    [
-                        validation_report.mean_loss * validation_report.transitions,
-                        validation_report.raw_mean_loss * validation_report.transitions,
-                        float(validation_report.transitions),
-                    ],
+                teacher_forced = _aggregate_validation_report(
+                    teacher_forced_report,
+                    torch_module=torch,
+                    dist_module=dist,
                     device=device,
-                    dtype=torch.float32 if device_type == "npu" else torch.float64,
+                    device_type=device_type,
+                    distributed=distributed,
                 )
-                if distributed:
-                    dist.all_reduce(validation_aggregate)
-                validation_mean_loss = float(
-                    validation_aggregate[0] / validation_aggregate[2]
+                free_rollout_report = trainer.evaluate_rollout_windows(
+                    local_validation_windows,
+                    seed=args.seed + 1_000_003,
+                    rollout_probability=1.0,
                 )
-                validation_raw_mean_loss = float(
-                    validation_aggregate[1] / validation_aggregate[2]
+                free_rollout = _aggregate_validation_report(
+                    free_rollout_report,
+                    torch_module=torch,
+                    dist_module=dist,
+                    device=device,
+                    device_type=device_type,
+                    distributed=distributed,
                 )
-                validation_transitions = int(validation_aggregate[2])
+                validation_mean_loss = float(teacher_forced["mean_loss"])
+                validation_raw_mean_loss = float(teacher_forced["raw_mean_loss"])
+                validation_transitions = int(teacher_forced["transitions"])
                 if rank == 0:
                     validation_record = {
                         "timestamp": time.time(),
@@ -1589,7 +1697,9 @@ def _train_stage_a(args: argparse.Namespace) -> None:
                         "validation_mean_loss": validation_mean_loss,
                         "validation_raw_mean_loss": validation_raw_mean_loss,
                         "validation_seed": args.seed + 1_000_003,
-                        "objective": "teacher_forced_fixed_noise",
+                        "objective": "teacher_forced_and_free_rollout_fixed_noise",
+                        "teacher_forced": teacher_forced,
+                        "free_rollout": free_rollout,
                         "checkpoint": str(checkpoint),
                     }
                     with validation_metrics_path.open("a", encoding="utf-8") as handle:
@@ -1887,6 +1997,7 @@ def _train_stage_b(args: argparse.Namespace) -> None:
                 device=device,
                 dtype=compute_dtype,
                 embedding_device="cpu",
+                pooling_mode=args.semantic_pooling,
             )
             # Ascend ranks have ample device memory but commonly share a tighter host-memory
             # cgroup. Move each freshly loaded model to its NPU before the next rank loads.
@@ -1954,6 +2065,7 @@ def _train_stage_b(args: argparse.Namespace) -> None:
                 rollout_horizon=args.rollout_horizon,
                 teacher_forcing_epochs=args.teacher_forcing_epochs,
                 rollout_ramp_epochs=args.rollout_ramp_epochs,
+                semantic_pooling=args.semantic_pooling,
                 seed=args.seed,
             ),
             optimizer=optimizer,
@@ -2113,6 +2225,7 @@ def _train_stage_b(args: argparse.Namespace) -> None:
                     "interval_transitions": progress.transitions,
                     "mean_loss": progress.mean_loss,
                     "raw_mean_loss": progress.raw_mean_loss,
+                    "component_losses": progress.component_mean_losses,
                     "learning_rate": progress.learning_rate,
                     "backbone_learning_rate": min(backbone_lrs) if backbone_lrs else None,
                     "cid_learning_rate": max(cid_lrs) if cid_lrs else None,
@@ -2263,27 +2376,35 @@ def _train_stage_b(args: argparse.Namespace) -> None:
 
             validation_mean_loss = None
             if local_validation_windows:
-                validation_report = trainer.evaluate_rollout_windows(
+                teacher_forced_report = trainer.evaluate_rollout_windows(
                     local_validation_windows,
                     seed=args.seed + 1_000_003,
+                    rollout_probability=0.0,
                 )
-                validation_aggregate = torch.tensor(
-                    [
-                        validation_report.mean_loss * validation_report.transitions,
-                        validation_report.raw_mean_loss * validation_report.transitions,
-                        float(validation_report.transitions),
-                    ],
+                teacher_forced = _aggregate_validation_report(
+                    teacher_forced_report,
+                    torch_module=torch,
+                    dist_module=dist,
                     device=device,
-                    dtype=torch.float32 if device_type == "npu" else torch.float64,
+                    device_type=device_type,
+                    distributed=True,
                 )
-                dist.all_reduce(validation_aggregate)
-                validation_mean_loss = float(
-                    validation_aggregate[0] / validation_aggregate[2]
+                free_rollout_report = trainer.evaluate_rollout_windows(
+                    local_validation_windows,
+                    seed=args.seed + 1_000_003,
+                    rollout_probability=1.0,
                 )
-                validation_raw_mean_loss = float(
-                    validation_aggregate[1] / validation_aggregate[2]
+                free_rollout = _aggregate_validation_report(
+                    free_rollout_report,
+                    torch_module=torch,
+                    dist_module=dist,
+                    device=device,
+                    device_type=device_type,
+                    distributed=True,
                 )
-                validation_transitions = int(validation_aggregate[2])
+                validation_mean_loss = float(teacher_forced["mean_loss"])
+                validation_raw_mean_loss = float(teacher_forced["raw_mean_loss"])
+                validation_transitions = int(teacher_forced["transitions"])
                 if rank == 0:
                     validation_record = {
                         "timestamp": time.time(),
@@ -2295,7 +2416,9 @@ def _train_stage_b(args: argparse.Namespace) -> None:
                         "validation_mean_loss": validation_mean_loss,
                         "validation_raw_mean_loss": validation_raw_mean_loss,
                         "validation_seed": args.seed + 1_000_003,
-                        "objective": "teacher_forced_fixed_noise",
+                        "objective": "teacher_forced_and_free_rollout_fixed_noise",
+                        "teacher_forced": teacher_forced,
+                        "free_rollout": free_rollout,
                         "checkpoint": str(checkpoint),
                     }
                     with validation_metrics_path.open("a", encoding="utf-8") as handle:
@@ -2776,6 +2899,12 @@ def main() -> None:
     train.add_argument("--timestep-min", type=float, default=0.05)
     train.add_argument("--timestep-max", type=float, default=1.0)
     train.add_argument("--rollout-horizon", type=int, default=3)
+    train.add_argument(
+        "--semantic-pooling",
+        choices=("mean-v1", "order-aware-v2"),
+        default="mean-v1",
+        help="TCT semantic pooling contract; order-aware-v2 preserves token order",
+    )
     train.add_argument("--teacher-forcing-epochs", type=int, default=1)
     train.add_argument("--rollout-ramp-epochs", type=int, default=2)
     train.add_argument("--thought-capacity", type=int, default=128)
@@ -2827,7 +2956,12 @@ def main() -> None:
         default=1e-5,
         help="peak CID-module learning rate; backbone LR is scaled separately",
     )
-    train_full.add_argument("--backbone-lr-scale", type=float, default=0.5)
+    train_full.add_argument(
+        "--backbone-lr-scale",
+        type=float,
+        default=0.5,
+        help="backbone LR multiplier; use a lower value for small-model retention when needed",
+    )
     train_full.add_argument("--weight-decay", type=float, default=0.01)
     train_full.add_argument("--micro-batch-size", type=int, default=1)
     train_full.add_argument(
@@ -2855,6 +2989,12 @@ def main() -> None:
     train_full.add_argument("--timestep-min", type=float, default=0.05)
     train_full.add_argument("--timestep-max", type=float, default=1.0)
     train_full.add_argument("--rollout-horizon", type=int, default=3)
+    train_full.add_argument(
+        "--semantic-pooling",
+        choices=("mean-v1", "order-aware-v2"),
+        default="mean-v1",
+        help="must match the Stage A checkpoint semantic pooling contract",
+    )
     train_full.add_argument("--teacher-forcing-epochs", type=int, default=0)
     train_full.add_argument("--rollout-ramp-epochs", type=int, default=0)
     train_full.add_argument("--thought-capacity", type=int, default=128)

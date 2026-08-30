@@ -685,6 +685,21 @@ def test_trajectory_tensorizer_keeps_multiple_bindings_on_one_cell_distinct() ->
     assert sample.targets.argument_mask[0, 1, 1, :2].all()
 
 
+def test_order_aware_text_encoder_distinguishes_reversed_token_order() -> None:
+    adapter = make_adapter(seed=127)
+    tokenizer = TinyTokenizer()
+    legacy = ILLaDATextEncoder(adapter, tokenizer, pooling_mode="mean-v1")
+    order_aware = ILLaDATextEncoder(adapter, tokenizer, pooling_mode="order-aware-v2")
+
+    legacy_ab = legacy.encode_one("ab", detach=True)
+    legacy_ba = legacy.encode_one("ba", detach=True)
+    ordered_ab = order_aware.encode_one("ab", detach=True)
+    ordered_ba = order_aware.encode_one("ba", detach=True)
+
+    assert torch.allclose(legacy_ab, legacy_ba)
+    assert not torch.allclose(ordered_ab, ordered_ba)
+
+
 def test_frozen_text_encoder_snapshot_is_independent_from_live_backbone() -> None:
     adapter = make_adapter()
     tokenizer = TinyTokenizer()
@@ -921,6 +936,31 @@ def test_trainer_checkpoint_restores_trainable_state_optimizer_and_progress(tmp_
         assert torch.equal(original_parameters[name], inference_parameters[name])
 
 
+def test_legacy_checkpoint_without_semantic_pooling_resumes_as_mean_v1(tmp_path) -> None:
+    adapter = make_adapter(seed=146)
+    config = CIDTrainerConfig(timestep_min=1.0, timestep_max=1.0)
+    trainer = CIDTrainer(
+        adapter,
+        ILLaDATrajectoryTensorizer(adapter, TinyTokenizer()),
+        config,
+    )
+    path = tmp_path / "current.pt"
+    trainer.save_checkpoint(path)
+    payload = torch.load(path, map_location="cpu", weights_only=False)
+    payload["trainer_config"].pop("semantic_pooling")
+    legacy = tmp_path / "legacy.pt"
+    torch.save(payload, legacy)
+
+    restored_adapter = make_adapter(seed=146)
+    restored = CIDTrainer(
+        restored_adapter,
+        ILLaDATrajectoryTensorizer(restored_adapter, TinyTokenizer()),
+        config,
+    )
+    restored.load_checkpoint(legacy)
+    assert restored.config.semantic_pooling == "mean-v1"
+
+
 def test_stage_a_checkpoint_rejects_previous_neural_contract(tmp_path) -> None:
     adapter = make_adapter(seed=145)
     trainer = CIDTrainer(
@@ -1052,11 +1092,21 @@ def test_validation_loss_is_deterministic_and_preserves_training_state() -> None
 
     first = trainer.evaluate_rollout_windows(windows, seed=12345)
     second = trainer.evaluate_rollout_windows(windows, seed=12345)
+    free_first = trainer.evaluate_rollout_windows(
+        windows, seed=12345, rollout_probability=1.0
+    )
+    free_second = trainer.evaluate_rollout_windows(
+        windows, seed=12345, rollout_probability=1.0
+    )
 
     assert first == second
+    assert free_first == free_second
     assert first.optimizer_steps == 0
     assert first.transitions > 0
     assert first.mean_loss > 0.0
+    assert first.component_mean_losses["intent"] >= 0.0
+    assert {"need_tp", "need_fp", "need_fn", "need_tn"}.issubset(first.behavior_counts)
+    assert free_first.transitions == first.transitions
     assert trainer.state == state_before
     assert torch.equal(trainer.generator.get_state(), generator_before)
     assert trainer.shuffle_rng.getstate() == shuffle_before

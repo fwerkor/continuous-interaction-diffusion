@@ -160,10 +160,11 @@ def cid_loss(
         targets.lifecycle,
         targets.lifecycle != -100,
     )
-    intent = _masked_binary_cross_entropy(
+    intent = _capped_positive_weight_binary_cross_entropy(
         output.need_logits,
         targets.need_targets,
         targets.thought_mask.unsqueeze(-1).expand_as(output.need_logits),
+        positive_weight_cap=8.0,
     )
     source = _masked_cross_entropy(
         output.source_logits,
@@ -344,6 +345,46 @@ def _balanced_masked_binary_cross_entropy(
     if not rows:
         return _differentiable_zero(logits)
     return torch.stack(rows).mean()
+
+
+def _capped_positive_weight_binary_cross_entropy(
+    logits: Tensor,
+    target: Tensor,
+    mask: Tensor,
+    *,
+    positive_weight_cap: float,
+) -> Tensor:
+    """Upweight sparse positives without letting inverse-frequency weights explode.
+
+    Information-need labels are intentionally sparse: most thought cells do not need a tool on
+    most steps.  Plain BCE therefore rewards an almost-always-negative classifier.  Full inverse
+    frequency balancing can swing too far in the other direction on small batches, so we estimate
+    the positive weight from each example and cap it at a conservative value.
+    """
+    if positive_weight_cap < 1.0:
+        raise ValueError("positive_weight_cap must be at least 1")
+    valid = mask.bool()
+    flat_valid = valid.flatten(start_dim=1)
+    flat_target = target.flatten(start_dim=1)
+    positive = flat_valid & (flat_target >= 0.5)
+    negative = flat_valid & ~positive
+    positive_count = positive.sum(dim=1)
+    negative_count = negative.sum(dim=1)
+    ratio = negative_count.to(dtype=logits.dtype) / positive_count.clamp_min(1).to(
+        dtype=logits.dtype
+    )
+    positive_weight = ratio.clamp(min=1.0, max=positive_weight_cap)
+
+    weights = torch.ones_like(flat_target)
+    weights = torch.where(positive, positive_weight.unsqueeze(1), weights)
+    weights = weights * flat_valid.to(dtype=weights.dtype)
+    losses = F.binary_cross_entropy_with_logits(
+        logits.flatten(start_dim=1), flat_target, reduction="none"
+    )
+    denominator = weights.sum(dim=1)
+    valid_rows = (denominator > 0).to(dtype=losses.dtype)
+    row_losses = (losses * weights).sum(dim=1) / denominator.clamp_min(1.0)
+    return (row_losses * valid_rows).sum() / valid_rows.sum().clamp_min(1.0)
 
 
 def _masked_binary_cross_entropy(logits: Tensor, target: Tensor, mask: Tensor) -> Tensor:

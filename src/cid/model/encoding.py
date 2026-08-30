@@ -14,14 +14,31 @@ from cid.state import FactItem
 
 
 class ILLaDATextEncoder:
-    """Tokenizer/embedding bridge shared by runtime and training tensorizers."""
+    """Tokenizer/embedding bridge shared by runtime and training tensorizers.
 
-    def __init__(self, adapter: ILLaDACIDAdapter, tokenizer: Any) -> None:
+    The encoder deliberately stays lightweight because Stage B cannot afford a second frozen
+    language model on 24 GB GPUs.  It nevertheless preserves token order through a first-moment
+    term instead of treating a sentence as an unordered bag of embeddings.
+    """
+
+    ENCODING_VERSION = 2
+    ORDER_MOMENT_SCALE = 0.25
+
+    def __init__(
+        self,
+        adapter: ILLaDACIDAdapter,
+        tokenizer: Any,
+        *,
+        pooling_mode: str = "mean-v1",
+    ) -> None:
+        if pooling_mode not in {"mean-v1", "order-aware-v2"}:
+            raise ValueError(f"unsupported semantic pooling mode: {pooling_mode}")
         self._embedding = adapter.input_embeddings
         self._output_device = self._embedding.weight.device
         self._output_dtype = self._embedding.weight.dtype
         self.tokenizer = tokenizer
         self.d_model = adapter.d_model
+        self.pooling_mode = pooling_mode
 
     @classmethod
     def from_frozen_snapshot(
@@ -32,7 +49,10 @@ class ILLaDATextEncoder:
         device: torch.device | str,
         dtype: torch.dtype = torch.bfloat16,
         embedding_device: torch.device | str | None = None,
+        pooling_mode: str = "mean-v1",
     ) -> ILLaDATextEncoder:
+        if pooling_mode not in {"mean-v1", "order-aware-v2"}:
+            raise ValueError(f"unsupported semantic pooling mode: {pooling_mode}")
         snapshot = cls.__new__(cls)
         output_device = torch.device(device)
         storage_device = (
@@ -46,6 +66,7 @@ class ILLaDATextEncoder:
         snapshot._output_dtype = dtype
         snapshot.tokenizer = tokenizer
         snapshot.d_model = adapter.d_model
+        snapshot.pooling_mode = pooling_mode
         return snapshot
 
     @property
@@ -95,8 +116,26 @@ class ILLaDATextEncoder:
         embeddings = embeddings.to(device=self.device, dtype=self.dtype)
         attention_mask = encoded["attention_mask"].to(device=self.device, dtype=self.dtype)
         weights = attention_mask.unsqueeze(-1)
-        pooled = (embeddings * weights).sum(dim=1)
-        pooled = pooled / weights.sum(dim=1).clamp_min(1.0)
+        token_count = weights.sum(dim=1).clamp_min(1.0)
+        mean = (embeddings * weights).sum(dim=1) / token_count
+        if self.pooling_mode == "mean-v1":
+            pooled = mean
+        else:
+            # Mean pooling is invariant to word order. Add a centered first positional moment so
+            # sequences containing the same tokens in a different order map to different semantic
+            # vectors while preserving the original embedding dimensionality and scale.
+            positions = torch.arange(
+                embeddings.shape[1], device=self.device, dtype=self.dtype
+            ).unsqueeze(0)
+            lengths = attention_mask.sum(dim=1, keepdim=True).clamp_min(1.0)
+            midpoint = (lengths - 1.0) * 0.5
+            radius = midpoint.clamp_min(1.0)
+            centered = ((positions - midpoint) / radius) * attention_mask
+            moment_denominator = centered.abs().sum(dim=1, keepdim=True).clamp_min(1.0)
+            directional = (
+                embeddings * centered.unsqueeze(-1)
+            ).sum(dim=1) / moment_denominator
+            pooled = mean + self.ORDER_MOMENT_SCALE * directional
         result = pooled.unsqueeze(0)
         return result.detach() if detach else result
 

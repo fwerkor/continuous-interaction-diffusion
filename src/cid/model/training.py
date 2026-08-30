@@ -6,7 +6,7 @@ import math
 import os
 import random
 from collections.abc import Callable, Mapping
-from dataclasses import asdict, dataclass, replace
+from dataclasses import asdict, dataclass, field, replace
 from functools import partial
 from inspect import signature
 from pathlib import Path
@@ -233,6 +233,7 @@ class CIDTrainerConfig:
     rollout_denoising_steps: int = 8
     rollout_display_revision_fraction: float = 0.125
     rollout_display_revision_margin: float = 0.15
+    semantic_pooling: str = "mean-v1"
     seed: int = 0
 
     def __post_init__(self) -> None:
@@ -270,6 +271,8 @@ class CIDTrainerConfig:
             raise ValueError("rollout_denoising_steps must be positive")
         if self.rollout_display_revision_margin < 0.0:
             raise ValueError("rollout_display_revision_margin must be non-negative")
+        if self.semantic_pooling not in {"mean-v1", "order-aware-v2"}:
+            raise ValueError("unsupported semantic_pooling mode")
 
 
 @dataclass(frozen=True, slots=True)
@@ -286,6 +289,8 @@ class CIDTrainReport:
     optimizer_steps: int
     mean_loss: float
     raw_mean_loss: float
+    component_mean_losses: dict[str, float] = field(default_factory=dict)
+    behavior_counts: dict[str, float] = field(default_factory=dict)
 
 
 @dataclass(frozen=True, slots=True)
@@ -296,6 +301,122 @@ class CIDTrainProgress:
     raw_mean_loss: float
     rollout_windows_seen_in_epoch: int
     learning_rate: float
+    component_mean_losses: dict[str, float] = field(default_factory=dict)
+
+
+CID_LOSS_COMPONENT_NAMES = (
+    "thought",
+    "convergence",
+    "allocation",
+    "display",
+    "roles",
+    "uncertainty",
+    "noise",
+    "lifecycle",
+    "intent",
+    "source",
+    "need_cell_route",
+    "need_display_route",
+    "argument_presence",
+    "argument_ground",
+    "revision",
+    "refresh",
+    "anchor_presence",
+    "anchor_kind",
+    "anchor_ground",
+    "link_presence",
+    "link_relation",
+    "link_target_kind",
+    "link_ground",
+    "auxiliary",
+)
+
+
+def _cid_loss_component_values(losses: CIDLoss) -> dict[str, Tensor]:
+    return {
+        name: getattr(losses, name).detach().float()
+        for name in CID_LOSS_COMPONENT_NAMES
+    }
+
+
+def _accumulate_metric_tensors(
+    destination: dict[str, Tensor],
+    values: Mapping[str, Tensor],
+    *,
+    scale: float = 1.0,
+) -> None:
+    for name, value in values.items():
+        contribution = value.detach().float() * scale
+        destination[name] = (
+            destination[name] + contribution if name in destination else contribution
+        )
+
+
+def _metric_tensor_means(
+    values: Mapping[str, Tensor],
+    denominator: int,
+) -> dict[str, float]:
+    if not values:
+        return {}
+    names = tuple(values)
+    stacked = torch.stack(tuple(values[name] for name in names)) / max(1, denominator)
+    host_values = stacked.detach().cpu().tolist()
+    return dict(zip(names, host_values, strict=True))
+
+
+def _metric_tensor_values(values: Mapping[str, Tensor]) -> dict[str, float]:
+    if not values:
+        return {}
+    names = tuple(values)
+    host_values = torch.stack(tuple(values[name] for name in names)).detach().cpu().tolist()
+    return dict(zip(names, host_values, strict=True))
+
+
+def _cid_behavior_counts(
+    output: CIDTensorOutput,
+    targets: CIDTargets,
+    *,
+    need_threshold: float,
+) -> dict[str, Tensor]:
+    zero = output.need_logits.new_zeros((), dtype=torch.float32)
+
+    need_mask = targets.thought_mask.unsqueeze(-1).expand_as(output.need_logits).bool()
+    need_prediction = torch.sigmoid(output.need_logits) >= need_threshold
+    need_target = targets.need_targets >= 0.5
+    counts = {
+        "need_tp": (need_prediction & need_target & need_mask).sum().float(),
+        "need_fp": (need_prediction & ~need_target & need_mask).sum().float(),
+        "need_fn": (~need_prediction & need_target & need_mask).sum().float(),
+        "need_tn": (~need_prediction & ~need_target & need_mask).sum().float(),
+    }
+
+    source_mask = targets.source_targets != -100
+    source_correct = zero
+    if output.source_logits.shape[-1] > 0:
+        source_prediction = output.source_logits.argmax(dim=-1)
+        source_correct = ((source_prediction == targets.source_targets) & source_mask).sum().float()
+    counts["source_correct"] = source_correct
+    counts["source_total"] = source_mask.sum().float()
+
+    convergence_prediction = torch.sigmoid(output.convergence_logits) >= 0.5
+    convergence_target = targets.convergence_targets >= 0.5
+    counts["convergence_correct"] = (convergence_prediction == convergence_target).sum().float()
+    counts["convergence_total"] = zero + convergence_target.numel()
+
+    lifecycle_mask = targets.lifecycle != -100
+    lifecycle_prediction = output.lifecycle_logits.argmax(dim=-1)
+    counts["lifecycle_correct"] = (
+        (lifecycle_prediction == targets.lifecycle) & lifecycle_mask
+    ).sum().float()
+    counts["lifecycle_total"] = lifecycle_mask.sum().float()
+
+    display_mask = targets.display_ids != -100
+    display_prediction = output.display_logits.argmax(dim=-1)
+    counts["display_token_correct"] = (
+        (display_prediction == targets.display_ids) & display_mask
+    ).sum().float()
+    counts["display_token_total"] = display_mask.sum().float()
+    return counts
 
 
 class CIDTrainer:
@@ -319,6 +440,8 @@ class CIDTrainer:
         self.gradient_clipper = gradient_clipper
         self.tensorizer = tensorizer
         self.config = config or CIDTrainerConfig()
+        if tensorizer.text_encoder.pooling_mode != self.config.semantic_pooling:
+            raise ValueError("trainer semantic pooling does not match trajectory tensorizer")
         self._trainable = tuple(
             (name, parameter)
             for name, parameter in adapter.named_parameters()
@@ -383,6 +506,18 @@ class CIDTrainer:
         *,
         rollout_probability: float,
     ) -> tuple[float, float, int]:
+        loss_sum, raw_loss_sum, transitions, _ = self._train_rollout_microbatch_with_metrics(
+            windows,
+            rollout_probability=rollout_probability,
+        )
+        return loss_sum, raw_loss_sum, transitions
+
+    def _train_rollout_microbatch_with_metrics(
+        self,
+        windows: tuple[CIDRolloutWindow, ...],
+        *,
+        rollout_probability: float,
+    ) -> tuple[float, float, int, dict[str, Tensor]]:
         if not windows:
             raise ValueError("rollout micro-batch cannot be empty")
         if not 0.0 <= rollout_probability <= 1.0:
@@ -399,6 +534,7 @@ class CIDTrainer:
         loss_sum = 0.0
         raw_loss_sum = 0.0
         transition_count = 0
+        component_sums: dict[str, Tensor] = {}
         for offset in range(next(iter(lengths))):
             samples: list[CIDTrainingStep] = []
             for index, window in enumerate(windows):
@@ -424,6 +560,11 @@ class CIDTrainer:
             raw_loss_sum += raw_loss
             loss_sum += raw_loss * loss_weight
             transition_count += batch_size
+            _accumulate_metric_tensors(
+                component_sums,
+                _cid_loss_component_values(losses),
+                scale=batch_size,
+            )
             # The predicted state is consumed only by a later transition in the same
             # window. Skipping the terminal materialization avoids pure accelerator work,
             # which is especially significant for compact NPU backbones.
@@ -439,7 +580,7 @@ class CIDTrainer:
                     for index, sample in enumerate(samples)
                 ]
             del output, training_batch, losses, samples
-        return loss_sum, raw_loss_sum, transition_count
+        return loss_sum, raw_loss_sum, transition_count, component_sums
 
     def _forward_backward(
         self,
@@ -622,10 +763,12 @@ class CIDTrainer:
         total_loss = 0.0
         total_raw_loss = 0.0
         total_transitions = 0
+        total_component_sums: dict[str, Tensor] = {}
         start_optimizer_steps = self.state.optimizer_steps
         progress_loss = 0.0
         progress_raw_loss = 0.0
         progress_transitions = 0
+        progress_component_sums: dict[str, Tensor] = {}
         next_progress_step = None
         if progress_callback is not None and progress_every_optimizer_steps is not None:
             next_progress_step = (
@@ -634,6 +777,7 @@ class CIDTrainer:
 
         def emit_progress_if_due() -> None:
             nonlocal progress_loss, progress_raw_loss, progress_transitions, next_progress_step
+            nonlocal progress_component_sums
             if (
                 progress_callback is None
                 or progress_every_optimizer_steps is None
@@ -650,11 +794,15 @@ class CIDTrainer:
                     raw_mean_loss=progress_raw_loss / progress_transitions,
                     rollout_windows_seen_in_epoch=self.state.rollout_windows_seen_in_epoch,
                     learning_rate=float(self.optimizer.param_groups[0]["lr"]),
+                    component_mean_losses=_metric_tensor_means(
+                        progress_component_sums, progress_transitions
+                    ),
                 )
             )
             progress_loss = 0.0
             progress_raw_loss = 0.0
             progress_transitions = 0
+            progress_component_sums = {}
             while next_progress_step <= self.state.optimizer_steps:
                 next_progress_step += progress_every_optimizer_steps
 
@@ -664,7 +812,12 @@ class CIDTrainer:
                 windows, shuffle=shuffle, preserve_order=preserve_order
             )
             for microbatch in microbatches:
-                loss_sum, raw_loss_sum, transitions = self.train_rollout_microbatch(
+                (
+                    loss_sum,
+                    raw_loss_sum,
+                    transitions,
+                    component_sums,
+                ) = self._train_rollout_microbatch_with_metrics(
                     microbatch,
                     rollout_probability=rollout_probability,
                 )
@@ -674,6 +827,8 @@ class CIDTrainer:
                 progress_loss += loss_sum
                 progress_raw_loss += raw_loss_sum
                 progress_transitions += transitions
+                _accumulate_metric_tensors(total_component_sums, component_sums)
+                _accumulate_metric_tensors(progress_component_sums, component_sums)
                 self.state = CIDTrainerState(
                     transitions_seen=self.state.transitions_seen,
                     optimizer_steps=self.state.optimizer_steps,
@@ -696,6 +851,9 @@ class CIDTrainer:
             optimizer_steps=self.state.optimizer_steps - start_optimizer_steps,
             mean_loss=total_loss / total_transitions,
             raw_mean_loss=total_raw_loss / total_transitions,
+            component_mean_losses=_metric_tensor_means(
+                total_component_sums, total_transitions
+            ),
         )
 
     def evaluate_rollout_windows(
@@ -703,19 +861,24 @@ class CIDTrainer:
         windows: tuple[CIDRolloutWindow, ...],
         *,
         seed: int,
+        rollout_probability: float = 0.0,
+        need_threshold: float = 0.6,
     ) -> CIDTrainReport:
-        """Evaluate a stable teacher-forced diffusion objective without mutating training state.
+        """Evaluate a deterministic diffusion objective without mutating training state.
 
-        Validation deliberately uses a fixed RNG seed and teacher-forced inputs on every epoch.
-        This makes loss values directly comparable across epochs even while Stage A changes its
-        rollout curriculum. Model/optimizer state and the trainer RNG streams are restored exactly
-        after evaluation.
+        ``rollout_probability=0`` is the comparable teacher-forced objective. Setting it to 1
+        feeds every non-initial step from the model's own prior prediction, exposing state drift
+        that teacher-forced loss cannot reveal.
         """
 
         if not windows:
             raise ValueError("validation data contains no rollout windows")
         if self._pending_accumulation:
             raise RuntimeError("flush accumulated gradients before validation")
+        if not 0.0 <= rollout_probability <= 1.0:
+            raise ValueError("rollout_probability must be in [0, 1]")
+        if not 0.0 <= need_threshold <= 1.0:
+            raise ValueError("need_threshold must be in [0, 1]")
 
         generator_state = self.generator.get_state().cpu()
         shuffle_state = self.shuffle_rng.getstate()
@@ -723,6 +886,8 @@ class CIDTrainer:
         total_loss = 0.0
         total_raw_loss = 0.0
         total_transitions = 0
+        component_sums: dict[str, Tensor] = {}
+        behavior_counts: dict[str, Tensor] = {}
         try:
             self.generator.manual_seed(seed)
             self.shuffle_rng.seed(seed)
@@ -741,16 +906,27 @@ class CIDTrainer:
                             "validation micro-batch windows must have the same loss_weight"
                         )
                     loss_weight = next(iter(loss_weights))
+                    rollout_states: list[CIDRolloutState | None] = [None] * len(microbatch)
                     for offset in range(next(iter(lengths))):
-                        samples = tuple(
-                            self.tensorizer.tensorize(
-                                window.example,
-                                window.source_steps[offset],
-                                timestep=self._sample_timestep(),
-                                generator=self.generator,
+                        samples_list: list[CIDTrainingStep] = []
+                        for index, window in enumerate(microbatch):
+                            use_rollout = (
+                                offset > 0
+                                and rollout_states[index] is not None
+                                and self.shuffle_rng.random() < rollout_probability
                             )
-                            for window in microbatch
-                        )
+                            samples_list.append(
+                                self.tensorizer.tensorize(
+                                    window.example,
+                                    window.source_steps[offset],
+                                    timestep=self._sample_timestep(),
+                                    generator=self.generator,
+                                    rollout_state=(
+                                        rollout_states[index] if use_rollout else None
+                                    ),
+                                )
+                            )
+                        samples = tuple(samples_list)
                         training_batch = collate_training_steps(
                             samples, pad_token_id=int(self.pad_token_id)
                         )
@@ -766,6 +942,30 @@ class CIDTrainer:
                         total_raw_loss += raw_loss
                         total_loss += raw_loss * loss_weight
                         total_transitions += batch_size
+                        _accumulate_metric_tensors(
+                            component_sums,
+                            _cid_loss_component_values(losses),
+                            scale=batch_size,
+                        )
+                        _accumulate_metric_tensors(
+                            behavior_counts,
+                            _cid_behavior_counts(
+                                output,
+                                training_batch.targets,
+                                need_threshold=need_threshold,
+                            ),
+                        )
+                        if offset + 1 < next(iter(lengths)) and rollout_probability > 0.0:
+                            rollout_states = [
+                                self._rollout_state_from_prediction(
+                                    sample,
+                                    training_batch,
+                                    output,
+                                    example=microbatch[index].example,
+                                    batch_index=index,
+                                )
+                                for index, sample in enumerate(samples)
+                            ]
                         del output, training_batch, losses, samples
         finally:
             self.generator.set_state(generator_state)
@@ -777,6 +977,10 @@ class CIDTrainer:
             optimizer_steps=0,
             mean_loss=total_loss / total_transitions,
             raw_mean_loss=total_raw_loss / total_transitions,
+            component_mean_losses=_metric_tensor_means(
+                component_sums, total_transitions
+            ),
+            behavior_counts=_metric_tensor_values(behavior_counts),
         )
 
     def _rollout_microbatches(
@@ -883,7 +1087,9 @@ class CIDTrainer:
         }
 
     def restore_local_progress_state(self, state: Mapping[str, Any]) -> None:
-        if state["trainer_config"] != asdict(self.config):
+        saved_config = dict(state["trainer_config"])
+        saved_config.setdefault("semantic_pooling", "mean-v1")
+        if saved_config != asdict(self.config):
             raise ValueError("checkpoint trainer configuration does not match this trainer")
         trainer_state = state["trainer_state"]
         self.state = CIDTrainerState(
@@ -916,6 +1122,7 @@ class CIDTrainer:
         """
 
         saved_config = dict(state["trainer_config"])
+        saved_config.setdefault("semantic_pooling", "mean-v1")
         current_config = asdict(self.config)
         saved_config["gradient_accumulation_steps"] = current_config["gradient_accumulation_steps"]
         if saved_config != current_config:
@@ -977,6 +1184,7 @@ class CIDTrainer:
         if checkpoint.get("neural_contract_version") != CID_NEURAL_CONTRACT_VERSION:
             raise ValueError("CID trainer checkpoint neural contract is incompatible")
         saved_trainer_config = dict(checkpoint["trainer_config"])
+        saved_trainer_config.setdefault("semantic_pooling", "mean-v1")
         current_trainer_config = asdict(self.config)
         if saved_trainer_config != current_trainer_config:
             saved_geometry = (
@@ -2717,6 +2925,7 @@ def save_stage_b_checkpoint(
             ),
             "world_size": dist.get_world_size(),
             "dataset_sha256": dataset_sha256,
+            "semantic_pooling": getattr(trainer.config, "semantic_pooling", "mean-v1"),
             "adapter_config": asdict(trainer.adapter.config),
             "backbone": {
                 "model_type": str(trainer.adapter.backbone.config.model_type),
