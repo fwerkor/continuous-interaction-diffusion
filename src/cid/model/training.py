@@ -976,8 +976,38 @@ class CIDTrainer:
             raise ValueError("unsupported CID trainer checkpoint version")
         if checkpoint.get("neural_contract_version") != CID_NEURAL_CONTRACT_VERSION:
             raise ValueError("CID trainer checkpoint neural contract is incompatible")
-        if checkpoint["trainer_config"] != asdict(self.config):
-            raise ValueError("checkpoint trainer configuration does not match this trainer")
+        saved_trainer_config = dict(checkpoint["trainer_config"])
+        current_trainer_config = asdict(self.config)
+        if saved_trainer_config != current_trainer_config:
+            saved_geometry = (
+                int(saved_trainer_config.get("micro_batch_size", 1)),
+                int(saved_trainer_config.get("gradient_accumulation_steps", 1)),
+            )
+            current_geometry = (
+                int(current_trainer_config.get("micro_batch_size", 1)),
+                int(current_trainer_config.get("gradient_accumulation_steps", 1)),
+            )
+            saved_without_geometry = dict(saved_trainer_config)
+            current_without_geometry = dict(current_trainer_config)
+            for key in ("micro_batch_size", "gradient_accumulation_steps"):
+                saved_without_geometry.pop(key, None)
+                current_without_geometry.pop(key, None)
+            trainer_state = checkpoint.get("trainer_state", {})
+            clean_epoch_boundary = (
+                int(trainer_state.get("rollout_windows_seen_in_epoch", 0)) == 0
+                and int(checkpoint.get("pending_accumulation", 0)) == 0
+                and int(checkpoint.get("pending_examples", 0)) == 0
+            )
+            equivalent_geometry = (
+                saved_geometry[0] * saved_geometry[1]
+                == current_geometry[0] * current_geometry[1]
+            )
+            if not (
+                clean_epoch_boundary
+                and equivalent_geometry
+                and saved_without_geometry == current_without_geometry
+            ):
+                raise ValueError("checkpoint trainer configuration does not match this trainer")
         if checkpoint["adapter_config"] != asdict(self.adapter.config):
             raise ValueError("checkpoint CID adapter configuration does not match this adapter")
         if tuple(checkpoint["trainable_names"]) != self.trainable_parameter_names:

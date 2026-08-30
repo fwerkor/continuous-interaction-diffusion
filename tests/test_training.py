@@ -2157,3 +2157,48 @@ def test_stage_a_checkpoint_without_data_order_marker_loads_legacy_order(tmp_pat
     restored.load_checkpoint(checkpoint)
 
     assert restored.data_order_version == 1
+
+
+def test_checkpoint_allows_equivalent_batch_geometry_at_clean_epoch_boundary(tmp_path) -> None:
+    adapter = make_adapter(seed=321)
+    config = CIDTrainerConfig(micro_batch_size=4, gradient_accumulation_steps=6)
+    trainer = CIDTrainer(
+        adapter, ILLaDATrajectoryTensorizer(adapter, TinyTokenizer()), config
+    )
+    trainer.state = CIDTrainerState(
+        transitions_seen=96, optimizer_steps=1, epochs_completed=1, rollout_windows_seen_in_epoch=0
+    )
+    checkpoint = tmp_path / "epoch-boundary.pt"
+    trainer.save_checkpoint(checkpoint)
+
+    restored_adapter = make_adapter(seed=321)
+    restored = CIDTrainer(
+        restored_adapter,
+        ILLaDATrajectoryTensorizer(restored_adapter, TinyTokenizer()),
+        CIDTrainerConfig(micro_batch_size=8, gradient_accumulation_steps=3),
+    )
+    restored.load_checkpoint(checkpoint)
+
+    assert restored.state.epochs_completed == 1
+    assert restored.state.rollout_windows_seen_in_epoch == 0
+
+
+def test_checkpoint_rejects_batch_geometry_change_mid_epoch(tmp_path) -> None:
+    adapter = make_adapter(seed=322)
+    trainer = CIDTrainer(
+        adapter,
+        ILLaDATrajectoryTensorizer(adapter, TinyTokenizer()),
+        CIDTrainerConfig(micro_batch_size=4, gradient_accumulation_steps=6),
+    )
+    trainer.state = CIDTrainerState(rollout_windows_seen_in_epoch=8)
+    checkpoint = tmp_path / "mid-epoch.pt"
+    trainer.save_checkpoint(checkpoint)
+
+    restored_adapter = make_adapter(seed=322)
+    restored = CIDTrainer(
+        restored_adapter,
+        ILLaDATrajectoryTensorizer(restored_adapter, TinyTokenizer()),
+        CIDTrainerConfig(micro_batch_size=8, gradient_accumulation_steps=3),
+    )
+    with pytest.raises(ValueError, match="trainer configuration"):
+        restored.load_checkpoint(checkpoint)
