@@ -1398,6 +1398,7 @@ def _train_stage_a(args: argparse.Namespace) -> None:
                 shuffle=not args.no_shuffle,
                 micro_batch_size=args.micro_batch_size,
                 legacy_resume_padding=legacy_partial_resume,
+                length_aware=trainer.data_order_version >= 2,
             )
             total_local_windows = len(local_windows)
             resumed_windows = trainer.state.rollout_windows_seen_in_epoch
@@ -1537,6 +1538,8 @@ def _train_stage_a(args: argparse.Namespace) -> None:
             raw_mean_loss = raw_loss_sum / transition_count
 
             checkpoint = output_dir / f"stage-a-epoch-{epoch:04d}.pt"
+            if trainer.data_order_version < 2:
+                trainer.data_order_version = 2
             if rank == 0:
                 trainer.save_checkpoint(checkpoint)
                 step_alias = output_dir / f"stage-a-step-{trainer.state.optimizer_steps:08d}.pt"
@@ -2057,6 +2060,7 @@ def _train_stage_b(args: argparse.Namespace) -> None:
                 shuffle=not args.no_shuffle,
                 micro_batch_size=args.micro_batch_size,
                 consumed_windows_by_bucket=epoch_base_consumed,
+                length_aware=trainer.data_order_version >= 2,
             )
             total_local_windows = len(epoch_shard)
             resumed_windows = trainer.state.rollout_windows_seen_in_epoch

@@ -339,6 +339,7 @@ class CIDTrainer:
         self.generator.manual_seed(self.config.seed)
         self.shuffle_rng = random.Random(self.config.seed)
         self.state = CIDTrainerState()
+        self.data_order_version = 2
         self._pending_accumulation = 0
         self._pending_examples = 0
         self.pad_token_id = getattr(tensorizer.tokenizer, "pad_token_id", None)
@@ -878,6 +879,7 @@ class CIDTrainer:
             "trainer_state": asdict(self.state),
             "generator_state": self.generator.get_state().cpu(),
             "shuffle_state": self.shuffle_rng.getstate(),
+            "data_order_version": self.data_order_version,
         }
 
     def restore_local_progress_state(self, state: Mapping[str, Any]) -> None:
@@ -894,6 +896,7 @@ class CIDTrainer:
         )
         self.generator.set_state(state["generator_state"])
         self.shuffle_rng.setstate(state["shuffle_state"])
+        self.data_order_version = int(state.get("data_order_version", 1))
         self._pending_accumulation = 0
         self._pending_examples = 0
         self.optimizer.zero_grad(set_to_none=True)
@@ -926,6 +929,7 @@ class CIDTrainer:
         )
         self._pending_accumulation = 0
         self._pending_examples = 0
+        self.data_order_version = int(state.get("data_order_version", 1))
         self.optimizer.zero_grad(set_to_none=True)
         self.reseed(seed)
 
@@ -960,6 +964,7 @@ class CIDTrainer:
             "gradient_state": gradient_state,
             "pending_accumulation": self._pending_accumulation,
             "pending_examples": self._pending_examples,
+            "data_order_version": self.data_order_version,
         }
         temporary = destination.with_name(f".{destination.name}.tmp")
         torch.save(payload, temporary)
@@ -996,6 +1001,7 @@ class CIDTrainer:
         self.optimizer.load_state_dict(checkpoint["optimizer_state"])
         self.generator.set_state(checkpoint["generator_state"])
         self.shuffle_rng.setstate(checkpoint["shuffle_state"])
+        self.data_order_version = int(checkpoint.get("data_order_version", 1))
         state = checkpoint["trainer_state"]
         self.state = CIDTrainerState(
             transitions_seen=int(state["transitions_seen"]),
@@ -2211,6 +2217,14 @@ def stage_b_consumed_windows_by_bucket(
     return {key: value for key, value in consumed.items() if value}
 
 
+def _rollout_window_length_key(window: CIDRolloutWindow) -> int:
+    display_chars = max(
+        (len(target.text) for target in window.example.display_targets),
+        default=len(window.example.target_display),
+    )
+    return len(window.example.prompt) + display_chars
+
+
 def shard_rollout_windows(
     windows: tuple[CIDRolloutWindow, ...],
     *,
@@ -2222,6 +2236,7 @@ def shard_rollout_windows(
     micro_batch_size: int = 1,
     consumed_windows_by_bucket: Mapping[str, int] | None = None,
     legacy_resume_padding: bool = False,
+    length_aware: bool = False,
 ) -> tuple[CIDRolloutWindow, ...]:
     if world_size <= 0:
         raise ValueError("world_size must be positive")
@@ -2264,6 +2279,23 @@ def shard_rollout_windows(
                 bucket.extend(original[:padding])
             else:
                 bucket.extend(original[index % len(original)] for index in range(padding))
+        if length_aware and len(bucket) > 1:
+            # Keep each rank-local logical microbatch close in sequence geometry.
+            # Global super-batches are shuffled as units, so sample order remains
+            # stochastic without letting one long trajectory pad many short ones.
+            global_microbatch = world_size * micro_batch_size
+            bucket.sort(key=_rollout_window_length_key)
+            groups = [
+                bucket[start : start + global_microbatch]
+                for start in range(0, len(bucket), global_microbatch)
+            ]
+            if shuffle:
+                for group_index, group in enumerate(groups):
+                    random.Random(
+                        seed + epoch * 1_000_033 + bucket_index * 10_007 + group_index
+                    ).shuffle(group)
+                random.Random(seed + epoch * 1_000_037 + bucket_index * 101).shuffle(groups)
+            bucket = [window for group in groups for window in group]
         local_bucket = bucket[rank::world_size]
         if legacy_resume_padding:
             target_local_windows = math.ceil(len(original) / world_size)

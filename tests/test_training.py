@@ -2099,3 +2099,61 @@ def test_binding_lifecycle_cells_marks_once_observation_targets_available() -> N
     waiting, available = ILLaDATrajectoryTensorizer._binding_lifecycle_cells(example, 2)
     assert waiting == set()
     assert available == {"answer"}
+
+
+def test_rollout_sharding_length_aware_limits_padding_spread() -> None:
+    base = make_trajectory()
+    windows = tuple(
+        CIDRolloutWindow(
+            example=replace(
+                base,
+                example_id=f"length-{index}",
+                prompt="x" * (64 + index * 64),
+            ),
+            source_steps=(0,),
+            loss_weight=1.0,
+        )
+        for index in range(32)
+    )
+    shards = tuple(
+        shard_rollout_windows(
+            windows,
+            world_size=4,
+            rank=rank,
+            seed=9,
+            epoch=2,
+            micro_batch_size=2,
+            length_aware=True,
+        )
+        for rank in range(4)
+    )
+
+    for shard in shards:
+        assert len(shard) == 8
+        for start in range(0, len(shard), 2):
+            lengths = [len(window.example.prompt) for window in shard[start : start + 2]]
+            assert max(lengths) - min(lengths) <= 7 * 64
+
+
+def test_stage_a_checkpoint_without_data_order_marker_loads_legacy_order(tmp_path) -> None:
+    adapter = make_adapter(seed=123)
+    trainer = CIDTrainer(
+        adapter,
+        ILLaDATrajectoryTensorizer(adapter, TinyTokenizer()),
+        CIDTrainerConfig(),
+    )
+    checkpoint = tmp_path / "checkpoint.pt"
+    trainer.save_checkpoint(checkpoint)
+    payload = torch.load(checkpoint, map_location="cpu", weights_only=False)
+    payload.pop("data_order_version")
+    torch.save(payload, checkpoint)
+
+    restored_adapter = make_adapter(seed=123)
+    restored = CIDTrainer(
+        restored_adapter,
+        ILLaDATrajectoryTensorizer(restored_adapter, TinyTokenizer()),
+        CIDTrainerConfig(),
+    )
+    restored.load_checkpoint(checkpoint)
+
+    assert restored.data_order_version == 1
