@@ -1675,12 +1675,35 @@ class CIDTrainer:
             if parameter.grad is not None:
                 parameter.grad.div_(normalizer)
         if self.gradient_clipper is None:
-            torch.nn.utils.clip_grad_norm_(
+            gradient_norm = torch.nn.utils.clip_grad_norm_(
                 (parameter for _, parameter in self._trainable),
                 self.config.max_grad_norm,
             )
         else:
-            self.gradient_clipper(self.config.max_grad_norm)
+            gradient_norm = self.gradient_clipper(self.config.max_grad_norm)
+        if isinstance(gradient_norm, Tensor):
+            finite_gradient_norm = bool(torch.isfinite(gradient_norm.detach()).all())
+            reported_gradient_norm = float(gradient_norm.detach().float().cpu())
+        else:
+            reported_gradient_norm = float(gradient_norm)
+            finite_gradient_norm = math.isfinite(reported_gradient_norm)
+        if torch.distributed.is_available() and torch.distributed.is_initialized():
+            finite_flag = torch.tensor(
+                int(finite_gradient_norm),
+                device=self.tensorizer.text_encoder.device,
+                dtype=torch.int32,
+            )
+            torch.distributed.all_reduce(finite_flag, op=torch.distributed.ReduceOp.SUM)
+            finite_gradient_norm = int(finite_flag.item()) == torch.distributed.get_world_size()
+        if not finite_gradient_norm:
+            self.optimizer.zero_grad(set_to_none=True)
+            self._pending_accumulation = 0
+            self._pending_examples = 0
+            self._pending_global_examples = 0
+            raise FloatingPointError(
+                "non-finite CID gradient norm on at least one rank before optimizer step; "
+                f"local_norm={reported_gradient_norm}"
+            )
         self.optimizer.step()
         self.optimizer.zero_grad(set_to_none=True)
         self._pending_accumulation = 0
@@ -2058,6 +2081,7 @@ class ILLaDATrajectoryTensorizer:
                 None if rollout_state is None else frozenset(rollout_state.executable_binding_ids)
             ),
             percept_projections=(None if rollout_state is None else percept_projections),
+            percept_routes=(None if rollout_state is None else percept_routes),
         )
         fact_memory = self.text_encoder.encode_texts(
             (
@@ -2311,27 +2335,32 @@ class ILLaDATrajectoryTensorizer:
                 return True
         return False
 
-    @staticmethod
     def _promoted_fact_texts(
+        self,
         example: TrajectoryExample,
         target_step: int,
         *,
         carried: tuple[str, ...],
         allowed_binding_ids: frozenset[str] | None,
         percept_projections: tuple[tuple[Any, Any], ...] | None = None,
+        percept_routes: tuple[CIDRolloutBindingRoute, ...] | None = None,
     ) -> tuple[str, ...]:
         texts = list(carried)
         descriptors = {str(item.get("name", "")): item for item in example.source_descriptors}
         if percept_projections is not None:
-            for binding, event in percept_projections:
+            if percept_routes is None or len(percept_routes) != len(percept_projections):
+                raise ValueError("closed-loop promoted facts require matching runtime routes")
+            for (binding, event), route in zip(
+                percept_projections, percept_routes, strict=True
+            ):
                 descriptor = descriptors.get(binding.source)
                 if descriptor is None or not bool(descriptor.get("promote_results_to_fact", False)):
                     continue
-                prefix = f"fact=binding:{binding.need_id} |"
+                prefix = f"fact=binding:{route.need_id} |"
                 texts = [text for text in texts if not text.startswith(prefix)]
                 texts.append(
                     canonical_fact_text(
-                        key=f"binding:{binding.need_id}",
+                        key=f"binding:{route.need_id}",
                         value=event.value,
                         source_type=binding.source,
                         version=event.version,
@@ -2356,8 +2385,9 @@ class ILLaDATrajectoryTensorizer:
             if not matching:
                 continue
             event = max(matching, key=lambda item: item.arrival_step)
+            runtime_need_id = self._runtime_need_id_for_binding(example, binding)
             text = canonical_fact_text(
-                key=f"binding:{binding.need_id}",
+                key=f"binding:{runtime_need_id}",
                 value=event.value,
                 source_type=binding.source,
                 version=event.version,
@@ -2366,6 +2396,15 @@ class ILLaDATrajectoryTensorizer:
                 texts.append(text)
                 seen.add(text)
         return tuple(texts)
+
+    def _runtime_need_id_for_binding(self, example: TrajectoryExample, binding: Any) -> str:
+        owner = binding.owner_cell
+        if owner is None:
+            return binding.need_id
+        need_slot = self._binding_slot_schedule(example).get((owner.identifier, binding.need_id))
+        if need_slot is None:
+            return binding.need_id
+        return f"need:{owner.identifier}:{need_slot}"
 
     def _percept_target_masks(
         self,

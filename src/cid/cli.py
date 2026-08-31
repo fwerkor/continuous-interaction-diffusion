@@ -25,7 +25,14 @@ from cid.computational_training import (
 )
 from cid.contracts import FreshnessDemand, InformationNeed, ModelContext, ModelUpdate
 from cid.correction_training import CorrectionTrainingConfig, build_correction_training
-from cid.data import TrajectoryExample, dump_jsonl, index_training_jsonl, load_jsonl
+from cid.data import (
+    TrajectoryExample,
+    TrajectoryExampleIndex,
+    dump_jsonl,
+    index_training_and_validation_jsonl,
+    index_training_jsonl,
+    load_jsonl,
+)
 from cid.dataset import dump_dataset_manifest, inspect_dataset, validate_neural_training_contract
 from cid.distill import (
     TeacherScheduleConfig,
@@ -1182,6 +1189,41 @@ def _load_explicit_validation_examples(
     return validation_examples
 
 
+def _index_train_and_load_validation_examples(
+    data_path: str | Path,
+    *,
+    validation_data_path: str | Path | None,
+    max_examples: int | None,
+    max_validation_examples: int | None,
+) -> tuple[tuple[TrajectoryExampleIndex, ...], tuple[TrajectoryExample, ...]]:
+    """Keep training data compact while materializing only held-out trajectories."""
+
+    if max_validation_examples is not None and max_validation_examples < 0:
+        raise ValueError("max_validation_examples must be non-negative when set")
+    if validation_data_path is None:
+        training_examples, validation_examples = index_training_and_validation_jsonl(
+            data_path,
+            max_examples=max_examples,
+            max_validation_examples=max_validation_examples,
+        )
+    else:
+        training_examples = index_training_jsonl(data_path, max_examples=max_examples)
+        validation_examples = _load_explicit_validation_examples(
+            validation_data_path,
+            max_validation_examples=max_validation_examples,
+        )
+    validation_ids = {example.example_id for example in validation_examples}
+    overlapping_ids = validation_ids.intersection(
+        example.example_id for example in training_examples
+    )
+    if overlapping_ids:
+        sample = sorted(overlapping_ids)[:3]
+        raise ValueError(
+            "training and validation data overlap by example_id: " + ", ".join(sample)
+        )
+    return training_examples, validation_examples
+
+
 def _load_train_and_validation_examples(
     data_path: str | Path,
     *,
@@ -1493,29 +1535,12 @@ def _train_stage_a(args: argparse.Namespace) -> None:
         if distributed:
             trainer.reseed(args.seed + rank + trainer.state.transitions_seen * 104729)
 
-        indexed_training = args.validation_data is not None
-        if indexed_training:
-            examples = index_training_jsonl(args.data, max_examples=args.max_examples)
-            validation_examples = _load_explicit_validation_examples(
-                args.validation_data,
-                max_validation_examples=args.max_validation_examples,
-            )
-            validation_ids = {example.example_id for example in validation_examples}
-            overlapping_ids = validation_ids.intersection(
-                example.example_id for example in examples
-            )
-            if overlapping_ids:
-                sample = sorted(overlapping_ids)[:3]
-                raise ValueError(
-                    "training and validation data overlap by example_id: " + ", ".join(sample)
-                )
-        else:
-            examples, validation_examples = _load_train_and_validation_examples(
-                args.data,
-                validation_data_path=None,
-                max_examples=args.max_examples,
-                max_validation_examples=args.max_validation_examples,
-            )
+        examples, validation_examples = _index_train_and_load_validation_examples(
+            args.data,
+            validation_data_path=args.validation_data,
+            max_examples=args.max_examples,
+            max_validation_examples=args.max_validation_examples,
+        )
         windows = balance_rollout_windows_by_semantic_task(
             trajectory_rollout_windows(examples, max_horizon=args.rollout_horizon)
         )
@@ -1660,8 +1685,7 @@ def _train_stage_a(args: argparse.Namespace) -> None:
                         f"windows_seen={resumed_windows}/{total_local_windows}",
                         flush=True,
                     )
-            if indexed_training:
-                local_windows = materialize_indexed_rollout_windows(args.data, local_windows)
+            local_windows = materialize_indexed_rollout_windows(args.data, local_windows)
             rollout_probability = trainer.rollout_probability()
 
             def report_progress(
@@ -2005,29 +2029,12 @@ def _train_stage_b(args: argparse.Namespace) -> None:
                 f"{dataset_manifest.thought_capacity_required} > {args.thought_capacity}"
             )
 
-        indexed_training = args.validation_data is not None
-        if indexed_training:
-            examples = index_training_jsonl(args.data, max_examples=args.max_examples)
-            validation_examples = _load_explicit_validation_examples(
-                args.validation_data,
-                max_validation_examples=args.max_validation_examples,
-            )
-            validation_ids = {example.example_id for example in validation_examples}
-            overlapping_ids = validation_ids.intersection(
-                example.example_id for example in examples
-            )
-            if overlapping_ids:
-                sample = sorted(overlapping_ids)[:3]
-                raise ValueError(
-                    "training and validation data overlap by example_id: " + ", ".join(sample)
-                )
-        else:
-            examples, validation_examples = _load_train_and_validation_examples(
-                args.data,
-                validation_data_path=None,
-                max_examples=args.max_examples,
-                max_validation_examples=args.max_validation_examples,
-            )
+        examples, validation_examples = _index_train_and_load_validation_examples(
+            args.data,
+            validation_data_path=args.validation_data,
+            max_examples=args.max_examples,
+            max_validation_examples=args.max_validation_examples,
+        )
         windows = balance_rollout_windows_by_semantic_task(
             trajectory_rollout_windows(examples, max_horizon=args.rollout_horizon)
         )
@@ -2338,8 +2345,7 @@ def _train_stage_b(args: argparse.Namespace) -> None:
                     f"new_world_size={world_size} optimizer_steps={trainer.state.optimizer_steps}",
                     flush=True,
                 )
-            if indexed_training:
-                local_windows = materialize_indexed_rollout_windows(args.data, local_windows)
+            local_windows = materialize_indexed_rollout_windows(args.data, local_windows)
             rollout_probability = trainer.rollout_probability()
 
             def report_progress(

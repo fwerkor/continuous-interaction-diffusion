@@ -324,37 +324,12 @@ def index_training_jsonl(
                 split = str(metadata.get("split", "")).strip().lower()
                 if split in {"validation", "test"}:
                     continue
-                steps = tuple(int(item["step"]) for item in raw.get("thought_targets", ()))
-                training_steps = training_transition_source_steps(steps)
-                display_lengths = tuple(
-                    len(str(item.get("text", ""))) for item in raw.get("display_targets", ())
-                )
-                rollout_length_key = len(str(raw.get("prompt", ""))) + max(
-                    display_lengths,
-                    default=len(str(raw.get("target_display", ""))),
-                )
-                compact_metadata = {
-                    key: metadata[key]
-                    for key in ("semantic_task_id", "training_weight")
-                    if key in metadata
-                }
-                max_age_binding_id = next(
-                    (
-                        str(binding.get("need_id", ""))
-                        for binding in raw.get("binding_targets", ())
-                        if str(binding.get("freshness", "once")) == "max_age"
-                    ),
-                    None,
-                )
                 indexed.append(
-                    TrajectoryExampleIndex(
+                    _trajectory_example_index(
+                        raw,
+                        metadata=metadata,
                         offset=offset,
                         length=len(line),
-                        example_id=str(raw["example_id"]),
-                        metadata=compact_metadata,
-                        training_source_steps=training_steps,
-                        rollout_length_key=rollout_length_key,
-                        max_age_binding_id=max_age_binding_id,
                     )
                 )
             except (KeyError, TypeError, ValueError, json.JSONDecodeError) as exc:
@@ -366,6 +341,102 @@ def index_training_jsonl(
     if not indexed:
         raise ValueError("training data contains no train examples")
     return tuple(indexed)
+
+
+def index_training_and_validation_jsonl(
+    path: str | Path,
+    *,
+    max_examples: int | None = None,
+    max_validation_examples: int | None = None,
+) -> tuple[tuple[TrajectoryExampleIndex, ...], tuple[TrajectoryExample, ...]]:
+    """Index training rows and materialize inline validation rows in one file pass."""
+
+    if max_examples is not None and max_examples <= 0:
+        raise ValueError("max_examples must be positive when set")
+    if max_validation_examples is not None and max_validation_examples < 0:
+        raise ValueError("max_validation_examples must be non-negative when set")
+    source = Path(path)
+    indexed: list[TrajectoryExampleIndex] = []
+    validation: list[TrajectoryExample] = []
+    with source.open("rb") as handle:
+        line_number = 0
+        while True:
+            offset = handle.tell()
+            line = handle.readline()
+            if not line:
+                break
+            line_number += 1
+            if not line.strip():
+                continue
+            try:
+                raw = json.loads(line)
+                metadata = dict(raw.get("metadata", {}))
+                split = str(metadata.get("split", "")).strip().lower()
+                if split == "test":
+                    continue
+                if split == "validation":
+                    if (
+                        max_validation_examples is None
+                        or len(validation) < max_validation_examples
+                    ):
+                        validation.append(TrajectoryExample.from_dict(raw))
+                    continue
+                if max_examples is None or len(indexed) < max_examples:
+                    indexed.append(
+                        _trajectory_example_index(
+                            raw,
+                            metadata=metadata,
+                            offset=offset,
+                            length=len(line),
+                        )
+                    )
+            except (KeyError, TypeError, ValueError, json.JSONDecodeError) as exc:
+                raise ValueError(
+                    f"invalid CID trajectory index at line {line_number}: {exc}"
+                ) from exc
+    if not indexed:
+        raise ValueError("training data contains no train examples")
+    return tuple(indexed), tuple(validation)
+
+
+def _trajectory_example_index(
+    raw: Mapping[str, Any],
+    *,
+    metadata: Mapping[str, Any],
+    offset: int,
+    length: int,
+) -> TrajectoryExampleIndex:
+    steps = tuple(int(item["step"]) for item in raw.get("thought_targets", ()))
+    training_steps = training_transition_source_steps(steps)
+    display_lengths = tuple(
+        len(str(item.get("text", ""))) for item in raw.get("display_targets", ())
+    )
+    rollout_length_key = len(str(raw.get("prompt", ""))) + max(
+        display_lengths,
+        default=len(str(raw.get("target_display", ""))),
+    )
+    compact_metadata = {
+        key: metadata[key]
+        for key in ("semantic_task_id", "training_weight")
+        if key in metadata
+    }
+    max_age_binding_id = next(
+        (
+            str(binding.get("need_id", ""))
+            for binding in raw.get("binding_targets", ())
+            if str(binding.get("freshness", "once")) == "max_age"
+        ),
+        None,
+    )
+    return TrajectoryExampleIndex(
+        offset=offset,
+        length=length,
+        example_id=str(raw["example_id"]),
+        metadata=compact_metadata,
+        training_source_steps=training_steps,
+        rollout_length_key=rollout_length_key,
+        max_age_binding_id=max_age_binding_id,
+    )
 
 
 def load_indexed_jsonl(

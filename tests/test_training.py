@@ -20,6 +20,7 @@ from cid.data import (
     GroundingTarget,
     ThoughtTarget,
     TrajectoryExample,
+    TrajectoryExampleIndex,
     dump_jsonl,
     index_training_jsonl,
 )
@@ -39,6 +40,7 @@ CIDTrainer = cid_model.CIDTrainer
 CIDTrainerConfig = cid_model.CIDTrainerConfig
 CIDTrainerState = cid_model.CIDTrainerState
 CIDRolloutState = cid_model.CIDRolloutState
+CIDRolloutBindingRoute = cid_model.CIDRolloutBindingRoute
 CIDRolloutWindow = cid_model.CIDRolloutWindow
 balance_rollout_windows_by_semantic_task = cid_model.balance_rollout_windows_by_semantic_task
 collate_training_steps = cid_model.collate_training_steps
@@ -444,6 +446,29 @@ def test_trajectory_tensorizer_runs_full_optimizer_step() -> None:
 
     assert not torch.equal(before, adapter.output_heads.allocation_head.weight)
     assert all(parameter.grad is None for parameter in adapter.backbone.parameters())
+
+
+def test_optimizer_step_rejects_nonfinite_gradient_before_parameter_update() -> None:
+    adapter = make_adapter(seed=166)
+    trainer = CIDTrainer(
+        adapter,
+        ILLaDATrajectoryTensorizer(adapter, TinyTokenizer()),
+        CIDTrainerConfig(learning_rate=1e-3),
+    )
+    parameter = next(parameter for _, parameter in trainer._trainable)
+    before = parameter.detach().clone()
+    parameter.grad = torch.full_like(parameter, float("inf"))
+    trainer._pending_accumulation = 1
+    trainer._pending_examples = 1
+    trainer._pending_global_examples = 1
+
+    with pytest.raises(FloatingPointError, match="non-finite CID gradient norm"):
+        trainer._optimizer_step()
+
+    assert torch.equal(parameter, before)
+    assert parameter.grad is None
+    assert trainer.pending_accumulation_steps == 0
+    assert trainer.state.optimizer_steps == 0
 
 
 def test_trajectory_tensorizer_rejects_display_that_exceeds_fixed_canvas() -> None:
@@ -1317,6 +1342,42 @@ def test_training_validation_split_excludes_validation_and_test(tmp_path) -> Non
     assert tuple(example.example_id for example in validation) == ("split-validation",)
 
 
+def test_training_index_path_keeps_inline_validation_without_materializing_train(tmp_path) -> None:
+    from cid.cli import _index_train_and_load_validation_examples
+
+    base = make_trajectory()
+    examples = (
+        replace(
+            base,
+            example_id="indexed-train",
+            metadata={**base.metadata, "split": "train"},
+        ),
+        replace(
+            base,
+            example_id="indexed-validation",
+            metadata={**base.metadata, "split": "validation"},
+        ),
+        replace(
+            base,
+            example_id="indexed-test",
+            metadata={**base.metadata, "split": "test"},
+        ),
+    )
+    data = tmp_path / "mixed-indexed.jsonl"
+    dump_jsonl(examples, data)
+
+    training, validation = _index_train_and_load_validation_examples(
+        data,
+        validation_data_path=None,
+        max_examples=None,
+        max_validation_examples=None,
+    )
+
+    assert all(isinstance(example, TrajectoryExampleIndex) for example in training)
+    assert tuple(example.example_id for example in training) == ("indexed-train",)
+    assert tuple(example.example_id for example in validation) == ("indexed-validation",)
+
+
 def test_transition_sharding_is_balanced_deterministic_and_complete() -> None:
     examples = tuple(replace(make_trajectory(), example_id=f"train-{index}") for index in range(5))
     transitions = trajectory_transitions(examples)
@@ -2077,6 +2138,77 @@ def test_partial_argument_binding_does_not_unlock_full_teacher_observation() -> 
     assert len(projections) == 1
     assert projections[0][1].value == "candidate"
     assert dict(observation_steps)[routes[0].need_id] == 1
+
+
+def test_promoted_facts_use_runtime_need_ids_in_teacher_and_closed_loop() -> None:
+    adapter = make_adapter(seed=167)
+    tensorizer = ILLaDATrajectoryTensorizer(adapter, TinyTokenizer())
+    base = make_rollout_trajectory()
+    binding = replace(base.binding_targets[0], owner_cell_id="c1")
+    descriptor = dict(base.source_descriptors[0])
+    descriptor["promote_results_to_fact"] = True
+    event = ExternalEvent(
+        source=binding.source,
+        value="37",
+        arrival_step=2,
+        version="v1",
+        arguments=binding.arguments,
+    )
+    example = replace(
+        base,
+        source_descriptors=(descriptor,),
+        binding_targets=(binding,),
+        events=(event,),
+    )
+
+    teacher = tensorizer.tensorize(example, source_step=1, timestep=0.0)
+
+    assert any(
+        text.startswith("fact=binding:need:c1:0 |") for text in teacher.promoted_fact_texts
+    )
+    assert not any(
+        text.startswith(f"fact=binding:{binding.need_id} |")
+        for text in teacher.promoted_fact_texts
+    )
+
+    runtime_need_id = "need:c1:3"
+    rollout = CIDRolloutState(
+        thought_semantic=teacher.batch.thought_semantic.clone(),
+        role_features=teacher.batch.role_features.clone(),
+        uncertainty=teacher.batch.uncertainty.clone(),
+        lifecycle_features=teacher.batch.lifecycle_features.clone(),
+        slot_occupancy=teacher.batch.slot_occupancy.clone(),
+        local_noise=teacher.batch.local_noise.clone(),
+        display_ids=teacher.batch.display_ids.clone(),
+        active_binding_ids=(runtime_need_id,),
+        executable_binding_ids=(runtime_need_id,),
+        binding_routes=(
+            CIDRolloutBindingRoute(
+                need_id=runtime_need_id,
+                target_cells=binding.target_cells,
+                target_display=binding.target_display,
+                freshness=binding.freshness,
+                source=binding.source,
+                arguments=binding.arguments,
+                replay_binding_id=binding.need_id,
+            ),
+        ),
+    )
+    closed_loop = tensorizer.tensorize(
+        example,
+        source_step=1,
+        timestep=0.0,
+        rollout_state=rollout,
+    )
+
+    assert any(
+        text.startswith(f"fact=binding:{runtime_need_id} |")
+        for text in closed_loop.promoted_fact_texts
+    )
+    assert not any(
+        text.startswith(f"fact=binding:{binding.need_id} |")
+        for text in closed_loop.promoted_fact_texts
+    )
 
 
 def test_predicted_binding_requires_live_owner_and_carries_predicted_routes() -> None:
