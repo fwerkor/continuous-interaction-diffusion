@@ -118,6 +118,7 @@ class CIDTrainingStep:
     input_binding_routes: tuple[CIDRolloutBindingRoute, ...] = ()
     input_runtime_cell_ids: tuple[str | None, ...] = ()
     input_next_cell_serial: int = 0
+    input_retired_at: tuple[tuple[str, int], ...] = ()
 
 
 @dataclass(slots=True)
@@ -165,6 +166,7 @@ class CIDRolloutState:
     binding_observation_steps: tuple[tuple[str, int], ...] = ()
     terminal_validated_binding_ids: tuple[str, ...] = ()
     promoted_fact_texts: tuple[str, ...] = ()
+    retired_at: tuple[tuple[str, int], ...] = ()
     equilibrium: bool = False
     converged: bool = False
     quiescent: bool = False
@@ -178,6 +180,7 @@ class _TeacherRuntimeTransition:
     target_output_slots: Mapping[str, int]
     input_runtime_cell_ids: tuple[str | None, ...]
     input_next_cell_serial: int
+    input_retired_at: tuple[tuple[str, int], ...]
     runtime_ids_by_teacher: Mapping[str, str]
 
 
@@ -999,6 +1002,24 @@ class CIDTrainer:
                 )
             lifecycle_features[0, slot, MODELED_LIFECYCLES.index(resolved)] = 1.0
 
+        final_lifecycle_indices = lifecycle_features.argmax(dim=-1)
+        retired_at = dict(sample.input_retired_at)
+        occupied_ids = {cell_id for cell_id in runtime_cell_ids if cell_id is not None}
+        retired_at = {
+            cell_id: retired_step
+            for cell_id, retired_step in retired_at.items()
+            if cell_id in occupied_ids
+        }
+        for slot in range(thought_slots):
+            if not bool(occupancy[0, slot, 0]):
+                continue
+            cell_id = runtime_cell_ids[slot]
+            if cell_id is None:
+                raise ValueError("occupied rollout slot is missing runtime cell identity")
+            if int(final_lifecycle_indices[0, slot]) == retired_index:
+                retired_at.setdefault(cell_id, sample.target_step)
+            else:
+                retired_at.pop(cell_id, None)
         input_noise = input_batch.local_noise[batch_index : batch_index + 1, slot_slice]
         base_noise = torch.where(
             previous_occupancy,
@@ -1070,6 +1091,7 @@ class CIDTrainer:
             binding_observation_steps=tuple(sorted(observation_steps.items())),
             terminal_validated_binding_ids=tuple(sorted(terminal_validated_ids)),
             promoted_fact_texts=sample.promoted_fact_texts,
+            retired_at=tuple(sorted(retired_at.items())),
             equilibrium=equilibrium,
             converged=converged,
             quiescent=quiescent,
@@ -2021,6 +2043,9 @@ class ILLaDATrajectoryTensorizer:
         device = self.text_encoder.device
         dtype = self.text_encoder.dtype
         capacity = self._trajectory_thought_capacity(example)
+        if rollout_state is not None:
+            self._validate_rollout_state(rollout_state, capacity)
+            rollout_state = self._reclaim_rollout_state(rollout_state, step=target_step)
         target_by_id = {cell.cell_id: cell for cell in target}
         target_output_slots = dict(transition.target_output_slots)
         teacher_runtime_ids = dict(transition.runtime_ids_by_teacher)
@@ -2053,8 +2078,8 @@ class ILLaDATrajectoryTensorizer:
                     role_features[0, cell.slot, role_index] = cell.roles.get(role, 0.0)
             input_runtime_cell_ids = transition.input_runtime_cell_ids
             input_next_cell_serial = transition.input_next_cell_serial
+            input_retired_at = transition.input_retired_at
         else:
-            self._validate_rollout_state(rollout_state, capacity)
             thought_semantic.copy_(rollout_state.thought_semantic.to(device=device, dtype=dtype))
             role_features.copy_(rollout_state.role_features.to(device=device, dtype=dtype))
             uncertainty.copy_(rollout_state.uncertainty.to(device=device, dtype=dtype))
@@ -2074,6 +2099,7 @@ class ILLaDATrajectoryTensorizer:
                     input_next_cell_serial,
                     occupancy,
                 )
+            input_retired_at = rollout_state.retired_at
 
         timestep_tensor = torch.tensor([timestep], device=device)
         thought_timesteps = (
@@ -2318,6 +2344,7 @@ class ILLaDATrajectoryTensorizer:
             input_binding_routes=(() if rollout_state is None else rollout_state.binding_routes),
             input_runtime_cell_ids=input_runtime_cell_ids,
             input_next_cell_serial=input_next_cell_serial,
+            input_retired_at=input_retired_at,
         )
 
     @staticmethod
@@ -2867,6 +2894,84 @@ class ILLaDATrajectoryTensorizer:
             )
         return tuple(active), tuple(executable), tuple(routes)
 
+    def _reclaim_rollout_state(self, state: CIDRolloutState, *, step: int) -> CIDRolloutState:
+        if not state.runtime_cell_ids:
+            return state
+
+        occupancy = state.slot_occupancy[0, :, 0].bool().detach().cpu().tolist()
+        lifecycle_indices = state.lifecycle_features[0].argmax(dim=-1).detach().cpu().tolist()
+        cells = []
+        for slot, occupied in enumerate(occupancy):
+            if not occupied:
+                cells.append(CognitiveCell(semantic=(0.0,)))
+                continue
+            cell_id = state.runtime_cell_ids[slot]
+            if cell_id is None:
+                raise ValueError("occupied rollout slot is missing runtime cell identity")
+            cells.append(
+                CognitiveCell(
+                    semantic=(0.0,),
+                    cell_id=cell_id,
+                    lifecycle=MODELED_LIFECYCLES[int(lifecycle_indices[slot])],
+                )
+            )
+        field = CognitiveField(
+            cells=tuple(cells),
+            next_cell_serial=state.next_cell_serial,
+        )
+        # Neural grounding resolves cell-link targets only among live proposed cells, so a
+        # strong link cannot survive onto a RETIRED reclamation candidate across rollout steps.
+        # Active/candidate bindings can still pin a tombstone and are carried explicitly.
+        pinned = {
+            target.identifier
+            for route in state.binding_routes
+            for target in route.target_cells
+        }
+        retired_at = dict(state.retired_at)
+        selected = retired_reclamation_candidates(
+            field,
+            retired_at=retired_at,
+            step=step,
+            pinned_cell_ids=frozenset(pinned),
+        )
+        if not selected:
+            return state
+
+        reclaimed_slots = {slot for slot, _ in selected}
+        retained_slots = [
+            slot
+            for slot, occupied in enumerate(occupancy)
+            if occupied and slot not in reclaimed_slots
+        ]
+        retained_ids = tuple(state.runtime_cell_ids[slot] for slot in retained_slots)
+        retained_id_set = {cell_id for cell_id in retained_ids if cell_id is not None}
+
+        def compact(tensor: Tensor, *, fill: float) -> Tensor:
+            result = torch.full_like(tensor, fill)
+            if retained_slots:
+                indices = torch.tensor(retained_slots, device=tensor.device, dtype=torch.long)
+                result[:, : len(retained_slots)] = tensor.index_select(1, indices)
+            return result
+
+        return replace(
+            state,
+            thought_semantic=compact(state.thought_semantic, fill=0.0),
+            role_features=compact(state.role_features, fill=0.0),
+            uncertainty=compact(state.uncertainty, fill=1.0),
+            lifecycle_features=compact(state.lifecycle_features, fill=0.0),
+            slot_occupancy=compact(state.slot_occupancy, fill=0.0),
+            local_noise=compact(state.local_noise, fill=0.0),
+            runtime_cell_ids=retained_ids
+            + (None,) * (len(state.runtime_cell_ids) - len(retained_ids)),
+            retired_at=tuple(
+                sorted(
+                    (cell_id, retired_step)
+                    for cell_id, retired_step in retired_at.items()
+                    if cell_id in retained_id_set
+                )
+            ),
+        )
+
     def _validate_rollout_state(self, state: CIDRolloutState, thought_slots: int) -> None:
         expected_thought = (1, thought_slots, self.adapter.d_model)
         if tuple(state.thought_semantic.shape) != expected_thought:
@@ -2905,9 +3010,30 @@ class ILLaDATrajectoryTensorizer:
                 for is_occupied, cell_id in zip(occupied, state.runtime_cell_ids, strict=True)
             ):
                 raise ValueError("rollout runtime cell identity does not match occupancy")
-            live_ids = tuple(cell_id for cell_id in state.runtime_cell_ids if cell_id is not None)
-            if len(live_ids) != len(set(live_ids)):
+            occupied_ids = tuple(
+                cell_id for cell_id in state.runtime_cell_ids if cell_id is not None
+            )
+            if len(occupied_ids) != len(set(occupied_ids)):
                 raise ValueError("rollout runtime cell identities must be unique")
+            retired_at = dict(state.retired_at)
+            if len(retired_at) != len(state.retired_at):
+                raise ValueError("rollout retirement timestamps must have unique cell IDs")
+            if any(retired_step < 0 for retired_step in retired_at.values()):
+                raise ValueError("rollout retirement timestamps must be non-negative")
+            unknown_retired = set(retired_at) - set(occupied_ids)
+            if unknown_retired:
+                raise ValueError("rollout retirement timestamps reference non-occupied cells")
+            retired_index = MODELED_LIFECYCLES.index(CellLifecycle.RETIRED)
+            slot_by_id = {
+                cell_id: slot
+                for slot, cell_id in enumerate(state.runtime_cell_ids)
+                if cell_id is not None
+            }
+            if any(
+                int(state.lifecycle_features[0, slot_by_id[cell_id]].argmax()) != retired_index
+                for cell_id in retired_at
+            ):
+                raise ValueError("rollout retirement timestamps require RETIRED lifecycle state")
 
     def _targets(
         self,
@@ -3468,6 +3594,7 @@ class ILLaDATrajectoryTensorizer:
                 cell.cell_id if cell.occupied else None for cell in field.cells
             )
             input_next_cell_serial = field.next_cell_serial
+            input_retired_at = tuple(sorted(retired_at.items()))
 
             raw_target = tuple(
                 sorted(
@@ -3537,6 +3664,7 @@ class ILLaDATrajectoryTensorizer:
                 target_output_slots={target.cell_id: target.slot for target in target},
                 input_runtime_cell_ids=input_runtime_cell_ids,
                 input_next_cell_serial=input_next_cell_serial,
+                input_retired_at=input_retired_at,
                 runtime_ids_by_teacher=dict(runtime_ids),
             )
 

@@ -362,6 +362,7 @@ def test_trajectory_tensorizer_reclaims_retired_tombstone_under_pressure_after_g
     before_reclaim = tensorizer.tensorize(trajectory, source_step=0, timestep=1.0)
     assert before_reclaim.batch.slot_occupancy.all()
     assert before_reclaim.input_runtime_cell_ids == ("c0", "c1", "c2", "c3")
+    assert before_reclaim.input_retired_at == (("c0", 0),)
     assert not before_reclaim.targets.allocation_targets.any()
 
     after_reclaim = tensorizer.tensorize(trajectory, source_step=1, timestep=1.0)
@@ -370,6 +371,58 @@ def test_trajectory_tensorizer_reclaims_retired_tombstone_under_pressure_after_g
     assert not after_reclaim.batch.slot_occupancy[0, 3]
     assert after_reclaim.targets.allocation_targets[0, 3] == 1
     assert after_reclaim.targets.thought_mask[0, 3]
+
+    rollout = CIDRolloutState(
+        thought_semantic=before_reclaim.batch.thought_semantic.clone(),
+        role_features=before_reclaim.batch.role_features.clone(),
+        uncertainty=before_reclaim.batch.uncertainty.clone(),
+        lifecycle_features=before_reclaim.batch.lifecycle_features.clone(),
+        slot_occupancy=before_reclaim.batch.slot_occupancy.clone(),
+        local_noise=before_reclaim.batch.local_noise.clone(),
+        display_ids=before_reclaim.batch.display_ids.clone(),
+        runtime_cell_ids=before_reclaim.input_runtime_cell_ids,
+        next_cell_serial=before_reclaim.input_next_cell_serial,
+        retired_at=before_reclaim.input_retired_at,
+    )
+    closed_loop = tensorizer.tensorize(
+        trajectory,
+        source_step=1,
+        timestep=1.0,
+        rollout_state=rollout,
+    )
+    assert closed_loop.input_runtime_cell_ids == after_reclaim.input_runtime_cell_ids
+    assert torch.equal(closed_loop.batch.slot_occupancy, after_reclaim.batch.slot_occupancy)
+    assert torch.equal(
+        closed_loop.targets.allocation_targets,
+        after_reclaim.targets.allocation_targets,
+    )
+
+    grace_blocked = tensorizer.tensorize(
+        trajectory,
+        source_step=1,
+        timestep=1.0,
+        rollout_state=replace(rollout, retired_at=(("c0", 1),)),
+    )
+    assert grace_blocked.batch.slot_occupancy.all()
+
+    binding_pinned = tensorizer.tensorize(
+        trajectory,
+        source_step=1,
+        timestep=1.0,
+        rollout_state=replace(
+            rollout,
+            binding_routes=(
+                CIDRolloutBindingRoute(
+                    need_id="candidate",
+                    target_cells=(ObjectRef.cell("c0"),),
+                    target_display=(),
+                    runtime_active=False,
+                ),
+            ),
+        ),
+    )
+    assert binding_pinned.batch.slot_occupancy.all()
+
 
 
 def test_teacher_reclamation_pins_match_runtime_binding_and_strong_link_rules() -> None:
@@ -492,6 +545,40 @@ def test_rollout_preserves_runtime_cell_identity_instead_of_teacher_ids() -> Non
     next_sample = tensorizer.tensorize(example, source_step=0, timestep=0.0, rollout_state=state)
     assert next_sample.input_runtime_cell_ids[:2] == ("c0", "c1")
     assert all(cell_id is None for cell_id in next_sample.input_runtime_cell_ids[2:])
+
+
+def test_rollout_prediction_tracks_retirement_age() -> None:
+    base = make_trajectory()
+    example = replace(
+        base,
+        source_descriptors=(),
+        binding_targets=(),
+        grounding_targets=(),
+    )
+    adapter = make_adapter(seed=171)
+    tensorizer = ILLaDATrajectoryTensorizer(adapter, TinyTokenizer())
+    trainer = CIDTrainer(adapter, tensorizer, CIDTrainerConfig(timestep_min=0.0, timestep_max=0.0))
+    sample = tensorizer.tensorize(example, source_step=0, timestep=0.0)
+    training_batch = collate_training_steps((sample,), pad_token_id=TinyTokenizer.pad_token_id)
+
+    active_index = MODELED_LIFECYCLES.index(CellLifecycle.ACTIVE)
+    retired_output = adapter(training_batch.batch)
+    retired_output.allocation_logits.fill_(-10.0)
+    retired_output.lifecycle_logits.fill_(-10.0)
+    retired_output.lifecycle_logits[..., active_index] = 10.0
+    retired_output.lifecycle_logits[0, 0].fill_(-10.0)
+    retired_output.lifecycle_logits[
+        0, 0, MODELED_LIFECYCLES.index(CellLifecycle.RETIRED)
+    ] = 10.0
+    retired_output.need_logits.fill_(-10.0)
+    retired_state = trainer._rollout_state_from_prediction(
+        sample,
+        training_batch,
+        retired_output,
+        example=example,
+        batch_index=0,
+    )
+    assert retired_state.retired_at == (("c0", sample.target_step),)
 
 
 def test_cell_link_supervision_uses_target_cell_semantic_embedding() -> None:
