@@ -425,10 +425,13 @@ first epoch uses teacher inputs, the next two epochs linearly ramp the probabili
 model's own detached state into the following transition, and later epochs use self-rollout. A
 `--rollout-horizon` value of 1 disables multi-step self-rollout; values greater than 1 preserve the
 full contiguous trajectory rather than injecting periodic teacher resets. The carried rollout state
-includes TCT/display state plus predicted tool bindings, executable-argument state, observations,
-and promoted facts. Teacher trajectories still define next-step supervision and the external event
-schedule, but an event can enter a self-rollout only after the model has produced a matching
-executable binding.
+includes TCT/display state plus runtime-materialized tool bindings, executable-argument state,
+observations, diffusion-epoch position, and promoted facts. Teacher trajectories still define
+next-step supervision and replayable external events, but an event can enter a self-rollout only
+after the model has materialized a matching source+argument work item. Spurious or wrong bindings
+therefore retain their runtime waiting/termination consequences. If a rollout terminates or becomes
+quiescent before a later supervised transition, that transition still receives a teacher-input
+correction loss without overwriting the blocked detached runtime state.
 
 The trainer pads variable-length prompt and external-memory sequences inside each micro-batch.
 `--thought-capacity` is an upper bound: trajectory tensorization canonicalizes dataset schedule slots

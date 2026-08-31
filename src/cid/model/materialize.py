@@ -7,7 +7,13 @@ from typing import Any, TypeVar
 import torch
 from torch import Tensor
 
-from cid.contracts import FreshnessDemand, InformationNeed, ModelContext, ModelUpdate
+from cid.contracts import (
+    FreshnessDemand,
+    InformationNeed,
+    ModelContext,
+    ModelUpdate,
+    SourceDescriptor,
+)
 from cid.grounding import Anchor, AnchorKind, CognitiveLink, LinkRelation, ObjectKind, ObjectRef
 from cid.lifecycle import MODELED_LIFECYCLES
 from cid.model.allocation import (
@@ -175,8 +181,13 @@ class CIDMaterializer:
         thought = self._materialize_cells(output, context.thought, batch_index)
         thought = self._materialize_grounding(output, thought, catalog, batch_index)
         display = self._materialize_display(context.display, display_token_ids)
-        needs = self._materialize_needs(
-            output, context, thought, display, catalog, batch_index
+        needs = self.materialize_needs(
+            output,
+            sources=context.sources,
+            thought=thought,
+            display=display,
+            catalog=catalog,
+            batch_index=batch_index,
         )
         reopen_cells = self._materialize_revisions(
             output,
@@ -340,17 +351,35 @@ class CIDMaterializer:
             min_similarity=self.config.retrieval_similarity_threshold,
         )
 
-    def _materialize_needs(
+    def materialize_needs(
         self,
         output: CIDTensorOutput,
-        context: ModelContext,
+        *,
+        sources: tuple[SourceDescriptor, ...],
         thought: CognitiveField,
         display: DisplayCanvas,
-        catalog: ClosedWorldMaterializationCatalog,
-        batch_index: int,
+        catalog: ClosedWorldMaterializationCatalog | None = None,
+        batch_index: int = 0,
     ) -> tuple[InformationNeed, ...]:
-        if not context.sources:
+        """Decode information needs with the exact runtime materialization contract.
+
+        Training closed-loop rollout uses this public entry point so spurious needs, wrong
+        sources, and wrong arguments have the same downstream binding semantics as inference.
+        The closed-world catalog only resolves model queries; it does not restrict which need
+        slots are allowed to exist.
+        """
+
+        if not 0 <= batch_index < output.need_logits.shape[0]:
+            raise IndexError("batch_index is outside model output")
+        if output.need_logits.shape[1] != thought.capacity:
+            raise ValueError("model need slot count does not match runtime TCT capacity")
+        if output.source_logits.shape[-1] != len(sources):
+            raise ValueError("model source count does not match runtime source descriptors")
+        if output.need_target_display_logits.shape[-1] != len(display.token_ids):
+            raise ValueError("need-to-display routing must match runtime display capacity")
+        if not sources:
             return ()
+        catalog = catalog or ClosedWorldMaterializationCatalog()
         need_probs = torch.sigmoid(output.need_logits[batch_index]).detach()
         source_probs = torch.softmax(output.source_logits[batch_index], dim=-1).detach()
         argument_presence = torch.sigmoid(output.argument_presence_logits[batch_index]).detach()
@@ -367,10 +396,10 @@ class CIDMaterializer:
                     continue
                 scores = {
                     descriptor.name: float(source_probs[slot, need_slot, source_index])
-                    for source_index, descriptor in enumerate(context.sources)
+                    for source_index, descriptor in enumerate(sources)
                 }
                 selected_index = int(source_probs[slot, need_slot].argmax())
-                source = context.sources[selected_index]
+                source = sources[selected_index]
                 arguments: dict[str, Any] = {}
                 for argument_slot, descriptor in enumerate(source.arguments):
                     if argument_slot >= output.argument_query.shape[3]:

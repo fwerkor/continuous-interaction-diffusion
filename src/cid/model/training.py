@@ -15,7 +15,11 @@ from typing import Any
 import torch
 from torch import Tensor
 
-from cid.contracts import FreshnessDemand
+from cid.contracts import (
+    ArgumentDescriptor,
+    FreshnessDemand,
+    SourceDescriptor,
+)
 from cid.data import ThoughtTarget, TrajectoryExample, training_transition_source_steps
 from cid.grounding import AnchorKind, LinkRelation, ObjectKind, ObjectRef
 from cid.lifecycle import (
@@ -42,12 +46,21 @@ from cid.model.encoding import (
 from cid.model.illada import ILLaDACIDAdapter
 from cid.model.losses import CIDLoss, CIDTargets, cid_loss
 from cid.model.materialize import (
+    ArgumentCandidate,
+    CIDMaterializer,
     CIDMaterializerConfig,
+    ClosedWorldMaterializationCatalog,
     RevisionAction,
-    decode_need_target_display,
 )
 from cid.model.tensors import CIDTensorBatch, CIDTensorOutput, build_percept_routing_masks
-from cid.state import CellLifecycle, CognitiveRole
+from cid.runtime.bindings import canonical_work_key
+from cid.state import (
+    CellLifecycle,
+    CognitiveCell,
+    CognitiveField,
+    CognitiveRole,
+    DisplayCanvas,
+)
 
 CID_NEURAL_CONTRACT_VERSION = 3
 STAGE_B_SEMANTIC_SNAPSHOT_FILENAME = "semantic-embedding.pt"
@@ -89,6 +102,7 @@ class CIDTrainingStep:
     observed_binding_ids: tuple[str, ...] = ()
     binding_observation_steps: tuple[tuple[str, int], ...] = ()
     terminal_validated_binding_ids: tuple[str, ...] = ()
+    input_binding_routes: tuple[CIDRolloutBindingRoute, ...] = ()
 
 
 @dataclass(slots=True)
@@ -102,13 +116,16 @@ class CIDTrainingBatch:
 
 @dataclass(frozen=True, slots=True)
 class CIDRolloutBindingRoute:
-    """Runtime-decoded routing carried across one detached rollout transition."""
+    """Runtime-decoded binding state carried across one detached transition."""
 
     need_id: str
     target_cells: tuple[ObjectRef, ...]
     target_display: tuple[ObjectRef, ...]
     freshness: FreshnessDemand = FreshnessDemand.ONCE
     runtime_active: bool = True
+    source: str = ""
+    work_key: str = ""
+    replay_binding_id: str | None = None
 
 
 @dataclass(frozen=True, slots=True)
@@ -123,6 +140,7 @@ class CIDRolloutState:
     local_noise: Tensor
     display_ids: Tensor
     display_noise_level: float = 1.0
+    diffusion_step: int | None = None
     active_binding_ids: tuple[str, ...] = ()
     executable_binding_ids: tuple[str, ...] = ()
     binding_routes: tuple[CIDRolloutBindingRoute, ...] = ()
@@ -479,8 +497,8 @@ def _cid_behavior_counts(
 
 
 class CIDTrainer:
-    CHECKPOINT_VERSION = 3
-    SUPPORTED_CHECKPOINT_VERSIONS = (3,)
+    CHECKPOINT_VERSION = 4
+    SUPPORTED_CHECKPOINT_VERSIONS = (3, 4)
 
     def __init__(
         self,
@@ -524,6 +542,7 @@ class CIDTrainer:
         self.data_order_version = 3
         self._pending_accumulation = 0
         self._pending_examples = 0
+        self._pending_global_examples = 0
         self.pad_token_id = getattr(tensorizer.tokenizer, "pad_token_id", None)
         if self.pad_token_id is None:
             raise ValueError("training tokenizer must define pad_token_id")
@@ -578,38 +597,62 @@ class CIDTrainer:
         rollout_states: list[CIDRolloutState | None],
         *,
         rollout_probability: float,
-    ) -> tuple[tuple[bool, ...], tuple[bool, ...]]:
+    ) -> tuple[tuple[bool, ...], tuple[bool, ...], tuple[bool, ...]]:
+        """Plan input source, loss coverage, and closed-loop state advancement separately.
+
+        A terminal or quiescent runtime state must not silently delete later supervised
+        transitions. Such rows receive a teacher-forced correction loss while the detached
+        closed-loop state remains untouched. If external progress later arrives, rollout resumes
+        from the original runtime state rather than from the corrective teacher snapshot.
+        """
+
         use_rollout_flags: list[bool] = []
         execute_rows: list[bool] = []
+        advance_state: list[bool] = []
         for index, window in enumerate(windows):
             state = rollout_states[index]
-            use_rollout = (
+            scheduled_rollout = (
                 offset > 0 and state is not None and self.shuffle_rng.random() < rollout_probability
             )
-            ready = True
-            if use_rollout and state is not None:
+            runtime_ready = True
+            if scheduled_rollout and state is not None:
                 if state.terminal:
-                    ready = False
+                    runtime_ready = False
                 elif state.quiescent:
-                    ready = self.tensorizer.rollout_external_progress(
+                    runtime_ready = self.tensorizer.rollout_external_progress(
                         window.example,
                         window.source_steps[offset] + 1,
                         state,
                     )
+            use_rollout = scheduled_rollout and runtime_ready
+            real_row = not window.is_padding
             use_rollout_flags.append(use_rollout)
-            execute_rows.append(not window.is_padding and ready)
-        return tuple(use_rollout_flags), tuple(execute_rows)
+            execute_rows.append(real_row)
+            # Teacher forcing selected by scheduled sampling intentionally resets the
+            # rollout state. Coverage-only correction for a blocked runtime row does not.
+            advance_state.append(real_row and (not scheduled_rollout or runtime_ready))
+        return tuple(use_rollout_flags), tuple(execute_rows), tuple(advance_state)
 
-    def _distributed_any_rows(self, local_rows: int) -> bool:
+    def _distributed_global_batch_size(self, local_rows: int) -> int:
+        if local_rows < 0:
+            raise ValueError("local valid-row count must be non-negative")
         if not torch.distributed.is_available() or not torch.distributed.is_initialized():
-            return local_rows > 0
-        flag = torch.tensor(
-            [1 if local_rows > 0 else 0],
-            dtype=torch.int32,
+            return local_rows
+        total = torch.tensor(
+            [local_rows],
+            dtype=torch.int64,
             device=self.tensorizer.text_encoder.device,
         )
-        torch.distributed.all_reduce(flag, op=torch.distributed.ReduceOp.MAX)
-        return bool(flag.item())
+        torch.distributed.all_reduce(total, op=torch.distributed.ReduceOp.SUM)
+        return int(total.item())
+
+    def _target_global_examples_per_step(self) -> int:
+        world_size = (
+            torch.distributed.get_world_size()
+            if torch.distributed.is_available() and torch.distributed.is_initialized()
+            else 1
+        )
+        return self.config.micro_batch_size * self.config.gradient_accumulation_steps * world_size
 
     def _train_rollout_microbatch_with_metrics(
         self,
@@ -636,7 +679,7 @@ class CIDTrainer:
         component_sums: dict[str, Tensor] = {}
         rollout_length = next(iter(lengths))
         for offset in range(rollout_length):
-            use_rollout_flags, sample_mask = self._rollout_step_plan(
+            use_rollout_flags, sample_mask, advance_state = self._rollout_step_plan(
                 windows,
                 offset,
                 rollout_states,
@@ -649,19 +692,22 @@ class CIDTrainer:
                     timestep=self._sample_timestep(),
                     generator=self.generator,
                     rollout_state=(rollout_states[index] if use_rollout_flags[index] else None),
+                    rollout_denoising_steps=self.config.rollout_denoising_steps,
                 )
                 for index, window in enumerate(windows)
             ]
             effective_batch_size = sum(sample_mask)
-            # All data-parallel ranks must make the same backward/optimizer-step
-            # decisions even when only another rank still has an executable row.
-            if not self._distributed_any_rows(effective_batch_size):
+            # All data-parallel ranks use the same globally valid-example count for
+            # accumulation, including ranks whose local shard contains only padding.
+            global_batch_size = self._distributed_global_batch_size(effective_batch_size)
+            if global_batch_size == 0:
                 continue
             losses, output, training_batch = self._forward_backward(
                 tuple(samples),
                 loss_scale=loss_weight,
                 sample_mask=sample_mask,
                 allow_optimizer_step=True,
+                global_effective_batch_size=global_batch_size,
             )
             raw_loss = float(losses.total.detach().float()) * effective_batch_size
             raw_loss_sum += raw_loss
@@ -678,7 +724,7 @@ class CIDTrainer:
             if offset + 1 < rollout_length and rollout_probability > 0.0:
                 next_states = list(rollout_states)
                 for index, sample in enumerate(samples):
-                    if not sample_mask[index]:
+                    if not advance_state[index]:
                         continue
                     next_states[index] = self._rollout_state_from_prediction(
                         sample,
@@ -698,6 +744,7 @@ class CIDTrainer:
         loss_scale: float = 1.0,
         sample_mask: tuple[bool, ...] | None = None,
         allow_optimizer_step: bool = True,
+        global_effective_batch_size: int | None = None,
     ) -> tuple[CIDLoss, CIDTensorOutput, CIDTrainingBatch]:
         if not samples:
             raise ValueError("training samples cannot be empty")
@@ -721,9 +768,14 @@ class CIDTrainer:
             names = ", ".join(training_batch.example_ids)
             raise FloatingPointError(f"non-finite CID loss for training micro-batch: {names}")
         effective_batch_size = int(valid_rows.sum())
+        if global_effective_batch_size is None:
+            global_effective_batch_size = self._distributed_global_batch_size(effective_batch_size)
+        if global_effective_batch_size < effective_batch_size:
+            raise ValueError("global valid-example count cannot be below the local count")
         (losses.total * effective_batch_size * loss_scale).backward()
         self._pending_accumulation += 1
         self._pending_examples += effective_batch_size
+        self._pending_global_examples += global_effective_batch_size
         self.state = CIDTrainerState(
             transitions_seen=self.state.transitions_seen + effective_batch_size,
             optimizer_steps=self.state.optimizer_steps,
@@ -732,7 +784,7 @@ class CIDTrainer:
         )
         if (
             allow_optimizer_step
-            and self._pending_accumulation >= self.config.gradient_accumulation_steps
+            and self._pending_global_examples >= self._target_global_examples_per_step()
         ):
             self._optimizer_step()
         return losses, output, training_batch
@@ -827,7 +879,25 @@ class CIDTrainer:
             output=output,
             batch_index=batch_index,
         )
-        observed_binding_ids = set(dict(sample.binding_observation_steps))
+        prior_routes = {route.need_id: route for route in sample.input_binding_routes}
+        carried_observations = dict(sample.binding_observation_steps)
+        carried_validated = set(sample.terminal_validated_binding_ids)
+        observation_steps: dict[str, int] = {}
+        terminal_validated: set[str] = set()
+        for route in binding_routes:
+            previous_route = prior_routes.get(route.need_id)
+            same_work = previous_route is not None and (
+                not previous_route.work_key
+                or not route.work_key
+                or previous_route.work_key == route.work_key
+            )
+            if not same_work:
+                continue
+            if route.need_id in carried_observations:
+                observation_steps[route.need_id] = carried_observations[route.need_id]
+            if route.need_id in carried_validated:
+                terminal_validated.add(route.need_id)
+        observed_binding_ids = set(observation_steps)
         waiting_cells: set[str] = set()
         available_cells: set[str] = set()
         for route in binding_routes:
@@ -892,7 +962,7 @@ class CIDTrainer:
             route.runtime_active and route.need_id not in observed_binding_ids
             for route in binding_routes
         )
-        terminal_validated = frozenset(sample.terminal_validated_binding_ids)
+        terminal_validated_ids = frozenset(terminal_validated)
         executable = frozenset(executable_binding_ids)
         # ALWAYS is refresh-due on every runtime step. MAX_AGE depends on wall-clock
         # elapsed time, which trajectory JSONL intentionally does not model, so a
@@ -902,7 +972,7 @@ class CIDTrainer:
             and route.need_id in observed_binding_ids
             and route.need_id in executable
             and route.freshness is FreshnessDemand.ALWAYS
-            and route.need_id not in terminal_validated
+            and route.need_id not in terminal_validated_ids
             for route in binding_routes
         )
         terminal = converged and not unresolved_binding and not pending_terminal_refresh
@@ -923,11 +993,12 @@ class CIDTrainer:
             display_noise_level=denoising_noise_level(
                 sample.next_diffusion_step, self.config.rollout_denoising_steps
             ),
+            diffusion_step=sample.next_diffusion_step,
             active_binding_ids=active_binding_ids,
             executable_binding_ids=executable_binding_ids,
             binding_routes=binding_routes,
-            binding_observation_steps=sample.binding_observation_steps,
-            terminal_validated_binding_ids=sample.terminal_validated_binding_ids,
+            binding_observation_steps=tuple(sorted(observation_steps.items())),
+            terminal_validated_binding_ids=tuple(sorted(terminal_validated_ids)),
             promoted_fact_texts=sample.promoted_fact_texts,
             equilibrium=equilibrium,
             converged=converged,
@@ -1114,7 +1185,7 @@ class CIDTrainer:
                     rollout_states: list[CIDRolloutState | None] = [None] * len(microbatch)
                     rollout_length = next(iter(lengths))
                     for offset in range(rollout_length):
-                        use_rollout_flags, execute_rows = self._rollout_step_plan(
+                        use_rollout_flags, execute_rows, advance_state = self._rollout_step_plan(
                             microbatch,
                             offset,
                             rollout_states,
@@ -1129,6 +1200,7 @@ class CIDTrainer:
                                 rollout_state=(
                                     rollout_states[index] if use_rollout_flags[index] else None
                                 ),
+                                rollout_denoising_steps=self.config.rollout_denoising_steps,
                             )
                             for index, window in enumerate(microbatch)
                         )
@@ -1172,7 +1244,7 @@ class CIDTrainer:
                         if offset + 1 < rollout_length and rollout_probability > 0.0:
                             next_states = list(rollout_states)
                             for index, sample in enumerate(samples):
-                                if not execute_rows[index]:
+                                if not advance_state[index]:
                                     continue
                                 next_states[index] = self._rollout_state_from_prediction(
                                     sample,
@@ -1319,6 +1391,7 @@ class CIDTrainer:
         self.data_order_version = int(state.get("data_order_version", 1))
         self._pending_accumulation = 0
         self._pending_examples = 0
+        self._pending_global_examples = 0
         self.optimizer.zero_grad(set_to_none=True)
 
     def restore_portable_progress_state(
@@ -1350,6 +1423,7 @@ class CIDTrainer:
         )
         self._pending_accumulation = 0
         self._pending_examples = 0
+        self._pending_global_examples = 0
         self.data_order_version = int(state.get("data_order_version", 1))
         self.optimizer.zero_grad(set_to_none=True)
         self.reseed(seed)
@@ -1390,6 +1464,7 @@ class CIDTrainer:
             "gradient_state": gradient_state,
             "pending_accumulation": self._pending_accumulation,
             "pending_examples": self._pending_examples,
+            "pending_global_examples": self._pending_global_examples,
             "data_order_version": self.data_order_version,
             "dataset_sha256": dataset_sha256,
         }
@@ -1438,6 +1513,7 @@ class CIDTrainer:
                 int(trainer_state.get("rollout_windows_seen_in_epoch", 0)) == 0
                 and int(checkpoint.get("pending_accumulation", 0)) == 0
                 and int(checkpoint.get("pending_examples", 0)) == 0
+                and int(checkpoint.get("pending_global_examples", 0)) == 0
             )
             equivalent_geometry = (
                 saved_geometry[0] * saved_geometry[1] == current_geometry[0] * current_geometry[1]
@@ -1498,14 +1574,27 @@ class CIDTrainer:
         self.optimizer.zero_grad(set_to_none=True)
         self._pending_accumulation = int(checkpoint.get("pending_accumulation", 0))
         self._pending_examples = int(checkpoint.get("pending_examples", 0))
+        saved_global_examples = checkpoint.get("pending_global_examples")
+        if saved_global_examples is None:
+            world_size = (
+                torch.distributed.get_world_size()
+                if torch.distributed.is_available() and torch.distributed.is_initialized()
+                else 1
+            )
+            saved_global_examples = self._pending_examples * world_size
+        self._pending_global_examples = int(saved_global_examples)
         gradient_state = checkpoint.get("gradient_state", {})
         parameters = dict(self._trainable)
         for name, saved in gradient_state.items():
             parameter = parameters[name]
             parameter.grad = saved.to(device=parameter.device, dtype=parameter.dtype)
-        if self._pending_accumulation == 0 and (self._pending_examples or gradient_state):
+        if self._pending_accumulation == 0 and (
+            self._pending_examples or self._pending_global_examples or gradient_state
+        ):
             raise ValueError("checkpoint contains gradients without pending accumulation")
-        if self._pending_accumulation > 0 and self._pending_examples < 0:
+        if self._pending_accumulation > 0 and (
+            self._pending_examples < 0 or self._pending_global_examples <= 0
+        ):
             raise ValueError("checkpoint pending accumulation has an invalid example count")
 
     def _optimizer_step(self) -> None:
@@ -1525,6 +1614,7 @@ class CIDTrainer:
         self.optimizer.zero_grad(set_to_none=True)
         self._pending_accumulation = 0
         self._pending_examples = 0
+        self._pending_global_examples = 0
         self.state = CIDTrainerState(
             transitions_seen=self.state.transitions_seen,
             optimizer_steps=self.state.optimizer_steps + 1,
@@ -1535,14 +1625,12 @@ class CIDTrainer:
     def _gradient_example_normalizer(self) -> float:
         """Return one common per-rank divisor for the global valid-example mean gradient."""
 
-        local_examples = float(self._pending_examples)
-        if torch.distributed.is_available() and torch.distributed.is_initialized():
-            device = self.tensorizer.text_encoder.device
-            total = torch.tensor(local_examples, device=device, dtype=torch.float32)
-            torch.distributed.all_reduce(total, op=torch.distributed.ReduceOp.SUM)
-            normalizer = float(total.item()) / torch.distributed.get_world_size()
-        else:
-            normalizer = local_examples
+        world_size = (
+            torch.distributed.get_world_size()
+            if torch.distributed.is_available() and torch.distributed.is_initialized()
+            else 1
+        )
+        normalizer = float(self._pending_global_examples) / world_size
         if not math.isfinite(normalizer) or normalizer <= 0.0:
             raise RuntimeError("optimizer step requires at least one valid accumulated example")
         return normalizer
@@ -1715,6 +1803,10 @@ class ILLaDATrajectoryTensorizer:
         self.scheduler = scheduler or CIDDiffusionScheduler(
             adapter.mask_token_id, adapter.eos_token_id
         )
+        self.materializer = CIDMaterializer()
+        self._runtime_argument_catalog_cache: (
+            tuple[int, ClosedWorldMaterializationCatalog] | None
+        ) = None
 
     def tensorize(
         self,
@@ -1724,9 +1816,12 @@ class ILLaDATrajectoryTensorizer:
         timestep: float = 0.5,
         generator: torch.Generator | None = None,
         rollout_state: CIDRolloutState | None = None,
+        rollout_denoising_steps: int = 8,
     ) -> CIDTrainingStep:
         if not 0.0 <= timestep <= 1.0:
             raise ValueError("timestep must be in [0, 1]")
+        if rollout_denoising_steps <= 0:
+            raise ValueError("rollout_denoising_steps must be positive")
         target_step = source_step + 1
         current = self._thought_snapshot(example, source_step)
         target = self._thought_snapshot(example, target_step)
@@ -1789,6 +1884,33 @@ class ILLaDATrajectoryTensorizer:
             generator=generator,
         )
 
+        (
+            percept_projections,
+            binding_observation_steps,
+            terminal_validated_binding_ids,
+        ) = self._available_percept_projections(
+            example,
+            target_step,
+            rollout_state=rollout_state,
+        )
+        if rollout_state is None or rollout_state.diffusion_step is None:
+            diffusion_step = self._runtime_diffusion_step(example, source_step)
+            next_diffusion_step = self._runtime_diffusion_step(example, target_step)
+            rollout_display_noise_level = (
+                None if rollout_state is None else rollout_state.display_noise_level
+            )
+        else:
+            external_progress = self._rollout_projection_has_external_progress(
+                rollout_state,
+                binding_observation_steps,
+                terminal_validated_binding_ids,
+            )
+            diffusion_step = 0 if external_progress else rollout_state.diffusion_step
+            next_diffusion_step = diffusion_step + 1
+            rollout_display_noise_level = denoising_noise_level(
+                diffusion_step, rollout_denoising_steps
+            )
+
         prompt_ids = self.text_encoder.tokenize(example.prompt, add_special_tokens=True)
         target_display = self._display_text(example, target_step)
         target_text_ids = self.text_encoder.tokenize(target_display, add_special_tokens=False)
@@ -1839,20 +1961,11 @@ class ILLaDATrajectoryTensorizer:
             display_labels[display_input_ids == target_display_ids] = -100
             display_noise = torch.full(
                 (*display_input_ids.shape, 1),
-                rollout_state.display_noise_level,
+                float(rollout_display_noise_level),
                 device=device,
                 dtype=dtype,
             )
 
-        (
-            percept_projections,
-            binding_observation_steps,
-            terminal_validated_binding_ids,
-        ) = self._available_percept_projections(
-            example,
-            target_step,
-            rollout_state=rollout_state,
-        )
         rollout_routes = (
             {}
             if rollout_state is None
@@ -1966,15 +2079,27 @@ class ILLaDATrajectoryTensorizer:
             example_id=example.example_id,
             source_step=source_step,
             target_step=target_step,
-            diffusion_step=self._runtime_diffusion_step(example, source_step),
-            next_diffusion_step=self._runtime_diffusion_step(example, target_step),
+            diffusion_step=diffusion_step,
+            next_diffusion_step=next_diffusion_step,
             batch=batch,
             targets=targets,
             promoted_fact_texts=promoted_fact_texts,
             observed_binding_ids=tuple(observed_binding_ids),
             binding_observation_steps=binding_observation_steps,
             terminal_validated_binding_ids=terminal_validated_binding_ids,
+            input_binding_routes=(() if rollout_state is None else rollout_state.binding_routes),
         )
+
+    @staticmethod
+    def _rollout_projection_has_external_progress(
+        state: CIDRolloutState,
+        observation_steps: tuple[tuple[str, int], ...],
+        validated_binding_ids: tuple[str, ...],
+    ) -> bool:
+        previous = dict(state.binding_observation_steps)
+        if any(previous.get(need_id) != step for need_id, step in observation_steps):
+            return True
+        return bool(set(validated_binding_ids) - set(state.terminal_validated_binding_ids))
 
     @staticmethod
     def _matching_binding_events(
@@ -2016,19 +2141,21 @@ class ILLaDATrajectoryTensorizer:
             )
 
         executable = frozenset(rollout_state.executable_binding_ids)
-        routes = {route.need_id: route for route in rollout_state.binding_routes}
+        bindings = {binding.need_id: binding for binding in example.binding_targets}
         observation_steps = dict(rollout_state.binding_observation_steps)
         validated = set(rollout_state.terminal_validated_binding_ids)
-        for binding in example.binding_targets:
-            if binding.first_need_step > target_step or binding.need_id not in executable:
+        for route in rollout_state.binding_routes:
+            if not route.runtime_active or route.need_id not in executable:
+                continue
+            replay_id = route.replay_binding_id or route.need_id
+            binding = bindings.get(replay_id)
+            if binding is None or binding.first_need_step > target_step:
                 continue
             matching = self._matching_binding_events(example, binding, target_step)
             if not matching:
                 continue
-            route = routes.get(binding.need_id)
-            freshness = FreshnessDemand.ONCE if route is None else route.freshness
-            previous_step = observation_steps.get(binding.need_id)
-            if previous_step is not None and freshness in (
+            previous_step = observation_steps.get(route.need_id)
+            if previous_step is not None and route.freshness in (
                 FreshnessDemand.ONCE,
                 FreshnessDemand.MAX_AGE,
             ):
@@ -2040,8 +2167,8 @@ class ILLaDATrajectoryTensorizer:
                 selected = max(matching, key=lambda event: event.arrival_step)
 
             if previous_step != selected.arrival_step:
-                observation_steps[binding.need_id] = selected.arrival_step
-                validated.discard(binding.need_id)
+                observation_steps[route.need_id] = selected.arrival_step
+                validated.discard(route.need_id)
             projections.append((binding, selected))
 
             # A converged ALWAYS binding performs one terminal refresh before the
@@ -2051,9 +2178,9 @@ class ILLaDATrajectoryTensorizer:
             if (
                 rollout_state.quiescent
                 and rollout_state.converged
-                and freshness is FreshnessDemand.ALWAYS
+                and route.freshness is FreshnessDemand.ALWAYS
             ):
-                validated.add(binding.need_id)
+                validated.add(route.need_id)
 
         return (
             tuple(projections),
@@ -2080,7 +2207,7 @@ class ILLaDATrajectoryTensorizer:
         for route in state.binding_routes:
             if not route.runtime_active or route.need_id not in executable:
                 continue
-            binding = bindings.get(route.need_id)
+            binding = bindings.get(route.replay_binding_id or route.need_id)
             if binding is None:
                 continue
             matching = self._matching_binding_events(example, binding, target_step)
@@ -2183,7 +2310,14 @@ class ILLaDATrajectoryTensorizer:
                 target_cells=binding.target_cells,
                 target_display=binding.target_display,
             )
-        predicted = rollout_routes.get(binding.need_id)
+        predicted = next(
+            (
+                route
+                for route in rollout_routes.values()
+                if (route.replay_binding_id or route.need_id) == binding.need_id
+            ),
+            None,
+        )
         if predicted is not None:
             return predicted
         # A legacy/manually constructed rollout state may carry only executable IDs.
@@ -2196,6 +2330,133 @@ class ILLaDATrajectoryTensorizer:
             target_cells=() if owner is None else (owner,),
             target_display=(),
         )
+
+    @staticmethod
+    def _runtime_source_descriptors(example: TrajectoryExample) -> tuple[SourceDescriptor, ...]:
+        return tuple(
+            SourceDescriptor(
+                name=str(raw["name"]),
+                description=str(raw.get("description", "")),
+                arguments=tuple(
+                    ArgumentDescriptor(
+                        name=str(argument["name"]),
+                        kind=str(argument.get("kind", "any")),
+                        description=str(argument.get("description", "")),
+                        required=bool(argument.get("required", True)),
+                    )
+                    for argument in raw.get("arguments", ())
+                ),
+                cacheable=bool(raw.get("cacheable", True)),
+                dynamic=bool(raw.get("dynamic", False)),
+                streamable=bool(raw.get("streamable", False)),
+                versioned=bool(raw.get("versioned", False)),
+                accepts_partial_arguments=bool(raw.get("accepts_partial_arguments", False)),
+                promote_results_to_fact=bool(raw.get("promote_results_to_fact", False)),
+            )
+            for raw in example.source_descriptors
+        )
+
+    def _runtime_argument_catalog(
+        self, example: TrajectoryExample
+    ) -> ClosedWorldMaterializationCatalog:
+        cache_key = id(example)
+        cached = self._runtime_argument_catalog_cache
+        if cached is not None and cached[0] == cache_key:
+            return cached[1]
+        arguments: list[ArgumentCandidate] = []
+        seen: set[tuple[str, str, str]] = set()
+        for binding in example.binding_targets:
+            for name, value in binding.arguments.items():
+                encoded = stable_text(value)
+                key = (binding.source, str(name), encoded)
+                if key in seen:
+                    continue
+                seen.add(key)
+                arguments.append(
+                    ArgumentCandidate(
+                        source=binding.source,
+                        name=str(name),
+                        value=value,
+                        embedding=self.text_encoder.encode_one(encoded, detach=True),
+                    )
+                )
+        catalog = ClosedWorldMaterializationCatalog(arguments=tuple(arguments))
+        # Production Stage A/B use micro-batch 1, so a one-entry cache eliminates repeated
+        # semantic encoding across every transition of a long rollout without retaining
+        # catalogs for the full 400k-example dataset.
+        self._runtime_argument_catalog_cache = (cache_key, catalog)
+        return catalog
+
+    @staticmethod
+    def _materialization_output_view(
+        output: CIDTensorOutput,
+        *,
+        thought_slots: int,
+        display_length: int,
+        source_count: int,
+    ) -> CIDTensorOutput:
+        """Crop collated padding before applying per-example runtime materialization."""
+
+        return replace(
+            output,
+            thought_semantic=output.thought_semantic[:, :thought_slots],
+            need_logits=output.need_logits[:, :thought_slots],
+            source_logits=output.source_logits[:, :thought_slots, :, :source_count],
+            need_target_cell_logits=output.need_target_cell_logits[
+                :, :thought_slots, :, :thought_slots
+            ],
+            need_target_display_logits=output.need_target_display_logits[
+                :, :thought_slots, :, :display_length
+            ],
+            argument_presence_logits=output.argument_presence_logits[:, :thought_slots],
+            argument_query=output.argument_query[:, :thought_slots],
+            refresh_logits=output.refresh_logits[:, :thought_slots],
+        )
+
+    @staticmethod
+    def _runtime_materialization_thought(
+        output: CIDTensorOutput,
+        *,
+        target_output_slots: Mapping[str, int],
+        live_slots: Tensor,
+        batch_index: int,
+    ) -> CognitiveField:
+        cell_id_by_slot = {slot: cell_id for cell_id, slot in target_output_slots.items()}
+        # Need materialization only consumes cell identity/liveness. Avoid copying each
+        # hidden vector to CPU, which would introduce one accelerator synchronization per slot.
+        semantic = (0.0,) * int(output.thought_semantic.shape[-1])
+        cells: list[CognitiveCell] = []
+        for slot in range(live_slots.shape[0]):
+            if bool(live_slots[slot]):
+                cells.append(
+                    CognitiveCell(
+                        semantic=semantic,
+                        cell_id=cell_id_by_slot.get(slot, f"__rollout_slot_{slot}"),
+                        lifecycle=CellLifecycle.ACTIVE,
+                    )
+                )
+            else:
+                cells.append(CognitiveCell(semantic=semantic))
+        return CognitiveField(cells=tuple(cells))
+
+    @staticmethod
+    def _matching_replay_binding(
+        example: TrajectoryExample,
+        *,
+        target_step: int,
+        source: str,
+        arguments: Mapping[str, Any],
+    ) -> Any | None:
+        candidates = tuple(
+            binding
+            for binding in example.binding_targets
+            if binding.first_need_step <= target_step
+            and binding.source == source
+            and dict(binding.arguments) == dict(arguments)
+        )
+        if not candidates:
+            return None
+        return min(candidates, key=lambda binding: (binding.first_need_step, binding.need_id))
 
     def predicted_binding_state(
         self,
@@ -2212,146 +2473,87 @@ class ILLaDATrajectoryTensorizer:
         tuple[str, ...],
         tuple[CIDRolloutBindingRoute, ...],
     ]:
-        """Match runtime-decodable model needs to teacher-addressable observations."""
+        """Decode all model needs with the same materializer used by inference.
 
-        thresholds = CIDMaterializerConfig()
-        source_names = tuple(str(item.get("name", "")) for item in example.source_descriptors)
-        schedule = self._binding_slot_schedule(example)
-        freshness_order = tuple(FreshnessDemand)
+        Teacher bindings are used only to decide whether a predicted source+argument work item
+        has a replayable observation. They no longer define which need slots are allowed to
+        exist, so spurious/wrong-source/wrong-argument needs retain their runtime consequences.
+        """
+
+        if live_slots.ndim != 1:
+            raise ValueError("predicted binding live-slot mask must be one-dimensional")
+        if display_active_length < 0:
+            raise ValueError("display_active_length must be non-negative")
+        thought_slots = int(live_slots.shape[0])
+        display_length = min(
+            int(output.need_target_display_logits.shape[-1]),
+            max(1, display_active_length),
+        )
+        sources = self._runtime_source_descriptors(example)
+        if not sources:
+            return (), (), ()
+        materialization_output = self._materialization_output_view(
+            output,
+            thought_slots=thought_slots,
+            display_length=display_length,
+            source_count=len(sources),
+        )
+        thought = self._runtime_materialization_thought(
+            materialization_output,
+            target_output_slots=target_output_slots,
+            live_slots=live_slots,
+            batch_index=batch_index,
+        )
+        display_tokens = [self.adapter.mask_token_id] * display_length
+        if display_active_length > 0:
+            display_tokens[min(display_active_length, display_length) - 1] = self.eos_token_id
+        display = DisplayCanvas(
+            token_ids=tuple(display_tokens),
+            mask_token_id=self.adapter.mask_token_id,
+            eos_token_id=self.eos_token_id,
+        )
+        needs = self.materializer.materialize_needs(
+            materialization_output,
+            sources=sources,
+            thought=thought,
+            display=display,
+            catalog=self._runtime_argument_catalog(example),
+            batch_index=batch_index,
+        )
+        descriptors = {descriptor.name: descriptor for descriptor in sources}
         active: list[str] = []
         executable: list[str] = []
         routes: list[CIDRolloutBindingRoute] = []
-        if live_slots.ndim != 1 or live_slots.shape[0] != output.need_logits.shape[1]:
-            raise ValueError("predicted binding live-slot mask has incompatible geometry")
-        if display_active_length < 0:
-            raise ValueError("display_active_length must be non-negative")
-        for binding in example.binding_targets:
-            if binding.first_need_step > target_step:
+        for need in needs:
+            source = need.selected_source()
+            if source is None:
                 continue
-            owner = binding.owner_cell
-            if owner is None:
-                continue
-            slot = target_output_slots.get(owner.identifier)
-            if slot is None or not bool(live_slots[slot]) or binding.source not in source_names:
-                continue
-            need_slot = schedule[(owner.identifier, binding.need_id)]
-            confidence = float(
-                torch.sigmoid(output.need_logits[batch_index, slot, need_slot].detach())
+            descriptor = descriptors[source]
+            arguments_complete = all(
+                name in need.arguments for name in descriptor.required_arguments
             )
-            if confidence < thresholds.need_threshold:
-                continue
-            source_index = int(output.source_logits[batch_index, slot, need_slot].detach().argmax())
-            if source_index >= len(source_names) or source_names[source_index] != binding.source:
-                continue
-            active.append(binding.need_id)
-
-            cell_probabilities = torch.sigmoid(
-                output.need_target_cell_logits[batch_index, slot, need_slot].detach()
+            runtime_active = arguments_complete or descriptor.accepts_partial_arguments
+            replay = self._matching_replay_binding(
+                example,
+                target_step=target_step,
+                source=source,
+                arguments=need.arguments,
             )
-            target_cells = [ObjectRef.cell(owner.identifier)]
-            for cell_id, target_slot in sorted(
-                target_output_slots.items(), key=lambda item: item[1]
-            ):
-                if (
-                    target_slot == slot
-                    or not bool(live_slots[target_slot])
-                    or float(cell_probabilities[target_slot])
-                    < thresholds.need_target_cell_threshold
-                ):
-                    continue
-                target_cells.append(ObjectRef.cell(cell_id))
-            display_probabilities = torch.sigmoid(
-                output.need_target_display_logits[batch_index, slot, need_slot].detach()
-            )
-            target_display = decode_need_target_display(
-                display_probabilities,
-                active_length=min(display_active_length, int(display_probabilities.numel())),
-                threshold=thresholds.need_target_display_threshold,
-            )
-            descriptor = example.source_descriptors[source_index]
-            required = tuple(
-                (argument_index, str(argument.get("name", "")))
-                for argument_index, argument in enumerate(descriptor.get("arguments", ()))
-                if bool(argument.get("required", True))
-            )
-            arguments_ok = True
-            for argument_index, name in required:
-                if (
-                    argument_index >= output.argument_query.shape[3]
-                    or name not in binding.arguments
-                ):
-                    arguments_ok = False
-                    break
-                presence = float(
-                    torch.sigmoid(
-                        output.argument_presence_logits[
-                            batch_index, slot, need_slot, argument_index
-                        ].detach()
-                    )
-                )
-                if presence < thresholds.argument_presence_threshold:
-                    arguments_ok = False
-                    break
-                query = (
-                    output.argument_query[batch_index, slot, need_slot, argument_index]
-                    .detach()
-                    .float()
-                )
-                candidates: list[tuple[str, Tensor]] = []
-                seen_values: set[str] = set()
-                for candidate_binding in example.binding_targets:
-                    if (
-                        candidate_binding.source != binding.source
-                        or name not in candidate_binding.arguments
-                    ):
-                        continue
-                    encoded = stable_text(candidate_binding.arguments[name])
-                    if encoded in seen_values:
-                        continue
-                    seen_values.add(encoded)
-                    candidates.append(
-                        (
-                            encoded,
-                            self.text_encoder.encode_one(encoded, detach=True).to(
-                                device=query.device, dtype=torch.float32
-                            ),
-                        )
-                    )
-                if not candidates:
-                    arguments_ok = False
-                    break
-                candidate_embeddings = torch.stack(
-                    [embedding for _, embedding in candidates], dim=0
-                )
-                similarities = torch.nn.functional.cosine_similarity(
-                    query.unsqueeze(0), candidate_embeddings, dim=-1
-                )
-                best_similarity, best_index = similarities.max(dim=0)
-                if float(best_similarity) < thresholds.retrieval_similarity_threshold or candidates[
-                    int(best_index)
-                ][0] != stable_text(binding.arguments[name]):
-                    arguments_ok = False
-                    break
-            freshness = freshness_order[
-                int(output.refresh_logits[batch_index, slot, need_slot].detach().argmax())
-            ]
+            active.append(need.need_id)
+            if arguments_complete:
+                executable.append(need.need_id)
             routes.append(
                 CIDRolloutBindingRoute(
-                    need_id=binding.need_id,
-                    target_cells=tuple(target_cells),
-                    target_display=target_display,
-                    freshness=freshness,
-                    runtime_active=(
-                        arguments_ok or bool(descriptor.get("accepts_partial_arguments", False))
-                    ),
+                    need_id=need.need_id,
+                    target_cells=need.target_cells,
+                    target_display=need.target_display,
+                    freshness=need.freshness,
+                    runtime_active=runtime_active,
+                    source=source,
+                    work_key=canonical_work_key(source, need.arguments),
+                    replay_binding_id=None if replay is None else replay.need_id,
                 )
             )
-            # Partial-argument sources may start speculative I/O at runtime, but the
-            # dataset event represents the binding's fully resolved observation. Do not
-            # inject that teacher observation until all required arguments resolve to the
-            # same closed-world values the runtime would use.
-            if arguments_ok:
-                executable.append(binding.need_id)
         return tuple(active), tuple(executable), tuple(routes)
 
     def _validate_rollout_state(self, state: CIDRolloutState, thought_slots: int) -> None:
@@ -2379,6 +2581,8 @@ class ILLaDATrajectoryTensorizer:
             raise ValueError("rollout display IDs must have shape [1, tokens]")
         if not 0.0 <= state.display_noise_level <= 1.0:
             raise ValueError("rollout display noise level must be in [0, 1]")
+        if state.diffusion_step is not None and state.diffusion_step < 0:
+            raise ValueError("rollout diffusion step must be non-negative when set")
 
     def _targets(
         self,
@@ -2419,19 +2623,16 @@ class ILLaDATrajectoryTensorizer:
         else:
             waiting_cells = set()
             available_cells = set()
-            active = active_binding_ids or frozenset()
+            del active_binding_ids
             routes = binding_routes or {}
-            for binding in example.binding_targets:
-                if binding.need_id not in active:
+            for route in routes.values():
+                if not route.runtime_active:
                     continue
+                replay_id = route.replay_binding_id or route.need_id
                 destination = (
-                    available_cells if binding.need_id in observed_binding_ids else waiting_cells
+                    available_cells if replay_id in observed_binding_ids else waiting_cells
                 )
-                route = routes.get(binding.need_id)
-                if route is not None:
-                    destination.update(target.identifier for target in route.target_cells)
-                elif binding.owner_cell is not None:
-                    destination.add(binding.owner_cell.identifier)
+                destination.update(target.identifier for target in route.target_cells)
             # Closed-loop equilibrium must reflect the binding state the model actually
             # materialized. A teacher WAITING label cannot make a failed/missing need look
             # like a valid asynchronous equilibrium.
@@ -3359,7 +3560,7 @@ def stage_b_optimizer_steps_per_epoch(
     shuffle: bool = True,
     length_aware: bool = True,
 ) -> int:
-    """Return optimizer steps for the exact Stage B transition-level accumulation schedule."""
+    """Simulate the exact globally valid-example Stage B accumulation schedule."""
 
     if world_size <= 0 or micro_batch_size <= 0 or gradient_accumulation_steps <= 0:
         raise ValueError("Stage B optimizer-step dimensions must be positive")
@@ -3367,42 +3568,61 @@ def stage_b_optimizer_steps_per_epoch(
         raise ValueError("Stage B optimizer-step epoch must be positive")
     if not windows:
         return 0
-    local_windows = shard_rollout_windows(
-        windows,
-        world_size=world_size,
-        rank=0,
-        seed=seed,
-        epoch=epoch,
-        shuffle=shuffle,
-        micro_batch_size=micro_batch_size,
-        length_aware=length_aware,
+
+    def microbatches(
+        local_windows: tuple[CIDRolloutWindow, ...],
+    ) -> tuple[tuple[CIDRolloutWindow, ...], ...]:
+        batches: list[tuple[CIDRolloutWindow, ...]] = []
+        current: list[CIDRolloutWindow] = []
+        current_key: tuple[int, float] | None = None
+        for window in local_windows:
+            key = (len(window.source_steps), window.loss_weight)
+            if current and (key != current_key or len(current) >= micro_batch_size):
+                batches.append(tuple(current))
+                current = []
+            current.append(window)
+            current_key = key
+        if current:
+            batches.append(tuple(current))
+        return tuple(batches)
+
+    rank_batches = tuple(
+        microbatches(
+            shard_rollout_windows(
+                windows,
+                world_size=world_size,
+                rank=rank,
+                seed=seed,
+                epoch=epoch,
+                shuffle=shuffle,
+                micro_batch_size=micro_batch_size,
+                length_aware=length_aware,
+            )
+        )
+        for rank in range(world_size)
     )
-    pending = 0
+    batch_counts = {len(batches) for batches in rank_batches}
+    if len(batch_counts) != 1:
+        raise RuntimeError("Stage B shards produced different backward schedules across ranks")
+
+    target_global_examples = world_size * micro_batch_size * gradient_accumulation_steps
+    pending_global_examples = 0
     optimizer_steps = 0
-    current_key: tuple[int, float] | None = None
-    current_size = 0
-
-    def finish_microbatch(key: tuple[int, float] | None) -> None:
-        nonlocal pending, optimizer_steps
-        if key is None:
-            return
-        # Every transition inside a rollout window performs one backward call. Optimizer
-        # boundaries are independent of window boundaries so long closed-loop trajectories
-        # retain state continuity without silently inflating the effective batch size.
-        pending += key[0]
-        completed, pending = divmod(pending, gradient_accumulation_steps)
-        optimizer_steps += completed
-
-    for window in local_windows:
-        key = (len(window.source_steps), window.loss_weight)
-        if current_size and (key != current_key or current_size >= micro_batch_size):
-            finish_microbatch(current_key)
-            current_size = 0
-        current_key = key
-        current_size += 1
-    if current_size:
-        finish_microbatch(current_key)
-    if pending:
+    for batch_index in range(next(iter(batch_counts))):
+        aligned = tuple(batches[batch_index] for batches in rank_batches)
+        lengths = {len(batch[0].source_steps) for batch in aligned if batch}
+        if len(lengths) != 1:
+            raise RuntimeError("Stage B shards disagree on rollout length at a backward step")
+        rollout_length = next(iter(lengths))
+        for _ in range(rollout_length):
+            global_valid = sum(sum(not window.is_padding for window in batch) for batch in aligned)
+            if global_valid == 0:
+                continue
+            pending_global_examples += global_valid
+            if pending_global_examples >= target_global_examples:
+                optimizer_steps += 1
+                pending_global_examples = 0
+    if pending_global_examples:
         optimizer_steps += 1
     return optimizer_steps
 

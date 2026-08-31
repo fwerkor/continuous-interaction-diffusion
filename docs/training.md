@@ -212,9 +212,14 @@ target-total count: resuming a partially completed one-epoch run with `--epochs 
 same epoch instead of scheduling a second one.
 
 Closed-loop state continuity is independent of optimizer accumulation. A long trajectory may carry
-its detached predicted T/Y state across many transitions, but AdamW steps as soon as the configured
-transition micro-batch accumulation is reached. The target global batch therefore remains meaningful
-even for trajectories much longer than `--rollout-horizon`, without reintroducing teacher resets.
+its detached predicted T/Y state across many transitions. Terminal or quiescent model decisions do
+not delete later supervision: a blocked transition receives a teacher-input correction loss while
+the blocked rollout state itself is preserved. AdamW accumulation counts globally valid transitions
+rather than backward calls or padded rows, and the Stage B warmup/cosine schedule is precomputed
+with the same valid-transition rule. The target global batch therefore remains meaningful even for
+long trajectories and uneven final shards. Closed-loop display diffusion resets only when a
+materialized predicted binding actually obtains replayed external progress; teacher event timing by
+itself cannot reset the diffusion epoch.
 
 The adapter is initially loaded as FP32 on CPU. A frozen BF16 snapshot of the input embedding is
 placed on the compute device for dataset semantic transport targets and external-memory text. CUDA
