@@ -843,9 +843,7 @@ def test_closed_loop_missing_binding_does_not_inherit_teacher_waiting_equilibriu
         active_binding_ids=(),
         executable_binding_ids=(),
     )
-    closed_loop = tensorizer.tensorize(
-        example, source_step=0, timestep=0.0, rollout_state=rollout
-    )
+    closed_loop = tensorizer.tensorize(example, source_step=0, timestep=0.0, rollout_state=rollout)
 
     assert closed_loop.targets.convergence_targets.item() == 0.0
 
@@ -1248,12 +1246,8 @@ def test_validation_loss_is_deterministic_and_preserves_training_state() -> None
 
     first = trainer.evaluate_rollout_windows(windows, seed=12345)
     second = trainer.evaluate_rollout_windows(windows, seed=12345)
-    free_first = trainer.evaluate_rollout_windows(
-        windows, seed=12345, rollout_probability=1.0
-    )
-    free_second = trainer.evaluate_rollout_windows(
-        windows, seed=12345, rollout_probability=1.0
-    )
+    free_first = trainer.evaluate_rollout_windows(windows, seed=12345, rollout_probability=1.0)
+    free_second = trainer.evaluate_rollout_windows(windows, seed=12345, rollout_probability=1.0)
 
     assert first == second
     assert free_first == free_second
@@ -1973,6 +1967,10 @@ def test_predicted_binding_requires_live_owner_and_carries_predicted_routes() ->
     output.need_target_display_logits[0, owner_slot, 0].fill_(-10.0)
     output.need_target_display_logits[0, owner_slot, 0, 1:3] = 10.0
     output.argument_presence_logits[0, owner_slot, 0].fill_(10.0)
+    output.refresh_logits[0, owner_slot, 0].fill_(-10.0)
+    output.refresh_logits[
+        0, owner_slot, 0, tuple(FreshnessDemand).index(FreshnessDemand.ALWAYS)
+    ] = 10.0
     for argument_index, name in enumerate(("key", "scope")):
         output.argument_query[0, owner_slot, 0, argument_index] = (
             tensorizer.text_encoder.encode_one(
@@ -1996,6 +1994,8 @@ def test_predicted_binding_requires_live_owner_and_carries_predicted_routes() ->
     assert executable == (binding.need_id,)
     assert routes[0].target_cells == (ObjectRef.cell("c1"), ObjectRef.cell("c0"))
     assert routes[0].target_display == (ObjectRef.display_span(1, 3),)
+    assert routes[0].freshness is FreshnessDemand.ALWAYS
+    assert routes[0].runtime_active
 
     live[owner_slot] = False
     active, executable, routes = tensorizer.predicted_binding_state(
@@ -2008,6 +2008,238 @@ def test_predicted_binding_requires_live_owner_and_carries_predicted_routes() ->
         batch_index=0,
     )
     assert active == executable == routes == ()
+
+
+def test_closed_loop_freshness_controls_which_observation_is_visible() -> None:
+    adapter = make_adapter(seed=155)
+    tensorizer = ILLaDATrajectoryTensorizer(adapter, TinyTokenizer())
+    base = make_rollout_trajectory()
+    binding = base.binding_targets[0]
+    example = replace(
+        base,
+        events=(
+            ExternalEvent(
+                source=binding.source,
+                value="37",
+                arrival_step=1,
+                arguments=binding.arguments,
+                version="v1",
+            ),
+            ExternalEvent(
+                source=binding.source,
+                value="38",
+                arrival_step=2,
+                arguments=binding.arguments,
+                version="v2",
+            ),
+        ),
+    )
+    teacher = tensorizer.tensorize(example, source_step=0, timestep=0.0)
+    route = cid_model.CIDRolloutBindingRoute(
+        need_id=binding.need_id,
+        target_cells=binding.target_cells,
+        target_display=binding.target_display,
+        freshness=FreshnessDemand.ONCE,
+    )
+    state = CIDRolloutState(
+        thought_semantic=teacher.batch.thought_semantic.clone(),
+        role_features=teacher.batch.role_features.clone(),
+        uncertainty=teacher.batch.uncertainty.clone(),
+        lifecycle_features=teacher.batch.lifecycle_features.clone(),
+        slot_occupancy=teacher.batch.slot_occupancy.clone(),
+        local_noise=teacher.batch.local_noise.clone(),
+        display_ids=teacher.batch.display_ids.clone(),
+        active_binding_ids=(binding.need_id,),
+        executable_binding_ids=(binding.need_id,),
+        binding_routes=(route,),
+        binding_observation_steps=((binding.need_id, 1),),
+    )
+
+    once, once_steps, _ = tensorizer._available_percept_projections(example, 2, rollout_state=state)
+    always, always_steps, _ = tensorizer._available_percept_projections(
+        example,
+        2,
+        rollout_state=replace(
+            state,
+            binding_routes=(replace(route, freshness=FreshnessDemand.ALWAYS),),
+        ),
+    )
+
+    assert once[0][1].value == "37"
+    assert dict(once_steps)[binding.need_id] == 1
+    assert always[0][1].value == "38"
+    assert dict(always_steps)[binding.need_id] == 2
+
+
+def test_closed_loop_quiescence_waits_until_external_progress() -> None:
+    adapter = make_adapter(seed=156)
+    tensorizer = ILLaDATrajectoryTensorizer(adapter, TinyTokenizer())
+    base = make_rollout_trajectory()
+    binding = base.binding_targets[0]
+    example = replace(
+        base,
+        events=(
+            ExternalEvent(
+                source=binding.source,
+                value="38",
+                arrival_step=3,
+                arguments=binding.arguments,
+            ),
+        ),
+    )
+    teacher = tensorizer.tensorize(base, source_step=0, timestep=0.0)
+    state = CIDRolloutState(
+        thought_semantic=teacher.batch.thought_semantic.clone(),
+        role_features=teacher.batch.role_features.clone(),
+        uncertainty=teacher.batch.uncertainty.clone(),
+        lifecycle_features=teacher.batch.lifecycle_features.clone(),
+        slot_occupancy=teacher.batch.slot_occupancy.clone(),
+        local_noise=teacher.batch.local_noise.clone(),
+        display_ids=teacher.batch.display_ids.clone(),
+        active_binding_ids=(binding.need_id,),
+        executable_binding_ids=(binding.need_id,),
+        binding_routes=(
+            cid_model.CIDRolloutBindingRoute(
+                need_id=binding.need_id,
+                target_cells=binding.target_cells,
+                target_display=binding.target_display,
+                freshness=FreshnessDemand.ONCE,
+            ),
+        ),
+        equilibrium=True,
+        quiescent=True,
+    )
+    trainer = CIDTrainer(
+        adapter,
+        tensorizer,
+        CIDTrainerConfig(
+            rollout_horizon=3,
+            teacher_forcing_epochs=0,
+            rollout_ramp_epochs=0,
+        ),
+    )
+    window = CIDRolloutWindow(example=example, source_steps=(0, 1, 2))
+
+    _, before_arrival = trainer._rollout_step_plan((window,), 1, [state], rollout_probability=1.0)
+    _, at_arrival = trainer._rollout_step_plan((window,), 2, [state], rollout_probability=1.0)
+
+    assert before_arrival == (False,)
+    assert at_arrival == (True,)
+
+
+def test_always_freshness_requires_terminal_refresh_before_finalization() -> None:
+    adapter = make_adapter(seed=158)
+    tensorizer = ILLaDATrajectoryTensorizer(adapter, TinyTokenizer())
+    base = make_rollout_trajectory()
+    binding = base.binding_targets[0]
+    example = replace(
+        base,
+        events=(
+            ExternalEvent(
+                source=binding.source,
+                value="37",
+                arrival_step=1,
+                arguments=binding.arguments,
+                version="v1",
+            ),
+        ),
+    )
+    sample = tensorizer.tensorize(example, source_step=1, timestep=0.0)
+    training_batch = collate_training_steps((sample,), pad_token_id=1)
+    output = adapter(training_batch.batch)
+    slots = tensorizer._target_output_slots(
+        tensorizer._thought_snapshot(example, 1),
+        tensorizer._thought_snapshot(example, 2),
+        sample.batch.thought_semantic.shape[1],
+    )
+    owner_slot = slots[binding.owner_cell.identifier]
+    active_index = tuple(import_module("cid.lifecycle").MODELED_LIFECYCLES).index(
+        CellLifecycle.ACTIVE
+    )
+    output.lifecycle_logits.fill_(-10.0)
+    output.lifecycle_logits[..., active_index] = 10.0
+    output.allocation_logits.fill_(-10.0)
+    output.need_logits.fill_(-10.0)
+    output.need_logits[0, owner_slot, 0] = 10.0
+    output.argument_presence_logits[0, owner_slot, 0].fill_(10.0)
+    for argument_index, name in enumerate(("key", "scope")):
+        output.argument_query[0, owner_slot, 0, argument_index] = (
+            tensorizer.text_encoder.encode_one(
+                json.dumps(binding.arguments[name], separators=(",", ":")), detach=True
+            )
+        )
+    output.refresh_logits[0, owner_slot, 0].fill_(-10.0)
+    output.refresh_logits[
+        0, owner_slot, 0, tuple(FreshnessDemand).index(FreshnessDemand.ALWAYS)
+    ] = 10.0
+    output.convergence_logits.fill_(20.0)
+    display_logits = torch.full_like(output.display_logits, -20.0)
+    display_logits.scatter_(-1, training_batch.batch.display_ids.unsqueeze(-1), 20.0)
+    output.display_logits = display_logits
+
+    trainer = CIDTrainer(adapter, tensorizer, CIDTrainerConfig())
+    state = trainer._rollout_state_from_prediction(
+        sample,
+        training_batch,
+        output,
+        example=example,
+        batch_index=0,
+    )
+
+    assert state.converged
+    assert state.quiescent
+    assert not state.terminal
+    assert state.binding_routes[0].freshness is FreshnessDemand.ALWAYS
+    assert tensorizer.rollout_external_progress(example, 3, state)
+
+    _, _, validated = tensorizer._available_percept_projections(example, 3, rollout_state=state)
+    assert binding.need_id in validated
+
+
+def test_free_rollout_stops_after_model_terminal_decision() -> None:
+    class EarlyConvergingModel(nn.Module):
+        def __init__(self, adapter) -> None:
+            super().__init__()
+            self.adapter = adapter
+
+        def forward(self, batch):
+            output = self.adapter(batch)
+            output.convergence_logits = torch.full_like(output.convergence_logits, 20.0)
+            output.need_logits = torch.full_like(output.need_logits, -20.0)
+            display_logits = torch.full_like(output.display_logits, -20.0)
+            display_logits.scatter_(
+                -1,
+                batch.display_ids.unsqueeze(-1),
+                20.0,
+            )
+            output.display_logits = display_logits
+            return output
+
+    adapter = make_adapter(seed=157)
+    tensorizer = ILLaDATrajectoryTensorizer(adapter, TinyTokenizer())
+    trainer = CIDTrainer(
+        adapter,
+        tensorizer,
+        CIDTrainerConfig(
+            timestep_min=0.0,
+            timestep_max=0.0,
+            rollout_horizon=2,
+            teacher_forcing_epochs=0,
+            rollout_ramp_epochs=0,
+        ),
+        forward_model=EarlyConvergingModel(adapter),
+    )
+    window = CIDRolloutWindow(
+        example=make_rollout_trajectory(),
+        source_steps=(0, 1),
+    )
+
+    teacher_forced = trainer.evaluate_rollout_windows((window,), seed=123, rollout_probability=0.0)
+    free_rollout = trainer.evaluate_rollout_windows((window,), seed=123, rollout_probability=1.0)
+
+    assert teacher_forced.transitions == 2
+    assert free_rollout.transitions == 1
+    assert free_rollout.behavior_counts["convergence_correct"] == 0.0
 
 
 def test_stage_a_fp32_cid_modules_keep_low_precision_backbone_frozen() -> None:
@@ -2579,9 +2811,7 @@ def test_stage_a_checkpoint_without_data_order_marker_loads_legacy_order(tmp_pat
 def test_checkpoint_allows_equivalent_batch_geometry_at_clean_epoch_boundary(tmp_path) -> None:
     adapter = make_adapter(seed=321)
     config = CIDTrainerConfig(micro_batch_size=4, gradient_accumulation_steps=6)
-    trainer = CIDTrainer(
-        adapter, ILLaDATrajectoryTensorizer(adapter, TinyTokenizer()), config
-    )
+    trainer = CIDTrainer(adapter, ILLaDATrajectoryTensorizer(adapter, TinyTokenizer()), config)
     trainer.state = CIDTrainerState(
         transitions_seen=96, optimizer_steps=1, epochs_completed=1, rollout_windows_seen_in_epoch=0
     )

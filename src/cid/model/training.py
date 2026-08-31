@@ -87,6 +87,8 @@ class CIDTrainingStep:
     targets: CIDTargets
     promoted_fact_texts: tuple[str, ...] = ()
     observed_binding_ids: tuple[str, ...] = ()
+    binding_observation_steps: tuple[tuple[str, int], ...] = ()
+    terminal_validated_binding_ids: tuple[str, ...] = ()
 
 
 @dataclass(slots=True)
@@ -105,6 +107,8 @@ class CIDRolloutBindingRoute:
     need_id: str
     target_cells: tuple[ObjectRef, ...]
     target_display: tuple[ObjectRef, ...]
+    freshness: FreshnessDemand = FreshnessDemand.ONCE
+    runtime_active: bool = True
 
 
 @dataclass(frozen=True, slots=True)
@@ -122,7 +126,13 @@ class CIDRolloutState:
     active_binding_ids: tuple[str, ...] = ()
     executable_binding_ids: tuple[str, ...] = ()
     binding_routes: tuple[CIDRolloutBindingRoute, ...] = ()
+    binding_observation_steps: tuple[tuple[str, int], ...] = ()
+    terminal_validated_binding_ids: tuple[str, ...] = ()
     promoted_fact_texts: tuple[str, ...] = ()
+    equilibrium: bool = False
+    converged: bool = False
+    quiescent: bool = False
+    terminal: bool = False
 
 
 @dataclass(frozen=True, slots=True)
@@ -222,12 +232,8 @@ def collate_training_steps(
         source_targets=_pad_slot_targets(steps, "source_targets", pad_value=-100),
         need_target_cell_targets=_pad_slot_targets(steps, "need_target_cell_targets"),
         need_target_cell_mask=_pad_slot_targets(steps, "need_target_cell_mask"),
-        need_target_display_targets=_pad_need_display_targets(
-            steps, "need_target_display_targets"
-        ),
-        need_target_display_mask=_pad_need_display_targets(
-            steps, "need_target_display_mask"
-        ),
+        need_target_display_targets=_pad_need_display_targets(steps, "need_target_display_targets"),
+        need_target_display_mask=_pad_need_display_targets(steps, "need_target_display_mask"),
         argument_presence_targets=_pad_slot_targets(steps, "argument_presence_targets"),
         argument_presence_mask=_pad_slot_targets(steps, "argument_presence_mask"),
         argument_embeddings=_pad_slot_targets(steps, "argument_embeddings"),
@@ -377,10 +383,7 @@ CID_LOSS_COMPONENT_NAMES = (
 
 
 def _cid_loss_component_values(losses: CIDLoss) -> dict[str, Tensor]:
-    return {
-        name: getattr(losses, name).detach().float()
-        for name in CID_LOSS_COMPONENT_NAMES
-    }
+    return {name: getattr(losses, name).detach().float() for name in CID_LOSS_COMPONENT_NAMES}
 
 
 def _accumulate_metric_tensors(
@@ -433,8 +436,7 @@ def _cid_behavior_counts(
     row = batch_mask.bool()
 
     need_mask = (
-        targets.thought_mask.unsqueeze(-1).expand_as(output.need_logits).bool()
-        & row[:, None, None]
+        targets.thought_mask.unsqueeze(-1).expand_as(output.need_logits).bool() & row[:, None, None]
     )
     need_prediction = torch.sigmoid(output.need_logits) >= need_threshold
     need_target = targets.need_targets >= 0.5
@@ -456,22 +458,22 @@ def _cid_behavior_counts(
     convergence_prediction = torch.sigmoid(output.convergence_logits) >= 0.5
     convergence_target = targets.convergence_targets >= 0.5
     counts["convergence_correct"] = (
-        (convergence_prediction == convergence_target) & row
-    ).sum().float()
+        ((convergence_prediction == convergence_target) & row).sum().float()
+    )
     counts["convergence_total"] = row.sum().float()
 
     lifecycle_mask = (targets.lifecycle != -100) & row[:, None]
     lifecycle_prediction = output.lifecycle_logits.argmax(dim=-1)
     counts["lifecycle_correct"] = (
-        (lifecycle_prediction == targets.lifecycle) & lifecycle_mask
-    ).sum().float()
+        ((lifecycle_prediction == targets.lifecycle) & lifecycle_mask).sum().float()
+    )
     counts["lifecycle_total"] = lifecycle_mask.sum().float()
 
     display_mask = (targets.display_ids != -100) & row[:, None]
     display_prediction = output.display_logits.argmax(dim=-1)
     counts["display_token_correct"] = (
-        (display_prediction == targets.display_ids) & display_mask
-    ).sum().float()
+        ((display_prediction == targets.display_ids) & display_mask).sum().float()
+    )
     counts["display_token_total"] = display_mask.sum().float()
     return counts
 
@@ -569,6 +571,46 @@ class CIDTrainer:
         )
         return loss_sum, raw_loss_sum, transitions
 
+    def _rollout_step_plan(
+        self,
+        windows: tuple[CIDRolloutWindow, ...],
+        offset: int,
+        rollout_states: list[CIDRolloutState | None],
+        *,
+        rollout_probability: float,
+    ) -> tuple[tuple[bool, ...], tuple[bool, ...]]:
+        use_rollout_flags: list[bool] = []
+        execute_rows: list[bool] = []
+        for index, window in enumerate(windows):
+            state = rollout_states[index]
+            use_rollout = (
+                offset > 0 and state is not None and self.shuffle_rng.random() < rollout_probability
+            )
+            ready = True
+            if use_rollout and state is not None:
+                if state.terminal:
+                    ready = False
+                elif state.quiescent:
+                    ready = self.tensorizer.rollout_external_progress(
+                        window.example,
+                        window.source_steps[offset] + 1,
+                        state,
+                    )
+            use_rollout_flags.append(use_rollout)
+            execute_rows.append(not window.is_padding and ready)
+        return tuple(use_rollout_flags), tuple(execute_rows)
+
+    def _distributed_any_rows(self, local_rows: int) -> bool:
+        if not torch.distributed.is_available() or not torch.distributed.is_initialized():
+            return local_rows > 0
+        flag = torch.tensor(
+            [1 if local_rows > 0 else 0],
+            dtype=torch.int32,
+            device=self.tensorizer.text_encoder.device,
+        )
+        torch.distributed.all_reduce(flag, op=torch.distributed.ReduceOp.MAX)
+        return bool(flag.item())
+
     def _train_rollout_microbatch_with_metrics(
         self,
         windows: tuple[CIDRolloutWindow, ...],
@@ -586,31 +628,35 @@ class CIDTrainer:
         if len(loss_weights) != 1:
             raise ValueError("rollout micro-batch windows must have the same loss_weight")
         loss_weight = next(iter(loss_weights))
-        sample_mask = tuple(not window.is_padding for window in windows)
-        effective_batch_size = sum(sample_mask)
 
         rollout_states: list[CIDRolloutState | None] = [None] * len(windows)
         loss_sum = 0.0
         raw_loss_sum = 0.0
         transition_count = 0
         component_sums: dict[str, Tensor] = {}
-        for offset in range(next(iter(lengths))):
-            samples: list[CIDTrainingStep] = []
-            for index, window in enumerate(windows):
-                use_rollout = (
-                    offset > 0
-                    and rollout_states[index] is not None
-                    and self.shuffle_rng.random() < rollout_probability
+        rollout_length = next(iter(lengths))
+        for offset in range(rollout_length):
+            use_rollout_flags, sample_mask = self._rollout_step_plan(
+                windows,
+                offset,
+                rollout_states,
+                rollout_probability=rollout_probability,
+            )
+            samples = [
+                self.tensorizer.tensorize(
+                    window.example,
+                    window.source_steps[offset],
+                    timestep=self._sample_timestep(),
+                    generator=self.generator,
+                    rollout_state=(rollout_states[index] if use_rollout_flags[index] else None),
                 )
-                samples.append(
-                    self.tensorizer.tensorize(
-                        window.example,
-                        window.source_steps[offset],
-                        timestep=self._sample_timestep(),
-                        generator=self.generator,
-                        rollout_state=rollout_states[index] if use_rollout else None,
-                    )
-                )
+                for index, window in enumerate(windows)
+            ]
+            effective_batch_size = sum(sample_mask)
+            # All data-parallel ranks must make the same backward/optimizer-step
+            # decisions even when only another rank still has an executable row.
+            if not self._distributed_any_rows(effective_batch_size):
+                continue
             losses, output, training_batch = self._forward_backward(
                 tuple(samples),
                 loss_scale=loss_weight,
@@ -626,20 +672,22 @@ class CIDTrainer:
                 _cid_loss_component_values(losses),
                 scale=effective_batch_size,
             )
-            # The predicted state is consumed only by a later transition in the same
-            # window. Skipping the terminal materialization avoids pure accelerator work,
-            # which is especially significant for compact NPU backbones.
-            if offset + 1 < next(iter(lengths)) and rollout_probability > 0.0:
-                rollout_states = [
-                    self._rollout_state_from_prediction(
+            # Preserve terminal/quiescent rows exactly as the runtime would: they do
+            # not acquire a new model state until a later scheduled-sampling decision
+            # teacher-forces them or external progress resumes a quiescent rollout.
+            if offset + 1 < rollout_length and rollout_probability > 0.0:
+                next_states = list(rollout_states)
+                for index, sample in enumerate(samples):
+                    if not sample_mask[index]:
+                        continue
+                    next_states[index] = self._rollout_state_from_prediction(
                         sample,
                         training_batch,
                         output,
                         example=windows[index].example,
                         batch_index=index,
                     )
-                    for index, sample in enumerate(samples)
-                ]
+                rollout_states = next_states
             del output, training_batch, losses, samples
         return loss_sum, raw_loss_sum, transition_count, component_sums
 
@@ -746,9 +794,7 @@ class CIDTrainer:
         # Existing live cells, however, stop owning needs immediately when materialized
         # as RETIRED. Decode bindings from that same provisional live set.
         live_slots = (
-            occupancy.squeeze(-1)
-            & ~previous_retired
-            & (~predicted_retired | newly_allocated)
+            occupancy.squeeze(-1) & ~previous_retired & (~predicted_retired | newly_allocated)
         )[0]
 
         display_length = sample.batch.display_ids.shape[1]
@@ -781,10 +827,12 @@ class CIDTrainer:
             output=output,
             batch_index=batch_index,
         )
-        observed_binding_ids = set(sample.observed_binding_ids)
+        observed_binding_ids = set(dict(sample.binding_observation_steps))
         waiting_cells: set[str] = set()
         available_cells: set[str] = set()
         for route in binding_routes:
+            if not route.runtime_active:
+                continue
             destination = (
                 available_cells if route.need_id in observed_binding_ids else waiting_cells
             )
@@ -831,6 +879,35 @@ class CIDTrainer:
         ).clamp(0.0, 1.0)
         local_noise = local_noise * occupancy.to(dtype=local_noise.dtype)
 
+        materializer_config = CIDMaterializerConfig()
+        equilibrium = (
+            float(torch.sigmoid(output.convergence_logits[batch_index]).detach())
+            >= materializer_config.convergence_threshold
+        )
+        display_unresolved = bool(
+            (display_ids[0, :display_active_length] == self.adapter.mask_token_id).any()
+        )
+        converged = equilibrium and not display_unresolved
+        unresolved_binding = any(
+            route.runtime_active and route.need_id not in observed_binding_ids
+            for route in binding_routes
+        )
+        terminal_validated = frozenset(sample.terminal_validated_binding_ids)
+        executable = frozenset(executable_binding_ids)
+        # ALWAYS is refresh-due on every runtime step. MAX_AGE depends on wall-clock
+        # elapsed time, which trajectory JSONL intentionally does not model, so a
+        # zero-wall-time training rollout treats MAX_AGE as not yet due.
+        pending_terminal_refresh = any(
+            route.runtime_active
+            and route.need_id in observed_binding_ids
+            and route.need_id in executable
+            and route.freshness is FreshnessDemand.ALWAYS
+            and route.need_id not in terminal_validated
+            for route in binding_routes
+        )
+        terminal = converged and not unresolved_binding and not pending_terminal_refresh
+        quiescent = (equilibrium and unresolved_binding) or (converged and pending_terminal_refresh)
+
         return CIDRolloutState(
             thought_semantic=output.thought_semantic[
                 batch_index : batch_index + 1, slot_slice
@@ -849,7 +926,13 @@ class CIDTrainer:
             active_binding_ids=active_binding_ids,
             executable_binding_ids=executable_binding_ids,
             binding_routes=binding_routes,
+            binding_observation_steps=sample.binding_observation_steps,
+            terminal_validated_binding_ids=sample.terminal_validated_binding_ids,
             promoted_fact_texts=sample.promoted_fact_texts,
+            equilibrium=equilibrium,
+            converged=converged,
+            quiescent=quiescent,
+            terminal=terminal,
         )
 
     def train_examples(
@@ -975,9 +1058,7 @@ class CIDTrainer:
             optimizer_steps=self.state.optimizer_steps - start_optimizer_steps,
             mean_loss=total_loss / total_transitions,
             raw_mean_loss=total_raw_loss / total_transitions,
-            component_mean_losses=_metric_tensor_means(
-                total_component_sums, total_transitions
-            ),
+            component_mean_losses=_metric_tensor_means(total_component_sums, total_transitions),
         )
 
     def evaluate_rollout_windows(
@@ -1031,45 +1112,45 @@ class CIDTrainer:
                         )
                     loss_weight = next(iter(loss_weights))
                     rollout_states: list[CIDRolloutState | None] = [None] * len(microbatch)
-                    for offset in range(next(iter(lengths))):
-                        samples_list: list[CIDTrainingStep] = []
-                        for index, window in enumerate(microbatch):
-                            use_rollout = (
-                                offset > 0
-                                and rollout_states[index] is not None
-                                and self.shuffle_rng.random() < rollout_probability
+                    rollout_length = next(iter(lengths))
+                    for offset in range(rollout_length):
+                        use_rollout_flags, execute_rows = self._rollout_step_plan(
+                            microbatch,
+                            offset,
+                            rollout_states,
+                            rollout_probability=rollout_probability,
+                        )
+                        samples = tuple(
+                            self.tensorizer.tensorize(
+                                window.example,
+                                window.source_steps[offset],
+                                timestep=self._sample_timestep(),
+                                generator=self.generator,
+                                rollout_state=(
+                                    rollout_states[index] if use_rollout_flags[index] else None
+                                ),
                             )
-                            samples_list.append(
-                                self.tensorizer.tensorize(
-                                    window.example,
-                                    window.source_steps[offset],
-                                    timestep=self._sample_timestep(),
-                                    generator=self.generator,
-                                    rollout_state=(
-                                        rollout_states[index] if use_rollout else None
-                                    ),
-                                )
-                            )
-                        samples = tuple(samples_list)
+                            for index, window in enumerate(microbatch)
+                        )
+                        batch_size = sum(execute_rows)
+                        if batch_size == 0:
+                            continue
                         training_batch = collate_training_steps(
                             samples, pad_token_id=int(self.pad_token_id)
                         )
                         batch_mask = torch.tensor(
-                            tuple(not window.is_padding for window in microbatch),
+                            execute_rows,
                             dtype=torch.bool,
                             device=training_batch.batch.thought_semantic.device,
                         )
                         training_batch.batch.sample_mask = batch_mask
                         output = self.forward_model(training_batch.batch)
-                        losses = cid_loss(
-                            output, training_batch.targets, batch_mask=batch_mask
-                        )
+                        losses = cid_loss(output, training_batch.targets, batch_mask=batch_mask)
                         if not bool(torch.isfinite(losses.total)):
                             names = ", ".join(training_batch.example_ids)
                             raise FloatingPointError(
                                 f"non-finite CID validation loss for micro-batch: {names}"
                             )
-                        batch_size = int(batch_mask.sum())
                         raw_loss = float(losses.total.detach().float()) * batch_size
                         total_raw_loss += raw_loss
                         total_loss += raw_loss * loss_weight
@@ -1088,17 +1169,19 @@ class CIDTrainer:
                                 batch_mask=batch_mask,
                             ),
                         )
-                        if offset + 1 < next(iter(lengths)) and rollout_probability > 0.0:
-                            rollout_states = [
-                                self._rollout_state_from_prediction(
+                        if offset + 1 < rollout_length and rollout_probability > 0.0:
+                            next_states = list(rollout_states)
+                            for index, sample in enumerate(samples):
+                                if not execute_rows[index]:
+                                    continue
+                                next_states[index] = self._rollout_state_from_prediction(
                                     sample,
                                     training_batch,
                                     output,
                                     example=microbatch[index].example,
                                     batch_index=index,
                                 )
-                                for index, sample in enumerate(samples)
-                            ]
+                            rollout_states = next_states
                         del output, training_batch, losses, samples
         finally:
             self.generator.set_state(generator_state)
@@ -1110,9 +1193,7 @@ class CIDTrainer:
             optimizer_steps=0,
             mean_loss=total_loss / total_transitions,
             raw_mean_loss=total_raw_loss / total_transitions,
-            component_mean_losses=_metric_tensor_means(
-                component_sums, total_transitions
-            ),
+            component_mean_losses=_metric_tensor_means(component_sums, total_transitions),
             behavior_counts=_metric_tensor_values(behavior_counts),
         )
 
@@ -1359,8 +1440,7 @@ class CIDTrainer:
                 and int(checkpoint.get("pending_examples", 0)) == 0
             )
             equivalent_geometry = (
-                saved_geometry[0] * saved_geometry[1]
-                == current_geometry[0] * current_geometry[1]
+                saved_geometry[0] * saved_geometry[1] == current_geometry[0] * current_geometry[1]
             )
             if not (
                 clean_epoch_boundary
@@ -1764,14 +1844,14 @@ class ILLaDATrajectoryTensorizer:
                 dtype=dtype,
             )
 
-        percept_projections = self._available_percept_projections(
+        (
+            percept_projections,
+            binding_observation_steps,
+            terminal_validated_binding_ids,
+        ) = self._available_percept_projections(
             example,
             target_step,
-            allowed_binding_ids=(
-                None
-                if rollout_state is None
-                else frozenset(rollout_state.executable_binding_ids)
-            ),
+            rollout_state=rollout_state,
         )
         rollout_routes = (
             {}
@@ -1791,10 +1871,9 @@ class ILLaDATrajectoryTensorizer:
             target_step,
             carried=() if rollout_state is None else rollout_state.promoted_fact_texts,
             allowed_binding_ids=(
-                None
-                if rollout_state is None
-                else frozenset(rollout_state.executable_binding_ids)
+                None if rollout_state is None else frozenset(rollout_state.executable_binding_ids)
             ),
+            percept_projections=(None if rollout_state is None else percept_projections),
         )
         fact_memory = self.text_encoder.encode_texts(
             (
@@ -1815,9 +1894,7 @@ class ILLaDATrajectoryTensorizer:
                     target_cells=route.target_cells,
                     target_display=route.target_display,
                 )
-                for (binding, event), route in zip(
-                    percept_projections, percept_routes, strict=True
-                )
+                for (binding, event), route in zip(percept_projections, percept_routes, strict=True)
             ),
             detach=True,
         )
@@ -1858,9 +1935,7 @@ class ILLaDATrajectoryTensorizer:
             percept_display_mask=percept_display_mask,
             display_padding_mask=display_padding_mask,
         )
-        observed_binding_ids = frozenset(
-            binding.need_id for binding, _ in percept_projections
-        )
+        observed_binding_ids = frozenset(binding.need_id for binding, _ in percept_projections)
         targets = self._targets(
             example=example,
             source_step=source_step,
@@ -1876,9 +1951,7 @@ class ILLaDATrajectoryTensorizer:
             input_state_noise=state_noise,
             observed_binding_ids=(observed_binding_ids if rollout_state is not None else None),
             active_binding_ids=(
-                None
-                if rollout_state is None
-                else frozenset(rollout_state.active_binding_ids)
+                None if rollout_state is None else frozenset(rollout_state.active_binding_ids)
             ),
             binding_routes=(
                 None
@@ -1899,38 +1972,129 @@ class ILLaDATrajectoryTensorizer:
             targets=targets,
             promoted_fact_texts=promoted_fact_texts,
             observed_binding_ids=tuple(observed_binding_ids),
+            binding_observation_steps=binding_observation_steps,
+            terminal_validated_binding_ids=terminal_validated_binding_ids,
         )
 
     @staticmethod
+    def _matching_binding_events(
+        example: TrajectoryExample, binding: Any, target_step: int
+    ) -> tuple[Any, ...]:
+        return tuple(
+            event
+            for event in example.events
+            if event.arrival_step <= target_step
+            and event.source == binding.source
+            and dict(event.arguments) == dict(binding.arguments)
+        )
+
     def _available_percept_projections(
+        self,
         example: TrajectoryExample,
         target_step: int,
         *,
-        allowed_binding_ids: frozenset[str] | None = None,
-    ) -> tuple[tuple[Any, Any], ...]:
+        rollout_state: CIDRolloutState | None,
+    ) -> tuple[tuple[tuple[Any, Any], ...], tuple[tuple[str, int], ...], tuple[str, ...]]:
         projections: list[tuple[Any, Any]] = []
-        for binding in example.binding_targets:
-            if binding.first_need_step > target_step:
-                continue
-            if allowed_binding_ids is not None and binding.need_id not in allowed_binding_ids:
-                continue
-            matching = tuple(
-                event
-                for event in example.events
-                if event.arrival_step <= target_step
-                and event.source == binding.source
-                and dict(event.arguments) == dict(binding.arguments)
-            )
-            if matching:
+        if rollout_state is None:
+            observation_steps: dict[str, int] = {}
+            for binding in example.binding_targets:
+                if binding.first_need_step > target_step:
+                    continue
+                matching = self._matching_binding_events(example, binding, target_step)
+                if not matching:
+                    continue
                 latest = max(matching, key=lambda event: event.arrival_step)
-                if (
-                    allowed_binding_ids is None
-                    and binding.freshness is FreshnessDemand.ONCE
-                    and latest.arrival_step < target_step
-                ):
+                observation_steps[binding.need_id] = latest.arrival_step
+                if binding.freshness is FreshnessDemand.ONCE and latest.arrival_step < target_step:
                     continue
                 projections.append((binding, latest))
-        return tuple(projections)
+            return (
+                tuple(projections),
+                tuple(sorted(observation_steps.items())),
+                (),
+            )
+
+        executable = frozenset(rollout_state.executable_binding_ids)
+        routes = {route.need_id: route for route in rollout_state.binding_routes}
+        observation_steps = dict(rollout_state.binding_observation_steps)
+        validated = set(rollout_state.terminal_validated_binding_ids)
+        for binding in example.binding_targets:
+            if binding.first_need_step > target_step or binding.need_id not in executable:
+                continue
+            matching = self._matching_binding_events(example, binding, target_step)
+            if not matching:
+                continue
+            route = routes.get(binding.need_id)
+            freshness = FreshnessDemand.ONCE if route is None else route.freshness
+            previous_step = observation_steps.get(binding.need_id)
+            if previous_step is not None and freshness in (
+                FreshnessDemand.ONCE,
+                FreshnessDemand.MAX_AGE,
+            ):
+                held = tuple(event for event in matching if event.arrival_step <= previous_step)
+                if not held:
+                    continue
+                selected = max(held, key=lambda event: event.arrival_step)
+            else:
+                selected = max(matching, key=lambda event: event.arrival_step)
+
+            if previous_step != selected.arrival_step:
+                observation_steps[binding.need_id] = selected.arrival_step
+                validated.discard(binding.need_id)
+            projections.append((binding, selected))
+
+            # A converged ALWAYS binding performs one terminal refresh before the
+            # runtime is allowed to finalize. Dataset events are discrete snapshots,
+            # so replaying the selected event here represents completion of that read
+            # even when the source returns the same version/value.
+            if (
+                rollout_state.quiescent
+                and rollout_state.converged
+                and freshness is FreshnessDemand.ALWAYS
+            ):
+                validated.add(binding.need_id)
+
+        return (
+            tuple(projections),
+            tuple(sorted(observation_steps.items())),
+            tuple(sorted(validated)),
+        )
+
+    def rollout_external_progress(
+        self,
+        example: TrajectoryExample,
+        target_step: int,
+        state: CIDRolloutState,
+    ) -> bool:
+        """Whether a quiescent closed-loop row may execute another model step."""
+
+        if state.terminal:
+            return False
+        if not state.quiescent:
+            return True
+        observations = dict(state.binding_observation_steps)
+        validated = frozenset(state.terminal_validated_binding_ids)
+        executable = frozenset(state.executable_binding_ids)
+        bindings = {binding.need_id: binding for binding in example.binding_targets}
+        for route in state.binding_routes:
+            if not route.runtime_active or route.need_id not in executable:
+                continue
+            binding = bindings.get(route.need_id)
+            if binding is None:
+                continue
+            matching = self._matching_binding_events(example, binding, target_step)
+            if not matching:
+                continue
+            if route.need_id not in observations:
+                return True
+            if (
+                state.converged
+                and route.freshness is FreshnessDemand.ALWAYS
+                and route.need_id not in validated
+            ):
+                return True
+        return False
 
     @staticmethod
     def _promoted_fact_texts(
@@ -1939,12 +2103,28 @@ class ILLaDATrajectoryTensorizer:
         *,
         carried: tuple[str, ...],
         allowed_binding_ids: frozenset[str] | None,
+        percept_projections: tuple[tuple[Any, Any], ...] | None = None,
     ) -> tuple[str, ...]:
         texts = list(carried)
+        descriptors = {str(item.get("name", "")): item for item in example.source_descriptors}
+        if percept_projections is not None:
+            for binding, event in percept_projections:
+                descriptor = descriptors.get(binding.source)
+                if descriptor is None or not bool(descriptor.get("promote_results_to_fact", False)):
+                    continue
+                prefix = f"fact=binding:{binding.need_id} |"
+                texts = [text for text in texts if not text.startswith(prefix)]
+                texts.append(
+                    canonical_fact_text(
+                        key=f"binding:{binding.need_id}",
+                        value=event.value,
+                        source_type=binding.source,
+                        version=event.version,
+                    )
+                )
+            return tuple(texts)
+
         seen = set(texts)
-        descriptors = {
-            str(item.get("name", "")): item for item in example.source_descriptors
-        }
         for binding in example.binding_targets:
             if allowed_binding_ids is not None and binding.need_id not in allowed_binding_ids:
                 continue
@@ -2037,6 +2217,7 @@ class ILLaDATrajectoryTensorizer:
         thresholds = CIDMaterializerConfig()
         source_names = tuple(str(item.get("name", "")) for item in example.source_descriptors)
         schedule = self._binding_slot_schedule(example)
+        freshness_order = tuple(FreshnessDemand)
         active: list[str] = []
         executable: list[str] = []
         routes: list[CIDRolloutBindingRoute] = []
@@ -2051,11 +2232,7 @@ class ILLaDATrajectoryTensorizer:
             if owner is None:
                 continue
             slot = target_output_slots.get(owner.identifier)
-            if (
-                slot is None
-                or not bool(live_slots[slot])
-                or binding.source not in source_names
-            ):
+            if slot is None or not bool(live_slots[slot]) or binding.source not in source_names:
                 continue
             need_slot = schedule[(owner.identifier, binding.need_id)]
             confidence = float(
@@ -2063,9 +2240,7 @@ class ILLaDATrajectoryTensorizer:
             )
             if confidence < thresholds.need_threshold:
                 continue
-            source_index = int(
-                output.source_logits[batch_index, slot, need_slot].detach().argmax()
-            )
+            source_index = int(output.source_logits[batch_index, slot, need_slot].detach().argmax())
             if source_index >= len(source_names) or source_names[source_index] != binding.source:
                 continue
             active.append(binding.need_id)
@@ -2093,14 +2268,6 @@ class ILLaDATrajectoryTensorizer:
                 active_length=min(display_active_length, int(display_probabilities.numel())),
                 threshold=thresholds.need_target_display_threshold,
             )
-            routes.append(
-                CIDRolloutBindingRoute(
-                    need_id=binding.need_id,
-                    target_cells=tuple(target_cells),
-                    target_display=target_display,
-                )
-            )
-
             descriptor = example.source_descriptors[source_index]
             required = tuple(
                 (argument_index, str(argument.get("name", "")))
@@ -2125,9 +2292,11 @@ class ILLaDATrajectoryTensorizer:
                 if presence < thresholds.argument_presence_threshold:
                     arguments_ok = False
                     break
-                query = output.argument_query[
-                    batch_index, slot, need_slot, argument_index
-                ].detach().float()
+                query = (
+                    output.argument_query[batch_index, slot, need_slot, argument_index]
+                    .detach()
+                    .float()
+                )
                 candidates: list[tuple[str, Tensor]] = []
                 seen_values: set[str] = set()
                 for candidate_binding in example.binding_targets:
@@ -2158,12 +2327,25 @@ class ILLaDATrajectoryTensorizer:
                     query.unsqueeze(0), candidate_embeddings, dim=-1
                 )
                 best_similarity, best_index = similarities.max(dim=0)
-                if (
-                    float(best_similarity) < thresholds.retrieval_similarity_threshold
-                    or candidates[int(best_index)][0] != stable_text(binding.arguments[name])
-                ):
+                if float(best_similarity) < thresholds.retrieval_similarity_threshold or candidates[
+                    int(best_index)
+                ][0] != stable_text(binding.arguments[name]):
                     arguments_ok = False
                     break
+            freshness = freshness_order[
+                int(output.refresh_logits[batch_index, slot, need_slot].detach().argmax())
+            ]
+            routes.append(
+                CIDRolloutBindingRoute(
+                    need_id=binding.need_id,
+                    target_cells=tuple(target_cells),
+                    target_display=target_display,
+                    freshness=freshness,
+                    runtime_active=(
+                        arguments_ok or bool(descriptor.get("accepts_partial_arguments", False))
+                    ),
+                )
+            )
             # Partial-argument sources may start speculative I/O at runtime, but the
             # dataset event represents the binding's fully resolved observation. Do not
             # inject that teacher observation until all required arguments resolve to the
@@ -2243,9 +2425,7 @@ class ILLaDATrajectoryTensorizer:
                 if binding.need_id not in active:
                     continue
                 destination = (
-                    available_cells
-                    if binding.need_id in observed_binding_ids
-                    else waiting_cells
+                    available_cells if binding.need_id in observed_binding_ids else waiting_cells
                 )
                 route = routes.get(binding.need_id)
                 if route is not None:
@@ -2446,9 +2626,7 @@ class ILLaDATrajectoryTensorizer:
                 start = max(0, min(start, display_width))
                 end = max(start, min(end, display_width))
                 need_target_display_targets[0, slot, need_slot, start:end] = 1.0
-            for argument_slot, argument in enumerate(
-                declared_arguments[: c.max_argument_slots]
-            ):
+            for argument_slot, argument in enumerate(declared_arguments[: c.max_argument_slots]):
                 argument_presence_mask[0, slot, need_slot, argument_slot] = True
                 name = str(argument.get("name", ""))
                 available_step = binding.argument_steps.get(
@@ -2886,8 +3064,7 @@ def trajectory_rollout_windows(
         for contiguous in runs:
             if max_horizon == 1:
                 windows.extend(
-                    CIDRolloutWindow(example=example, source_steps=(step,))
-                    for step in contiguous
+                    CIDRolloutWindow(example=example, source_steps=(step,)) for step in contiguous
                 )
             else:
                 # Rollout states are detached after every transition, so carrying them
@@ -3696,10 +3873,7 @@ def load_stage_b_model_checkpoint(
     source = Path(path)
     metadata = json.loads((source / "metadata.json").read_text(encoding="utf-8"))
     version = int(metadata.get("format_version", 0))
-    if (
-        version not in (4, 5, 6)
-        or metadata.get("kind") != "cid-stage-b-fsdp"
-    ):
+    if version not in (4, 5, 6) or metadata.get("kind") != "cid-stage-b-fsdp":
         raise ValueError("unsupported Stage B checkpoint format")
     if metadata.get("neural_contract_version") != CID_NEURAL_CONTRACT_VERSION:
         raise ValueError("Stage B checkpoint neural contract is incompatible")
