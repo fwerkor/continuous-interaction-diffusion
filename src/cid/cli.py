@@ -1496,6 +1496,7 @@ def _train_stage_a(args: argparse.Namespace) -> None:
                 epoch=0,
                 shuffle=False,
                 micro_batch_size=args.micro_batch_size,
+                portable_bucket_order=True,
             )
             if validation_windows
             else ()
@@ -1549,6 +1550,7 @@ def _train_stage_a(args: argparse.Namespace) -> None:
                 legacy_resume_padding=legacy_partial_resume,
                 length_aware=trainer.data_order_version >= 2,
                 zero_gradient_padding=trainer.data_order_version >= 3,
+                portable_bucket_order=trainer.data_order_version >= 4,
             )
             total_local_windows = len(local_windows)
             resumed_windows = trainer.state.rollout_windows_seen_in_epoch
@@ -1621,11 +1623,9 @@ def _train_stage_a(args: argparse.Namespace) -> None:
                 current_total_windows: int = total_local_windows,
             ) -> None:
                 nonlocal next_checkpoint_step
-                loss_sum = progress.mean_loss * progress.transitions
-                raw_loss_sum = progress.raw_mean_loss * progress.transitions
                 interval_transitions = progress.transitions
-                mean_loss = loss_sum / interval_transitions
-                raw_mean_loss = raw_loss_sum / interval_transitions
+                mean_loss = progress.mean_loss
+                raw_mean_loss = progress.raw_mean_loss
                 windows_seen = progress.rollout_windows_seen_in_epoch
                 record = {
                     "timestamp": time.time(),
@@ -1991,6 +1991,7 @@ def _train_stage_b(args: argparse.Namespace) -> None:
                 epoch=0,
                 shuffle=False,
                 micro_batch_size=args.micro_batch_size,
+                portable_bucket_order=True,
             )
             if validation_windows
             else ()
@@ -2020,6 +2021,7 @@ def _train_stage_b(args: argparse.Namespace) -> None:
                     epoch=epoch,
                     shuffle=not args.no_shuffle,
                     length_aware=True,
+                    portable_bucket_order=True,
                 )
                 for epoch in range(1, args.epochs + 1)
             ),
@@ -2176,6 +2178,11 @@ def _train_stage_b(args: argparse.Namespace) -> None:
             if loaded_checkpoint_metadata is not None
             else None
         )
+        if world_size_changed and saved_partial_windows and trainer.data_order_version < 4:
+            raise ValueError(
+                "cross-world-size Stage B mid-epoch resume requires data-order v4; "
+                "resume this legacy checkpoint with its original world size"
+            )
         if world_size_changed and saved_partial_windows and resume_epoch_progress is None:
             raise ValueError(
                 "cross-world-size Stage B resume requires a v3 partial-epoch data cursor"
@@ -2247,6 +2254,7 @@ def _train_stage_b(args: argparse.Namespace) -> None:
                 consumed_windows_by_bucket=epoch_base_consumed,
                 length_aware=trainer.data_order_version >= 2,
                 zero_gradient_padding=trainer.data_order_version >= 3,
+                portable_bucket_order=trainer.data_order_version >= 4,
             )
             total_local_windows = len(epoch_shard)
             resumed_windows = trainer.state.rollout_windows_seen_in_epoch

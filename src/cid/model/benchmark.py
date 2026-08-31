@@ -73,11 +73,7 @@ async def run_neural_benchmark_case(
     expected_ids = tuple(int(token) for token in expected_ids_tensor[0].tolist())
     if not expected_ids:
         raise ValueError("benchmark target display must tokenize to at least one token")
-    canvas_tokens = adapter.config.display_canvas_tokens
-    if len(expected_ids) + 1 > canvas_tokens:
-        raise ValueError(
-            "benchmark target display plus EOS exceeds the fixed runtime display canvas"
-        )
+    canvas_tokens = _benchmark_display_canvas_tokens(adapter, len(expected_ids) + 1)
 
     thought = (
         teacher_seed_thought(example, adapter, encoder)
@@ -109,6 +105,22 @@ async def run_neural_benchmark_case(
         evaluation=replay.evaluation,
         trace_events=replay.runtime.trace.to_dicts(),
     )
+
+
+def _benchmark_display_canvas_tokens(adapter: ILLaDACIDAdapter, required_tokens: int) -> int:
+    """Choose the same coarse expandable display bucket used during training."""
+
+    if required_tokens <= 0:
+        raise ValueError("benchmark display requires at least one token")
+    maximum = adapter.config.max_display_tokens
+    if required_tokens > maximum:
+        raise ValueError(
+            "benchmark target display plus EOS exceeds the checkpoint maximum display capacity"
+        )
+    canvas = adapter.config.display_canvas_tokens
+    while canvas < required_tokens:
+        canvas = min(maximum, canvas * 2)
+    return canvas
 
 
 def build_materialization_catalog(

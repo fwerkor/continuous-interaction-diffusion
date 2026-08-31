@@ -514,7 +514,11 @@ next clean gradient-accumulation boundary. Every completed epoch is additionally
 as `stage-b-epoch-XXXX` (or `.pt` on the single-NPU compact path); `stage-b-latest` and the epoch-end
 step name are symlinks to that snapshot. Periodic cleanup never deletes epoch snapshots. Stage B uses
 the same deterministic per-epoch validation objective and `validation_metrics.jsonl` as Stage A.
-Resume requires the same world size, dataset SHA-256, and resolved trainer configuration:
+Resume requires the same dataset SHA-256 and resolved trainer configuration. Same-world-size resume
+is always supported. New data-order-v4 checkpoints keep each rollout bucket in a world-size-independent
+canonical order and may also resume mid-epoch with a different FSDP world size; legacy partial-epoch
+checkpoints and the Ascend rank-local optimizer checkpoint format must resume with their original
+world size:
 
 ```bash
 torchrun --standalone --nproc-per-node=${WORLD_SIZE} -m cid.cli train-full \
@@ -532,9 +536,11 @@ configuration once it starts.
 ### Neural replay benchmark
 
 `cid benchmark` runs a trained CID checkpoint through the same step-exact replay sources used by the
-runtime evaluator and writes both per-case JSONL and an aggregate JSON summary. The default starts
-from an empty TCT; `--seed-teacher-state` is available only as a diagnostic that isolates downstream
-interaction behavior from initial cognitive allocation.
+runtime evaluator and writes both per-case JSONL and an aggregate JSON summary. The benchmark uses
+the same coarse display buckets as training, expanding from the checkpoint's minimum canvas up to
+`max_display_tokens` when a target requires it. The default starts from an empty TCT;
+`--seed-teacher-state` is available only as a diagnostic that isolates downstream interaction
+behavior from initial cognitive allocation.
 
 For a Stage A CID-only checkpoint:
 

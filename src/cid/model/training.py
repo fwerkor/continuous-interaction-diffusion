@@ -539,7 +539,9 @@ class CIDTrainer:
         self.generator.manual_seed(self.config.seed)
         self.shuffle_rng = random.Random(self.config.seed)
         self.state = CIDTrainerState()
-        self.data_order_version = 3
+        # v4 keeps rollout buckets in a world-size-independent canonical order so a
+        # per-bucket consumed prefix is sufficient for safe elastic mid-epoch resume.
+        self.data_order_version = 4
         self._pending_accumulation = 0
         self._pending_examples = 0
         self._pending_global_examples = 0
@@ -964,14 +966,22 @@ class CIDTrainer:
         )
         terminal_validated_ids = frozenset(terminal_validated)
         executable = frozenset(executable_binding_ids)
+        streamable_sources = {
+            str(descriptor.get("name", ""))
+            for descriptor in example.source_descriptors
+            if bool(descriptor.get("streamable", False))
+        }
         # ALWAYS is refresh-due on every runtime step. MAX_AGE depends on wall-clock
         # elapsed time, which trajectory JSONL intentionally does not model, so a
-        # zero-wall-time training rollout treats MAX_AGE as not yet due.
+        # zero-wall-time training rollout treats MAX_AGE as not yet due. Streaming
+        # sources are validated by stream queue state in the runtime, so they do not
+        # launch an extra terminal refresh.
         pending_terminal_refresh = any(
             route.runtime_active
             and route.need_id in observed_binding_ids
             and route.need_id in executable
             and route.freshness is FreshnessDemand.ALWAYS
+            and route.source not in streamable_sources
             and route.need_id not in terminal_validated_ids
             for route in binding_routes
         )
@@ -1061,20 +1071,26 @@ class CIDTrainer:
                 or progress_every_optimizer_steps is None
                 or next_progress_step is None
                 or self.state.optimizer_steps < next_progress_step
-                or progress_transitions == 0
             ):
                 return
+            mean_loss = progress_loss / progress_transitions if progress_transitions else 0.0
+            raw_mean_loss = (
+                progress_raw_loss / progress_transitions if progress_transitions else 0.0
+            )
+            component_mean_losses = (
+                _metric_tensor_means(progress_component_sums, progress_transitions)
+                if progress_transitions
+                else {}
+            )
             progress_callback(
                 CIDTrainProgress(
                     transitions=progress_transitions,
                     optimizer_steps=self.state.optimizer_steps,
-                    mean_loss=progress_loss / progress_transitions,
-                    raw_mean_loss=progress_raw_loss / progress_transitions,
+                    mean_loss=mean_loss,
+                    raw_mean_loss=raw_mean_loss,
                     rollout_windows_seen_in_epoch=self.state.rollout_windows_seen_in_epoch,
                     learning_rate=float(self.optimizer.param_groups[0]["lr"]),
-                    component_mean_losses=_metric_tensor_means(
-                        progress_component_sums, progress_transitions
-                    ),
+                    component_mean_losses=component_mean_losses,
                 )
             )
             progress_loss = 0.0
@@ -3370,7 +3386,13 @@ def stage_b_consumed_windows_by_bucket(
     world_size: int,
     base_consumed_by_bucket: Mapping[str, int] | None = None,
 ) -> dict[str, int]:
-    """Return a world-size-portable cursor for a synchronized Stage B shard prefix."""
+    """Return the consumed canonical prefix for each Stage B bucket.
+
+    Data-order v4 guarantees that all real windows precede zero-gradient padding and
+    that rank-local microbatches preserve canonical bucket order. Under those
+    conditions ``local_count * world_size`` is the number of consumed canonical
+    positions; capping at the real bucket size removes only final padding.
+    """
 
     if world_size <= 0:
         raise ValueError("world_size must be positive")
@@ -3419,6 +3441,7 @@ def shard_rollout_windows(
     legacy_resume_padding: bool = False,
     length_aware: bool = False,
     zero_gradient_padding: bool = True,
+    portable_bucket_order: bool = False,
 ) -> tuple[CIDRolloutWindow, ...]:
     if world_size <= 0:
         raise ValueError("world_size must be positive")
@@ -3429,9 +3452,11 @@ def shard_rollout_windows(
     if not windows:
         return ()
     local_microbatches: list[tuple[CIDRolloutWindow, ...]] = []
+    portable_bucket_microbatches: list[list[tuple[CIDRolloutWindow, ...]]] = []
     resume_repair_microbatches: list[tuple[CIDRolloutWindow, ...]] = []
     keys = sorted({(len(window.source_steps), window.loss_weight) for window in windows})
-    for bucket_index, key in enumerate(keys):
+    indexed_keys = list(enumerate(keys))
+    for bucket_index, key in indexed_keys:
         length, loss_weight = key
         bucket = [
             window
@@ -3440,6 +3465,11 @@ def shard_rollout_windows(
         ]
         if shuffle:
             random.Random(seed + epoch * 1009 + length * 100_003 + bucket_index).shuffle(bucket)
+        if portable_bucket_order and length_aware and len(bucket) > 1:
+            # The deterministic shuffle above randomizes equal-geometry ties. Stable
+            # sorting then defines a canonical order independent of world size; the old
+            # global-microbatch grouping changed order whenever ranks changed.
+            bucket.sort(key=_rollout_window_length_key)
         portable_key = _stage_b_rollout_bucket_key(bucket[0])
         consumed = int((consumed_windows_by_bucket or {}).get(portable_key, 0))
         if consumed < 0 or consumed > len(bucket):
@@ -3466,7 +3496,7 @@ def shard_rollout_windows(
                     replace(original[index % len(original)], is_padding=True)
                     for index in range(padding)
                 )
-        if length_aware and len(bucket) > 1:
+        if length_aware and len(bucket) > 1 and not portable_bucket_order:
             # Keep each rank-local logical microbatch close in sequence geometry.
             # Global super-batches are shuffled as units, so sample order remains
             # stochastic without letting one long trajectory pad many short ones.
@@ -3493,9 +3523,49 @@ def shard_rollout_windows(
                 )
                 for start in range(0, len(repairs), micro_batch_size):
                     resume_repair_microbatches.append(repairs[start : start + micro_batch_size])
-        for start in range(0, len(local_bucket), micro_batch_size):
-            local_microbatches.append(tuple(local_bucket[start : start + micro_batch_size]))
-    if shuffle:
+        bucket_microbatches = [
+            tuple(local_bucket[start : start + micro_batch_size])
+            for start in range(0, len(local_bucket), micro_batch_size)
+        ]
+        if portable_bucket_order:
+            portable_bucket_microbatches.append(bucket_microbatches)
+        else:
+            local_microbatches.extend(bucket_microbatches)
+    if portable_bucket_order:
+        if shuffle:
+            # Randomly interleave buckets while only consuming the next microbatch from
+            # each bucket. This keeps the old global mixture diversity without ever
+            # reordering a bucket internally, so a per-bucket prefix remains exact.
+            rng = random.Random(seed + epoch * 1_000_003 + 97)
+            positions = [0] * len(portable_bucket_microbatches)
+            active = [
+                index
+                for index, batches in enumerate(portable_bucket_microbatches)
+                if batches
+            ]
+            previous_bucket: int | None = None
+            while active:
+                candidate_positions = [
+                    position
+                    for position, bucket_index in enumerate(active)
+                    if bucket_index != previous_bucket
+                ]
+                active_index = rng.choice(candidate_positions or list(range(len(active))))
+                bucket_index = active[active_index]
+                position = positions[bucket_index]
+                batches = portable_bucket_microbatches[bucket_index]
+                local_microbatches.append(batches[position])
+                positions[bucket_index] = position + 1
+                previous_bucket = bucket_index
+                if positions[bucket_index] == len(batches):
+                    active.pop(active_index)
+        else:
+            local_microbatches.extend(
+                microbatch
+                for batches in portable_bucket_microbatches
+                for microbatch in batches
+            )
+    elif shuffle:
         random.Random(seed + epoch * 1_000_003 + 97).shuffle(local_microbatches)
     if resume_repair_microbatches:
         local_microbatches.extend(resume_repair_microbatches)
@@ -3559,6 +3629,7 @@ def stage_b_optimizer_steps_per_epoch(
     epoch: int = 1,
     shuffle: bool = True,
     length_aware: bool = True,
+    portable_bucket_order: bool = False,
 ) -> int:
     """Simulate the exact globally valid-example Stage B accumulation schedule."""
 
@@ -3597,6 +3668,7 @@ def stage_b_optimizer_steps_per_epoch(
                 shuffle=shuffle,
                 micro_batch_size=micro_batch_size,
                 length_aware=length_aware,
+                portable_bucket_order=portable_bucket_order,
             )
         )
         for rank in range(world_size)

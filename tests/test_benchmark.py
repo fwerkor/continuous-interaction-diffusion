@@ -151,10 +151,20 @@ def make_example() -> TrajectoryExample:
     )
 
 
-def configured_adapter() -> ILLaDACIDAdapter:
+def configured_adapter(
+    *,
+    max_display_tokens: int = 8,
+    display_canvas_tokens: int | None = None,
+) -> ILLaDACIDAdapter:
+    config_kwargs = {
+        "max_thought_slots": 4,
+        "max_display_tokens": max_display_tokens,
+    }
+    if display_canvas_tokens is not None:
+        config_kwargs["display_canvas_tokens"] = display_canvas_tokens
     adapter = ILLaDACIDAdapter(
         TinyBackbone(),
-        cid_model.ILLaDACIDConfig(max_thought_slots=4, max_display_tokens=8),
+        cid_model.ILLaDACIDConfig(**config_kwargs),
         freeze_backbone=True,
     )
     with torch.no_grad():
@@ -260,3 +270,25 @@ async def test_neural_benchmark_case_runs_replay_and_scores_display() -> None:
     assert payload["trace_events"][0]["kind"] == "trajectory_started"
     assert any(event["kind"] == "trajectory_finished" for event in payload["trace_events"])
     assert all(event["timestamp_s"] >= 0 for event in payload["trace_events"])
+
+
+async def test_neural_benchmark_expands_display_bucket_for_longer_target() -> None:
+    adapter = configured_adapter(max_display_tokens=16, display_canvas_tokens=4)
+    base = make_example()
+    example = TrajectoryExample(
+        example_id="bench-expanded-display",
+        prompt="p",
+        target_display="abcdefgh",
+        thought_targets=base.thought_targets,
+    )
+
+    result = await run_neural_benchmark_case(
+        adapter,
+        TinyTokenizer(),
+        example,
+        seed_teacher_state=True,
+        denoising_steps=1,
+        max_steps=4,
+    )
+
+    assert len(result.final_display_ids) == 16

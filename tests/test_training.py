@@ -1395,6 +1395,29 @@ def test_stage_a_ddp_two_rank_mixed_external_graph_smoke() -> None:
     assert completed.returncode == 0, completed.stdout + completed.stderr
 
 
+def test_distributed_padding_only_rank_keeps_progress_collectives_aligned() -> None:
+    if not dist.is_available():
+        pytest.skip("torch.distributed is unavailable")
+    worker = Path(__file__).with_name("distributed_progress_worker.py")
+    completed = subprocess.run(
+        [
+            sys.executable,
+            "-m",
+            "torch.distributed.run",
+            "--standalone",
+            "--nproc-per-node=2",
+            str(worker),
+        ],
+        cwd=Path(__file__).resolve().parents[1],
+        capture_output=True,
+        text=True,
+        timeout=60,
+        check=False,
+    )
+
+    assert completed.returncode == 0, completed.stdout + completed.stderr
+
+
 @pytest.mark.filterwarnings("ignore:FSDP is switching to use.*NO_SHARD.*")
 @pytest.mark.filterwarnings("ignore:When using .*NO_SHARD.*")
 def test_stage_b_fsdp_runs_full_parameter_optimizer_step_on_cpu(tmp_path) -> None:
@@ -2155,7 +2178,36 @@ def test_always_freshness_requires_terminal_refresh_before_finalization() -> Non
             ),
         ),
     )
-    sample = tensorizer.tensorize(example, source_step=1, timestep=0.0)
+    teacher = tensorizer.tensorize(example, source_step=1, timestep=0.0)
+    runtime_need_id = "need:c1:0"
+    prior_state = CIDRolloutState(
+        thought_semantic=teacher.batch.thought_semantic.clone(),
+        role_features=teacher.batch.role_features.clone(),
+        uncertainty=teacher.batch.uncertainty.clone(),
+        lifecycle_features=teacher.batch.lifecycle_features.clone(),
+        slot_occupancy=teacher.batch.slot_occupancy.clone(),
+        local_noise=torch.zeros_like(teacher.batch.local_noise),
+        display_ids=teacher.batch.display_ids.clone(),
+        active_binding_ids=(runtime_need_id,),
+        executable_binding_ids=(runtime_need_id,),
+        binding_routes=(
+            cid_model.CIDRolloutBindingRoute(
+                need_id=runtime_need_id,
+                target_cells=binding.target_cells,
+                target_display=binding.target_display,
+                freshness=FreshnessDemand.ALWAYS,
+                source=binding.source,
+                replay_binding_id=binding.need_id,
+            ),
+        ),
+        binding_observation_steps=((runtime_need_id, 1),),
+    )
+    sample = tensorizer.tensorize(
+        example,
+        source_step=1,
+        timestep=0.0,
+        rollout_state=prior_state,
+    )
     training_batch = collate_training_steps((sample,), pad_token_id=1)
     output = adapter(training_batch.batch)
     slots = tensorizer._target_output_slots(
@@ -2205,6 +2257,21 @@ def test_always_freshness_requires_terminal_refresh_before_finalization() -> Non
 
     _, _, validated = tensorizer._available_percept_projections(example, 3, rollout_state=state)
     assert state.binding_routes[0].need_id in validated
+
+    streaming_descriptor = dict(example.source_descriptors[0])
+    streaming_descriptor.update(streamable=True, dynamic=True, versioned=True)
+    streaming_example = replace(example, source_descriptors=(streaming_descriptor,))
+    streaming_state = trainer._rollout_state_from_prediction(
+        sample,
+        training_batch,
+        output,
+        example=streaming_example,
+        batch_index=0,
+    )
+
+    assert streaming_state.converged
+    assert streaming_state.terminal
+    assert not streaming_state.quiescent
 
 
 def test_free_rollout_keeps_supervision_after_model_terminal_decision() -> None:
@@ -2552,6 +2619,7 @@ def test_rollout_sharding_globally_mixes_weighted_microbatches() -> None:
             seed=11,
             epoch=4,
             micro_batch_size=2,
+            portable_bucket_order=True,
         )
         for rank in range(3)
     )
@@ -2643,6 +2711,7 @@ def test_stage_b_bucket_cursor_repartitions_remaining_windows_without_replay() -
             seed=17,
             epoch=1,
             micro_batch_size=1,
+            portable_bucket_order=True,
         )
         for rank in range(4)
     )
@@ -2662,6 +2731,7 @@ def test_stage_b_bucket_cursor_repartitions_remaining_windows_without_replay() -
             epoch=1,
             micro_batch_size=1,
             consumed_windows_by_bucket=cursor,
+            portable_bucket_order=True,
         )
         for rank in range(2)
     )
@@ -2671,6 +2741,73 @@ def test_stage_b_bucket_cursor_repartitions_remaining_windows_without_replay() -
     assert len(remaining_ids) == 2
     assert consumed_ids.isdisjoint(remaining_ids)
     assert consumed_ids | remaining_ids == {window.example.example_id for window in windows}
+
+
+def test_stage_b_portable_cursor_handles_padded_bucket_prefix_exactly() -> None:
+    base = make_trajectory()
+    windows = tuple(
+        CIDRolloutWindow(
+            example=replace(base, example_id=f"padded-elastic-{index}"),
+            source_steps=(0,),
+            loss_weight=1.0,
+        )
+        for index in range(5)
+    )
+    old_shards = tuple(
+        shard_rollout_windows(
+            windows,
+            world_size=4,
+            rank=rank,
+            seed=11,
+            epoch=1,
+            micro_batch_size=1,
+            length_aware=True,
+            zero_gradient_padding=True,
+            portable_bucket_order=True,
+        )
+        for rank in range(4)
+    )
+
+    first_slice_ids = {
+        shard[0].example.example_id
+        for shard in old_shards
+        if not shard[0].is_padding
+    }
+    assert len(first_slice_ids) == 4
+    cursor = stage_b_consumed_windows_by_bucket(
+        windows,
+        old_shards[0],
+        local_windows_seen=1,
+        world_size=4,
+    )
+    assert tuple(cursor.values()) == (4,)
+
+    new_shards = tuple(
+        shard_rollout_windows(
+            windows,
+            world_size=2,
+            rank=rank,
+            seed=11,
+            epoch=1,
+            micro_batch_size=1,
+            consumed_windows_by_bucket=cursor,
+            length_aware=True,
+            zero_gradient_padding=True,
+            portable_bucket_order=True,
+        )
+        for rank in range(2)
+    )
+    remaining_ids = {
+        window.example.example_id
+        for shard in new_shards
+        for window in shard
+        if not window.is_padding
+    }
+    assert len(remaining_ids) == 1
+    assert first_slice_ids.isdisjoint(remaining_ids)
+    assert first_slice_ids | remaining_ids == {
+        window.example.example_id for window in windows
+    }
 
 
 def test_stage_b_optimizer_step_count_matches_bucket_padding() -> None:
@@ -2687,6 +2824,7 @@ def test_stage_b_optimizer_step_count_matches_bucket_padding() -> None:
             world_size=4,
             micro_batch_size=1,
             gradient_accumulation_steps=2,
+            portable_bucket_order=True,
         )
         == 2
     )
@@ -2696,6 +2834,7 @@ def test_stage_b_optimizer_step_count_matches_bucket_padding() -> None:
             world_size=4,
             micro_batch_size=2,
             gradient_accumulation_steps=2,
+            portable_bucket_order=True,
         )
         == 1
     )
