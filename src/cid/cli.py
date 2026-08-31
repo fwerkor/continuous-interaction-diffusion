@@ -1342,9 +1342,12 @@ def _train_stage_a(args: argparse.Namespace) -> None:
     from cid.model.encoding import ILLaDATextEncoder
     from cid.model.loading import pretrained_revision
 
+    if args.dtype == "fp16":
+        raise ValueError(
+            "Stage A training does not support --dtype fp16 without loss scaling; use bf16"
+        )
     dtype = {
         "bf16": torch.bfloat16,
-        "fp16": torch.float16,
         "fp32": torch.float32,
     }[args.dtype]
     dataset_manifest = inspect_dataset(args.data)
@@ -1685,11 +1688,9 @@ def _train_stage_a(args: argparse.Namespace) -> None:
                 progress_callback=report_progress,
             )
 
-            loss_sum = report.mean_loss * report.transitions
-            raw_loss_sum = report.raw_mean_loss * report.transitions
             transition_count = report.transitions
-            mean_loss = loss_sum / transition_count
-            raw_mean_loss = raw_loss_sum / transition_count
+            mean_loss = report.mean_loss
+            raw_mean_loss = report.raw_mean_loss
 
             checkpoint = output_dir / f"stage-a-epoch-{epoch:04d}.pt"
             if trainer.data_order_version < 2:
@@ -1794,6 +1795,11 @@ def _stage_b_execution_target(
         raise ValueError(f"unsupported Stage B device {requested_device!r}")
     if world_size <= 0:
         raise ValueError("Stage B world size must be positive")
+    if dtype != "bf16":
+        raise ValueError(
+            "Stage B training supports --dtype bf16 only; fp16 is disabled because loss "
+            "scaling is not implemented"
+        )
 
     if requested_device == "auto":
         device_type = "cuda" if cuda_available else "npu" if npu_available else "cpu"
@@ -1818,14 +1824,10 @@ def _stage_b_execution_target(
                 "Stage B NPU training supports one NPU rank for compact models or "
                 "at least four NPU ranks for sharded large-model training"
             )
-        if dtype != "bf16":
-            raise ValueError("Stage B NPU training currently supports --dtype bf16 only")
         if cpu_offload:
             raise ValueError("--fsdp-cpu-offload is not used by NPU Stage B training")
         return "npu", local_rank, distributed_backend("npu")
 
-    if dtype != "bf16":
-        raise ValueError("Stage B CPU training currently supports --dtype bf16 only")
     if cpu_offload:
         raise ValueError("--fsdp-cpu-offload is only meaningful for CUDA Stage B training")
     return "cpu", None, distributed_backend("cpu")
@@ -1925,10 +1927,7 @@ def _train_stage_b(args: argparse.Namespace) -> None:
         args.micro_batch_size * gradient_accumulation_steps * world_size
     )
 
-    compute_dtype = {
-        "bf16": torch.bfloat16,
-        "fp16": torch.float16,
-    }[args.dtype]
+    compute_dtype = torch.bfloat16
     if device_type in {"cuda", "npu"}:
         assert device_index is not None
         configure_torch_accelerator(torch, device_type, device_index)
@@ -2974,7 +2973,7 @@ def main() -> None:
     train.add_argument("--model", default="GSAI-ML/iLLaDA-8B-Base")
     train.add_argument("--resume")
     train.add_argument("--device", choices=("auto", "cuda", "npu", "cpu"), default="auto")
-    train.add_argument("--dtype", choices=("bf16", "fp16", "fp32"), default="bf16")
+    train.add_argument("--dtype", choices=("bf16", "fp32"), default="bf16")
     train.add_argument("--epochs", type=int, default=1)
     train.add_argument("--learning-rate", type=float, default=1e-4)
     train.add_argument("--weight-decay", type=float, default=0.01)
@@ -3031,7 +3030,7 @@ def main() -> None:
     )
     train_full.add_argument("--resume")
     train_full.add_argument("--init-cid-checkpoint")
-    train_full.add_argument("--dtype", choices=("bf16", "fp16"), default="bf16")
+    train_full.add_argument("--dtype", choices=("bf16",), default="bf16")
     train_full.add_argument(
         "--epochs",
         type=int,

@@ -1418,6 +1418,57 @@ def test_distributed_padding_only_rank_keeps_progress_collectives_aligned() -> N
     assert completed.returncode == 0, completed.stdout + completed.stderr
 
 
+def test_padding_only_shard_returns_zero_train_and_validation_reports() -> None:
+    base = make_trajectory()
+    windows = (
+        CIDRolloutWindow(
+            example=replace(base, example_id="padding-only"),
+            source_steps=(0,),
+            loss_weight=1.0,
+        ),
+    )
+    local_windows = shard_rollout_windows(
+        windows,
+        world_size=4,
+        rank=3,
+        seed=1,
+        epoch=1,
+        shuffle=False,
+        micro_batch_size=1,
+        zero_gradient_padding=True,
+        portable_bucket_order=True,
+    )
+    assert local_windows and all(window.is_padding for window in local_windows)
+
+    adapter = make_adapter(seed=301)
+    trainer = CIDTrainer(
+        adapter,
+        ILLaDATrajectoryTensorizer(adapter, TinyTokenizer()),
+        CIDTrainerConfig(micro_batch_size=1, timestep_min=0.0, timestep_max=0.0),
+    )
+
+    train_report = trainer.train_rollout_windows(
+        local_windows,
+        epochs=1,
+        shuffle=False,
+        preserve_order=True,
+    )
+    assert train_report.transitions == 0
+    assert train_report.mean_loss == 0.0
+    assert train_report.raw_mean_loss == 0.0
+    assert len(train_report.component_mean_losses) == 24
+    assert all(value == 0.0 for value in train_report.component_mean_losses.values())
+
+    validation_report = trainer.evaluate_rollout_windows(local_windows, seed=2)
+    assert validation_report.transitions == 0
+    assert validation_report.mean_loss == 0.0
+    assert validation_report.raw_mean_loss == 0.0
+    assert len(validation_report.component_mean_losses) == 24
+    assert len(validation_report.behavior_counts) == 12
+    assert all(value == 0.0 for value in validation_report.component_mean_losses.values())
+    assert all(value == 0.0 for value in validation_report.behavior_counts.values())
+
+
 @pytest.mark.filterwarnings("ignore:FSDP is switching to use.*NO_SHARD.*")
 @pytest.mark.filterwarnings("ignore:When using .*NO_SHARD.*")
 def test_stage_b_fsdp_runs_full_parameter_optimizer_step_on_cpu(tmp_path) -> None:
@@ -3136,6 +3187,80 @@ def test_checkpoint_allows_equivalent_batch_geometry_at_clean_epoch_boundary(tmp
     )
     restored.load_checkpoint(checkpoint)
 
+    assert restored.state.epochs_completed == 1
+    assert restored.state.rollout_windows_seen_in_epoch == 0
+
+
+def test_checkpoint_rejects_world_size_change_mid_epoch(tmp_path) -> None:
+    adapter = make_adapter(seed=323)
+    trainer = CIDTrainer(
+        adapter,
+        ILLaDATrajectoryTensorizer(adapter, TinyTokenizer()),
+        CIDTrainerConfig(),
+    )
+    trainer.state = CIDTrainerState(rollout_windows_seen_in_epoch=8)
+    checkpoint = tmp_path / "mid-epoch-world-size.pt"
+    trainer.save_checkpoint(checkpoint)
+    payload = torch.load(checkpoint, map_location="cpu", weights_only=False)
+    assert payload["world_size"] == 1
+    payload["world_size"] = 4
+    torch.save(payload, checkpoint)
+
+    restored_adapter = make_adapter(seed=323)
+    restored = CIDTrainer(
+        restored_adapter,
+        ILLaDATrajectoryTensorizer(restored_adapter, TinyTokenizer()),
+        CIDTrainerConfig(),
+    )
+    with pytest.raises(ValueError, match="world size does not match"):
+        restored.load_checkpoint(checkpoint)
+
+
+def test_checkpoint_rejects_legacy_partial_epoch_without_world_size(tmp_path) -> None:
+    adapter = make_adapter(seed=324)
+    trainer = CIDTrainer(
+        adapter,
+        ILLaDATrajectoryTensorizer(adapter, TinyTokenizer()),
+        CIDTrainerConfig(),
+    )
+    trainer.state = CIDTrainerState(rollout_windows_seen_in_epoch=8)
+    checkpoint = tmp_path / "legacy-mid-epoch.pt"
+    trainer.save_checkpoint(checkpoint)
+    payload = torch.load(checkpoint, map_location="cpu", weights_only=False)
+    payload.pop("world_size")
+    torch.save(payload, checkpoint)
+
+    restored_adapter = make_adapter(seed=324)
+    restored = CIDTrainer(
+        restored_adapter,
+        ILLaDATrajectoryTensorizer(restored_adapter, TinyTokenizer()),
+        CIDTrainerConfig(),
+    )
+    with pytest.raises(ValueError, match="does not record its world size"):
+        restored.load_checkpoint(checkpoint)
+
+
+def test_checkpoint_allows_world_size_change_at_epoch_boundary(tmp_path) -> None:
+    adapter = make_adapter(seed=325)
+    trainer = CIDTrainer(
+        adapter,
+        ILLaDATrajectoryTensorizer(adapter, TinyTokenizer()),
+        CIDTrainerConfig(),
+    )
+    trainer.state = CIDTrainerState(epochs_completed=1, rollout_windows_seen_in_epoch=0)
+    checkpoint = tmp_path / "epoch-boundary-world-size.pt"
+    trainer.save_checkpoint(checkpoint)
+    payload = torch.load(checkpoint, map_location="cpu", weights_only=False)
+    payload["world_size"] = 4
+    torch.save(payload, checkpoint)
+
+    restored_adapter = make_adapter(seed=325)
+    restored = CIDTrainer(
+        restored_adapter,
+        ILLaDATrajectoryTensorizer(restored_adapter, TinyTokenizer()),
+        CIDTrainerConfig(),
+    )
+    restored.load_checkpoint(checkpoint)
     assert restored.state.epochs_completed == 1
     assert restored.state.rollout_windows_seen_in_epoch == 0
 

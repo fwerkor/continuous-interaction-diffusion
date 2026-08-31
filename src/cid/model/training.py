@@ -399,6 +399,21 @@ CID_LOSS_COMPONENT_NAMES = (
     "auxiliary",
 )
 
+CID_BEHAVIOR_COUNT_NAMES = (
+    "need_tp",
+    "need_fp",
+    "need_fn",
+    "need_tn",
+    "source_correct",
+    "source_total",
+    "convergence_correct",
+    "convergence_total",
+    "lifecycle_correct",
+    "lifecycle_total",
+    "display_token_correct",
+    "display_token_total",
+)
+
 
 def _cid_loss_component_values(losses: CIDLoss) -> dict[str, Tensor]:
     return {name: getattr(losses, name).detach().float() for name in CID_LOSS_COMPONENT_NAMES}
@@ -1143,9 +1158,13 @@ class CIDTrainer:
         return CIDTrainReport(
             transitions=total_transitions,
             optimizer_steps=self.state.optimizer_steps - start_optimizer_steps,
-            mean_loss=total_loss / total_transitions,
-            raw_mean_loss=total_raw_loss / total_transitions,
-            component_mean_losses=_metric_tensor_means(total_component_sums, total_transitions),
+            mean_loss=total_loss / total_transitions if total_transitions else 0.0,
+            raw_mean_loss=total_raw_loss / total_transitions if total_transitions else 0.0,
+            component_mean_losses=(
+                _metric_tensor_means(total_component_sums, total_transitions)
+                if total_component_sums
+                else {name: 0.0 for name in CID_LOSS_COMPONENT_NAMES}
+            ),
         )
 
     def evaluate_rollout_windows(
@@ -1279,10 +1298,18 @@ class CIDTrainer:
         return CIDTrainReport(
             transitions=total_transitions,
             optimizer_steps=0,
-            mean_loss=total_loss / total_transitions,
-            raw_mean_loss=total_raw_loss / total_transitions,
-            component_mean_losses=_metric_tensor_means(component_sums, total_transitions),
-            behavior_counts=_metric_tensor_values(behavior_counts),
+            mean_loss=total_loss / total_transitions if total_transitions else 0.0,
+            raw_mean_loss=total_raw_loss / total_transitions if total_transitions else 0.0,
+            component_mean_losses=(
+                _metric_tensor_means(component_sums, total_transitions)
+                if component_sums
+                else {name: 0.0 for name in CID_LOSS_COMPONENT_NAMES}
+            ),
+            behavior_counts=(
+                _metric_tensor_values(behavior_counts)
+                if behavior_counts
+                else {name: 0.0 for name in CID_BEHAVIOR_COUNT_NAMES}
+            ),
         )
 
     def _rollout_microbatches(
@@ -1481,6 +1508,11 @@ class CIDTrainer:
             "pending_accumulation": self._pending_accumulation,
             "pending_examples": self._pending_examples,
             "pending_global_examples": self._pending_global_examples,
+            "world_size": (
+                torch.distributed.get_world_size()
+                if torch.distributed.is_available() and torch.distributed.is_initialized()
+                else 1
+            ),
             "data_order_version": self.data_order_version,
             "dataset_sha256": dataset_sha256,
         }
@@ -1507,6 +1539,24 @@ class CIDTrainer:
             and checkpoint.get("dataset_sha256") != expected_dataset_sha256
         ):
             raise ValueError("CID trainer checkpoint dataset SHA-256 does not match training data")
+        trainer_state = checkpoint.get("trainer_state", {})
+        if int(trainer_state.get("rollout_windows_seen_in_epoch", 0)) > 0:
+            saved_world_size = checkpoint.get("world_size")
+            current_world_size = (
+                torch.distributed.get_world_size()
+                if torch.distributed.is_available() and torch.distributed.is_initialized()
+                else 1
+            )
+            if saved_world_size is None:
+                raise ValueError(
+                    "partial-epoch checkpoint does not record its world size; resume from an "
+                    "epoch-boundary checkpoint instead"
+                )
+            if int(saved_world_size) != current_world_size:
+                raise ValueError(
+                    "partial-epoch checkpoint world size does not match the current training "
+                    "world size; resume from an epoch-boundary checkpoint before changing ranks"
+                )
         saved_trainer_config = dict(checkpoint["trainer_config"])
         saved_trainer_config.setdefault("semantic_pooling", "mean-v1")
         current_trainer_config = asdict(self.config)
@@ -1524,7 +1574,6 @@ class CIDTrainer:
             for key in ("micro_batch_size", "gradient_accumulation_steps"):
                 saved_without_geometry.pop(key, None)
                 current_without_geometry.pop(key, None)
-            trainer_state = checkpoint.get("trainer_state", {})
             clean_epoch_boundary = (
                 int(trainer_state.get("rollout_windows_seen_in_epoch", 0)) == 0
                 and int(checkpoint.get("pending_accumulation", 0)) == 0

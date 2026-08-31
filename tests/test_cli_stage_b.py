@@ -46,9 +46,22 @@ def test_stage_b_cuda_target_keeps_four_rank_minimum() -> None:
         npu_available=False,
         world_size=4,
         local_rank=3,
-        dtype="fp16",
+        dtype="bf16",
         cpu_offload=True,
     ) == ("cuda", 3, "nccl")
+
+
+def test_stage_b_cuda_rejects_fp16_without_loss_scaling() -> None:
+    with pytest.raises(ValueError, match="--dtype bf16 only.*loss scaling"):
+        cli._stage_b_execution_target(
+            "cuda",
+            cuda_available=True,
+            npu_available=False,
+            world_size=4,
+            local_rank=0,
+            dtype="fp16",
+            cpu_offload=False,
+        )
 
 
 def test_stage_b_npu_target_supports_single_or_four_plus_ranks() -> None:
