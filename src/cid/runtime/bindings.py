@@ -83,7 +83,7 @@ class BindingTable:
         return frozenset(
             target.identifier
             for binding in self.active()
-            if binding.observation is None
+            if binding.observation is None and binding.status is not BindingStatus.CANDIDATE
             for target in binding.target_cells
         )
 

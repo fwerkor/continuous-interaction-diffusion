@@ -739,6 +739,8 @@ class CIDRuntime:
         now = time.monotonic()
         pending = False
         for binding in self.bindings.active():
+            if binding.status is BindingStatus.CANDIDATE:
+                continue
             if binding.observation is None:
                 self._launch_due_jobs(step)
                 pending = True
@@ -871,7 +873,7 @@ class CIDRuntime:
         return any(
             binding.observation is None
             for binding in self.bindings.active()
-            if binding.status is not BindingStatus.RETIRED
+            if binding.status is not BindingStatus.CANDIDATE
         )
 
     def _has_pending_required_external_work(self) -> bool:

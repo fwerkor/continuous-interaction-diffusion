@@ -1401,7 +1401,8 @@ class CIDTrainer:
             )
             if restored_encoder.pooling_mode != self.config.semantic_pooling:
                 raise ValueError(
-                    "checkpoint frozen semantic snapshot pooling does not match trainer configuration"
+                    "checkpoint frozen semantic snapshot pooling does not match "
+                    "trainer configuration"
                 )
             self.tensorizer.text_encoder = restored_encoder
         self.generator.set_state(checkpoint["generator_state"])

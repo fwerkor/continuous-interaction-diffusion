@@ -103,6 +103,25 @@ class PersistentNeedPolicy:
         )
 
 
+class IncompleteCandidatePolicy:
+    def step(self, context: ModelContext) -> ModelUpdate:
+        target_cell = context.thought.live_cell_ids[0]
+        need = InformationNeed(
+            need_id="candidate-only",
+            source_scores={"source": 1.0},
+            arguments={},
+            confidence=1.0,
+            target_cells=(ObjectRef.cell(target_cell),),
+        )
+        return ModelUpdate(
+            thought=context.thought.advance(context.thought.cells),
+            display=context.display.advance(context.display.token_ids),
+            needs=(need,),
+            equilibrium=True,
+            converged=True,
+        )
+
+
 @dataclass
 class IncrementingDynamicSource:
     reads: int = 0
@@ -327,6 +346,25 @@ async def test_static_observation_is_reprojected_without_refetch() -> None:
     assert source.reads == 1
     assert result.bindings[0].cognitive_projections >= 3
     assert result.bindings[0].external_refreshes == 1
+
+
+async def test_incomplete_candidate_does_not_block_convergence_or_start_io() -> None:
+    source = CountingSource()
+    registry = SourceRegistry()
+    registry.register(source)
+    thought = seeded_thought(1)
+
+    result = await CIDRuntime(registry, RuntimeConfig(max_steps=4)).run(
+        IncompleteCandidatePolicy(),
+        thought=thought,
+        display=DisplayCanvas.masked(1, -1),
+    )
+
+    assert result.converged
+    assert result.steps == 1
+    assert source.reads == 0
+    assert result.bindings[0].status.value == "candidate"
+    assert result.thought.cells[0].lifecycle is CellLifecycle.ACTIVE
 
 
 async def test_model_compute_overlaps_source_wait() -> None:
