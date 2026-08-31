@@ -6,6 +6,8 @@ from cid.data import (
     ThoughtTarget,
     TrajectoryExample,
     dump_jsonl,
+    index_training_jsonl,
+    load_indexed_jsonl,
     load_jsonl,
 )
 from cid.grounding import (
@@ -89,3 +91,10 @@ def test_trajectory_jsonl_round_trip(tmp_path) -> None:
     loaded = load_jsonl(path)
 
     assert loaded == (example,)
+
+    indexed = index_training_jsonl(path)
+    assert len(indexed) == 1
+    assert indexed[0].example_id == example.example_id
+    assert indexed[0].training_source_steps == (1,)
+    assert indexed[0].rollout_length_key == len(example.prompt) + len("37 ms")
+    assert load_indexed_jsonl(path, indexed) == (example,)

@@ -20,6 +20,8 @@ from cid.data import (
     GroundingTarget,
     ThoughtTarget,
     TrajectoryExample,
+    dump_jsonl,
+    index_training_jsonl,
 )
 from cid.grounding import Anchor, AnchorKind, CognitiveLink, LinkRelation, ObjectRef
 from cid.state import CellLifecycle, CognitiveRole
@@ -41,6 +43,7 @@ CIDRolloutWindow = cid_model.CIDRolloutWindow
 balance_rollout_windows_by_semantic_task = cid_model.balance_rollout_windows_by_semantic_task
 collate_training_steps = cid_model.collate_training_steps
 load_cid_adapter_checkpoint = cid_model.load_cid_adapter_checkpoint
+materialize_indexed_rollout_windows = cid_model.materialize_indexed_rollout_windows
 load_stage_b_checkpoint = cid_model.load_stage_b_checkpoint
 load_stage_b_model_checkpoint = cid_model.load_stage_b_model_checkpoint
 load_stage_b_semantic_encoder = cid_model.load_stage_b_semantic_encoder
@@ -565,6 +568,19 @@ def test_bootstrap_transition_trains_single_snapshot_from_empty_tct() -> None:
     )
     report = trainer.train_examples((single,), epochs=1, shuffle=False)
     assert report.transitions == 1
+
+
+def test_rollout_windows_reject_max_age_without_wall_clock_timeline() -> None:
+    base = make_trajectory()
+    binding = replace(
+        base.binding_targets[0],
+        freshness=FreshnessDemand.MAX_AGE,
+        max_age_s=5.0,
+    )
+    example = replace(base, binding_targets=(binding,))
+
+    with pytest.raises(ValueError, match="MAX_AGE freshness.*wall-clock timeline"):
+        trajectory_rollout_windows((example,), max_horizon=3)
 
 
 def test_one_shot_need_is_supervised_before_but_not_after_its_observation() -> None:
@@ -2004,7 +2020,7 @@ def test_partial_argument_binding_does_not_unlock_full_teacher_observation() -> 
         json.dumps(binding.arguments["key"], separators=(",", ":")), detach=True
     )
 
-    active, executable, _ = tensorizer.predicted_binding_state(
+    active, executable, routes = tensorizer.predicted_binding_state(
         example,
         1,
         target_output_slots=slots,
@@ -2016,6 +2032,51 @@ def test_partial_argument_binding_does_not_unlock_full_teacher_observation() -> 
 
     assert active == ("need:c1:0",)
     assert executable == ()
+    assert routes[0].runtime_active
+    assert routes[0].replay_binding_id == binding.need_id
+    assert dict(routes[0].arguments) == {"key": "latency_ms"}
+
+    progressive = replace(
+        example,
+        events=(
+            ExternalEvent(
+                source=binding.source,
+                value="candidate",
+                arrival_step=1,
+                arguments={"key": "latency_ms"},
+            ),
+            ExternalEvent(
+                source=binding.source,
+                value="37",
+                arrival_step=1,
+                arguments=binding.arguments,
+            ),
+        ),
+    )
+    rollout = CIDRolloutState(
+        thought_semantic=sample.batch.thought_semantic.clone(),
+        role_features=sample.batch.role_features.clone(),
+        uncertainty=sample.batch.uncertainty.clone(),
+        lifecycle_features=sample.batch.lifecycle_features.clone(),
+        slot_occupancy=sample.batch.slot_occupancy.clone(),
+        local_noise=sample.batch.local_noise.clone(),
+        display_ids=sample.batch.display_ids.clone(),
+        active_binding_ids=active,
+        executable_binding_ids=executable,
+        binding_routes=routes,
+        equilibrium=True,
+        quiescent=True,
+    )
+
+    assert tensorizer.rollout_external_progress(progressive, 1, rollout)
+    projections, observation_steps, _ = tensorizer._available_percept_projections(
+        progressive,
+        1,
+        rollout_state=rollout,
+    )
+    assert len(projections) == 1
+    assert projections[0][1].value == "candidate"
+    assert dict(observation_steps)[routes[0].need_id] == 1
 
 
 def test_predicted_binding_requires_live_owner_and_carries_predicted_routes() -> None:
@@ -2483,6 +2544,16 @@ def test_stage_a_legacy_resume_repair_is_limited_to_pre_v2_checkpoints() -> None
     assert not needs_repair(data_order_version=1, windows_seen_in_epoch=0)
 
 
+def test_stage_a_legacy_order_upgrades_only_at_completed_epoch_boundary() -> None:
+    completed_version = import_module("cid.cli")._stage_a_completed_epoch_data_order_version
+
+    assert completed_version(1) == 4
+    assert completed_version(2) == 4
+    assert completed_version(3) == 4
+    assert completed_version(4) == 4
+    assert completed_version(5) == 5
+
+
 def test_closed_loop_diffusion_reset_requires_actual_replayed_observation() -> None:
     adapter = make_adapter(seed=160)
     tensorizer = ILLaDATrajectoryTensorizer(adapter, TinyTokenizer())
@@ -2704,6 +2775,70 @@ def test_semantic_task_balancing_equalizes_total_transition_loss_mass() -> None:
     total_transitions = sum(len(window.source_steps) for window in balanced)
     weighted_transitions = sum(len(window.source_steps) * window.loss_weight for window in balanced)
     assert weighted_transitions == pytest.approx(total_transitions)
+
+
+def test_indexed_rollout_sharding_matches_eager_examples(tmp_path) -> None:
+    examples = tuple(
+        replace(
+            make_rollout_trajectory(),
+            example_id=f"indexed-{index}",
+            metadata={
+                "semantic_task_id": f"task-{index // 2}",
+                "training_weight": 1.0 + (index // 2),
+            },
+        )
+        for index in range(6)
+    )
+    path = tmp_path / "training.jsonl"
+    dump_jsonl(examples, path)
+
+    eager = balance_rollout_windows_by_semantic_task(
+        trajectory_rollout_windows(examples, max_horizon=3)
+    )
+    indexed_examples = index_training_jsonl(path)
+    indexed = balance_rollout_windows_by_semantic_task(
+        trajectory_rollout_windows(indexed_examples, max_horizon=3)
+    )
+
+    for rank in range(2):
+        kwargs = dict(
+            world_size=2,
+            rank=rank,
+            seed=77,
+            epoch=2,
+            shuffle=True,
+            micro_batch_size=1,
+            length_aware=True,
+            zero_gradient_padding=True,
+            portable_bucket_order=True,
+        )
+        eager_shard = shard_rollout_windows(eager, **kwargs)
+        indexed_shard = shard_rollout_windows(indexed, **kwargs)
+        eager_signature = tuple(
+            (
+                window.example.example_id,
+                window.source_steps,
+                window.loss_weight,
+                window.is_padding,
+            )
+            for window in eager_shard
+        )
+        indexed_signature = tuple(
+            (
+                window.example.example_id,
+                window.source_steps,
+                window.loss_weight,
+                window.is_padding,
+            )
+            for window in indexed_shard
+        )
+        assert indexed_signature == eager_signature
+
+        materialized = materialize_indexed_rollout_windows(path, indexed_shard)
+        assert tuple(window.example.example_id for window in materialized) == tuple(
+            window.example.example_id for window in eager_shard
+        )
+        assert all(isinstance(window.example, TrajectoryExample) for window in materialized)
 
 
 def test_semantic_task_balancing_respects_declared_training_weight() -> None:

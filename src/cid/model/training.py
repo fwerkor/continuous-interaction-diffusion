@@ -20,7 +20,13 @@ from cid.contracts import (
     FreshnessDemand,
     SourceDescriptor,
 )
-from cid.data import ThoughtTarget, TrajectoryExample, training_transition_source_steps
+from cid.data import (
+    ThoughtTarget,
+    TrajectoryExample,
+    TrajectoryExampleIndex,
+    load_indexed_jsonl,
+    training_transition_source_steps,
+)
 from cid.grounding import AnchorKind, LinkRelation, ObjectKind, ObjectRef
 from cid.lifecycle import (
     MODELED_LIFECYCLES,
@@ -126,6 +132,7 @@ class CIDRolloutBindingRoute:
     source: str = ""
     work_key: str = ""
     replay_binding_id: str | None = None
+    arguments: Mapping[str, Any] = field(default_factory=dict)
 
 
 @dataclass(frozen=True, slots=True)
@@ -155,7 +162,7 @@ class CIDRolloutState:
 
 @dataclass(frozen=True, slots=True)
 class CIDRolloutWindow:
-    example: TrajectoryExample
+    example: TrajectoryExample | TrajectoryExampleIndex
     source_steps: tuple[int, ...]
     loss_weight: float = 1.0
     is_padding: bool = False
@@ -980,21 +987,20 @@ class CIDTrainer:
             for route in binding_routes
         )
         terminal_validated_ids = frozenset(terminal_validated)
-        executable = frozenset(executable_binding_ids)
         streamable_sources = {
             str(descriptor.get("name", ""))
             for descriptor in example.source_descriptors
             if bool(descriptor.get("streamable", False))
         }
-        # ALWAYS is refresh-due on every runtime step. MAX_AGE depends on wall-clock
-        # elapsed time, which trajectory JSONL intentionally does not model, so a
-        # zero-wall-time training rollout treats MAX_AGE as not yet due. Streaming
-        # sources are validated by stream queue state in the runtime, so they do not
-        # launch an extra terminal refresh.
+        # ALWAYS is refresh-due on every runtime step. Teacher trajectories using
+        # MAX_AGE are rejected when rollout windows are built because JSONL trajectories
+        # do not carry wall-clock time; an out-of-distribution MAX_AGE prediction is
+        # therefore treated as not yet due rather than inventing elapsed seconds.
+        # Streaming sources are validated by stream queue state in the runtime, so they
+        # do not launch an extra terminal refresh.
         pending_terminal_refresh = any(
             route.runtime_active
             and route.need_id in observed_binding_ids
-            and route.need_id in executable
             and route.freshness is FreshnessDemand.ALWAYS
             and route.source not in streamable_sources
             and route.need_id not in terminal_validated_ids
@@ -2178,6 +2184,25 @@ class ILLaDATrajectoryTensorizer:
             and dict(event.arguments) == dict(binding.arguments)
         )
 
+    @staticmethod
+    def _matching_rollout_events(
+        example: TrajectoryExample,
+        binding: Any,
+        route: CIDRolloutBindingRoute,
+        target_step: int,
+    ) -> tuple[Any, ...]:
+        """Match the exact work item that the model launched in closed loop."""
+
+        source = route.source or binding.source
+        arguments = dict(route.arguments) if route.arguments else dict(binding.arguments)
+        return tuple(
+            event
+            for event in example.events
+            if event.arrival_step <= target_step
+            and event.source == source
+            and dict(event.arguments) == arguments
+        )
+
     def _available_percept_projections(
         self,
         example: TrajectoryExample,
@@ -2205,18 +2230,17 @@ class ILLaDATrajectoryTensorizer:
                 (),
             )
 
-        executable = frozenset(rollout_state.executable_binding_ids)
         bindings = {binding.need_id: binding for binding in example.binding_targets}
         observation_steps = dict(rollout_state.binding_observation_steps)
         validated = set(rollout_state.terminal_validated_binding_ids)
         for route in rollout_state.binding_routes:
-            if not route.runtime_active or route.need_id not in executable:
+            if not route.runtime_active:
                 continue
             replay_id = route.replay_binding_id or route.need_id
             binding = bindings.get(replay_id)
             if binding is None or binding.first_need_step > target_step:
                 continue
-            matching = self._matching_binding_events(example, binding, target_step)
+            matching = self._matching_rollout_events(example, binding, route, target_step)
             if not matching:
                 continue
             previous_step = observation_steps.get(route.need_id)
@@ -2267,15 +2291,14 @@ class ILLaDATrajectoryTensorizer:
             return True
         observations = dict(state.binding_observation_steps)
         validated = frozenset(state.terminal_validated_binding_ids)
-        executable = frozenset(state.executable_binding_ids)
         bindings = {binding.need_id: binding for binding in example.binding_targets}
         for route in state.binding_routes:
-            if not route.runtime_active or route.need_id not in executable:
+            if not route.runtime_active:
                 continue
             binding = bindings.get(route.replay_binding_id or route.need_id)
             if binding is None:
                 continue
-            matching = self._matching_binding_events(example, binding, target_step)
+            matching = self._matching_rollout_events(example, binding, route, target_step)
             if not matching:
                 continue
             if route.need_id not in observations:
@@ -2511,13 +2534,23 @@ class ILLaDATrajectoryTensorizer:
         target_step: int,
         source: str,
         arguments: Mapping[str, Any],
+        allow_partial: bool = False,
     ) -> Any | None:
         candidates = tuple(
             binding
             for binding in example.binding_targets
             if binding.first_need_step <= target_step
             and binding.source == source
-            and dict(binding.arguments) == dict(arguments)
+            and (
+                dict(binding.arguments) == dict(arguments)
+                or (
+                    allow_partial
+                    and all(
+                        name in binding.arguments and binding.arguments[name] == value
+                        for name, value in arguments.items()
+                    )
+                )
+            )
         )
         if not candidates:
             return None
@@ -2603,6 +2636,7 @@ class ILLaDATrajectoryTensorizer:
                 target_step=target_step,
                 source=source,
                 arguments=need.arguments,
+                allow_partial=descriptor.accepts_partial_arguments and not arguments_complete,
             )
             active.append(need.need_id)
             if arguments_complete:
@@ -2615,6 +2649,7 @@ class ILLaDATrajectoryTensorizer:
                     freshness=need.freshness,
                     runtime_active=runtime_active,
                     source=source,
+                    arguments=dict(need.arguments),
                     work_key=canonical_work_key(source, need.arguments),
                     replay_binding_id=None if replay is None else replay.need_id,
                 )
@@ -3306,16 +3341,35 @@ def trajectory_transitions(
 
 
 def trajectory_rollout_windows(
-    examples: tuple[TrajectoryExample, ...],
+    examples: tuple[TrajectoryExample | TrajectoryExampleIndex, ...],
     *,
     max_horizon: int,
 ) -> tuple[CIDRolloutWindow, ...]:
     if max_horizon <= 0:
         raise ValueError("max_horizon must be positive")
+    for example in examples:
+        if isinstance(example, TrajectoryExampleIndex):
+            if example.max_age_binding_id is not None:
+                raise ValueError(
+                    "MAX_AGE freshness cannot be used for neural rollout training until "
+                    "trajectory data carries a wall-clock timeline; "
+                    f"example={example.example_id!r} binding={example.max_age_binding_id!r}"
+                )
+            continue
+        for binding in example.binding_targets:
+            if binding.freshness is FreshnessDemand.MAX_AGE:
+                raise ValueError(
+                    "MAX_AGE freshness cannot be used for neural rollout training until "
+                    "trajectory data carries a wall-clock timeline; "
+                    f"example={example.example_id!r} binding={binding.need_id!r}"
+                )
     windows: list[CIDRolloutWindow] = []
     for example in examples:
-        steps = (target.step for target in example.thought_targets)
-        source_steps = training_transition_source_steps(steps)
+        source_steps = (
+            example.training_source_steps
+            if isinstance(example, TrajectoryExampleIndex)
+            else training_transition_source_steps(target.step for target in example.thought_targets)
+        )
         if not source_steps:
             continue
         run: list[int] = [source_steps[0]]
@@ -3338,6 +3392,33 @@ def trajectory_rollout_windows(
                 # trajectory here only injected artificial teacher resets every N steps.
                 windows.append(CIDRolloutWindow(example=example, source_steps=contiguous))
     return tuple(windows)
+
+
+def materialize_indexed_rollout_windows(
+    path: str | Path,
+    windows: tuple[CIDRolloutWindow, ...],
+) -> tuple[CIDRolloutWindow, ...]:
+    """Load only the trajectory records retained by a deterministic rollout shard."""
+
+    indexed = tuple(
+        window.example
+        for window in windows
+        if isinstance(window.example, TrajectoryExampleIndex)
+    )
+    if not indexed:
+        return windows
+    materialized = iter(load_indexed_jsonl(path, indexed))
+    result: list[CIDRolloutWindow] = []
+    for window in windows:
+        if isinstance(window.example, TrajectoryExampleIndex):
+            result.append(replace(window, example=next(materialized)))
+        else:
+            result.append(window)
+    try:
+        next(materialized)
+    except StopIteration:
+        return tuple(result)
+    raise RuntimeError("indexed rollout materialization produced extra examples")
 
 
 def _binding_observation_available(
@@ -3470,6 +3551,8 @@ def stage_b_consumed_windows_by_bucket(
 
 
 def _rollout_window_length_key(window: CIDRolloutWindow) -> int:
+    if isinstance(window.example, TrajectoryExampleIndex):
+        return window.example.rollout_length_key
     display_chars = max(
         (len(target.text) for target in window.example.display_targets),
         default=len(window.example.target_display),

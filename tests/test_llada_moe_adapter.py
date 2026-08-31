@@ -208,6 +208,48 @@ def test_llada_moe_router_auxiliary_loss_ignores_padding_only_rows() -> None:
     assert output.auxiliary_loss.item() == pytest.approx(0.0)
 
 
+def test_llada_moe_router_auxiliary_loss_is_invariant_to_batch_packing() -> None:
+    load_balance = import_module("cid.model.illada")._moe_load_balancing_loss
+    num_experts = TinyLLaDAMoEConfig.num_experts
+    top_k = TinyLLaDAMoEConfig.num_experts_per_tok
+    sequence_length = 3
+    layer_count = 2
+    first = tuple(
+        torch.randn(sequence_length, num_experts, requires_grad=True)
+        for _ in range(layer_count)
+    )
+    second = tuple(
+        torch.randn(sequence_length, num_experts, requires_grad=True)
+        for _ in range(layer_count)
+    )
+    mask = torch.tensor([[True, True, False]])
+
+    individual = [
+        load_balance(
+            logits,
+            num_experts=num_experts,
+            top_k=top_k,
+            attention_mask=mask,
+        )
+        for logits in (first, second)
+    ]
+    joint_logits = tuple(
+        torch.cat((first[layer], second[layer]), dim=0)
+        for layer in range(layer_count)
+    )
+    joint = load_balance(
+        joint_logits,
+        num_experts=num_experts,
+        top_k=top_k,
+        attention_mask=torch.cat((mask, mask), dim=0),
+    )
+
+    assert joint is not None
+    assert all(loss is not None for loss in individual)
+    expected = 0.5 * (individual[0] + individual[1])
+    torch.testing.assert_close(joint, expected, rtol=1e-6, atol=1e-7)
+
+
 def test_llada_moe_grouped_experts_match_reference_outputs_and_input_gradients() -> None:
     backbone = TinyLLaDAMoEBackbone()
     adapter = ILLaDACIDAdapter(backbone, freeze_backbone=True)

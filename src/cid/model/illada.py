@@ -291,53 +291,63 @@ def _moe_load_balancing_loss(
     top_k: int,
     attention_mask: torch.Tensor | None,
 ) -> torch.Tensor | None:
-    """Match the upstream LLaDA-MoE router balancing objective.
+    """Compute LLaDA-MoE router balancing without micro-batch packing drift.
 
-    CID calls the hidden decoder directly so it can inject TCT embeddings. That bypasses
-    ``LLaDAMoEModelLM.forward()``, where the upstream implementation normally adds this
-    objective. Recompute the same scalar from the decoder router logits instead of silently
-    dropping router supervision during full-parameter Stage B training.
+    CID calls the hidden decoder directly so it can inject TCT embeddings, bypassing
+    ``LLaDAMoEModelLM.forward()`` where upstream normally adds router supervision.
+    With a CID attention mask we evaluate the same load/probability product per valid
+    example and then average examples. This keeps the auxiliary gradient invariant to
+    how examples are packed into micro-batches or data-parallel ranks, matching the
+    trainer's per-example normalization contract. A maskless call retains the upstream
+    batch-level reduction for compatibility.
     """
 
     if not router_logits:
         return None
     compute_device = router_logits[0].device
-    concatenated = torch.cat(
-        tuple(layer_logits.to(compute_device) for layer_logits in router_logits), dim=0
-    )
-    routing_weights = torch.softmax(concatenated, dim=-1, dtype=torch.float32)
-    _, selected_experts = torch.topk(routing_weights, top_k, dim=-1)
-    expert_mask = torch.nn.functional.one_hot(
-        selected_experts, num_classes=num_experts
-    )
+    layer_logits = tuple(logits.to(compute_device) for logits in router_logits)
 
     if attention_mask is None:
+        concatenated = torch.cat(layer_logits, dim=0)
+        routing_weights = torch.softmax(concatenated, dim=-1, dtype=torch.float32)
+        _, selected_experts = torch.topk(routing_weights, top_k, dim=-1)
+        expert_mask = torch.nn.functional.one_hot(selected_experts, num_classes=num_experts)
         tokens_per_expert = expert_mask.float().mean(dim=0)
         router_prob_per_expert = routing_weights.mean(dim=0)
-    else:
-        batch_size, sequence_length = attention_mask.shape
-        layer_count = concatenated.shape[0] // (batch_size * sequence_length)
-        expert_attention_mask = (
-            attention_mask[None, :, :, None, None]
-            .expand(layer_count, batch_size, sequence_length, top_k, num_experts)
-            .reshape(-1, top_k, num_experts)
-            .to(device=compute_device, dtype=torch.float32)
-        )
-        tokens_per_expert = (
-            expert_mask.float() * expert_attention_mask
-        ).sum(dim=0) / expert_attention_mask.sum(dim=0).clamp_min(1.0)
+        return torch.sum(tokens_per_expert * router_prob_per_expert.unsqueeze(0)) * num_experts
 
-        router_attention_mask = (
-            attention_mask[None, :, :, None]
-            .expand(layer_count, batch_size, sequence_length, num_experts)
-            .reshape(-1, num_experts)
-            .to(device=compute_device, dtype=torch.float32)
-        )
-        router_prob_per_expert = (
-            routing_weights * router_attention_mask
-        ).sum(dim=0) / router_attention_mask.sum(dim=0).clamp_min(1.0)
+    batch_size, sequence_length = attention_mask.shape
+    expected_tokens = batch_size * sequence_length
+    if any(logits.shape != (expected_tokens, num_experts) for logits in layer_logits):
+        raise ValueError("MoE router logits do not match CID batch geometry")
 
-    return torch.sum(tokens_per_expert * router_prob_per_expert.unsqueeze(0)) * num_experts
+    stacked = torch.stack(
+        tuple(logits.reshape(batch_size, sequence_length, num_experts) for logits in layer_logits),
+        dim=0,
+    )
+    routing_weights = torch.softmax(stacked, dim=-1, dtype=torch.float32)
+    _, selected_experts = torch.topk(routing_weights, top_k, dim=-1)
+    expert_mask = torch.nn.functional.one_hot(selected_experts, num_classes=num_experts).float()
+
+    token_mask = attention_mask.to(device=compute_device, dtype=torch.bool)
+    valid_rows = token_mask.any(dim=1)
+    if not bool(valid_rows.any()):
+        return (routing_weights * 0.0).sum()
+
+    layer_count = stacked.shape[0]
+    token_denominator = token_mask.sum(dim=1).to(dtype=torch.float32) * layer_count
+    expert_weight = token_mask[None, :, :, None, None].to(dtype=torch.float32)
+    tokens_per_expert = (expert_mask * expert_weight).sum(dim=(0, 2))
+    tokens_per_expert = tokens_per_expert / token_denominator[:, None, None].clamp_min(1.0)
+
+    router_weight = token_mask[None, :, :, None].to(dtype=torch.float32)
+    router_prob_per_expert = (routing_weights * router_weight).sum(dim=(0, 2))
+    router_prob_per_expert = router_prob_per_expert / token_denominator[:, None].clamp_min(1.0)
+
+    per_example = (
+        tokens_per_expert * router_prob_per_expert[:, None, :]
+    ).sum(dim=(1, 2)) * num_experts
+    return per_example[valid_rows].mean()
 
 
 @dataclass(frozen=True, slots=True)

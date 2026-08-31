@@ -28,6 +28,27 @@ class ExternalEvent:
 
 
 @dataclass(frozen=True, slots=True)
+class TrajectoryExampleIndex:
+    """Compact JSONL record metadata used to shard before materializing examples."""
+
+    offset: int
+    length: int
+    example_id: str
+    metadata: Mapping[str, Any]
+    training_source_steps: tuple[int, ...]
+    rollout_length_key: int
+    max_age_binding_id: str | None = None
+
+    def __post_init__(self) -> None:
+        if self.offset < 0 or self.length <= 0:
+            raise ValueError("indexed trajectory byte range must be positive")
+        if not self.example_id:
+            raise ValueError("indexed trajectory example_id must be non-empty")
+        if self.rollout_length_key < 0:
+            raise ValueError("indexed trajectory rollout length key must be non-negative")
+
+
+@dataclass(frozen=True, slots=True)
 class BindingTarget:
     need_id: str
     source: str
@@ -268,6 +289,111 @@ def load_jsonl(path: str | Path) -> tuple[TrajectoryExample, ...]:
                 examples.append(TrajectoryExample.from_dict(raw))
             except (KeyError, TypeError, ValueError, json.JSONDecodeError) as exc:
                 raise ValueError(f"invalid CID trajectory at line {line_number}: {exc}") from exc
+    return tuple(examples)
+
+
+def index_training_jsonl(
+    path: str | Path,
+    *,
+    max_examples: int | None = None,
+) -> tuple[TrajectoryExampleIndex, ...]:
+    """Index train-eligible JSONL records without retaining full trajectory objects.
+
+    ``inspect_dataset`` performs the full schema validation before neural training.  This
+    second pass keeps only the fields required for semantic weighting and deterministic
+    rollout sharding, reducing steady-state host memory on multi-rank jobs.
+    """
+
+    if max_examples is not None and max_examples <= 0:
+        raise ValueError("max_examples must be positive when set")
+    source = Path(path)
+    indexed: list[TrajectoryExampleIndex] = []
+    with source.open("rb") as handle:
+        line_number = 0
+        while True:
+            offset = handle.tell()
+            line = handle.readline()
+            if not line:
+                break
+            line_number += 1
+            if not line.strip():
+                continue
+            try:
+                raw = json.loads(line)
+                metadata = dict(raw.get("metadata", {}))
+                split = str(metadata.get("split", "")).strip().lower()
+                if split in {"validation", "test"}:
+                    continue
+                steps = tuple(int(item["step"]) for item in raw.get("thought_targets", ()))
+                training_steps = training_transition_source_steps(steps)
+                display_lengths = tuple(
+                    len(str(item.get("text", ""))) for item in raw.get("display_targets", ())
+                )
+                rollout_length_key = len(str(raw.get("prompt", ""))) + max(
+                    display_lengths,
+                    default=len(str(raw.get("target_display", ""))),
+                )
+                compact_metadata = {
+                    key: metadata[key]
+                    for key in ("semantic_task_id", "training_weight")
+                    if key in metadata
+                }
+                max_age_binding_id = next(
+                    (
+                        str(binding.get("need_id", ""))
+                        for binding in raw.get("binding_targets", ())
+                        if str(binding.get("freshness", "once")) == "max_age"
+                    ),
+                    None,
+                )
+                indexed.append(
+                    TrajectoryExampleIndex(
+                        offset=offset,
+                        length=len(line),
+                        example_id=str(raw["example_id"]),
+                        metadata=compact_metadata,
+                        training_source_steps=training_steps,
+                        rollout_length_key=rollout_length_key,
+                        max_age_binding_id=max_age_binding_id,
+                    )
+                )
+            except (KeyError, TypeError, ValueError, json.JSONDecodeError) as exc:
+                raise ValueError(
+                    f"invalid CID trajectory index at line {line_number}: {exc}"
+                ) from exc
+            if max_examples is not None and len(indexed) >= max_examples:
+                break
+    if not indexed:
+        raise ValueError("training data contains no train examples")
+    return tuple(indexed)
+
+
+def load_indexed_jsonl(
+    path: str | Path,
+    indices: Iterable[TrajectoryExampleIndex],
+) -> tuple[TrajectoryExample, ...]:
+    """Materialize indexed records in the supplied order, reusing duplicate records."""
+
+    source = Path(path)
+    cache: dict[tuple[int, int], TrajectoryExample] = {}
+    examples: list[TrajectoryExample] = []
+    with source.open("rb") as handle:
+        for index in indices:
+            key = (index.offset, index.length)
+            example = cache.get(key)
+            if example is None:
+                handle.seek(index.offset)
+                raw_line = handle.read(index.length)
+                try:
+                    example = TrajectoryExample.from_dict(json.loads(raw_line))
+                except (KeyError, TypeError, ValueError, json.JSONDecodeError) as exc:
+                    raise ValueError(
+                        f"invalid indexed CID trajectory {index.example_id!r}: {exc}"
+                    ) from exc
+                if example.example_id != index.example_id:
+                    raise ValueError("indexed CID trajectory identity changed after indexing")
+                cache[key] = example
+            examples.append(example)
     return tuple(examples)
 
 

@@ -25,7 +25,7 @@ from cid.computational_training import (
 )
 from cid.contracts import FreshnessDemand, InformationNeed, ModelContext, ModelUpdate
 from cid.correction_training import CorrectionTrainingConfig, build_correction_training
-from cid.data import TrajectoryExample, dump_jsonl, load_jsonl
+from cid.data import TrajectoryExample, dump_jsonl, index_training_jsonl, load_jsonl
 from cid.dataset import dump_dataset_manifest, inspect_dataset, validate_neural_training_contract
 from cid.distill import (
     TeacherScheduleConfig,
@@ -1160,6 +1160,28 @@ def _trajectory_split(example: TrajectoryExample) -> str | None:
     return split if split in {"train", "validation", "test"} else None
 
 
+def _load_explicit_validation_examples(
+    validation_data_path: str | Path,
+    *,
+    max_validation_examples: int | None,
+) -> tuple[TrajectoryExample, ...]:
+    validation_source = load_jsonl(validation_data_path)
+    validation_labels = tuple(_trajectory_split(example) for example in validation_source)
+    if any(label is not None for label in validation_labels):
+        validation_examples = tuple(
+            example
+            for example, label in zip(validation_source, validation_labels, strict=True)
+            if label == "validation"
+        )
+        if not validation_examples:
+            raise ValueError("--validation-data contains split labels but no validation examples")
+    else:
+        validation_examples = validation_source
+    if max_validation_examples is not None:
+        validation_examples = validation_examples[:max_validation_examples]
+    return validation_examples
+
+
 def _load_train_and_validation_examples(
     data_path: str | Path,
     *,
@@ -1183,28 +1205,16 @@ def _load_train_and_validation_examples(
         inline_validation = ()
 
     if validation_data_path is not None:
-        validation_source = load_jsonl(validation_data_path)
-        validation_labels = tuple(_trajectory_split(example) for example in validation_source)
-        if any(label is not None for label in validation_labels):
-            validation_examples = tuple(
-                example
-                for example, label in zip(
-                    validation_source, validation_labels, strict=True
-                )
-                if label == "validation"
-            )
-            if not validation_examples:
-                raise ValueError(
-                    "--validation-data contains split labels but no validation examples"
-                )
-        else:
-            validation_examples = validation_source
+        validation_examples = _load_explicit_validation_examples(
+            validation_data_path,
+            max_validation_examples=max_validation_examples,
+        )
     else:
         validation_examples = inline_validation
 
     if max_examples is not None:
         training_examples = training_examples[:max_examples]
-    if max_validation_examples is not None:
+    if max_validation_examples is not None and validation_data_path is None:
         validation_examples = validation_examples[:max_validation_examples]
     if not training_examples:
         raise ValueError("training data contains no train examples")
@@ -1330,6 +1340,12 @@ def _stage_a_needs_legacy_resume_repair(
     return windows_seen_in_epoch > 0 and data_order_version < 2
 
 
+def _stage_a_completed_epoch_data_order_version(data_order_version: int) -> int:
+    """Upgrade legacy ordering only after its in-flight epoch has finished."""
+
+    return max(data_order_version, 4)
+
+
 def _train_stage_a(args: argparse.Namespace) -> None:
     import torch
     import torch.distributed as dist
@@ -1345,6 +1361,7 @@ def _train_stage_a(args: argparse.Namespace) -> None:
         ILLaDATrajectoryTensorizer,
         balance_rollout_windows_by_semantic_task,
         load_cid_adapter_from_pretrained,
+        materialize_indexed_rollout_windows,
         shard_rollout_windows,
         trajectory_rollout_windows,
         wrap_stage_a_ddp,
@@ -1476,17 +1493,31 @@ def _train_stage_a(args: argparse.Namespace) -> None:
         if distributed:
             trainer.reseed(args.seed + rank + trainer.state.transitions_seen * 104729)
 
-        examples, validation_examples = _load_train_and_validation_examples(
-            args.data,
-            validation_data_path=args.validation_data,
-            max_examples=args.max_examples,
-            max_validation_examples=args.max_validation_examples,
-        )
-        windows = balance_rollout_windows_by_semantic_task(
-            trajectory_rollout_windows(
-                examples,
-                max_horizon=args.rollout_horizon,
+        indexed_training = args.validation_data is not None
+        if indexed_training:
+            examples = index_training_jsonl(args.data, max_examples=args.max_examples)
+            validation_examples = _load_explicit_validation_examples(
+                args.validation_data,
+                max_validation_examples=args.max_validation_examples,
             )
+            validation_ids = {example.example_id for example in validation_examples}
+            overlapping_ids = validation_ids.intersection(
+                example.example_id for example in examples
+            )
+            if overlapping_ids:
+                sample = sorted(overlapping_ids)[:3]
+                raise ValueError(
+                    "training and validation data overlap by example_id: " + ", ".join(sample)
+                )
+        else:
+            examples, validation_examples = _load_train_and_validation_examples(
+                args.data,
+                validation_data_path=None,
+                max_examples=args.max_examples,
+                max_validation_examples=args.max_validation_examples,
+            )
+        windows = balance_rollout_windows_by_semantic_task(
+            trajectory_rollout_windows(examples, max_horizon=args.rollout_horizon)
         )
         if not windows:
             raise ValueError("training data contains no adjacent thought transitions")
@@ -1629,6 +1660,8 @@ def _train_stage_a(args: argparse.Namespace) -> None:
                         f"windows_seen={resumed_windows}/{total_local_windows}",
                         flush=True,
                     )
+            if indexed_training:
+                local_windows = materialize_indexed_rollout_windows(args.data, local_windows)
             rollout_probability = trainer.rollout_probability()
 
             def report_progress(
@@ -1706,8 +1739,9 @@ def _train_stage_a(args: argparse.Namespace) -> None:
             raw_mean_loss = report.raw_mean_loss
 
             checkpoint = output_dir / f"stage-a-epoch-{epoch:04d}.pt"
-            if trainer.data_order_version < 2:
-                trainer.data_order_version = 2
+            trainer.data_order_version = _stage_a_completed_epoch_data_order_version(
+                trainer.data_order_version
+            )
             if rank == 0:
                 trainer.save_checkpoint(
                     checkpoint,
@@ -1885,6 +1919,7 @@ def _train_stage_b(args: argparse.Namespace) -> None:
         load_cid_adapter_checkpoint,
         load_cid_adapter_from_pretrained,
         load_stage_b_checkpoint,
+        materialize_indexed_rollout_windows,
         save_stage_b_checkpoint,
         shard_rollout_windows,
         stage_b_adamw_parameter_groups,
@@ -1970,17 +2005,31 @@ def _train_stage_b(args: argparse.Namespace) -> None:
                 f"{dataset_manifest.thought_capacity_required} > {args.thought_capacity}"
             )
 
-        examples, validation_examples = _load_train_and_validation_examples(
-            args.data,
-            validation_data_path=args.validation_data,
-            max_examples=args.max_examples,
-            max_validation_examples=args.max_validation_examples,
-        )
-        windows = balance_rollout_windows_by_semantic_task(
-            trajectory_rollout_windows(
-                examples,
-                max_horizon=args.rollout_horizon,
+        indexed_training = args.validation_data is not None
+        if indexed_training:
+            examples = index_training_jsonl(args.data, max_examples=args.max_examples)
+            validation_examples = _load_explicit_validation_examples(
+                args.validation_data,
+                max_validation_examples=args.max_validation_examples,
             )
+            validation_ids = {example.example_id for example in validation_examples}
+            overlapping_ids = validation_ids.intersection(
+                example.example_id for example in examples
+            )
+            if overlapping_ids:
+                sample = sorted(overlapping_ids)[:3]
+                raise ValueError(
+                    "training and validation data overlap by example_id: " + ", ".join(sample)
+                )
+        else:
+            examples, validation_examples = _load_train_and_validation_examples(
+                args.data,
+                validation_data_path=None,
+                max_examples=args.max_examples,
+                max_validation_examples=args.max_validation_examples,
+            )
+        windows = balance_rollout_windows_by_semantic_task(
+            trajectory_rollout_windows(examples, max_horizon=args.rollout_horizon)
         )
         if not windows:
             raise ValueError("training data contains no adjacent thought transitions")
@@ -2289,6 +2338,8 @@ def _train_stage_b(args: argparse.Namespace) -> None:
                     f"new_world_size={world_size} optimizer_steps={trainer.state.optimizer_steps}",
                     flush=True,
                 )
+            if indexed_training:
+                local_windows = materialize_indexed_rollout_windows(args.data, local_windows)
             rollout_probability = trainer.rollout_probability()
 
             def report_progress(
