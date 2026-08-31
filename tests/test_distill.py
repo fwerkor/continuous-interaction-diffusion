@@ -376,7 +376,7 @@ def test_teacher_compiler_tolerates_entity_anchor_case_variants() -> None:
     assert catalog["entity:person"].value == "Alberto De Martino"
 
 
-def test_teacher_slot_allocator_recycles_retired_cells() -> None:
+def test_teacher_slot_allocator_recycles_retired_annotation_slots() -> None:
     def cell(cell_id: str, lifecycle: CellLifecycle) -> TeacherCellPlan:
         return TeacherCellPlan(
             cell_id=cell_id,

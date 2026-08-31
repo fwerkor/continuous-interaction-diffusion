@@ -25,7 +25,8 @@ from cid.data import (
     index_training_jsonl,
 )
 from cid.grounding import Anchor, AnchorKind, CognitiveLink, LinkRelation, ObjectRef
-from cid.state import CellLifecycle, CognitiveRole
+from cid.lifecycle import MODELED_LIFECYCLES
+from cid.state import CellLifecycle, CognitiveField, CognitiveRole
 
 torch = pytest.importorskip("torch")
 ILLaDATextEncoder = import_module("cid.model.encoding").ILLaDATextEncoder
@@ -63,6 +64,10 @@ wrap_stage_b_fsdp = cid_model.wrap_stage_b_fsdp
 cid_loss = cid_model.cid_loss
 chunked_illada_mlp_forward = import_module("cid.model.illada")._chunked_illada_mlp_forward
 chunked_illada_rms_norm_forward = import_module("cid.model.illada")._chunked_illada_rms_norm_forward
+
+
+def _slots_by_cell(snapshot: tuple[ThoughtTarget, ...]) -> dict[str, int]:
+    return {cell.cell_id: cell.slot for cell in snapshot}
 
 
 class TinyConfig:
@@ -283,7 +288,7 @@ def test_chunked_illada_rms_norm_matches_unchunked_forward_and_gradient() -> Non
     assert torch.allclose(chunked_grads[1], reference_grads[1], rtol=1e-6, atol=1e-6)
 
 
-def test_trajectory_tensorizer_recycles_retired_source_slot() -> None:
+def test_trajectory_tensorizer_retired_tombstone_blocks_slot_without_pressure() -> None:
     adapter = make_adapter()
     tensorizer = ILLaDATrajectoryTensorizer(adapter, TinyTokenizer())
     trajectory = replace(
@@ -306,7 +311,7 @@ def test_trajectory_tensorizer_recycles_retired_source_slot() -> None:
                 step=1,
                 slot=0,
                 cell_id="replacement",
-                semantic_text="Reuse the released slot for new work.",
+                semantic_text="Continue with new work.",
                 roles={CognitiveRole.PLAN: 1.0},
                 uncertainty=0.2,
                 noise=0.2,
@@ -315,13 +320,17 @@ def test_trajectory_tensorizer_recycles_retired_source_slot() -> None:
     )
 
     sample = tensorizer.tensorize(trajectory, source_step=0, timestep=1.0)
+    retired_index = MODELED_LIFECYCLES.index(CellLifecycle.RETIRED)
 
+    assert sample.batch.slot_occupancy[0, 0]
+    assert sample.batch.lifecycle_features[0, 0, retired_index] == 1
+    assert sample.input_runtime_cell_ids[0] == "c0"
+    assert not sample.targets.allocation_mask[0, 0]
     assert sample.targets.allocation_targets[0, 1] == 1
-    assert sample.targets.allocation_mask[0, 1]
     assert sample.targets.thought_mask[0, 1]
 
 
-def test_trajectory_tensorizer_never_reuses_retired_slot_within_trajectory() -> None:
+def test_trajectory_tensorizer_reclaims_retired_tombstone_under_pressure_after_grace() -> None:
     adapter = make_adapter()
     tensorizer = ILLaDATrajectoryTensorizer(adapter, TinyTokenizer())
     trajectory = replace(
@@ -332,22 +341,92 @@ def test_trajectory_tensorizer_never_reuses_retired_slot_within_trajectory() -> 
         thought_targets=(
             ThoughtTarget(
                 step=0,
-                slot=0,
-                cell_id="retired",
+                slot=3,
+                cell_id="a-retired",
                 semantic_text="Old state.",
                 lifecycle=CellLifecycle.RETIRED,
             ),
-            ThoughtTarget(step=1, slot=0, cell_id="next", semantic_text="Next state."),
-            ThoughtTarget(step=2, slot=0, cell_id="next", semantic_text="Next state updated."),
-            ThoughtTarget(step=2, slot=1, cell_id="later", semantic_text="Later state."),
+            ThoughtTarget(step=0, slot=2, cell_id="b-live", semantic_text="B."),
+            ThoughtTarget(step=0, slot=1, cell_id="c-live", semantic_text="C."),
+            ThoughtTarget(step=0, slot=0, cell_id="d-live", semantic_text="D."),
+            ThoughtTarget(step=1, slot=2, cell_id="b-live", semantic_text="B1."),
+            ThoughtTarget(step=1, slot=1, cell_id="c-live", semantic_text="C1."),
+            ThoughtTarget(step=1, slot=0, cell_id="d-live", semantic_text="D1."),
+            ThoughtTarget(step=2, slot=2, cell_id="b-live", semantic_text="B2."),
+            ThoughtTarget(step=2, slot=1, cell_id="c-live", semantic_text="C2."),
+            ThoughtTarget(step=2, slot=0, cell_id="d-live", semantic_text="D2."),
+            ThoughtTarget(step=2, slot=3, cell_id="e-new", semantic_text="E."),
         ),
     )
 
-    sample = tensorizer.tensorize(trajectory, source_step=1, timestep=1.0)
+    before_reclaim = tensorizer.tensorize(trajectory, source_step=0, timestep=1.0)
+    assert before_reclaim.batch.slot_occupancy.all()
+    assert before_reclaim.input_runtime_cell_ids == ("c0", "c1", "c2", "c3")
+    assert not before_reclaim.targets.allocation_targets.any()
 
-    assert sample.targets.allocation_targets[0, 2] == 1.0
-    assert sample.targets.allocation_targets[0, 0] == 0.0
-    assert sample.targets.thought_mask[0, 2]
+    after_reclaim = tensorizer.tensorize(trajectory, source_step=1, timestep=1.0)
+    assert after_reclaim.input_runtime_cell_ids == ("c1", "c2", "c3", None)
+    assert after_reclaim.batch.slot_occupancy[0, :3].all()
+    assert not after_reclaim.batch.slot_occupancy[0, 3]
+    assert after_reclaim.targets.allocation_targets[0, 3] == 1
+    assert after_reclaim.targets.thought_mask[0, 3]
+
+
+def test_teacher_reclamation_pins_match_runtime_binding_and_strong_link_rules() -> None:
+    tensorizer = ILLaDATrajectoryTensorizer(make_adapter(), TinyTokenizer())
+    field = CognitiveField.empty(capacity=4, width=1)
+    field, retired_runtime_id = field.allocate()
+    field, live_runtime_id = field.allocate()
+    field = field.retire(retired_runtime_id)
+    mapping = {"retired": retired_runtime_id, "live": live_runtime_id}
+
+    binding = BindingTarget(
+        need_id="need-retired",
+        source="lookup",
+        first_need_step=0,
+        executable_step=0,
+        arguments={"q": "x"},
+        target_cells=(ObjectRef.cell("retired"),),
+    )
+    base = replace(
+        make_trajectory(),
+        binding_targets=(binding,),
+        events=(),
+        grounding_targets=(),
+    )
+    assert tensorizer._teacher_reclamation_pins(
+        base, source_step=0, field=field, teacher_to_runtime=mapping
+    ) == frozenset((retired_runtime_id,))
+
+    observed = replace(
+        base,
+        events=(ExternalEvent(source="lookup", value="ok", arrival_step=0, arguments={"q": "x"}),),
+    )
+    assert (
+        tensorizer._teacher_reclamation_pins(
+            observed, source_step=0, field=field, teacher_to_runtime=mapping
+        )
+        == frozenset()
+    )
+
+    linked = replace(
+        observed,
+        grounding_targets=(
+            GroundingTarget(
+                step=0,
+                cell_id="live",
+                links=(
+                    CognitiveLink(
+                        relation=LinkRelation.DEPENDS_ON,
+                        target=ObjectRef.cell("retired"),
+                    ),
+                ),
+            ),
+        ),
+    )
+    assert tensorizer._teacher_reclamation_pins(
+        linked, source_step=0, field=field, teacher_to_runtime=mapping
+    ) == frozenset((retired_runtime_id,))
 
 
 def test_trajectory_tensorizer_always_uses_adapter_physical_tct_capacity() -> None:
@@ -457,7 +536,7 @@ def test_cell_link_supervision_uses_target_cell_semantic_embedding() -> None:
     )
     sample = tensorizer.tensorize(example, source_step=-1, timestep=0.0)
     target = tensorizer._thought_snapshot(example, 0)
-    slots = tensorizer._target_output_slots((), target, sample.batch.thought_semantic.shape[1])
+    slots = _slots_by_cell(target)
     expected = tensorizer.text_encoder.encode_one(solution.semantic_text, detach=True)
 
     assert torch.allclose(
@@ -512,11 +591,7 @@ def test_cell_link_supervision_ignores_runtime_unresolvable_retired_targets() ->
     )
     sample = tensorizer.tensorize(example, source_step=0, timestep=0.0)
     target = tensorizer._thought_snapshot(example, 1)
-    slots = tensorizer._target_output_slots(
-        tensorizer._thought_snapshot(example, 0),
-        target,
-        sample.batch.thought_semantic.shape[1],
-    )
+    slots = _slots_by_cell(target)
 
     answer_slot = slots["answer"]
     assert sample.targets.link_presence_mask[0, answer_slot].all()
@@ -554,7 +629,7 @@ def test_trajectory_tensorizer_rejects_reuse_of_live_source_slot() -> None:
         ),
     )
 
-    with pytest.raises(ValueError, match="removed cells without retirement"):
+    with pytest.raises(ValueError, match="without retirement"):
         tensorizer.tensorize(trajectory, source_step=0, timestep=1.0)
 
 
@@ -2309,9 +2384,8 @@ def test_partial_argument_binding_does_not_unlock_full_teacher_observation() -> 
     output = adapter(sample.batch)
 
     binding = example.binding_targets[0]
-    current = tensorizer._thought_snapshot(example, 0)
     target = tensorizer._thought_snapshot(example, 1)
-    slots = tensorizer._target_output_slots(current, target, sample.batch.thought_semantic.shape[1])
+    slots = _slots_by_cell(target)
     owner_slot = slots[binding.owner_cell.identifier]
     output.need_logits.fill_(-10.0)
     output.need_logits[0, owner_slot, 0].fill_(10.0)
@@ -2453,12 +2527,9 @@ def test_promoted_facts_use_runtime_need_ids_in_teacher_and_closed_loop() -> Non
 
     teacher = tensorizer.tensorize(example, source_step=1, timestep=0.0)
 
-    assert any(
-        text.startswith("fact=binding:need:c1:0 |") for text in teacher.promoted_fact_texts
-    )
+    assert any(text.startswith("fact=binding:need:c1:0 |") for text in teacher.promoted_fact_texts)
     assert not any(
-        text.startswith(f"fact=binding:{binding.need_id} |")
-        for text in teacher.promoted_fact_texts
+        text.startswith(f"fact=binding:{binding.need_id} |") for text in teacher.promoted_fact_texts
     )
 
     runtime_need_id = "need:c1:3"
@@ -2514,9 +2585,8 @@ def test_predicted_binding_requires_live_owner_and_carries_predicted_routes() ->
     example = replace(base, binding_targets=(binding,))
     sample = tensorizer.tensorize(example, source_step=0, timestep=0.0)
     output = adapter(sample.batch)
-    current = tensorizer._thought_snapshot(example, 0)
     target = tensorizer._thought_snapshot(example, 1)
-    slots = tensorizer._target_output_slots(current, target, sample.batch.thought_semantic.shape[1])
+    slots = _slots_by_cell(target)
     owner_slot = slots["c1"]
     other_slot = slots["c0"]
     output.need_logits.fill_(-10.0)
@@ -2744,11 +2814,7 @@ def test_always_freshness_requires_terminal_refresh_before_finalization() -> Non
     )
     training_batch = collate_training_steps((sample,), pad_token_id=1)
     output = adapter(training_batch.batch)
-    slots = tensorizer._target_output_slots(
-        tensorizer._thought_snapshot(example, 1),
-        tensorizer._thought_snapshot(example, 2),
-        sample.batch.thought_semantic.shape[1],
-    )
+    slots = _slots_by_cell(tensorizer._thought_snapshot(example, 2))
     owner_slot = slots[binding.owner_cell.identifier]
     active_index = tuple(import_module("cid.lifecycle").MODELED_LIFECYCLES).index(
         CellLifecycle.ACTIVE
@@ -3064,11 +3130,7 @@ def test_wrong_source_need_has_runtime_binding_consequences() -> None:
     sample = tensorizer.tensorize(example, source_step=0, timestep=0.0)
     training_batch = collate_training_steps((sample,), pad_token_id=1)
     output = adapter(training_batch.batch)
-    slots = tensorizer._target_output_slots(
-        tensorizer._thought_snapshot(example, 0),
-        tensorizer._thought_snapshot(example, 1),
-        sample.batch.thought_semantic.shape[1],
-    )
+    slots = _slots_by_cell(tensorizer._thought_snapshot(example, 1))
     owner_slot = slots[base.binding_targets[0].owner_cell.identifier]
     output.allocation_logits.fill_(-20.0)
     output.allocation_logits[0, owner_slot] = 20.0
@@ -3453,9 +3515,7 @@ def test_stage_b_portable_cursor_handles_padded_bucket_prefix_exactly() -> None:
     )
 
     first_slice_ids = {
-        shard[0].example.example_id
-        for shard in old_shards
-        if not shard[0].is_padding
+        shard[0].example.example_id for shard in old_shards if not shard[0].is_padding
     }
     assert len(first_slice_ids) == 4
     cursor = stage_b_consumed_windows_by_bucket(
@@ -3489,9 +3549,7 @@ def test_stage_b_portable_cursor_handles_padded_bucket_prefix_exactly() -> None:
     }
     assert len(remaining_ids) == 1
     assert first_slice_ids.isdisjoint(remaining_ids)
-    assert first_slice_ids | remaining_ids == {
-        window.example.example_id for window in windows
-    }
+    assert first_slice_ids | remaining_ids == {window.example.example_id for window in windows}
 
 
 def test_stage_b_optimizer_step_count_matches_bucket_padding() -> None:

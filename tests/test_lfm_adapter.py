@@ -1,6 +1,7 @@
 from __future__ import annotations
 
 import sys
+from copy import deepcopy
 from importlib import import_module
 from types import ModuleType, SimpleNamespace
 
@@ -113,17 +114,19 @@ def test_lfm_adapter_uses_native_bidirectional_hidden_backbone() -> None:
     assert backbone.lfm2.last_position_ids[0].tolist() == [0, 1, 8, 9, 10, 11, 12, 13, 14]
 
 
-def test_lfm_retired_slots_are_neurally_equivalent_to_empty_slots() -> None:
+def test_lfm_retired_slots_expose_only_physical_occupancy_marker() -> None:
     backbone = TinyLFMBackbone()
     adapter = LFMCIDAdapter(
         backbone,
         ILLaDACIDConfig(max_thought_slots=8, max_display_tokens=16),
     )
-    empty = make_batch()
-    adapter(empty)
+    base = make_batch()
+
+    empty = deepcopy(base)
+    empty_output = adapter(empty)
     empty_seed = backbone.lfm2.last_inputs_embeds[:, 1].clone()
 
-    retired = make_batch()
+    retired = deepcopy(base)
     retired.slot_occupancy[0, 1, 0] = 1.0
     retired.thought_semantic[0, 1] = 100.0
     retired.role_features[0, 1] = 1.0
@@ -131,11 +134,22 @@ def test_lfm_retired_slots_are_neurally_equivalent_to_empty_slots() -> None:
     retired.local_noise[0, 1, 0] = 0.75
     retired.lifecycle_features = torch.zeros(1, 2, adapter.config.num_lifecycles)
     retired.lifecycle_features[0, 1, 3] = 1.0
-    adapter(retired)
-    retired_seed = backbone.lfm2.last_inputs_embeds[:, 1]
+    retired_output = adapter(retired)
+    retired_seed = backbone.lfm2.last_inputs_embeds[:, 1].clone()
+    retired_attention = backbone.lfm2.last_attention_mask.clone()
 
-    assert torch.equal(empty_seed, retired_seed)
-    assert not backbone.lfm2.last_attention_mask[0, 1]
+    mutated = deepcopy(retired)
+    mutated.thought_semantic[0, 1] = -100.0
+    mutated.role_features[0, 1] = 0.0
+    mutated.uncertainty[0, 1, 0] = 0.9
+    mutated.local_noise[0, 1, 0] = 0.1
+    adapter(mutated)
+    mutated_seed = backbone.lfm2.last_inputs_embeds[:, 1]
+
+    assert not torch.equal(empty_seed, retired_seed)
+    assert torch.equal(retired_seed, mutated_seed)
+    assert retired_attention[0, 1]
+    assert not torch.equal(empty_output.allocation_logits, retired_output.allocation_logits)
 
 
 def test_lfm_adapter_skips_illada_specific_chunk_patches() -> None:

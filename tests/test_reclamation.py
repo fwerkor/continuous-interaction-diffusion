@@ -4,6 +4,7 @@ from dataclasses import replace
 
 from cid.contracts import ModelContext, ModelUpdate
 from cid.grounding import CognitiveLink, LinkRelation, ObjectKind, ObjectRef
+from cid.reclamation import retired_reclamation_candidates
 from cid.runtime import CIDRuntime, RuntimeConfig, SourceRegistry
 from cid.state import CellLifecycle, CognitiveField, DisplayCanvas
 
@@ -161,3 +162,40 @@ async def test_trajectory_finalization_archives_safe_retired_cells_without_press
     assert result.trace.count("cell_reclaimed") == 1
     assert result.archive[0].cell_id == retired_id
     assert result.thought.empty_count == 3
+
+
+def _full_field_with_two_retired() -> tuple[CognitiveField, str, str]:
+    field = CognitiveField.empty(capacity=4, width=2)
+    field, first = field.allocate()
+    field, second = field.allocate()
+    field, _ = field.allocate()
+    field, _ = field.allocate()
+    return field.retire(first).retire(second), first, second
+
+
+def test_reclamation_selector_keeps_tombstones_without_pressure() -> None:
+    field = CognitiveField.empty(capacity=8, width=2)
+    field, cell_id = field.allocate()
+    field = field.retire(cell_id)
+
+    assert retired_reclamation_candidates(field, retired_at={cell_id: 0}, step=10) == ()
+
+
+def test_reclamation_selector_respects_grace_and_pins_under_pressure() -> None:
+    field, first, second = _full_field_with_two_retired()
+
+    assert retired_reclamation_candidates(field, retired_at={first: 0, second: 1}, step=1) == ()
+    assert retired_reclamation_candidates(
+        field,
+        retired_at={first: 0, second: 0},
+        step=2,
+        pinned_cell_ids=frozenset((first,)),
+    ) == ((1, second),)
+
+
+def test_reclamation_selector_stops_at_target_watermark() -> None:
+    field, first, second = _full_field_with_two_retired()
+
+    selected = retired_reclamation_candidates(field, retired_at={first: 0, second: 1}, step=3)
+
+    assert selected == ((0, first),)

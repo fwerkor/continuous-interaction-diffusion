@@ -27,7 +27,13 @@ from cid.data import (
     load_indexed_jsonl,
     training_transition_source_steps,
 )
-from cid.grounding import AnchorKind, LinkRelation, ObjectKind, ObjectRef
+from cid.grounding import (
+    STRONG_LINK_RELATIONS,
+    AnchorKind,
+    LinkRelation,
+    ObjectKind,
+    ObjectRef,
+)
 from cid.lifecycle import (
     MODELED_LIFECYCLES,
     LifecycleTransitionController,
@@ -59,6 +65,7 @@ from cid.model.materialize import (
     RevisionAction,
 )
 from cid.model.tensors import CIDTensorBatch, CIDTensorOutput, build_percept_routing_masks
+from cid.reclamation import retired_reclamation_candidates
 from cid.runtime.bindings import canonical_work_key
 from cid.state import (
     CellLifecycle,
@@ -162,6 +169,16 @@ class CIDRolloutState:
     converged: bool = False
     quiescent: bool = False
     terminal: bool = False
+
+
+@dataclass(frozen=True, slots=True)
+class _TeacherRuntimeTransition:
+    current: tuple[ThoughtTarget, ...]
+    target: tuple[ThoughtTarget, ...]
+    target_output_slots: Mapping[str, int]
+    input_runtime_cell_ids: tuple[str | None, ...]
+    input_next_cell_serial: int
+    runtime_ids_by_teacher: Mapping[str, str]
 
 
 @dataclass(frozen=True, slots=True)
@@ -1977,6 +1994,9 @@ class ILLaDATrajectoryTensorizer:
         self._runtime_argument_catalog_cache: (
             tuple[int, ClosedWorldMaterializationCatalog] | None
         ) = None
+        self._teacher_runtime_replay_cache: (
+            tuple[int, dict[int, _TeacherRuntimeTransition], dict[str, str]] | None
+        ) = None
 
     def tensorize(
         self,
@@ -1993,21 +2013,16 @@ class ILLaDATrajectoryTensorizer:
         if rollout_denoising_steps <= 0:
             raise ValueError("rollout_denoising_steps must be positive")
         target_step = source_step + 1
-        canonical_slots = self._canonical_slot_schedule(example)
-        current = self._thought_snapshot(example, source_step, canonical_slots=canonical_slots)
-        target = self._thought_snapshot(example, target_step, canonical_slots=canonical_slots)
-        if not target:
-            raise ValueError(f"trajectory has no thought targets for step {target_step}")
+        transition = self._teacher_runtime_transition(example, source_step)
+        current = transition.current
+        target = transition.target
 
         device = self.text_encoder.device
         dtype = self.text_encoder.dtype
         capacity = self._trajectory_thought_capacity(example)
         target_by_id = {cell.cell_id: cell for cell in target}
-        target_output_slots = self._target_output_slots(current, target, capacity)
-        canonical_runtime_ids = self._canonical_runtime_cell_ids(
-            example,
-            canonical_slots=canonical_slots,
-        )
+        target_output_slots = dict(transition.target_output_slots)
+        teacher_runtime_ids = dict(transition.runtime_ids_by_teacher)
 
         current_vectors = self._semantic_vectors(current)
         target_vectors = self._semantic_vectors(target)
@@ -2035,13 +2050,8 @@ class ILLaDATrajectoryTensorizer:
                 lifecycle_features[0, cell.slot, lifecycle_order.index(cell.lifecycle)] = 1.0
                 for role_index, role in enumerate(role_order):
                     role_features[0, cell.slot, role_index] = cell.roles.get(role, 0.0)
-            input_runtime_cell_ids, input_next_cell_serial = self._teacher_runtime_state(
-                example,
-                source_step,
-                capacity,
-                canonical_runtime_ids=canonical_runtime_ids,
-                canonical_slots=canonical_slots,
-            )
+            input_runtime_cell_ids = transition.input_runtime_cell_ids
+            input_next_cell_serial = transition.input_next_cell_serial
         else:
             self._validate_rollout_state(rollout_state, capacity)
             thought_semantic.copy_(rollout_state.thought_semantic.to(device=device, dtype=dtype))
@@ -2056,13 +2066,8 @@ class ILLaDATrajectoryTensorizer:
                 input_runtime_cell_ids = rollout_state.runtime_cell_ids
                 input_next_cell_serial = rollout_state.next_cell_serial
             else:
-                input_runtime_cell_ids, input_next_cell_serial = self._teacher_runtime_state(
-                    example,
-                    source_step,
-                    capacity,
-                    canonical_runtime_ids=canonical_runtime_ids,
-                    canonical_slots=canonical_slots,
-                )
+                input_runtime_cell_ids = transition.input_runtime_cell_ids
+                input_next_cell_serial = transition.input_next_cell_serial
                 input_runtime_cell_ids, input_next_cell_serial = self._fill_missing_runtime_ids(
                     input_runtime_cell_ids,
                     input_next_cell_serial,
@@ -2181,7 +2186,7 @@ class ILLaDATrajectoryTensorizer:
                 rollout_routes=rollout_routes,
                 closed_loop=rollout_state is not None,
                 runtime_ids_by_teacher=(
-                    runtime_ids_by_teacher if rollout_state is not None else canonical_runtime_ids
+                    runtime_ids_by_teacher if rollout_state is not None else teacher_runtime_ids
                 ),
             )
             for binding, _ in percept_projections
@@ -2223,7 +2228,7 @@ class ILLaDATrajectoryTensorizer:
             {
                 runtime_id: slot
                 for cell_id, slot in target_output_slots.items()
-                if (runtime_id := canonical_runtime_ids.get(cell_id)) is not None
+                if (runtime_id := teacher_runtime_ids.get(cell_id)) is not None
             }
             if rollout_state is None
             else {
@@ -2485,9 +2490,7 @@ class ILLaDATrajectoryTensorizer:
         if percept_projections is not None:
             if percept_routes is None or len(percept_routes) != len(percept_projections):
                 raise ValueError("closed-loop promoted facts require matching runtime routes")
-            for (binding, event), route in zip(
-                percept_projections, percept_routes, strict=True
-            ):
+            for (binding, event), route in zip(percept_projections, percept_routes, strict=True):
                 descriptor = descriptors.get(binding.source)
                 if descriptor is None or not bool(descriptor.get("promote_results_to_fact", False)):
                     continue
@@ -2539,7 +2542,7 @@ class ILLaDATrajectoryTensorizer:
         need_slot = self._binding_slot_schedule(example).get((owner.identifier, binding.need_id))
         if need_slot is None:
             return binding.need_id
-        runtime_owner = self._canonical_runtime_cell_ids(example).get(owner.identifier)
+        runtime_owner = self._teacher_runtime_ids(example).get(owner.identifier)
         if runtime_owner is None:
             return binding.need_id
         return f"need:{runtime_owner}:{need_slot}"
@@ -2595,14 +2598,10 @@ class ILLaDATrajectoryTensorizer:
         # routes to the live owner at minimum, while an empty display route is its
         # global-display fallback.
         owner = binding.owner_cell
-        runtime_owner = (
-            None if owner is None else runtime_ids_by_teacher.get(owner.identifier)
-        )
+        runtime_owner = None if owner is None else runtime_ids_by_teacher.get(owner.identifier)
         return CIDRolloutBindingRoute(
             need_id=binding.need_id,
-            target_cells=(
-                () if runtime_owner is None else (ObjectRef.cell(runtime_owner),)
-            ),
+            target_cells=(() if runtime_owner is None else (ObjectRef.cell(runtime_owner),)),
             target_display=(),
         )
 
@@ -2778,13 +2777,13 @@ class ILLaDATrajectoryTensorizer:
         if runtime_cell_ids is None:
             if target_output_slots is None:
                 raise ValueError("predicted binding materialization requires runtime cell identity")
-            canonical_runtime_ids = self._canonical_runtime_cell_ids(example)
+            teacher_runtime_ids = self._teacher_runtime_ids(example)
             identities: list[str | None] = [None] * thought_slots
             for teacher_id, slot in target_output_slots.items():
                 if 0 <= slot < thought_slots and bool(live_slots[slot]):
-                    identities[slot] = canonical_runtime_ids.get(teacher_id)
+                    identities[slot] = teacher_runtime_ids.get(teacher_id)
             existing = {cell_id for cell_id in identities if cell_id is not None}
-            next_serial = len(canonical_runtime_ids)
+            next_serial = len(teacher_runtime_ids)
             for slot in range(thought_slots):
                 if not bool(live_slots[slot]) or identities[slot] is not None:
                     continue
@@ -2900,9 +2899,10 @@ class ILLaDATrajectoryTensorizer:
             if len(state.runtime_cell_ids) != thought_slots:
                 raise ValueError("rollout runtime cell identity does not match adapter geometry")
             occupied = state.slot_occupancy[0, :, 0].bool().tolist()
-            if any(is_occupied != (cell_id is not None) for is_occupied, cell_id in zip(
-                occupied, state.runtime_cell_ids, strict=True
-            )):
+            if any(
+                is_occupied != (cell_id is not None)
+                for is_occupied, cell_id in zip(occupied, state.runtime_cell_ids, strict=True)
+            ):
                 raise ValueError("rollout runtime cell identity does not match occupancy")
             live_ids = tuple(cell_id for cell_id in state.runtime_cell_ids if cell_id is not None)
             if len(live_ids) != len(set(live_ids)):
@@ -3066,9 +3066,7 @@ class ILLaDATrajectoryTensorizer:
                 role_targets[0, slot, role_index] = target.roles.get(role, 0.0)
             actually_occupied = bool(input_occupancy[0, slot, 0])
             runtime_cell_id = (
-                input_runtime_cell_ids[slot]
-                if slot < len(input_runtime_cell_ids)
-                else None
+                input_runtime_cell_ids[slot] if slot < len(input_runtime_cell_ids) else None
             )
             if not actually_occupied:
                 # A newly allocated cell cannot become STABLE/RETIRED in the same runtime
@@ -3137,6 +3135,8 @@ class ILLaDATrajectoryTensorizer:
                     signals=signals,
                 )
                 lifecycle[0, slot] = lifecycle_order.index(effective_lifecycle)
+
+        self._validate_allocation_targets(input_occupancy, allocation_targets)
 
         target_slots = set(target_output_slots.values())
         retired_index = lifecycle_order.index(CellLifecycle.RETIRED)
@@ -3302,6 +3302,27 @@ class ILLaDATrajectoryTensorizer:
         return max(0, source_step - epoch_start)
 
     @staticmethod
+    def _validate_allocation_targets(input_occupancy: Tensor, allocation_targets: Tensor) -> None:
+        target = allocation_targets.bool()
+        if int(target.sum().item()) > DEFAULT_MAX_ALLOCATIONS_PER_STEP:
+            raise ValueError("teacher transition exceeds runtime allocation limit")
+        logits = torch.where(
+            target,
+            torch.full_like(allocation_targets, 20.0),
+            torch.full_like(allocation_targets, -20.0),
+        )
+        decoded = prefix_allocation_mask(
+            input_occupancy.squeeze(-1).bool(),
+            logits,
+            threshold=0.5,
+            max_allocations=DEFAULT_MAX_ALLOCATIONS_PER_STEP,
+        )
+        if not torch.equal(decoded, target):
+            raise ValueError(
+                "teacher allocation targets are not realizable by the runtime first-free decoder"
+            )
+
+    @staticmethod
     def _binding_lifecycle_cells(
         example: TrajectoryExample, target_step: int
     ) -> tuple[set[str], set[str]]:
@@ -3344,112 +3365,224 @@ class ILLaDATrajectoryTensorizer:
         self,
         example: TrajectoryExample,
         step: int,
-        *,
-        canonical_slots: Mapping[tuple[int, str], int] | None = None,
     ) -> tuple[ThoughtTarget, ...]:
-        canonical = canonical_slots or self._canonical_slot_schedule(example)
-        snapshot = tuple(
-            replace(target, slot=canonical[(target.step, target.cell_id)])
-            for target in example.thought_targets
-            if target.step == step
-        )
-        return tuple(sorted(snapshot, key=lambda target: target.slot))
+        if step < 0:
+            return ()
+        transitions, _ = self._teacher_runtime_replay(example)
+        transition = transitions.get(step - 1)
+        if transition is None:
+            raise ValueError(f"trajectory has no thought targets for step {step}")
+        return transition.target
 
     def _trajectory_thought_capacity(self, example: TrajectoryExample) -> int:
-        required = max(1, len({target.cell_id for target in example.thought_targets}))
         maximum = self.adapter.config.max_thought_slots
-        if required > maximum:
+        peak = max(
+            (
+                len({target.cell_id for target in example.thought_targets if target.step == step})
+                for step in {target.step for target in example.thought_targets}
+            ),
+            default=1,
+        )
+        if peak > maximum:
             raise ValueError(
-                f"trajectory requires {required} unique thought slots but adapter "
+                f"trajectory requires {peak} simultaneous thought slots but adapter "
                 f"supports {maximum}"
             )
         return maximum
 
-    def _canonical_slot_schedule(self, example: TrajectoryExample) -> dict[tuple[int, str], int]:
-        capacity = self._trajectory_thought_capacity(example)
-        assigned_slots: dict[str, int] = {}
-        last_lifecycle: dict[str, CellLifecycle] = {}
-        used_slots: set[int] = set()
-        schedule: dict[tuple[int, str], int] = {}
-        steps = sorted({target.step for target in example.thought_targets})
+    def _teacher_runtime_transition(
+        self, example: TrajectoryExample, source_step: int
+    ) -> _TeacherRuntimeTransition:
+        transitions, _ = self._teacher_runtime_replay(example)
+        try:
+            return transitions[source_step]
+        except KeyError as exc:
+            raise ValueError(
+                f"trajectory has no trainable transition from step {source_step}"
+            ) from exc
 
-        for step in steps:
-            snapshot = tuple(
+    def _teacher_runtime_ids(self, example: TrajectoryExample) -> dict[str, str]:
+        _, runtime_ids = self._teacher_runtime_replay(example)
+        return dict(runtime_ids)
+
+    def _teacher_runtime_replay(
+        self, example: TrajectoryExample
+    ) -> tuple[dict[int, _TeacherRuntimeTransition], dict[str, str]]:
+        cache_key = id(example)
+        cached = self._teacher_runtime_replay_cache
+        if cached is not None and cached[0] == cache_key:
+            return cached[1], cached[2]
+
+        capacity = self._trajectory_thought_capacity(example)
+        steps = sorted({target.step for target in example.thought_targets})
+        if not steps or steps[0] != 0 or steps != list(range(steps[-1] + 1)):
+            raise ValueError("thought trajectory steps must be contiguous and start at zero")
+
+        field = CognitiveField.empty(capacity, 1)
+        teacher_to_runtime: dict[str, str] = {}
+        runtime_ids: dict[str, str] = {}
+        cell_targets: dict[str, ThoughtTarget] = {}
+        retired_at: dict[str, int] = {}
+        transitions: dict[int, _TeacherRuntimeTransition] = {}
+
+        for target_step in steps:
+            pinned_runtime_ids = self._teacher_reclamation_pins(
+                example,
+                source_step=target_step - 1,
+                field=field,
+                teacher_to_runtime=teacher_to_runtime,
+            )
+            selected = retired_reclamation_candidates(
+                field,
+                retired_at=retired_at,
+                step=target_step,
+                pinned_cell_ids=pinned_runtime_ids,
+            )
+            if selected:
+                runtime_to_teacher = {
+                    runtime_id: teacher_id for teacher_id, runtime_id in teacher_to_runtime.items()
+                }
+                for _, runtime_id in selected:
+                    teacher_id = runtime_to_teacher[runtime_id]
+                    field = field.reclaim(runtime_id)
+                    del teacher_to_runtime[teacher_id]
+                    del cell_targets[teacher_id]
+                    retired_at.pop(runtime_id, None)
+                field = field.compact()
+
+            current = tuple(
                 sorted(
-                    (target for target in example.thought_targets if target.step == step),
+                    (
+                        replace(
+                            cell_targets[teacher_id],
+                            slot=field.slot_of(runtime_id),
+                            lifecycle=field.get(runtime_id).lifecycle,
+                        )
+                        for teacher_id, runtime_id in teacher_to_runtime.items()
+                    ),
+                    key=lambda target: target.slot,
+                )
+            )
+            input_runtime_cell_ids = tuple(
+                cell.cell_id if cell.occupied else None for cell in field.cells
+            )
+            input_next_cell_serial = field.next_cell_serial
+
+            raw_target = tuple(
+                sorted(
+                    (target for target in example.thought_targets if target.step == target_step),
                     key=lambda target: target.cell_id,
                 )
             )
-            snapshot_ids = {target.cell_id for target in snapshot}
-            stale = {
-                cell_id
-                for cell_id, lifecycle in last_lifecycle.items()
-                if cell_id not in snapshot_ids and lifecycle is not CellLifecycle.RETIRED
+            raw_by_id = {target.cell_id: target for target in raw_target}
+            target_ids = set(raw_by_id)
+
+            removed_live = {
+                teacher_id
+                for teacher_id, runtime_id in teacher_to_runtime.items()
+                if teacher_id not in target_ids
+                and field.get(runtime_id).lifecycle is not CellLifecycle.RETIRED
             }
-            if stale:
-                names = ", ".join(sorted(stale))
-                raise ValueError(f"thought trajectory removed cells without retirement: {names}")
+            if removed_live:
+                names = ", ".join(sorted(removed_live))
+                raise ValueError(
+                    f"thought trajectory removed live cells without retirement: {names}"
+                )
 
-            for target in snapshot:
-                if target.cell_id not in assigned_slots:
-                    try:
-                        slot = next(slot for slot in range(capacity) if slot not in used_slots)
-                    except StopIteration as exc:
-                        raise ValueError(
-                            "thought trajectory exceeds canonical slot capacity"
-                        ) from exc
-                    assigned_slots[target.cell_id] = slot
-                    used_slots.add(slot)
-                schedule[(step, target.cell_id)] = assigned_slots[target.cell_id]
-                last_lifecycle[target.cell_id] = target.lifecycle
+            new_ids = sorted(target_ids - set(teacher_to_runtime))
+            for teacher_id in new_ids:
+                if teacher_id in runtime_ids:
+                    raise ValueError(
+                        f"reclaimed thought cell {teacher_id!r} cannot reappear "
+                        "with the same identity"
+                    )
+                field, runtime_id = field.allocate()
+                teacher_to_runtime[teacher_id] = runtime_id
+                runtime_ids[teacher_id] = runtime_id
 
-        return schedule
+            cells = list(field.cells)
+            for teacher_id, raw in raw_by_id.items():
+                runtime_id = teacher_to_runtime[teacher_id]
+                slot = field.slot_of(runtime_id)
+                previous = cells[slot].lifecycle
+                if previous is CellLifecycle.RETIRED and raw.lifecycle is not CellLifecycle.RETIRED:
+                    raise ValueError(
+                        f"retired thought cell {teacher_id!r} cannot be reactivated; "
+                        "reclaim it and allocate a new cell identity"
+                    )
+                cells[slot] = replace(cells[slot], lifecycle=raw.lifecycle)
+                if raw.lifecycle is CellLifecycle.RETIRED:
+                    retired_at.setdefault(runtime_id, target_step)
+                cell_targets[teacher_id] = raw
+            field = replace(field, cells=tuple(cells))
 
-    def _canonical_runtime_cell_ids(
-        self,
-        example: TrajectoryExample,
-        *,
-        canonical_slots: Mapping[tuple[int, str], int] | None = None,
-    ) -> dict[str, str]:
-        schedule = canonical_slots or self._canonical_slot_schedule(example)
-        runtime_ids: dict[str, str] = {}
-        next_serial = 0
-        for step in sorted({target.step for target in example.thought_targets}):
-            newly_visible = {
-                target.cell_id
-                for target in example.thought_targets
-                if target.step == step and target.cell_id not in runtime_ids
-            }
-            for cell_id in sorted(newly_visible, key=lambda item: schedule[(step, item)]):
-                runtime_ids[cell_id] = f"c{next_serial}"
-                next_serial += 1
-        return runtime_ids
-
-    def _teacher_runtime_state(
-        self,
-        example: TrajectoryExample,
-        source_step: int,
-        capacity: int,
-        *,
-        canonical_runtime_ids: Mapping[str, str] | None = None,
-        canonical_slots: Mapping[tuple[int, str], int] | None = None,
-    ) -> tuple[tuple[str | None, ...], int]:
-        if source_step < 0:
-            return (None,) * capacity, 0
-        runtime_ids = dict(canonical_runtime_ids or self._canonical_runtime_cell_ids(example))
-        schedule = canonical_slots or self._canonical_slot_schedule(example)
-        snapshot = self._thought_snapshot(example, source_step, canonical_slots=schedule)
-        by_slot: list[str | None] = [None] * capacity
-        for target in snapshot:
-            by_slot[schedule[(source_step, target.cell_id)]] = runtime_ids[target.cell_id]
-        first_steps: dict[str, int] = {}
-        for target in example.thought_targets:
-            first_steps[target.cell_id] = min(
-                first_steps.get(target.cell_id, target.step),
-                target.step,
+            target = tuple(
+                sorted(
+                    (
+                        replace(
+                            raw,
+                            slot=field.slot_of(teacher_to_runtime[raw.cell_id]),
+                        )
+                        for raw in raw_target
+                    ),
+                    key=lambda item: item.slot,
+                )
             )
-        next_serial = sum(step <= source_step for step in first_steps.values())
-        return tuple(by_slot), next_serial
+            for target_cell in target:
+                cell_targets[target_cell.cell_id] = target_cell
+            transitions[target_step - 1] = _TeacherRuntimeTransition(
+                current=current,
+                target=target,
+                target_output_slots={target.cell_id: target.slot for target in target},
+                input_runtime_cell_ids=input_runtime_cell_ids,
+                input_next_cell_serial=input_next_cell_serial,
+                runtime_ids_by_teacher=dict(runtime_ids),
+            )
+
+        self._teacher_runtime_replay_cache = (cache_key, transitions, runtime_ids)
+        return transitions, runtime_ids
+
+    @staticmethod
+    def _teacher_reclamation_pins(
+        example: TrajectoryExample,
+        *,
+        source_step: int,
+        field: CognitiveField,
+        teacher_to_runtime: Mapping[str, str],
+    ) -> frozenset[str]:
+        if source_step < 0:
+            return frozenset()
+
+        pinned_teacher_ids: set[str] = set()
+        for binding in example.binding_targets:
+            if binding.first_need_step > source_step:
+                continue
+            if binding.freshness is FreshnessDemand.ONCE and _binding_observation_available(
+                example, binding, source_step
+            ):
+                continue
+            pinned_teacher_ids.update(target.identifier for target in binding.target_cells)
+
+        grounding_by_cell = {
+            item.cell_id: item for item in example.grounding_targets if item.step == source_step
+        }
+        for teacher_id, runtime_id in teacher_to_runtime.items():
+            if not field.get(runtime_id).live:
+                continue
+            grounding = grounding_by_cell.get(teacher_id)
+            if grounding is None:
+                continue
+            pinned_teacher_ids.update(
+                link.target.identifier
+                for link in grounding.links
+                if link.target.kind is ObjectKind.CELL and link.relation in STRONG_LINK_RELATIONS
+            )
+
+        return frozenset(
+            teacher_to_runtime[teacher_id]
+            for teacher_id in pinned_teacher_ids
+            if teacher_id in teacher_to_runtime
+        )
 
     @staticmethod
     def _fill_missing_runtime_ids(
@@ -3479,44 +3612,6 @@ class ILLaDATrajectoryTensorizer:
             target.cell_id: self.text_encoder.encode_one(target.semantic_text, detach=True)
             for target in snapshot
         }
-
-    def _target_output_slots(
-        self,
-        current: tuple[ThoughtTarget, ...],
-        target: tuple[ThoughtTarget, ...],
-        capacity: int,
-    ) -> dict[str, int]:
-        current_by_id = {cell.cell_id: cell for cell in current}
-        occupied_source_slots = {
-            cell.slot for cell in current if cell.lifecycle is not CellLifecycle.RETIRED
-        }
-        slots: dict[str, int] = {}
-        used: set[int] = set()
-        for cell in target:
-            if cell.cell_id in current_by_id:
-                slot = current_by_id[cell.cell_id].slot
-            else:
-                slot = cell.slot
-                if slot in occupied_source_slots:
-                    raise ValueError(
-                        "new thought target cannot allocate into an occupied source slot"
-                    )
-            if not 0 <= slot < capacity or slot in used:
-                raise ValueError(
-                    "target thought transition has an invalid or colliding output slot"
-                )
-            slots[cell.cell_id] = slot
-            used.add(slot)
-        target_ids = {cell.cell_id for cell in target}
-        missing = {
-            cell_id
-            for cell_id, cell in current_by_id.items()
-            if cell_id not in target_ids and cell.lifecycle is not CellLifecycle.RETIRED
-        }
-        if missing:
-            names = ", ".join(sorted(missing))
-            raise ValueError(f"target snapshot removed cells without RETIRED state: {names}")
-        return slots
 
     def _display_canvas_size(
         self,
@@ -3769,9 +3864,7 @@ def materialize_indexed_rollout_windows(
     """Load only the trajectory records retained by a deterministic rollout shard."""
 
     indexed = tuple(
-        window.example
-        for window in windows
-        if isinstance(window.example, TrajectoryExampleIndex)
+        window.example for window in windows if isinstance(window.example, TrajectoryExampleIndex)
     )
     if not indexed:
         return windows
@@ -4039,9 +4132,7 @@ def shard_rollout_windows(
             rng = random.Random(seed + epoch * 1_000_003 + 97)
             positions = [0] * len(portable_bucket_microbatches)
             active = [
-                index
-                for index, batches in enumerate(portable_bucket_microbatches)
-                if batches
+                index for index, batches in enumerate(portable_bucket_microbatches) if batches
             ]
             previous_bucket: int | None = None
             while active:
@@ -4061,9 +4152,7 @@ def shard_rollout_windows(
                     active.pop(active_index)
         else:
             local_microbatches.extend(
-                microbatch
-                for batches in portable_bucket_microbatches
-                for microbatch in batches
+                microbatch for batches in portable_bucket_microbatches for microbatch in batches
             )
     elif shuffle:
         random.Random(seed + epoch * 1_000_003 + 97).shuffle(local_microbatches)

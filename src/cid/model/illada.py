@@ -659,17 +659,19 @@ class ILLaDACIDAdapter(nn.Module):
         percept_memory = batch.percept_memory.to(dtype=model_dtype)
         source_memory = batch.source_memory.to(dtype=model_dtype)
 
-        neural_occupancy = live_slot_occupancy(slot_occupancy, lifecycle_features)
+        physical_occupancy = slot_occupancy.clamp(0.0, 1.0)
+        neural_occupancy = live_slot_occupancy(physical_occupancy, lifecycle_features)
         t_scalars = torch.cat((uncertainty, local_noise), dim=-1)
         thought_content = (
             thought
             + self.role_projection(role_features)
             + self.lifecycle_projection(lifecycle_features)
             + self.scalar_projection(t_scalars)
-            + self.occupancy_projection(neural_occupancy)
         )
+        occupancy_marker = self.occupancy_projection(physical_occupancy) * physical_occupancy
         thought_hidden = (
             thought_content * neural_occupancy
+            + occupancy_marker
             + self.channel_embedding.weight[0][None, None, :]
         )
         prompt_hidden = (
@@ -696,7 +698,7 @@ class ILLaDACIDAdapter(nn.Module):
             device=batch.display_ids.device,
         )
         attention_mask = torch.cat(
-            (neural_occupancy.squeeze(-1).bool(), prompt_keys, display_keys),
+            (physical_occupancy.squeeze(-1).bool(), prompt_keys, display_keys),
             dim=1,
         )
         position_ids = self._logical_position_ids(

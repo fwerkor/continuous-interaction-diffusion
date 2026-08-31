@@ -145,16 +145,17 @@ class TorchCIDCore(nn.Module):
             if batch.lifecycle_features is None
             else batch.lifecycle_features.to(dtype=thought.dtype)
         )
-        neural_occupancy = live_slot_occupancy(batch.slot_occupancy, lifecycle_features)
+        physical_occupancy = batch.slot_occupancy.to(dtype=thought.dtype).clamp(0.0, 1.0)
+        neural_occupancy = live_slot_occupancy(physical_occupancy, lifecycle_features)
         t_scalars = torch.cat((batch.uncertainty, batch.local_noise), dim=-1)
         thought_content = (
             thought
             + self.role_projection(batch.role_features)
             + self.lifecycle_projection(lifecycle_features)
             + self.scalar_projection(t_scalars)
-            + self.occupancy_projection(neural_occupancy)
         )
-        thought_hidden = thought_content * neural_occupancy + t_pos + t_channel
+        occupancy_marker = self.occupancy_projection(physical_occupancy) * physical_occupancy
+        thought_hidden = thought_content * neural_occupancy + occupancy_marker + t_pos + t_channel
         prompt_hidden = self.token_embedding(batch.prompt_ids) + p_pos + p_channel
         display_hidden = (
             self.token_embedding(batch.display_ids)
@@ -182,7 +183,7 @@ class TorchCIDCore(nn.Module):
 
         key_padding_mask = torch.cat(
             (
-                ~neural_occupancy.squeeze(-1).bool(),
+                ~physical_occupancy.squeeze(-1).bool(),
                 ~prompt_keys,
                 ~display_keys,
             ),

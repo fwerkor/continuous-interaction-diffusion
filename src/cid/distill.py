@@ -1004,13 +1004,13 @@ def _allocate_teacher_slots(
     capacity: int,
     rng: random.Random,
 ) -> tuple[dict[str, dict[str, int]], dict[str, frozenset[str]]]:
-    """Allocate physical TCT slots while recycling retired semantic cells.
+    """Allocate compact serialization slots for teacher-frame supervision.
 
-    A retirement transition remains supervised for one semantic frame.  Once a
-    cell was already retired in the previous frame, it no longer occupies a
-    physical slot and its slot may be reused by a later cell.  This mirrors the
-    runtime RETIRED -> EMPTY reclamation contract while preserving an explicit
-    retirement target for the model.
+    These slots describe cells visible in a serialized teacher frame; they are
+    not authoritative runtime physical occupancy.  A retirement transition stays
+    visible for one frame, after which its annotation slot may be reused.  During
+    training, teacher snapshots are replayed through ``CognitiveField`` so a
+    RETIRED cell remains physically occupied until runtime reclamation selects it.
     """
 
     if capacity <= 0:

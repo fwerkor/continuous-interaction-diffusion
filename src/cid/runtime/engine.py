@@ -1,7 +1,6 @@
 from __future__ import annotations
 
 import asyncio
-import math
 import time
 from collections.abc import Iterable
 from copy import deepcopy
@@ -11,6 +10,12 @@ from typing import Any
 from cid.contracts import CIDPolicy, FreshnessDemand, ModelContext, Observation, Percept
 from cid.grounding import STRONG_LINK_RELATIONS, ClosedWorldGrounder, ObjectKind, ObjectRef
 from cid.lifecycle import LifecycleTransitionController, LifecycleTransitionSignals
+from cid.reclamation import (
+    DEFAULT_RECLAMATION_GRACE_STEPS,
+    DEFAULT_RECLAMATION_LOW_WATERMARK,
+    DEFAULT_RECLAMATION_TARGET_WATERMARK,
+    retired_reclamation_candidates,
+)
 from cid.runtime.archive import CognitiveArchive, CognitiveTombstone
 from cid.runtime.bindings import Binding, BindingStatus, BindingTable
 from cid.runtime.sources import (
@@ -30,9 +35,9 @@ class RuntimeConfig:
     max_wall_time_s: float | None = 300.0
     binding_threshold: float = 0.55
     idle_yield_s: float = 0.001
-    reclamation_grace_steps: int = 2
-    reclamation_low_watermark: float = 0.125
-    reclamation_target_watermark: float = 0.25
+    reclamation_grace_steps: int = DEFAULT_RECLAMATION_GRACE_STEPS
+    reclamation_low_watermark: float = DEFAULT_RECLAMATION_LOW_WATERMARK
+    reclamation_target_watermark: float = DEFAULT_RECLAMATION_TARGET_WATERMARK
 
     def __post_init__(self) -> None:
         if self.max_steps <= 0:
@@ -891,31 +896,23 @@ class CIDRuntime:
         *,
         force: bool = False,
     ) -> CognitiveField:
-        low = math.ceil(thought.capacity * self.config.reclamation_low_watermark)
-        target = math.ceil(thought.capacity * self.config.reclamation_target_watermark)
-        if not force and thought.empty_count >= low:
+        pinned = self.bindings.pinned_target_cells() | self._strong_link_pins(thought)
+        selected = retired_reclamation_candidates(
+            thought,
+            retired_at=self._retired_at,
+            step=step,
+            grace_steps=self.config.reclamation_grace_steps,
+            low_watermark=self.config.reclamation_low_watermark,
+            target_watermark=self.config.reclamation_target_watermark,
+            pinned_cell_ids=pinned,
+            force=force,
+        )
+        if not selected:
             return thought
 
-        binding_pins = self.bindings.pinned_target_cells()
-        strong_link_pins = self._strong_link_pins(thought)
-        candidates = []
-        for slot, cell in enumerate(thought.cells):
-            if cell.cell_id is None or cell.lifecycle is not CellLifecycle.RETIRED:
-                continue
-            retired_step = self._retired_at.setdefault(cell.cell_id, step)
-            if step - retired_step < self.config.reclamation_grace_steps:
-                continue
-            if cell.cell_id in binding_pins or cell.cell_id in strong_link_pins:
-                continue
-            candidates.append((retired_step, slot, cell.cell_id))
-
         field = thought
-        reclaimed = 0
-        for _, _, cell_id in sorted(candidates):
-            if not force and field.empty_count >= target:
-                break
-            slot = field.slot_of(cell_id)
-            cell = field.get(cell_id)
+        for slot, cell_id in selected:
+            cell = thought.get(cell_id)
             tombstone = self.archive.record(
                 cell,
                 created_step=self._created_at.get(cell_id, 0),
@@ -925,7 +922,6 @@ class CIDRuntime:
                 binding_ids=self.bindings.binding_ids_targeting(cell_id),
             )
             field = field.reclaim(cell_id)
-            reclaimed += 1
             self.trace.emit(
                 "cell_reclaimed",
                 step,
@@ -934,14 +930,13 @@ class CIDRuntime:
                 archived_step=tombstone.archived_step,
             )
 
-        if reclaimed:
-            field = field.compact()
-            self.trace.emit(
-                "cognitive_compaction",
-                step,
-                reclaimed=reclaimed,
-                empty_slots=field.empty_count,
-            )
+        field = field.compact()
+        self.trace.emit(
+            "cognitive_compaction",
+            step,
+            reclaimed=len(selected),
+            empty_slots=field.empty_count,
+        )
         return field
 
     @staticmethod
