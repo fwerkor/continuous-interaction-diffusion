@@ -17,6 +17,7 @@ CIDMaterializer = cid_model.CIDMaterializer
 CIDMaterializerConfig = cid_model.CIDMaterializerConfig
 CIDTensorOutput = cid_model.CIDTensorOutput
 ClosedWorldMaterializationCatalog = cid_model.ClosedWorldMaterializationCatalog
+ObjectCandidate = cid_model.ObjectCandidate
 RevisionAction = cid_model.RevisionAction
 
 
@@ -149,6 +150,40 @@ def test_materializer_creates_cells_arguments_anchors_links_and_revisions() -> N
     assert update.reopen_cells == (ObjectRef.cell(first),)
     assert update.display.token_ids == (7, 8, 9)
     assert update.converged
+
+
+def test_materializer_never_resolves_cell_link_from_closed_world_catalog() -> None:
+    field = CognitiveField.empty(capacity=3, width=4)
+    field, runtime_cell = field.allocate(semantic=(1.0, 0.0, 0.0, 0.0))
+    context = ModelContext(
+        facts=FactStore().snapshot(),
+        thought=field,
+        display=DisplayCanvas.masked(length=3, mask_token_id=5),
+        sources=(SourceDescriptor(name="unused", description="unused"),),
+        percepts=(),
+        step=0,
+    )
+    output = make_output()
+    output.allocation_logits.fill_(-10.0)
+    output.need_logits.fill_(-10.0)
+    output.link_presence_logits[0, 0, 0] = 10.0
+    output.link_relation_logits[0, 0, 0, list(LinkRelation).index(LinkRelation.DEPENDS_ON)] = 10.0
+    output.link_target_kind_logits[0, 0, 0, list(ObjectKind).index(ObjectKind.CELL)] = 10.0
+    output.link_target_query[0, 0, 0] = torch.tensor([0.0, 1.0, 0.0, 0.0])
+    catalog = ClosedWorldMaterializationCatalog(
+        objects=(
+            ObjectCandidate(
+                ref=ObjectRef.cell("teacher-solution"),
+                embedding=torch.tensor([0.0, 1.0, 0.0, 0.0]),
+            ),
+        )
+    )
+
+    update = CIDMaterializer(
+        CIDMaterializerConfig(retrieval_similarity_threshold=0.8)
+    ).materialize(output, context, catalog=catalog)
+
+    assert update.thought.get(runtime_cell).links == ()
 
 
 def test_materializer_leaves_need_latent_until_required_argument_resolves() -> None:

@@ -338,13 +338,11 @@ class CIDMaterializer:
                 for cell in thought.cells
                 if cell.live and cell.cell_id is not None
             )
-            target = _nearest_value(
+            return _nearest_value(
                 query,
                 cell_candidates,
                 min_similarity=self.config.retrieval_similarity_threshold,
             )
-            if target is not None:
-                return target
         return catalog.resolve_object(
             kind,
             query,

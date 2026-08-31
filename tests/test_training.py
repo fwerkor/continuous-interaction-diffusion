@@ -350,7 +350,7 @@ def test_trajectory_tensorizer_never_reuses_retired_slot_within_trajectory() -> 
     assert sample.targets.thought_mask[0, 2]
 
 
-def test_trajectory_tensorizer_always_uses_adapter_physical_tct_capacity() -> None:
+def test_trajectory_tensorizer_uses_trajectory_physical_tct_capacity() -> None:
     adapter = ILLaDACIDAdapter(
         TinyBackbone(),
         ILLaDACIDConfig(
@@ -364,9 +364,161 @@ def test_trajectory_tensorizer_always_uses_adapter_physical_tct_capacity() -> No
 
     sample = tensorizer.tensorize(make_trajectory(), source_step=0, timestep=0.5)
 
-    assert sample.batch.thought_semantic.shape[1] == 8
-    assert sample.batch.slot_occupancy.shape[1] == 8
-    assert sample.targets.allocation_targets.shape[1] == 8
+    assert sample.batch.thought_semantic.shape[1] == 2
+    assert sample.batch.slot_occupancy.shape[1] == 2
+    assert sample.targets.allocation_targets.shape[1] == 2
+
+
+def test_rollout_preserves_runtime_cell_identity_instead_of_teacher_ids() -> None:
+    base = make_trajectory()
+    teacher_ids = {"c0": "plan", "c1": "lookup-result"}
+    example = replace(
+        base,
+        source_descriptors=(),
+        binding_targets=(),
+        grounding_targets=(),
+        thought_targets=tuple(
+            replace(target, cell_id=teacher_ids[target.cell_id]) for target in base.thought_targets
+        ),
+    )
+    adapter = make_adapter(seed=170)
+    tensorizer = ILLaDATrajectoryTensorizer(
+        adapter,
+        TinyTokenizer(),
+        minimum_thought_slots=1,
+    )
+    trainer = CIDTrainer(adapter, tensorizer, CIDTrainerConfig(timestep_min=0.0, timestep_max=0.0))
+    sample = tensorizer.tensorize(example, source_step=0, timestep=0.0)
+
+    assert sample.input_runtime_cell_ids == ("c0", None)
+    assert sample.input_next_cell_serial == 1
+
+    output = adapter(sample.batch)
+    output.allocation_logits.fill_(-10.0)
+    output.allocation_logits[0, 1] = 10.0
+    training_batch = collate_training_steps((sample,), pad_token_id=TinyTokenizer.pad_token_id)
+    state = trainer._rollout_state_from_prediction(
+        sample,
+        training_batch,
+        output,
+        example=example,
+        batch_index=0,
+    )
+
+    assert state.runtime_cell_ids == ("c0", "c1")
+    assert state.next_cell_serial == 2
+    assert not ({"plan", "lookup-result"} & set(filter(None, state.runtime_cell_ids)))
+    next_sample = tensorizer.tensorize(example, source_step=0, timestep=0.0, rollout_state=state)
+    assert next_sample.input_runtime_cell_ids == ("c0", "c1")
+
+
+def test_cell_link_supervision_uses_target_cell_semantic_embedding() -> None:
+    base = make_trajectory()
+    solution = ThoughtTarget(
+        step=0,
+        slot=0,
+        cell_id="solution",
+        semantic_text="Solve the problem from the prompt.",
+    )
+    answer = ThoughtTarget(
+        step=0,
+        slot=1,
+        cell_id="answer",
+        semantic_text="Return the resulting answer.",
+        roles={CognitiveRole.CONCLUSION: 1.0},
+    )
+    example = replace(
+        base,
+        source_descriptors=(),
+        binding_targets=(),
+        thought_targets=(solution, answer),
+        grounding_targets=(
+            GroundingTarget(
+                step=0,
+                cell_id="answer",
+                links=(
+                    CognitiveLink(
+                        relation=LinkRelation.DERIVED_FROM,
+                        target=ObjectRef.cell("solution"),
+                    ),
+                ),
+            ),
+        ),
+        display_targets=(DisplayTarget(step=0, text="37"),),
+    )
+    adapter = make_adapter(seed=171)
+    tensorizer = ILLaDATrajectoryTensorizer(
+        adapter,
+        TinyTokenizer(),
+        minimum_thought_slots=1,
+    )
+    sample = tensorizer.tensorize(example, source_step=-1, timestep=0.0)
+    target = tensorizer._thought_snapshot(example, 0)
+    slots = tensorizer._target_output_slots((), target, sample.batch.thought_semantic.shape[1])
+    expected = tensorizer.text_encoder.encode_one(solution.semantic_text, detach=True)
+
+    assert torch.allclose(
+        sample.targets.link_target_embeddings[0, slots["answer"], 0],
+        expected,
+    )
+
+
+def test_cell_link_supervision_ignores_runtime_unresolvable_retired_targets() -> None:
+    base = make_trajectory()
+    history0 = ThoughtTarget(
+        step=0,
+        slot=0,
+        cell_id="history",
+        semantic_text="Earlier supporting state.",
+    )
+    answer0 = ThoughtTarget(
+        step=0,
+        slot=1,
+        cell_id="answer",
+        semantic_text="Working answer.",
+    )
+    history1 = replace(history0, step=1, lifecycle=CellLifecycle.RETIRED)
+    answer1 = replace(answer0, step=1, semantic_text="Final answer.")
+    example = replace(
+        base,
+        source_descriptors=(),
+        binding_targets=(),
+        thought_targets=(history0, answer0, history1, answer1),
+        grounding_targets=(
+            GroundingTarget(
+                step=1,
+                cell_id="answer",
+                links=(
+                    CognitiveLink(
+                        relation=LinkRelation.DERIVED_FROM,
+                        target=ObjectRef.cell("history"),
+                    ),
+                ),
+            ),
+        ),
+        display_targets=(
+            DisplayTarget(step=0, text="Working."),
+            DisplayTarget(step=1, text="Final."),
+        ),
+    )
+    adapter = make_adapter(seed=172)
+    tensorizer = ILLaDATrajectoryTensorizer(
+        adapter,
+        TinyTokenizer(),
+        minimum_thought_slots=1,
+    )
+    sample = tensorizer.tensorize(example, source_step=0, timestep=0.0)
+    target = tensorizer._thought_snapshot(example, 1)
+    slots = tensorizer._target_output_slots(
+        tensorizer._thought_snapshot(example, 0),
+        target,
+        sample.batch.thought_semantic.shape[1],
+    )
+
+    answer_slot = slots["answer"]
+    assert sample.targets.link_presence_mask[0, answer_slot].all()
+    assert not sample.targets.link_presence_targets[0, answer_slot].any()
+    assert not sample.targets.link_mask[0, answer_slot].any()
 
 
 def test_trajectory_tensorizer_rejects_reuse_of_live_source_slot() -> None:

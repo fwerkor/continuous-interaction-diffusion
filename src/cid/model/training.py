@@ -109,6 +109,8 @@ class CIDTrainingStep:
     binding_observation_steps: tuple[tuple[str, int], ...] = ()
     terminal_validated_binding_ids: tuple[str, ...] = ()
     input_binding_routes: tuple[CIDRolloutBindingRoute, ...] = ()
+    input_runtime_cell_ids: tuple[str | None, ...] = ()
+    input_next_cell_serial: int = 0
 
 
 @dataclass(slots=True)
@@ -146,6 +148,8 @@ class CIDRolloutState:
     slot_occupancy: Tensor
     local_noise: Tensor
     display_ids: Tensor
+    runtime_cell_ids: tuple[str | None, ...] = ()
+    next_cell_serial: int = 0
     display_noise_level: float = 1.0
     diffusion_step: int | None = None
     active_binding_ids: tuple[str, ...] = ()
@@ -255,8 +259,8 @@ def collate_training_steps(
         lifecycle=_pad_slot_targets(steps, "lifecycle", pad_value=-100),
         need_targets=_pad_slot_targets(steps, "need_targets"),
         source_targets=_pad_slot_targets(steps, "source_targets", pad_value=-100),
-        need_target_cell_targets=_pad_slot_targets(steps, "need_target_cell_targets"),
-        need_target_cell_mask=_pad_slot_targets(steps, "need_target_cell_mask"),
+        need_target_cell_targets=_pad_need_cell_targets(steps, "need_target_cell_targets"),
+        need_target_cell_mask=_pad_need_cell_targets(steps, "need_target_cell_mask"),
         need_target_display_targets=_pad_need_display_targets(steps, "need_target_display_targets"),
         need_target_display_mask=_pad_need_display_targets(steps, "need_target_display_mask"),
         argument_presence_targets=_pad_slot_targets(steps, "argument_presence_targets"),
@@ -852,18 +856,23 @@ class CIDTrainer:
             device=lifecycle_indices.device,
             dtype=sample.batch.role_features.dtype,
         )
-        source_snapshot = self.tensorizer._thought_snapshot(example, sample.source_step)
-        target_snapshot = self.tensorizer._thought_snapshot(example, sample.target_step)
-        target_output_slots = self.tensorizer._target_output_slots(
-            source_snapshot, target_snapshot, thought_slots
-        )
-        cell_id_by_slot = {slot: cell_id for cell_id, slot in target_output_slots.items()}
-
         retired_index = MODELED_LIFECYCLES.index(CellLifecycle.RETIRED)
         previous_retired = previous_occupancy.squeeze(-1) & (
             input_lifecycle.argmax(dim=-1) == retired_index
         )
         newly_allocated = occupancy.squeeze(-1) & ~previous_occupancy.squeeze(-1)
+        if len(sample.input_runtime_cell_ids) != thought_slots:
+            raise ValueError("training step runtime cell identity does not match thought geometry")
+        runtime_cell_ids = list(sample.input_runtime_cell_ids)
+        next_cell_serial = sample.input_next_cell_serial
+        existing_runtime_ids = {cell_id for cell_id in runtime_cell_ids if cell_id is not None}
+        for slot in newly_allocated[0].nonzero(as_tuple=False).flatten().tolist():
+            while f"c{next_cell_serial}" in existing_runtime_ids:
+                next_cell_serial += 1
+            runtime_cell_id = f"c{next_cell_serial}"
+            runtime_cell_ids[slot] = runtime_cell_id
+            existing_runtime_ids.add(runtime_cell_id)
+            next_cell_serial += 1
         predicted_retired = lifecycle_indices == retired_index
         # CIDMaterializer never revives a previously retired cell, and it coerces a
         # newly allocated cell to ACTIVE unless the model explicitly predicts WAITING.
@@ -897,7 +906,7 @@ class CIDTrainer:
         ) = self.tensorizer.predicted_binding_state(
             example,
             sample.target_step,
-            target_output_slots=target_output_slots,
+            runtime_cell_ids=tuple(runtime_cell_ids),
             live_slots=live_slots,
             display_active_length=display_active_length,
             output=output,
@@ -934,7 +943,9 @@ class CIDTrainer:
         for slot in range(thought_slots):
             if not bool(occupancy[0, slot, 0]):
                 continue
-            cell_id = cell_id_by_slot.get(slot, f"__rollout_slot_{slot}")
+            cell_id = runtime_cell_ids[slot]
+            if cell_id is None:
+                raise ValueError("occupied rollout slot is missing runtime cell identity")
             proposed = MODELED_LIFECYCLES[int(lifecycle_indices[0, slot])]
             if not bool(previous_occupancy[0, slot, 0]):
                 resolved = (
@@ -1021,6 +1032,8 @@ class CIDTrainer:
             slot_occupancy=occupancy.to(dtype=sample.batch.slot_occupancy.dtype).detach(),
             local_noise=local_noise.detach(),
             display_ids=display_ids.detach(),
+            runtime_cell_ids=tuple(runtime_cell_ids),
+            next_cell_serial=next_cell_serial,
             display_noise_level=denoising_noise_level(
                 sample.next_diffusion_step, self.config.rollout_denoising_steps
             ),
@@ -1917,8 +1930,9 @@ class ILLaDATrajectoryTensorizer:
         if rollout_denoising_steps <= 0:
             raise ValueError("rollout_denoising_steps must be positive")
         target_step = source_step + 1
-        current = self._thought_snapshot(example, source_step)
-        target = self._thought_snapshot(example, target_step)
+        canonical_slots = self._canonical_slot_schedule(example)
+        current = self._thought_snapshot(example, source_step, canonical_slots=canonical_slots)
+        target = self._thought_snapshot(example, target_step, canonical_slots=canonical_slots)
         if not target:
             raise ValueError(f"trajectory has no thought targets for step {target_step}")
 
@@ -1927,6 +1941,10 @@ class ILLaDATrajectoryTensorizer:
         capacity = self._trajectory_thought_capacity(example)
         target_by_id = {cell.cell_id: cell for cell in target}
         target_output_slots = self._target_output_slots(current, target, capacity)
+        canonical_runtime_ids = self._canonical_runtime_cell_ids(
+            example,
+            canonical_slots=canonical_slots,
+        )
 
         current_vectors = self._semantic_vectors(current)
         target_vectors = self._semantic_vectors(target)
@@ -1954,6 +1972,13 @@ class ILLaDATrajectoryTensorizer:
                 lifecycle_features[0, cell.slot, lifecycle_order.index(cell.lifecycle)] = 1.0
                 for role_index, role in enumerate(role_order):
                     role_features[0, cell.slot, role_index] = cell.roles.get(role, 0.0)
+            input_runtime_cell_ids, input_next_cell_serial = self._teacher_runtime_state(
+                example,
+                source_step,
+                capacity,
+                canonical_runtime_ids=canonical_runtime_ids,
+                canonical_slots=canonical_slots,
+            )
         else:
             self._validate_rollout_state(rollout_state, capacity)
             thought_semantic.copy_(rollout_state.thought_semantic.to(device=device, dtype=dtype))
@@ -1964,6 +1989,22 @@ class ILLaDATrajectoryTensorizer:
             )
             occupancy.copy_(rollout_state.slot_occupancy.to(device=device, dtype=dtype))
             state_noise.copy_(rollout_state.local_noise.to(device=device, dtype=dtype))
+            if rollout_state.runtime_cell_ids:
+                input_runtime_cell_ids = rollout_state.runtime_cell_ids
+                input_next_cell_serial = rollout_state.next_cell_serial
+            else:
+                input_runtime_cell_ids, input_next_cell_serial = self._teacher_runtime_state(
+                    example,
+                    source_step,
+                    capacity,
+                    canonical_runtime_ids=canonical_runtime_ids,
+                    canonical_slots=canonical_slots,
+                )
+                input_runtime_cell_ids, input_next_cell_serial = self._fill_missing_runtime_ids(
+                    input_runtime_cell_ids,
+                    input_next_cell_serial,
+                    occupancy,
+                )
 
         timestep_tensor = torch.tensor([timestep], device=device)
         thought_timesteps = (
@@ -2065,11 +2106,20 @@ class ILLaDATrajectoryTensorizer:
             if rollout_state is None
             else {route.need_id: route for route in rollout_state.binding_routes}
         )
+        runtime_ids_by_teacher = {
+            cell_id: runtime_id
+            for cell_id, slot in target_output_slots.items()
+            if slot < len(input_runtime_cell_ids)
+            and (runtime_id := input_runtime_cell_ids[slot]) is not None
+        }
         percept_routes = tuple(
             self._percept_route(
                 binding,
                 rollout_routes=rollout_routes,
                 closed_loop=rollout_state is not None,
+                runtime_ids_by_teacher=(
+                    runtime_ids_by_teacher if rollout_state is not None else canonical_runtime_ids
+                ),
             )
             for binding, _ in percept_projections
         )
@@ -2106,9 +2156,22 @@ class ILLaDATrajectoryTensorizer:
             ),
             detach=True,
         )
+        percept_cell_slots = (
+            {
+                runtime_id: slot
+                for cell_id, slot in target_output_slots.items()
+                if (runtime_id := canonical_runtime_ids.get(cell_id)) is not None
+            }
+            if rollout_state is None
+            else {
+                runtime_id: slot
+                for slot, runtime_id in enumerate(input_runtime_cell_ids)
+                if runtime_id is not None
+            }
+        )
         percept_thought_mask, percept_display_mask = self._percept_target_masks(
             percept_routes,
-            target_output_slots=target_output_slots,
+            cell_slots=percept_cell_slots,
             display_length=display_input_ids.shape[1],
             thought_slots=capacity,
             device=device,
@@ -2166,6 +2229,7 @@ class ILLaDATrajectoryTensorizer:
                 if rollout_state is None
                 else {route.need_id: route for route in rollout_state.binding_routes}
             ),
+            input_runtime_cell_ids=input_runtime_cell_ids,
             thought_slots=capacity,
             dtype=dtype,
             device=device,
@@ -2183,6 +2247,8 @@ class ILLaDATrajectoryTensorizer:
             binding_observation_steps=binding_observation_steps,
             terminal_validated_binding_ids=terminal_validated_binding_ids,
             input_binding_routes=(() if rollout_state is None else rollout_state.binding_routes),
+            input_runtime_cell_ids=input_runtime_cell_ids,
+            input_next_cell_serial=input_next_cell_serial,
         )
 
     @staticmethod
@@ -2404,13 +2470,16 @@ class ILLaDATrajectoryTensorizer:
         need_slot = self._binding_slot_schedule(example).get((owner.identifier, binding.need_id))
         if need_slot is None:
             return binding.need_id
-        return f"need:{owner.identifier}:{need_slot}"
+        runtime_owner = self._canonical_runtime_cell_ids(example).get(owner.identifier)
+        if runtime_owner is None:
+            return binding.need_id
+        return f"need:{runtime_owner}:{need_slot}"
 
     def _percept_target_masks(
         self,
         routes: tuple[CIDRolloutBindingRoute, ...],
         *,
-        target_output_slots: Mapping[str, int],
+        cell_slots: Mapping[str, int],
         display_length: int,
         thought_slots: int,
         device: torch.device,
@@ -2418,7 +2487,7 @@ class ILLaDATrajectoryTensorizer:
         return build_percept_routing_masks(
             tuple(route.target_cells for route in routes),
             tuple(route.target_display for route in routes),
-            cell_slots=target_output_slots,
+            cell_slots=cell_slots,
             thought_slots=thought_slots,
             display_length=display_length,
             device=device,
@@ -2430,11 +2499,16 @@ class ILLaDATrajectoryTensorizer:
         *,
         rollout_routes: Mapping[str, CIDRolloutBindingRoute],
         closed_loop: bool,
+        runtime_ids_by_teacher: Mapping[str, str],
     ) -> CIDRolloutBindingRoute:
         if not closed_loop:
             return CIDRolloutBindingRoute(
                 need_id=binding.need_id,
-                target_cells=binding.target_cells,
+                target_cells=tuple(
+                    ObjectRef.cell(runtime_ids_by_teacher[target.identifier])
+                    for target in binding.target_cells
+                    if target.identifier in runtime_ids_by_teacher
+                ),
                 target_display=binding.target_display,
             )
         predicted = next(
@@ -2452,9 +2526,14 @@ class ILLaDATrajectoryTensorizer:
         # routes to the live owner at minimum, while an empty display route is its
         # global-display fallback.
         owner = binding.owner_cell
+        runtime_owner = (
+            None if owner is None else runtime_ids_by_teacher.get(owner.identifier)
+        )
         return CIDRolloutBindingRoute(
             need_id=binding.need_id,
-            target_cells=() if owner is None else (owner,),
+            target_cells=(
+                () if runtime_owner is None else (ObjectRef.cell(runtime_owner),)
+            ),
             target_display=(),
         )
 
@@ -2544,21 +2623,25 @@ class ILLaDATrajectoryTensorizer:
     def _runtime_materialization_thought(
         output: CIDTensorOutput,
         *,
-        target_output_slots: Mapping[str, int],
+        runtime_cell_ids: tuple[str | None, ...],
         live_slots: Tensor,
         batch_index: int,
     ) -> CognitiveField:
-        cell_id_by_slot = {slot: cell_id for cell_id, slot in target_output_slots.items()}
+        if len(runtime_cell_ids) != live_slots.shape[0]:
+            raise ValueError("runtime cell identity does not match rollout thought geometry")
         # Need materialization only consumes cell identity/liveness. Avoid copying each
         # hidden vector to CPU, which would introduce one accelerator synchronization per slot.
         semantic = (0.0,) * int(output.thought_semantic.shape[-1])
         cells: list[CognitiveCell] = []
         for slot in range(live_slots.shape[0]):
             if bool(live_slots[slot]):
+                cell_id = runtime_cell_ids[slot]
+                if cell_id is None:
+                    raise ValueError("live rollout slot is missing runtime cell identity")
                 cells.append(
                     CognitiveCell(
                         semantic=semantic,
-                        cell_id=cell_id_by_slot.get(slot, f"__rollout_slot_{slot}"),
+                        cell_id=cell_id,
                         lifecycle=CellLifecycle.ACTIVE,
                     )
                 )
@@ -2600,11 +2683,12 @@ class ILLaDATrajectoryTensorizer:
         example: TrajectoryExample,
         target_step: int,
         *,
-        target_output_slots: Mapping[str, int],
         live_slots: Tensor,
         display_active_length: int,
         output: CIDTensorOutput,
         batch_index: int,
+        runtime_cell_ids: tuple[str | None, ...] | None = None,
+        target_output_slots: Mapping[str, int] | None = None,
     ) -> tuple[
         tuple[str, ...],
         tuple[str, ...],
@@ -2622,6 +2706,25 @@ class ILLaDATrajectoryTensorizer:
         if display_active_length < 0:
             raise ValueError("display_active_length must be non-negative")
         thought_slots = int(live_slots.shape[0])
+        if runtime_cell_ids is None:
+            if target_output_slots is None:
+                raise ValueError("predicted binding materialization requires runtime cell identity")
+            canonical_runtime_ids = self._canonical_runtime_cell_ids(example)
+            identities: list[str | None] = [None] * thought_slots
+            for teacher_id, slot in target_output_slots.items():
+                if 0 <= slot < thought_slots and bool(live_slots[slot]):
+                    identities[slot] = canonical_runtime_ids.get(teacher_id)
+            existing = {cell_id for cell_id in identities if cell_id is not None}
+            next_serial = len(canonical_runtime_ids)
+            for slot in range(thought_slots):
+                if not bool(live_slots[slot]) or identities[slot] is not None:
+                    continue
+                while f"c{next_serial}" in existing:
+                    next_serial += 1
+                identities[slot] = f"c{next_serial}"
+                existing.add(identities[slot])
+                next_serial += 1
+            runtime_cell_ids = tuple(identities)
         display_length = min(
             int(output.need_target_display_logits.shape[-1]),
             max(1, display_active_length),
@@ -2637,7 +2740,7 @@ class ILLaDATrajectoryTensorizer:
         )
         thought = self._runtime_materialization_thought(
             materialization_output,
-            target_output_slots=target_output_slots,
+            runtime_cell_ids=runtime_cell_ids,
             live_slots=live_slots,
             batch_index=batch_index,
         )
@@ -2722,6 +2825,19 @@ class ILLaDATrajectoryTensorizer:
             raise ValueError("rollout display noise level must be in [0, 1]")
         if state.diffusion_step is not None and state.diffusion_step < 0:
             raise ValueError("rollout diffusion step must be non-negative when set")
+        if state.next_cell_serial < 0:
+            raise ValueError("rollout next cell serial must be non-negative")
+        if state.runtime_cell_ids:
+            if len(state.runtime_cell_ids) != thought_slots:
+                raise ValueError("rollout runtime cell identity does not match adapter geometry")
+            occupied = state.slot_occupancy[0, :, 0].bool().tolist()
+            if any(is_occupied != (cell_id is not None) for is_occupied, cell_id in zip(
+                occupied, state.runtime_cell_ids, strict=True
+            )):
+                raise ValueError("rollout runtime cell identity does not match occupancy")
+            live_ids = tuple(cell_id for cell_id in state.runtime_cell_ids if cell_id is not None)
+            if len(live_ids) != len(set(live_ids)):
+                raise ValueError("rollout runtime cell identities must be unique")
 
     def _targets(
         self,
@@ -2741,6 +2857,7 @@ class ILLaDATrajectoryTensorizer:
         observed_binding_ids: frozenset[str] | None,
         active_binding_ids: frozenset[str] | None,
         binding_routes: Mapping[str, CIDRolloutBindingRoute] | None,
+        input_runtime_cell_ids: tuple[str | None, ...],
         thought_slots: int,
         dtype: torch.dtype,
         device: torch.device,
@@ -2754,14 +2871,23 @@ class ILLaDATrajectoryTensorizer:
         object_order = tuple(ObjectKind)
         freshness_order = tuple(FreshnessDemand)
         final_step = max(target.step for target in example.thought_targets)
+        runtime_cell_slots = {
+            cell_id: slot
+            for slot, cell_id in enumerate(input_runtime_cell_ids)
+            if cell_id is not None
+        }
         if observed_binding_ids is None:
             waiting_cells, available_cells = self._binding_lifecycle_cells(example, target_step)
+            waiting_slots: set[int] = set()
+            available_slots: set[int] = set()
             waiting_equilibrium = any(
                 target.lifecycle is CellLifecycle.WAITING for target in target_by_id.values()
             )
         else:
             waiting_cells = set()
             available_cells = set()
+            waiting_slots = set()
+            available_slots = set()
             del active_binding_ids
             routes = binding_routes or {}
             for route in routes.values():
@@ -2772,6 +2898,14 @@ class ILLaDATrajectoryTensorizer:
                     available_cells if replay_id in observed_binding_ids else waiting_cells
                 )
                 destination.update(target.identifier for target in route.target_cells)
+                slot_destination = (
+                    available_slots if replay_id in observed_binding_ids else waiting_slots
+                )
+                slot_destination.update(
+                    runtime_cell_slots[target.identifier]
+                    for target in route.target_cells
+                    if target.identifier in runtime_cell_slots
+                )
             # Closed-loop equilibrium must reflect the binding state the model actually
             # materialized. A teacher WAITING label cannot make a failed/missing need look
             # like a valid asynchronous equilibrium.
@@ -2862,6 +2996,11 @@ class ILLaDATrajectoryTensorizer:
             for role_index, role in enumerate(role_order):
                 role_targets[0, slot, role_index] = target.roles.get(role, 0.0)
             actually_occupied = bool(input_occupancy[0, slot, 0])
+            runtime_cell_id = (
+                input_runtime_cell_ids[slot]
+                if slot < len(input_runtime_cell_ids)
+                else None
+            )
             if not actually_occupied:
                 # A newly allocated cell cannot become STABLE/RETIRED in the same runtime
                 # update. Train the lifecycle head on the effective hard-gated state:
@@ -2870,7 +3009,12 @@ class ILLaDATrajectoryTensorizer:
                 noise_delta[0, slot, 0] = target.noise - 1.0
                 effective_lifecycle = (
                     CellLifecycle.WAITING
-                    if target.lifecycle is CellLifecycle.WAITING and cell_id in waiting_cells
+                    if target.lifecycle is CellLifecycle.WAITING
+                    and (
+                        slot in waiting_slots
+                        if observed_binding_ids is not None
+                        else cell_id in waiting_cells
+                    )
                     else CellLifecycle.ACTIVE
                 )
                 lifecycle[0, slot] = lifecycle_order.index(effective_lifecycle)
@@ -2894,10 +3038,22 @@ class ILLaDATrajectoryTensorizer:
                     else CellLifecycle.ACTIVE
                 )
                 signals = LifecycleTransitionSignals(
-                    waiting_cells=frozenset(waiting_cells),
-                    available_cells=frozenset(available_cells),
+                    waiting_cells=(
+                        frozenset((runtime_cell_id,))
+                        if runtime_cell_id is not None and slot in waiting_slots
+                        else frozenset()
+                    )
+                    if observed_binding_ids is not None
+                    else frozenset(waiting_cells),
+                    available_cells=(
+                        frozenset((runtime_cell_id,))
+                        if runtime_cell_id is not None and slot in available_slots
+                        else frozenset()
+                    )
+                    if observed_binding_ids is not None
+                    else frozenset(available_cells),
                     reopen_cells=(
-                        frozenset((cell_id,))
+                        frozenset(((runtime_cell_id or cell_id),))
                         if revision_action is RevisionAction.REOPEN
                         else frozenset()
                     ),
@@ -2906,7 +3062,7 @@ class ILLaDATrajectoryTensorizer:
                 # self-rollout this may differ from the teacher snapshot, and using the
                 # teacher lifecycle here creates contradictory closed-loop labels.
                 effective_lifecycle = LifecycleTransitionController.resolve(
-                    cell_id=cell_id,
+                    cell_id=runtime_cell_id or cell_id,
                     current=current_lifecycle,
                     proposed=target.lifecycle,
                     signals=signals,
@@ -3000,7 +3156,16 @@ class ILLaDATrajectoryTensorizer:
                 continue
             if len(grounding.anchors) > c.max_anchor_slots:
                 raise ValueError("grounding target exceeds configured anchor slot capacity")
-            if len(grounding.links) > c.max_link_slots:
+            runtime_links = tuple(
+                link
+                for link in grounding.links
+                if link.target.kind is not ObjectKind.CELL
+                or (
+                    link.target.identifier in target_by_id
+                    and target_by_id[link.target.identifier].lifecycle is not CellLifecycle.RETIRED
+                )
+            )
+            if len(runtime_links) > c.max_link_slots:
                 raise ValueError("grounding target exceeds configured link slot capacity")
             for index, anchor in enumerate(grounding.anchors):
                 anchor_presence_targets[0, slot, index] = 1.0
@@ -3009,13 +3174,16 @@ class ILLaDATrajectoryTensorizer:
                     anchor.canonical_key, detach=True
                 )
                 anchor_mask[0, slot, index] = True
-            for index, link in enumerate(grounding.links):
+            for index, link in enumerate(runtime_links):
                 link_presence_targets[0, slot, index] = 1.0
                 link_relation_targets[0, slot, index] = relation_order.index(link.relation)
                 link_target_kind_targets[0, slot, index] = object_order.index(link.target.kind)
-                link_target_embeddings[0, slot, index] = self.text_encoder.encode_one(
-                    _object_text(link.target), detach=True
-                )
+                if link.target.kind is ObjectKind.CELL:
+                    link_target_embeddings[0, slot, index] = target_vectors[link.target.identifier]
+                else:
+                    link_target_embeddings[0, slot, index] = self.text_encoder.encode_one(
+                        _object_text(link.target), detach=True
+                    )
                 link_mask[0, slot, index] = True
 
         return CIDTargets(
@@ -3103,8 +3271,14 @@ class ILLaDATrajectoryTensorizer:
                 schedule[(cell_id, binding.need_id)] = need_slot
         return schedule
 
-    def _thought_snapshot(self, example: TrajectoryExample, step: int) -> tuple[ThoughtTarget, ...]:
-        canonical = self._canonical_slot_schedule(example)
+    def _thought_snapshot(
+        self,
+        example: TrajectoryExample,
+        step: int,
+        *,
+        canonical_slots: Mapping[tuple[int, str], int] | None = None,
+    ) -> tuple[ThoughtTarget, ...]:
+        canonical = canonical_slots or self._canonical_slot_schedule(example)
         snapshot = tuple(
             replace(target, slot=canonical[(target.step, target.cell_id)])
             for target in example.thought_targets
@@ -3113,17 +3287,14 @@ class ILLaDATrajectoryTensorizer:
         return tuple(sorted(snapshot, key=lambda target: target.slot))
 
     def _trajectory_thought_capacity(self, example: TrajectoryExample) -> int:
-        counts: dict[int, int] = {}
-        for target in example.thought_targets:
-            counts[target.step] = counts.get(target.step, 0) + 1
-        required = max(counts.values(), default=1)
+        required = max(1, len({target.cell_id for target in example.thought_targets}))
         maximum = self.adapter.config.max_thought_slots
         if required > maximum:
             raise ValueError(
-                f"trajectory requires {required} simultaneous thought slots but adapter "
+                f"trajectory requires {required} unique thought slots but adapter "
                 f"supports {maximum}"
             )
-        return maximum
+        return min(maximum, max(self.minimum_thought_slots, required))
 
     def _canonical_slot_schedule(self, example: TrajectoryExample) -> dict[tuple[int, str], int]:
         capacity = self._trajectory_thought_capacity(example)
@@ -3164,6 +3335,75 @@ class ILLaDATrajectoryTensorizer:
                 last_lifecycle[target.cell_id] = target.lifecycle
 
         return schedule
+
+    def _canonical_runtime_cell_ids(
+        self,
+        example: TrajectoryExample,
+        *,
+        canonical_slots: Mapping[tuple[int, str], int] | None = None,
+    ) -> dict[str, str]:
+        schedule = canonical_slots or self._canonical_slot_schedule(example)
+        runtime_ids: dict[str, str] = {}
+        next_serial = 0
+        for step in sorted({target.step for target in example.thought_targets}):
+            newly_visible = {
+                target.cell_id
+                for target in example.thought_targets
+                if target.step == step and target.cell_id not in runtime_ids
+            }
+            for cell_id in sorted(newly_visible, key=lambda item: schedule[(step, item)]):
+                runtime_ids[cell_id] = f"c{next_serial}"
+                next_serial += 1
+        return runtime_ids
+
+    def _teacher_runtime_state(
+        self,
+        example: TrajectoryExample,
+        source_step: int,
+        capacity: int,
+        *,
+        canonical_runtime_ids: Mapping[str, str] | None = None,
+        canonical_slots: Mapping[tuple[int, str], int] | None = None,
+    ) -> tuple[tuple[str | None, ...], int]:
+        if source_step < 0:
+            return (None,) * capacity, 0
+        runtime_ids = dict(canonical_runtime_ids or self._canonical_runtime_cell_ids(example))
+        schedule = canonical_slots or self._canonical_slot_schedule(example)
+        snapshot = self._thought_snapshot(example, source_step, canonical_slots=schedule)
+        by_slot: list[str | None] = [None] * capacity
+        for target in snapshot:
+            by_slot[schedule[(source_step, target.cell_id)]] = runtime_ids[target.cell_id]
+        first_steps: dict[str, int] = {}
+        for target in example.thought_targets:
+            first_steps[target.cell_id] = min(
+                first_steps.get(target.cell_id, target.step),
+                target.step,
+            )
+        next_serial = sum(step <= source_step for step in first_steps.values())
+        return tuple(by_slot), next_serial
+
+    @staticmethod
+    def _fill_missing_runtime_ids(
+        runtime_cell_ids: tuple[str | None, ...],
+        next_cell_serial: int,
+        occupancy: Tensor,
+    ) -> tuple[tuple[str | None, ...], int]:
+        identities = list(runtime_cell_ids)
+        existing = {cell_id for cell_id in identities if cell_id is not None}
+        occupied = occupancy[0, :, 0].bool().tolist()
+        for slot, is_occupied in enumerate(occupied):
+            if not is_occupied:
+                identities[slot] = None
+                continue
+            if identities[slot] is not None:
+                continue
+            while f"c{next_cell_serial}" in existing:
+                next_cell_serial += 1
+            identity = f"c{next_cell_serial}"
+            identities[slot] = identity
+            existing.add(identity)
+            next_cell_serial += 1
+        return tuple(identities), next_cell_serial
 
     def _semantic_vectors(self, snapshot: tuple[ThoughtTarget, ...]) -> dict[str, Tensor]:
         return {
@@ -3270,6 +3510,26 @@ def _pad_slot_targets(
         tuple(getattr(step.targets, name) for step in steps),
         pad_value=pad_value,
     )
+
+
+def _pad_need_cell_targets(
+    steps: tuple[CIDTrainingStep, ...],
+    name: str,
+) -> Tensor:
+    tensors = tuple(getattr(step.targets, name) for step in steps)
+    if any(tensor.ndim != 4 or tensor.shape[0] != 1 for tensor in tensors):
+        raise ValueError("need-cell targets must have shape [1, slots, need_slots, target_slots]")
+    need_slots = tensors[0].shape[2]
+    if any(tensor.shape[2] != need_slots for tensor in tensors):
+        raise ValueError("need-cell targets in one batch must share need-slot capacity")
+    if any(tensor.shape[1] != tensor.shape[3] for tensor in tensors):
+        raise ValueError("need-cell targets must use the same source and target slot capacity")
+    max_slots = max(tensor.shape[1] for tensor in tensors)
+    output = tensors[0].new_zeros((len(tensors), max_slots, need_slots, max_slots))
+    for row, tensor in enumerate(tensors):
+        slots = tensor.shape[1]
+        output[row, :slots, :, :slots] = tensor[0]
+    return output
 
 
 def _pad_need_display_targets(
