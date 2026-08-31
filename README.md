@@ -434,13 +434,11 @@ quiescent before a later supervised transition, that transition still receives a
 correction loss without overwriting the blocked detached runtime state.
 
 The trainer pads variable-length prompt and external-memory sequences inside each micro-batch.
-`--thought-capacity` is an upper bound: trajectory tensorization canonicalizes dataset schedule slots
-to a deterministic first-free layout and uses only the unique per-trajectory cell footprint required
-by that example (with an eight-slot minimum). Retired slots remain reserved within one supervised
-trajectory because reclamation is runtime-owned rather than a learned transition. The configured
-maximum TCT width is nevertheless reserved in the logical position space, so changing a sample from
-eight physical slots to 128 cannot shift its
-prompt or display positions. `--display-canvas-tokens` is the minimum display bucket (`64` by
+CID v1 uses a fixed physical TCT width of 128 slots in both training and runtime inference. Dataset
+schedule slots are canonicalized to a deterministic first-free layout inside that fixed field; unused
+slots remain empty, and retired slots stay reserved within one supervised trajectory because
+reclamation is runtime-owned rather than a learned transition. The v1 training commands therefore
+require `--thought-capacity 128`. `--display-canvas-tokens` is the minimum display bucket (`64` by
 default); training expands it only when needed through coarse buckets (64, 128, 256, 512, 1024,
 then the configured maximum, 1536 by default). The realized text is terminated by EOS and positions
 after EOS receive no token loss. This avoids paying for a 1536-token canvas on short examples while

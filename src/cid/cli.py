@@ -1411,6 +1411,8 @@ def _train_stage_a(args: argparse.Namespace) -> None:
     from cid.model.encoding import ILLaDATextEncoder
     from cid.model.loading import pretrained_revision
 
+    if args.thought_capacity != 128:
+        raise ValueError("CID v1 Stage A requires --thought-capacity 128")
     if args.dtype == "fp16":
         raise ValueError(
             "Stage A training does not support --dtype fp16 without loss scaling; use bf16"
@@ -1956,6 +1958,8 @@ def _train_stage_b(args: argparse.Namespace) -> None:
     from cid.model.encoding import ILLaDATextEncoder
     from cid.model.loading import backbone_model_type, pretrained_revision
 
+    if args.thought_capacity != 128:
+        raise ValueError("CID v1 Stage B requires --thought-capacity 128")
     if args.resume and args.init_cid_checkpoint:
         raise ValueError("--resume and --init-cid-checkpoint are mutually exclusive")
     if not args.resume and not args.init_cid_checkpoint:

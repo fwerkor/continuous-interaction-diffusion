@@ -535,12 +535,18 @@ class CIDTrainer:
         optimizer: torch.optim.Optimizer | None = None,
         forward_model: torch.nn.Module | None = None,
         gradient_clipper: Callable[[float], Tensor | float] | None = None,
+        preserve_reduced_gradients: bool | None = None,
     ) -> None:
         if tensorizer.adapter is not adapter:
             raise ValueError("trainer and trajectory tensorizer must share the same adapter")
         self.adapter = adapter
         self.forward_model = forward_model or adapter
         self.gradient_clipper = gradient_clipper
+        if preserve_reduced_gradients is None:
+            preserve_reduced_gradients = bool(
+                getattr(self.forward_model, "_cid_cpu_offload_reduced_gradients", False)
+            )
+        self.preserve_reduced_gradients = preserve_reduced_gradients
         self.tensorizer = tensorizer
         self.config = config or CIDTrainerConfig()
         if tensorizer.text_encoder.pooling_mode != self.config.semantic_pooling:
@@ -571,6 +577,7 @@ class CIDTrainer:
         self._pending_accumulation = 0
         self._pending_examples = 0
         self._pending_global_examples = 0
+        self._reduced_gradient_accumulator: dict[str, Tensor] = {}
         self.pad_token_id = getattr(tensorizer.tokenizer, "pad_token_id", None)
         if self.pad_token_id is None:
             raise ValueError("training tokenizer must define pad_token_id")
@@ -800,6 +807,8 @@ class CIDTrainer:
             global_effective_batch_size = self._distributed_global_batch_size(effective_batch_size)
         if global_effective_batch_size < effective_batch_size:
             raise ValueError("global valid-example count cannot be below the local count")
+        if self.preserve_reduced_gradients and self._pending_accumulation:
+            self._stash_reduced_gradients()
         (losses.total * effective_batch_size * loss_scale).backward()
         self._pending_accumulation += 1
         self._pending_examples += effective_batch_size
@@ -1454,6 +1463,7 @@ class CIDTrainer:
         self._pending_accumulation = 0
         self._pending_examples = 0
         self._pending_global_examples = 0
+        self._reduced_gradient_accumulator.clear()
         self.optimizer.zero_grad(set_to_none=True)
 
     def restore_portable_progress_state(
@@ -1486,6 +1496,7 @@ class CIDTrainer:
         self._pending_accumulation = 0
         self._pending_examples = 0
         self._pending_global_examples = 0
+        self._reduced_gradient_accumulator.clear()
         self.data_order_version = int(state.get("data_order_version", 1))
         self.optimizer.zero_grad(set_to_none=True)
         self.reseed(seed)
@@ -1501,11 +1512,7 @@ class CIDTrainer:
         trainable_state = {
             name: parameter.detach().cpu().clone() for name, parameter in self._trainable
         }
-        gradient_state = {
-            name: parameter.grad.detach().cpu().clone()
-            for name, parameter in self._trainable
-            if parameter.grad is not None
-        }
+        gradient_state = self._combined_gradient_state()
         payload = {
             "format_version": self.CHECKPOINT_VERSION,
             "neural_contract_version": CID_NEURAL_CONTRACT_VERSION,
@@ -1656,6 +1663,7 @@ class CIDTrainer:
             rollout_windows_seen_in_epoch=int(state.get("rollout_windows_seen_in_epoch", 0)),
         )
         self.optimizer.zero_grad(set_to_none=True)
+        self._reduced_gradient_accumulator.clear()
         self._pending_accumulation = int(checkpoint.get("pending_accumulation", 0))
         self._pending_examples = int(checkpoint.get("pending_examples", 0))
         saved_global_examples = checkpoint.get("pending_global_examples")
@@ -1682,6 +1690,8 @@ class CIDTrainer:
             raise ValueError("checkpoint pending accumulation has an invalid example count")
 
     def _optimizer_step(self) -> None:
+        if self.preserve_reduced_gradients:
+            self._restore_reduced_gradients()
         normalizer = self._gradient_example_normalizer()
         self._set_learning_rate_for_step(self.state.optimizer_steps + 1)
         for _, parameter in self._trainable:
@@ -1741,6 +1751,57 @@ class CIDTrainer:
         if not math.isfinite(normalizer) or normalizer <= 0.0:
             raise RuntimeError("optimizer step requires at least one valid accumulated example")
         return normalizer
+
+    def _stash_reduced_gradients(self) -> None:
+        """Preserve gradients before a backward path that overwrites reduced grads.
+
+        FSDP with parameter CPU offload reduces and offloads each micro-batch gradient,
+        but does not accumulate it into an existing CPU gradient outside ``no_sync``.
+        Stashing the already-reduced local shards on CPU lets Stage B retain ordinary
+        gradient-accumulation semantics without holding full unsharded gradients on GPU.
+        """
+
+        for name, parameter in self._trainable:
+            gradient = parameter.grad
+            if gradient is None:
+                continue
+            detached = gradient.detach()
+            saved = self._reduced_gradient_accumulator.get(name)
+            if saved is None:
+                self._reduced_gradient_accumulator[name] = detached.clone()
+            else:
+                saved.add_(detached.to(device=saved.device, dtype=saved.dtype))
+            parameter.grad = None
+
+    def _restore_reduced_gradients(self) -> None:
+        if not self._reduced_gradient_accumulator:
+            return
+        parameters = dict(self._trainable)
+        for name, saved in self._reduced_gradient_accumulator.items():
+            parameter = parameters[name]
+            restored = saved.to(device=parameter.device, dtype=parameter.dtype)
+            if parameter.grad is None:
+                parameter.grad = restored
+            else:
+                parameter.grad.add_(
+                    restored.to(device=parameter.grad.device, dtype=parameter.grad.dtype)
+                )
+        self._reduced_gradient_accumulator.clear()
+
+    def _combined_gradient_state(self) -> dict[str, Tensor]:
+        gradients = {
+            name: saved.detach().cpu().clone()
+            for name, saved in self._reduced_gradient_accumulator.items()
+        }
+        for name, parameter in self._trainable:
+            if parameter.grad is None:
+                continue
+            current = parameter.grad.detach().cpu()
+            if name in gradients:
+                gradients[name].add_(current.to(dtype=gradients[name].dtype))
+            else:
+                gradients[name] = current.clone()
+        return gradients
 
     def _set_learning_rate_for_step(self, step: int) -> None:
         learning_rate = self._learning_rate_for_step(step)
@@ -1896,6 +1957,8 @@ class ILLaDATrajectoryTensorizer:
         if minimum_thought_slots <= 0:
             raise ValueError("minimum_thought_slots must be positive")
         self.display_replacement_fraction = display_replacement_fraction
+        # Kept as an accepted compatibility knob for older callers. CID v1 always
+        # tensorizes the full adapter TCT width, so this no longer changes geometry.
         self.minimum_thought_slots = min(
             minimum_thought_slots,
             adapter.config.max_thought_slots,
@@ -3294,7 +3357,7 @@ class ILLaDATrajectoryTensorizer:
                 f"trajectory requires {required} unique thought slots but adapter "
                 f"supports {maximum}"
             )
-        return min(maximum, max(self.minimum_thought_slots, required))
+        return maximum
 
     def _canonical_slot_schedule(self, example: TrajectoryExample) -> dict[tuple[int, str], int]:
         capacity = self._trajectory_thought_capacity(example)
@@ -4208,7 +4271,7 @@ def wrap_stage_b_fsdp(
         transformer_auto_wrap_policy,
         transformer_layer_cls={layer_class},
     )
-    return FullyShardedDataParallel(
+    fsdp = FullyShardedDataParallel(
         adapter,
         auto_wrap_policy=auto_wrap_policy,
         sharding_strategy=ShardingStrategy.FULL_SHARD,
@@ -4224,6 +4287,11 @@ def wrap_stage_b_fsdp(
         limit_all_gathers=True,
         use_orig_params=True,
     )
+    # FSDP CPU offload overwrites an existing reduced CPU gradient on the next
+    # backward. CIDTrainer detects this marker and explicitly accumulates those
+    # already-reduced shards between micro-batches.
+    fsdp._cid_cpu_offload_reduced_gradients = cpu_offload
+    return fsdp
 
 
 def _ensure_stage_b_npu_sharded_tensor_compatibility() -> None:

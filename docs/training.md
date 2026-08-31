@@ -453,10 +453,10 @@ external evidence. The generalization probe is excluded from training and uses a
 domain vocabulary plus a heavier depth/capacity tail and denser long-range dependencies. Surface
 rephrasings are measured as a generalization axis rather than claimed as a strict lexical holdout.
 
-The trainer treats 128 as a **maximum capacity**, not a mandatory tensor width for every example.
-Each trajectory is tensorized at its actual slot footprint (with an eight-slot minimum), and mixed
-micro-batches pad only to the largest footprint in that batch. This keeps ordinary 8/16-slot examples
-close to their previous memory cost while preserving a real 128-slot ability ceiling.
+CID v1 uses 128 as the **fixed physical TCT width** in both training and runtime inference. The
+8/16/32/64/128 labels describe cognitive-load buckets in the teacher trajectories; every transition
+is still tensorized into 128 physical slots, with unused slots left empty. This keeps train/runtime
+geometry identical while preserving the long-tail curriculum over how many distinct cells are used.
 
 ```bash
 cid build-compositional-training \

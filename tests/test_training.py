@@ -350,7 +350,7 @@ def test_trajectory_tensorizer_never_reuses_retired_slot_within_trajectory() -> 
     assert sample.targets.thought_mask[0, 2]
 
 
-def test_trajectory_tensorizer_uses_trajectory_physical_tct_capacity() -> None:
+def test_trajectory_tensorizer_always_uses_adapter_physical_tct_capacity() -> None:
     adapter = ILLaDACIDAdapter(
         TinyBackbone(),
         ILLaDACIDConfig(
@@ -364,9 +364,9 @@ def test_trajectory_tensorizer_uses_trajectory_physical_tct_capacity() -> None:
 
     sample = tensorizer.tensorize(make_trajectory(), source_step=0, timestep=0.5)
 
-    assert sample.batch.thought_semantic.shape[1] == 2
-    assert sample.batch.slot_occupancy.shape[1] == 2
-    assert sample.targets.allocation_targets.shape[1] == 2
+    assert sample.batch.thought_semantic.shape[1] == 8
+    assert sample.batch.slot_occupancy.shape[1] == 8
+    assert sample.targets.allocation_targets.shape[1] == 8
 
 
 def test_rollout_preserves_runtime_cell_identity_instead_of_teacher_ids() -> None:
@@ -390,7 +390,8 @@ def test_rollout_preserves_runtime_cell_identity_instead_of_teacher_ids() -> Non
     trainer = CIDTrainer(adapter, tensorizer, CIDTrainerConfig(timestep_min=0.0, timestep_max=0.0))
     sample = tensorizer.tensorize(example, source_step=0, timestep=0.0)
 
-    assert sample.input_runtime_cell_ids == ("c0", None)
+    assert sample.input_runtime_cell_ids[0] == "c0"
+    assert all(cell_id is None for cell_id in sample.input_runtime_cell_ids[1:])
     assert sample.input_next_cell_serial == 1
 
     output = adapter(sample.batch)
@@ -405,11 +406,13 @@ def test_rollout_preserves_runtime_cell_identity_instead_of_teacher_ids() -> Non
         batch_index=0,
     )
 
-    assert state.runtime_cell_ids == ("c0", "c1")
+    assert state.runtime_cell_ids[:2] == ("c0", "c1")
+    assert all(cell_id is None for cell_id in state.runtime_cell_ids[2:])
     assert state.next_cell_serial == 2
     assert not ({"plan", "lookup-result"} & set(filter(None, state.runtime_cell_ids)))
     next_sample = tensorizer.tensorize(example, source_step=0, timestep=0.0, rollout_state=state)
-    assert next_sample.input_runtime_cell_ids == ("c0", "c1")
+    assert next_sample.input_runtime_cell_ids[:2] == ("c0", "c1")
+    assert all(cell_id is None for cell_id in next_sample.input_runtime_cell_ids[2:])
 
 
 def test_cell_link_supervision_uses_target_cell_semantic_embedding() -> None:
@@ -1124,6 +1127,91 @@ def test_trainer_uses_configured_micro_batches() -> None:
     assert report.transitions == 8
     assert report.optimizer_steps == 2
     assert trainer.state.transitions_seen == 8
+
+
+def test_trainer_preserves_reduced_gradients_across_accumulation() -> None:
+    config = CIDTrainerConfig(
+        learning_rate=1e-3,
+        gradient_accumulation_steps=2,
+        timestep_min=1.0,
+        timestep_max=1.0,
+        seed=7,
+    )
+    example = make_rollout_trajectory()
+
+    baseline_adapter = make_adapter(seed=176)
+    baseline = CIDTrainer(
+        baseline_adapter,
+        ILLaDATrajectoryTensorizer(baseline_adapter, TinyTokenizer()),
+        config,
+    )
+    baseline.train_transition(example, 0)
+    baseline.train_transition(example, 1)
+
+    preserved_adapter = make_adapter(seed=176)
+    preserved = CIDTrainer(
+        preserved_adapter,
+        ILLaDATrajectoryTensorizer(preserved_adapter, TinyTokenizer()),
+        config,
+        preserve_reduced_gradients=True,
+    )
+    preserved.train_transition(example, 0)
+    preserved.train_transition(example, 1)
+
+    baseline_parameters = dict(baseline_adapter.named_parameters())
+    preserved_parameters = dict(preserved_adapter.named_parameters())
+    for name in baseline.trainable_parameter_names:
+        assert torch.allclose(baseline_parameters[name], preserved_parameters[name])
+    assert preserved.state.optimizer_steps == 1
+
+
+def test_preserved_reduced_gradients_survive_mid_accumulation_checkpoint(tmp_path) -> None:
+    config = CIDTrainerConfig(
+        learning_rate=1e-3,
+        gradient_accumulation_steps=3,
+        timestep_min=1.0,
+        timestep_max=1.0,
+        seed=8,
+    )
+    example = make_rollout_trajectory()
+
+    baseline_adapter = make_adapter(seed=177)
+    baseline = CIDTrainer(
+        baseline_adapter,
+        ILLaDATrajectoryTensorizer(baseline_adapter, TinyTokenizer()),
+        config,
+        preserve_reduced_gradients=True,
+    )
+    for source_step in (0, 1, 0):
+        baseline.train_transition(example, source_step)
+
+    adapter = make_adapter(seed=177)
+    trainer = CIDTrainer(
+        adapter,
+        ILLaDATrajectoryTensorizer(adapter, TinyTokenizer()),
+        config,
+        preserve_reduced_gradients=True,
+    )
+    trainer.train_transition(example, 0)
+    trainer.train_transition(example, 1)
+    path = tmp_path / "preserved-mid-accumulation.pt"
+    trainer.save_checkpoint(path)
+
+    restored_adapter = make_adapter(seed=177)
+    restored = CIDTrainer(
+        restored_adapter,
+        ILLaDATrajectoryTensorizer(restored_adapter, TinyTokenizer()),
+        config,
+        preserve_reduced_gradients=True,
+    )
+    restored.load_checkpoint(path)
+    restored.train_transition(example, 0)
+
+    baseline_parameters = dict(baseline_adapter.named_parameters())
+    restored_parameters = dict(restored_adapter.named_parameters())
+    for name in baseline.trainable_parameter_names:
+        assert torch.allclose(baseline_parameters[name], restored_parameters[name])
+    assert restored.state.optimizer_steps == 1
 
 
 def test_trainer_checkpoint_restores_trainable_state_optimizer_and_progress(tmp_path) -> None:
