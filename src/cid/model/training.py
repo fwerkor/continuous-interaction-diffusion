@@ -1285,7 +1285,8 @@ class CIDTrainer:
                             for index, window in enumerate(microbatch)
                         )
                         batch_size = sum(execute_rows)
-                        if batch_size == 0:
+                        global_batch_size = self._distributed_global_batch_size(batch_size)
+                        if global_batch_size == 0:
                             continue
                         training_batch = collate_training_steps(
                             samples, pad_token_id=int(self.pad_token_id)

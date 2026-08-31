@@ -1810,6 +1810,29 @@ def test_distributed_padding_only_rank_keeps_progress_collectives_aligned() -> N
     assert completed.returncode == 0, completed.stdout + completed.stderr
 
 
+def test_stage_b_fsdp_validation_keeps_padding_only_rank_in_forward_collectives() -> None:
+    if not dist.is_available():
+        pytest.skip("torch.distributed is unavailable")
+    worker = Path(__file__).with_name("fsdp_validation_padding_worker.py")
+    completed = subprocess.run(
+        [
+            sys.executable,
+            "-m",
+            "torch.distributed.run",
+            "--standalone",
+            "--nproc-per-node=2",
+            str(worker),
+        ],
+        cwd=Path(__file__).resolve().parents[1],
+        capture_output=True,
+        text=True,
+        timeout=60,
+        check=False,
+    )
+
+    assert completed.returncode == 0, completed.stdout + completed.stderr
+
+
 def test_padding_only_shard_returns_zero_train_and_validation_reports() -> None:
     base = make_trajectory()
     windows = (
