@@ -2346,14 +2346,20 @@ class ILLaDATrajectoryTensorizer:
     ) -> tuple[Any, ...]:
         """Match the exact work item that the model launched in closed loop."""
 
-        source = route.source or binding.source
-        arguments = dict(route.arguments) if route.arguments else dict(binding.arguments)
+        if route.work_key:
+            # Runtime-decoded routes always carry their exact work key, including
+            # intentionally empty argument sets for partial-argument sources.
+            work_key = route.work_key
+        else:
+            # Legacy/manual rollout routes may predate explicit work-key state.
+            source = route.source or binding.source
+            arguments = dict(route.arguments) if route.arguments else dict(binding.arguments)
+            work_key = canonical_work_key(source, arguments)
         return tuple(
             event
             for event in example.events
             if event.arrival_step <= target_step
-            and event.source == source
-            and dict(event.arguments) == arguments
+            and canonical_work_key(event.source, event.arguments) == work_key
         )
 
     def _available_percept_projections(

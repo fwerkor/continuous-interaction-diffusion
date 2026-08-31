@@ -2,6 +2,7 @@ from __future__ import annotations
 
 import hashlib
 import json
+from dataclasses import replace
 
 import pytest
 
@@ -37,7 +38,11 @@ def test_dataset_manifest_is_deterministic_and_describes_training_shape(tmp_path
     assert first.max_trajectory_steps >= 3
     assert first.bindings == 6
     assert first.explicit_owner_bindings == 6
+    assert first.owner_bindings_without_target_cells == 0
     assert first.multi_cell_bindings == 6
+    assert first.max_bindings_per_owner <= 4
+    assert first.max_source_arguments <= 4
+    assert first.bindings_with_undeclared_arguments == 0
     assert first.global_display_fallback_bindings == 6
     assert set(first.tag_counts) == {
         "family:competing_sources",
@@ -104,3 +109,80 @@ def test_neural_training_contract_rejects_tool_data_without_multi_cell_routes(tm
     assert manifest.multi_cell_bindings == 0
     with pytest.raises(ValueError, match="no multi-cell"):
         validate_neural_training_contract(manifest)
+
+
+def test_neural_training_contract_rejects_owner_without_target_cells(tmp_path) -> None:
+    data = tmp_path / "missing-owner-route.jsonl"
+    examples = generate_synthetic(
+        SyntheticConfig(count_per_family=1, seed=37, thought_capacity=8)
+    )
+    dump_jsonl(examples, data)
+    rows = [json.loads(line) for line in data.read_text(encoding="utf-8").splitlines()]
+    rows[0]["binding_targets"][0]["target_cells"] = []
+    data.write_text(
+        "".join(json.dumps(row, ensure_ascii=False) + "\n" for row in rows),
+        encoding="utf-8",
+    )
+
+    manifest = inspect_dataset(data)
+
+    assert manifest.owner_bindings_without_target_cells == 1
+    with pytest.raises(ValueError, match="without target_cells"):
+        validate_neural_training_contract(manifest)
+
+
+def test_neural_training_contract_rejects_source_argument_capacity_overflow(tmp_path) -> None:
+    data = tmp_path / "too-many-arguments.jsonl"
+    examples = generate_synthetic(
+        SyntheticConfig(count_per_family=1, seed=41, thought_capacity=8)
+    )
+    dump_jsonl(examples, data)
+    rows = [json.loads(line) for line in data.read_text(encoding="utf-8").splitlines()]
+    descriptor = rows[0]["source_descriptors"][0]
+    descriptor["arguments"].extend(
+        {"name": f"extra_{index}", "kind": "string", "required": False}
+        for index in range(5)
+    )
+    data.write_text(
+        "".join(json.dumps(row, ensure_ascii=False) + "\n" for row in rows),
+        encoding="utf-8",
+    )
+
+    manifest = inspect_dataset(data)
+
+    assert manifest.max_source_arguments > 4
+    with pytest.raises(ValueError, match="argument capacity"):
+        validate_neural_training_contract(manifest, max_argument_slots=4)
+
+
+def test_neural_training_contract_rejects_undeclared_binding_arguments(tmp_path) -> None:
+    data = tmp_path / "undeclared-argument.jsonl"
+    examples = generate_synthetic(
+        SyntheticConfig(count_per_family=1, seed=43, thought_capacity=8)
+    )
+    dump_jsonl(examples, data)
+    rows = [json.loads(line) for line in data.read_text(encoding="utf-8").splitlines()]
+    rows[0]["binding_targets"][0]["arguments"]["undeclared"] = "value"
+    data.write_text(
+        "".join(json.dumps(row, ensure_ascii=False) + "\n" for row in rows),
+        encoding="utf-8",
+    )
+
+    manifest = inspect_dataset(data)
+
+    assert manifest.bindings_with_undeclared_arguments == 1
+    with pytest.raises(ValueError, match="not declared"):
+        validate_neural_training_contract(manifest)
+
+
+def test_neural_training_contract_rejects_need_slot_capacity_overflow(tmp_path) -> None:
+    data = tmp_path / "synthetic.jsonl"
+    examples = generate_synthetic(
+        SyntheticConfig(count_per_family=1, seed=47, thought_capacity=8)
+    )
+    dump_jsonl(examples, data)
+    manifest = inspect_dataset(data)
+    oversized = replace(manifest, max_bindings_per_owner=5)
+
+    with pytest.raises(ValueError, match="information-need capacity"):
+        validate_neural_training_contract(oversized, max_need_slots=4)

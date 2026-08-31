@@ -1421,8 +1421,17 @@ def _train_stage_a(args: argparse.Namespace) -> None:
         "bf16": torch.bfloat16,
         "fp32": torch.float32,
     }[args.dtype]
+    adapter_config = ILLaDACIDConfig(
+        max_thought_slots=args.thought_capacity,
+        max_display_tokens=args.max_display_tokens,
+        display_canvas_tokens=args.display_canvas_tokens,
+    )
     dataset_manifest = inspect_dataset(args.data)
-    validate_neural_training_contract(dataset_manifest)
+    validate_neural_training_contract(
+        dataset_manifest,
+        max_argument_slots=adapter_config.max_argument_slots,
+        max_need_slots=adapter_config.max_need_slots,
+    )
     world_size = int(os.environ.get("WORLD_SIZE", "1"))
     distributed = world_size > 1
     rank = int(os.environ.get("RANK", "0"))
@@ -1442,12 +1451,6 @@ def _train_stage_a(args: argparse.Namespace) -> None:
         device = device_type
 
     try:
-        adapter_config = ILLaDACIDConfig(
-            max_thought_slots=args.thought_capacity,
-            max_display_tokens=args.max_display_tokens,
-            display_canvas_tokens=args.display_canvas_tokens,
-        )
-
         def load_adapter() -> ILLaDACIDAdapter:
             model = load_cid_adapter_from_pretrained(
                 args.model,
@@ -2025,8 +2028,17 @@ def _train_stage_b(args: argparse.Namespace) -> None:
     world_size = dist.get_world_size()
 
     try:
+        adapter_config = ILLaDACIDConfig(
+            max_thought_slots=args.thought_capacity,
+            max_display_tokens=args.max_display_tokens,
+            display_canvas_tokens=args.display_canvas_tokens,
+        )
         dataset_manifest = inspect_dataset(args.data)
-        validate_neural_training_contract(dataset_manifest)
+        validate_neural_training_contract(
+            dataset_manifest,
+            max_argument_slots=adapter_config.max_argument_slots,
+            max_need_slots=adapter_config.max_need_slots,
+        )
         if dataset_manifest.thought_capacity_required > args.thought_capacity:
             raise ValueError(
                 "training data requires a larger TCT capacity: "
@@ -2113,11 +2125,6 @@ def _train_stage_b(args: argparse.Namespace) -> None:
         if revision is not None:
             tokenizer_kwargs["revision"] = revision
         tokenizer = AutoTokenizer.from_pretrained(args.model, **tokenizer_kwargs)
-        adapter_config = ILLaDACIDConfig(
-            max_thought_slots=args.thought_capacity,
-            max_display_tokens=args.max_display_tokens,
-            display_canvas_tokens=args.display_canvas_tokens,
-        )
 
         def load_adapter() -> tuple[ILLaDACIDAdapter, ILLaDATextEncoder]:
             # Keep the initial FP32 model on host memory. On CUDA, FSDP's device_id moves

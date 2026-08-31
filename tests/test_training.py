@@ -2369,6 +2369,56 @@ def test_partial_argument_binding_does_not_unlock_full_teacher_observation() -> 
         quiescent=True,
     )
 
+    full_only = replace(
+        example,
+        events=(
+            ExternalEvent(
+                source=binding.source,
+                value="37",
+                arrival_step=1,
+                arguments=binding.arguments,
+            ),
+        ),
+    )
+    assert not tensorizer.rollout_external_progress(full_only, 1, rollout)
+    projections, observation_steps, _ = tensorizer._available_percept_projections(
+        full_only,
+        1,
+        rollout_state=rollout,
+    )
+    assert projections == ()
+    assert observation_steps == ()
+
+    output.argument_presence_logits[0, owner_slot, 0].fill_(-10.0)
+    empty_active, empty_executable, empty_routes = tensorizer.predicted_binding_state(
+        example,
+        1,
+        target_output_slots=slots,
+        live_slots=torch.ones(sample.batch.thought_semantic.shape[1], dtype=torch.bool),
+        display_active_length=sample.batch.display_ids.shape[1],
+        output=output,
+        batch_index=0,
+    )
+    assert empty_active == ("need:c1:0",)
+    assert empty_executable == ()
+    assert empty_routes[0].runtime_active
+    assert empty_routes[0].replay_binding_id == binding.need_id
+    assert dict(empty_routes[0].arguments) == {}
+    empty_rollout = replace(
+        rollout,
+        active_binding_ids=empty_active,
+        executable_binding_ids=empty_executable,
+        binding_routes=empty_routes,
+    )
+    assert not tensorizer.rollout_external_progress(full_only, 1, empty_rollout)
+    projections, observation_steps, _ = tensorizer._available_percept_projections(
+        full_only,
+        1,
+        rollout_state=empty_rollout,
+    )
+    assert projections == ()
+    assert observation_steps == ()
+
     assert tensorizer.rollout_external_progress(progressive, 1, rollout)
     projections, observation_steps, _ = tensorizer._available_percept_projections(
         progressive,
