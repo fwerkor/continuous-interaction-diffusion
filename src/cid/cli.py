@@ -1320,6 +1320,16 @@ def _replace_checkpoint_alias(
     alias.symlink_to(target.name, target_is_directory=target_is_directory)
 
 
+def _stage_a_needs_legacy_resume_repair(
+    *,
+    data_order_version: int,
+    windows_seen_in_epoch: int,
+) -> bool:
+    """Whether a partial Stage A checkpoint used the pre-v2 under-filled padding order."""
+
+    return windows_seen_in_epoch > 0 and data_order_version < 2
+
+
 def _train_stage_a(args: argparse.Namespace) -> None:
     import torch
     import torch.distributed as dist
@@ -1540,7 +1550,10 @@ def _train_stage_a(args: argparse.Namespace) -> None:
             legacy_partial_resume = bool(
                 args.resume
                 and epoch == first_epoch
-                and trainer.state.rollout_windows_seen_in_epoch
+                and _stage_a_needs_legacy_resume_repair(
+                    data_order_version=trainer.data_order_version,
+                    windows_seen_in_epoch=trainer.state.rollout_windows_seen_in_epoch,
+                )
             )
             local_windows = shard_rollout_windows(
                 windows,

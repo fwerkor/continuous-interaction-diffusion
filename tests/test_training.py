@@ -2396,15 +2396,91 @@ def test_valid_example_accumulation_ignores_masked_rows() -> None:
         ),
     )
 
-    trainer._forward_backward(samples, sample_mask=(True, False))
+    masked_losses, _, _ = trainer._forward_backward(samples, sample_mask=(True, False))
     assert trainer.state.optimizer_steps == 0
     assert trainer._pending_examples == 1
     assert trainer._pending_global_examples == 1
+    with torch.no_grad():
+        single_batch = collate_training_steps((samples[0],), pad_token_id=1)
+        single_losses = cid_loss(adapter(single_batch.batch), single_batch.targets)
+    assert masked_losses.total.detach().float().item() == pytest.approx(
+        single_losses.total.detach().float().item(),
+        rel=1e-6,
+        abs=1e-7,
+    )
 
     trainer._forward_backward(samples, sample_mask=(True, False))
     assert trainer.state.optimizer_steps == 1
     assert trainer._pending_examples == 0
     assert trainer._pending_global_examples == 0
+
+
+def test_sparse_component_losses_are_invariant_to_microbatch_packing() -> None:
+    adapter = make_adapter(seed=161)
+    adapter.eval()
+    tensorizer = ILLaDATrajectoryTensorizer(adapter, TinyTokenizer())
+    rich = make_trajectory()
+    plain = replace(
+        make_trajectory(),
+        example_id="plain-no-external-supervision",
+        protected_facts={},
+        source_descriptors=(),
+        binding_targets=(),
+        grounding_targets=(),
+    )
+    samples = (
+        tensorizer.tensorize(rich, source_step=0, timestep=0.0),
+        tensorizer.tensorize(plain, source_step=0, timestep=0.0),
+    )
+
+    with torch.no_grad():
+        individual = []
+        for sample in samples:
+            batch = collate_training_steps((sample,), pad_token_id=1)
+            individual.append(cid_loss(adapter(batch.batch), batch.targets))
+        joint_batch = collate_training_steps(samples, pad_token_id=1)
+        joint = cid_loss(adapter(joint_batch.batch), joint_batch.targets)
+
+    component_names = (
+        "thought",
+        "convergence",
+        "allocation",
+        "display",
+        "roles",
+        "uncertainty",
+        "noise",
+        "lifecycle",
+        "intent",
+        "source",
+        "need_cell_route",
+        "need_display_route",
+        "argument_presence",
+        "argument_ground",
+        "revision",
+        "refresh",
+        "anchor_presence",
+        "anchor_kind",
+        "anchor_ground",
+        "link_presence",
+        "link_relation",
+        "link_target_kind",
+        "link_ground",
+    )
+    for name in component_names:
+        expected = 0.5 * (getattr(individual[0], name) + getattr(individual[1], name))
+        assert getattr(joint, name) == pytest.approx(expected, rel=1e-5, abs=1e-6), name
+    expected_total = 0.5 * (individual[0].total + individual[1].total)
+    assert joint.total == pytest.approx(expected_total, rel=1e-5, abs=1e-6)
+
+
+def test_stage_a_legacy_resume_repair_is_limited_to_pre_v2_checkpoints() -> None:
+    needs_repair = import_module("cid.cli")._stage_a_needs_legacy_resume_repair
+
+    assert needs_repair(data_order_version=1, windows_seen_in_epoch=3)
+    assert not needs_repair(data_order_version=2, windows_seen_in_epoch=3)
+    assert not needs_repair(data_order_version=3, windows_seen_in_epoch=3)
+    assert not needs_repair(data_order_version=4, windows_seen_in_epoch=3)
+    assert not needs_repair(data_order_version=1, windows_seen_in_epoch=0)
 
 
 def test_closed_loop_diffusion_reset_requires_actual_replayed_observation() -> None:

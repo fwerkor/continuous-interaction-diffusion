@@ -150,122 +150,145 @@ def cid_loss(
         output.thought_semantic,
         targets.thought_semantic,
         thought_mask,
+        batch_mask=batch_mask,
     )
     convergence = _masked_binary_cross_entropy(
         output.convergence_logits,
         targets.convergence_targets,
         batch_mask,
+        batch_mask=batch_mask,
     )
     allocation = _balanced_masked_binary_cross_entropy(
         output.allocation_logits,
         targets.allocation_targets,
         allocation_mask,
+        batch_mask=batch_mask,
     )
     display = _masked_cross_entropy(
         output.display_logits,
         targets.display_ids,
         display_mask,
+        batch_mask=batch_mask,
     )
     roles = _masked_binary_cross_entropy(
         output.role_logits,
         targets.role_targets,
         thought_mask.unsqueeze(-1).expand_as(output.role_logits),
+        batch_mask=batch_mask,
     )
     uncertainty = _masked_vector_mse(
         output.uncertainty,
         targets.uncertainty,
         thought_mask,
+        batch_mask=batch_mask,
     )
     noise = _masked_vector_mse(
         output.noise_delta,
         targets.noise_delta,
         thought_mask,
+        batch_mask=batch_mask,
     )
     lifecycle = _masked_cross_entropy(
         output.lifecycle_logits,
         targets.lifecycle,
         lifecycle_mask,
+        batch_mask=batch_mask,
     )
     intent = _capped_positive_weight_binary_cross_entropy(
         output.need_logits,
         targets.need_targets,
         thought_mask.unsqueeze(-1).expand_as(output.need_logits),
         positive_weight_cap=8.0,
+        batch_mask=batch_mask,
     )
     source = _masked_cross_entropy(
         output.source_logits,
         targets.source_targets,
         source_mask,
+        batch_mask=batch_mask,
     )
     need_cell_route = _capped_positive_weight_binary_cross_entropy(
         output.need_target_cell_logits,
         targets.need_target_cell_targets,
         need_cell_route_mask,
         positive_weight_cap=6.0,
+        batch_mask=batch_mask,
     )
     need_display_route = _capped_positive_weight_binary_cross_entropy(
         output.need_target_display_logits,
         targets.need_target_display_targets,
         need_display_route_mask,
         positive_weight_cap=6.0,
+        batch_mask=batch_mask,
     )
     argument_presence = _capped_positive_weight_binary_cross_entropy(
         output.argument_presence_logits,
         targets.argument_presence_targets,
         argument_presence_mask,
         positive_weight_cap=6.0,
+        batch_mask=batch_mask,
     )
     argument_ground = _masked_cosine_loss(
         output.argument_query,
         targets.argument_embeddings,
         argument_mask,
+        batch_mask=batch_mask,
     )
     revision = _masked_cross_entropy(
         output.revision_logits,
         targets.revision_targets,
         revision_mask,
+        batch_mask=batch_mask,
     )
     refresh = _masked_cross_entropy(
         output.refresh_logits,
         targets.refresh_targets,
         refresh_mask,
+        batch_mask=batch_mask,
     )
     anchor_presence = _capped_positive_weight_binary_cross_entropy(
         output.anchor_presence_logits,
         anchor_presence_targets,
         anchor_presence_mask,
         positive_weight_cap=6.0,
+        batch_mask=batch_mask,
     )
     anchor_kind = _masked_cross_entropy(
         output.anchor_kind_logits,
         anchor_kind_targets,
         _with_batch_mask(anchor_mask, batch_mask),
+        batch_mask=batch_mask,
     )
     anchor_ground = _masked_cosine_loss(
         output.anchor_query,
         anchor_embeddings,
         _with_batch_mask(anchor_mask, batch_mask),
+        batch_mask=batch_mask,
     )
     link_presence = _capped_positive_weight_binary_cross_entropy(
         output.link_presence_logits,
         link_presence_targets,
         link_presence_mask,
         positive_weight_cap=6.0,
+        batch_mask=batch_mask,
     )
     link_relation = _masked_cross_entropy(
         output.link_relation_logits,
         link_relation_targets,
         _with_batch_mask(link_mask, batch_mask),
+        batch_mask=batch_mask,
     )
     link_target_kind = _masked_cross_entropy(
         output.link_target_kind_logits,
         link_target_kind_targets,
         _with_batch_mask(link_mask, batch_mask),
+        batch_mask=batch_mask,
     )
     link_ground = _masked_cosine_loss(
         output.link_target_query,
         link_target_embeddings,
         _with_batch_mask(link_mask, batch_mask),
+        batch_mask=batch_mask,
     )
     auxiliary = (
         output.auxiliary_loss
@@ -339,28 +362,79 @@ def _with_batch_mask(mask: Tensor, batch_mask: Tensor) -> Tensor:
     return mask.bool() & batch_mask.reshape(shape)
 
 
-def _masked_cosine_loss(query: Tensor, target: Tensor, mask: Tensor) -> Tensor:
+def _masked_element_mean(
+    losses: Tensor,
+    mask: Tensor,
+    *,
+    batch_mask: Tensor | None,
+    reference: Tensor,
+) -> Tensor:
+    if losses.shape != mask.shape:
+        raise ValueError("masked element loss and mask shapes must match")
+    selected = mask.bool()
+    if batch_mask is None:
+        values = losses[selected]
+        if values.numel() == 0:
+            return _differentiable_zero(reference)
+        return values.mean()
+    if batch_mask.shape != (losses.shape[0],):
+        raise ValueError("component batch_mask must have shape [batch]")
+    active_rows = batch_mask.bool()
+    if not bool(active_rows.any()):
+        return _differentiable_zero(reference)
+    flat_losses = losses.reshape(losses.shape[0], -1)
+    flat_mask = selected.reshape(selected.shape[0], -1)
+    counts = flat_mask.sum(dim=1)
+    row_losses = (flat_losses * flat_mask.to(dtype=flat_losses.dtype)).sum(dim=1)
+    row_losses = row_losses / counts.clamp_min(1).to(dtype=flat_losses.dtype)
+    # A valid example with no labels for this component contributes zero. This keeps
+    # CIDLoss a true per-example mean, which is required because the trainer multiplies
+    # losses.total by the valid-example count before gradient accumulation.
+    return row_losses[active_rows].mean()
+
+
+def _masked_cosine_loss(
+    query: Tensor,
+    target: Tensor,
+    mask: Tensor,
+    *,
+    batch_mask: Tensor | None = None,
+) -> Tensor:
     cosine = F.cosine_similarity(query, target, dim=-1)
-    selected = cosine[mask.bool()]
-    if selected.numel() == 0:
-        return _differentiable_zero(query)
-    return (1.0 - selected).mean()
+    return _masked_element_mean(
+        1.0 - cosine,
+        mask,
+        batch_mask=batch_mask,
+        reference=query,
+    )
 
 
-def _masked_vector_mse(prediction: Tensor, target: Tensor, mask: Tensor) -> Tensor:
+def _masked_vector_mse(
+    prediction: Tensor,
+    target: Tensor,
+    mask: Tensor,
+    *,
+    batch_mask: Tensor | None = None,
+) -> Tensor:
     if prediction.shape != target.shape:
         raise ValueError("masked MSE prediction and target shapes must match")
     if mask.shape != prediction.shape[:2]:
         raise ValueError("masked MSE mask must have shape [batch, slots]")
     per_slot = (prediction - target).float().square().flatten(start_dim=2).mean(dim=-1)
-    selected = per_slot[mask.bool()]
-    if selected.numel() == 0:
-        return _differentiable_zero(prediction)
-    return selected.mean()
+    return _masked_element_mean(
+        per_slot,
+        mask,
+        batch_mask=batch_mask,
+        reference=prediction,
+    )
 
 
 def _balanced_masked_binary_cross_entropy(
-    logits: Tensor, target: Tensor, mask: Tensor
+    logits: Tensor,
+    target: Tensor,
+    mask: Tensor,
+    *,
+    batch_mask: Tensor | None = None,
 ) -> Tensor:
     """Balance positive/negative allocation supervision within each example.
 
@@ -369,8 +443,12 @@ def _balanced_masked_binary_cross_entropy(
     deceptively low loss with probabilities that never cross the runtime allocation threshold.
     """
     losses = F.binary_cross_entropy_with_logits(logits, target, reduction="none")
+    if batch_mask is not None and batch_mask.shape != (logits.shape[0],):
+        raise ValueError("component batch_mask must have shape [batch]")
     rows: list[Tensor] = []
     for row in range(logits.shape[0]):
+        if batch_mask is not None and not bool(batch_mask[row]):
+            continue
         valid = mask[row].bool()
         positive = losses[row][valid & (target[row] >= 0.5)]
         negative = losses[row][valid & (target[row] < 0.5)]
@@ -380,6 +458,8 @@ def _balanced_masked_binary_cross_entropy(
             rows.append(positive.mean())
         elif negative.numel():
             rows.append(negative.mean())
+        elif batch_mask is not None:
+            rows.append(_differentiable_zero(logits[row : row + 1]))
     if not rows:
         return _differentiable_zero(logits)
     return torch.stack(rows).mean()
@@ -391,6 +471,7 @@ def _capped_positive_weight_binary_cross_entropy(
     mask: Tensor,
     *,
     positive_weight_cap: float,
+    batch_mask: Tensor | None = None,
 ) -> Tensor:
     """Upweight sparse positives without letting inverse-frequency weights explode.
 
@@ -420,25 +501,57 @@ def _capped_positive_weight_binary_cross_entropy(
         logits.flatten(start_dim=1), flat_target, reduction="none"
     )
     denominator = weights.sum(dim=1)
-    valid_rows = (denominator > 0).to(dtype=losses.dtype)
     row_losses = (losses * weights).sum(dim=1) / denominator.clamp_min(1.0)
-    return (row_losses * valid_rows).sum() / valid_rows.sum().clamp_min(1.0)
+    if batch_mask is None:
+        valid_rows = (denominator > 0).to(dtype=losses.dtype)
+        return (row_losses * valid_rows).sum() / valid_rows.sum().clamp_min(1.0)
+    if batch_mask.shape != (logits.shape[0],):
+        raise ValueError("component batch_mask must have shape [batch]")
+    active_rows = batch_mask.bool()
+    if not bool(active_rows.any()):
+        return _differentiable_zero(logits)
+    return row_losses[active_rows].mean()
 
 
-def _masked_binary_cross_entropy(logits: Tensor, target: Tensor, mask: Tensor) -> Tensor:
+def _masked_binary_cross_entropy(
+    logits: Tensor,
+    target: Tensor,
+    mask: Tensor,
+    *,
+    batch_mask: Tensor | None = None,
+) -> Tensor:
     losses = F.binary_cross_entropy_with_logits(logits, target, reduction="none")
-    selected = losses[mask.bool()]
-    if selected.numel() == 0:
-        return _differentiable_zero(logits)
-    return selected.mean()
+    return _masked_element_mean(
+        losses,
+        mask,
+        batch_mask=batch_mask,
+        reference=logits,
+    )
 
 
-def _masked_cross_entropy(logits: Tensor, target: Tensor, mask: Tensor) -> Tensor:
-    selected_logits = logits[mask.bool()]
-    selected_target = target[mask.bool()]
-    if selected_target.numel() == 0:
+def _masked_cross_entropy(
+    logits: Tensor,
+    target: Tensor,
+    mask: Tensor,
+    *,
+    batch_mask: Tensor | None = None,
+) -> Tensor:
+    selected = mask.bool()
+    if not bool(selected.any()):
         return _differentiable_zero(logits)
-    return F.cross_entropy(selected_logits, selected_target)
+    class_count = logits.shape[-1]
+    safe_target = target.masked_fill(~selected, 0)
+    per_element = F.cross_entropy(
+        logits.reshape(-1, class_count),
+        safe_target.reshape(-1),
+        reduction="none",
+    ).reshape(target.shape)
+    return _masked_element_mean(
+        per_element,
+        selected,
+        batch_mask=batch_mask,
+        reference=logits,
+    )
 
 
 def _align_anchor_targets(
