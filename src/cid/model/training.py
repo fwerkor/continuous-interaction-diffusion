@@ -80,6 +80,10 @@ CID_NEURAL_CONTRACT_VERSION = 3
 STAGE_B_SEMANTIC_SNAPSHOT_FILENAME = "semantic-embedding.pt"
 
 
+class CIDRolloutRecoveryError(ValueError):
+    """A closed-loop model state cannot be reconciled with the teacher under runtime limits."""
+
+
 def _trainer_frozen_semantic_snapshot(trainer: Any) -> dict[str, Any] | None:
     tensorizer = getattr(trainer, "tensorizer", None)
     encoder = getattr(tensorizer, "text_encoder", None)
@@ -444,6 +448,8 @@ CID_BEHAVIOR_COUNT_NAMES = (
     "lifecycle_total",
     "display_token_correct",
     "display_token_total",
+    "rollout_transition_total",
+    "rollout_recovery_failures",
 )
 
 
@@ -1295,7 +1301,14 @@ class CIDTrainer:
         total_raw_loss = 0.0
         total_transitions = 0
         component_sums: dict[str, Tensor] = {}
-        behavior_counts: dict[str, Tensor] = {}
+        metric_zero = torch.zeros(
+            (),
+            dtype=torch.float32,
+            device=self.tensorizer.text_encoder.device,
+        )
+        behavior_counts: dict[str, Tensor] = {
+            name: metric_zero.clone() for name in CID_BEHAVIOR_COUNT_NAMES
+        }
         try:
             self.generator.manual_seed(seed)
             self.shuffle_rng.seed(seed)
@@ -1315,6 +1328,7 @@ class CIDTrainer:
                         )
                     loss_weight = next(iter(loss_weights))
                     rollout_states: list[CIDRolloutState | None] = [None] * len(microbatch)
+                    failed_rollout_rows = [False] * len(microbatch)
                     rollout_length = next(iter(lengths))
                     for offset in range(rollout_length):
                         use_rollout_flags, execute_rows, advance_state = self._rollout_step_plan(
@@ -1323,25 +1337,59 @@ class CIDTrainer:
                             rollout_states,
                             rollout_probability=rollout_probability,
                         )
-                        samples = tuple(
-                            self.tensorizer.tensorize(
-                                window.example,
-                                window.source_steps[offset],
-                                timestep=self._sample_timestep(),
-                                generator=self.generator,
-                                rollout_state=(
-                                    rollout_states[index] if use_rollout_flags[index] else None
-                                ),
-                                rollout_denoising_steps=self.config.rollout_denoising_steps,
+                        execute_rows = list(execute_rows)
+                        advance_state = list(advance_state)
+                        samples: list[CIDTrainingStep] = []
+                        for index, window in enumerate(microbatch):
+                            timestep = self._sample_timestep()
+                            use_rollout = (
+                                use_rollout_flags[index] and not failed_rollout_rows[index]
                             )
-                            for index, window in enumerate(microbatch)
-                        )
+                            if failed_rollout_rows[index]:
+                                execute_rows[index] = False
+                                advance_state[index] = False
+                            if use_rollout and execute_rows[index]:
+                                behavior_counts["rollout_transition_total"] += 1.0
+                            generator_state_before_rollout = (
+                                self.generator.get_state().cpu() if use_rollout else None
+                            )
+                            try:
+                                sample = self.tensorizer.tensorize(
+                                    window.example,
+                                    window.source_steps[offset],
+                                    timestep=timestep,
+                                    generator=self.generator,
+                                    rollout_state=(rollout_states[index] if use_rollout else None),
+                                    rollout_denoising_steps=self.config.rollout_denoising_steps,
+                                )
+                            except CIDRolloutRecoveryError:
+                                if not use_rollout or not execute_rows[index]:
+                                    raise
+                                # This is a model-behavior failure, not a validation-system
+                                # failure. Mask this row from the failed transition onward while
+                                # keeping a teacher-forced placeholder for distributed collation.
+                                assert generator_state_before_rollout is not None
+                                self.generator.set_state(generator_state_before_rollout)
+                                behavior_counts["rollout_recovery_failures"] += 1.0
+                                failed_rollout_rows[index] = True
+                                execute_rows[index] = False
+                                advance_state[index] = False
+                                sample = self.tensorizer.tensorize(
+                                    window.example,
+                                    window.source_steps[offset],
+                                    timestep=timestep,
+                                    generator=self.generator,
+                                    rollout_state=None,
+                                    rollout_denoising_steps=self.config.rollout_denoising_steps,
+                                )
+                            samples.append(sample)
+                        samples_tuple = tuple(samples)
                         batch_size = sum(execute_rows)
                         global_batch_size = self._distributed_global_batch_size(batch_size)
                         if global_batch_size == 0:
                             continue
                         training_batch = collate_training_steps(
-                            samples, pad_token_id=int(self.pad_token_id)
+                            samples_tuple, pad_token_id=int(self.pad_token_id)
                         )
                         batch_mask = torch.tensor(
                             execute_rows,
@@ -1376,7 +1424,7 @@ class CIDTrainer:
                         )
                         if offset + 1 < rollout_length and rollout_probability > 0.0:
                             next_states = list(rollout_states)
-                            for index, sample in enumerate(samples):
+                            for index, sample in enumerate(samples_tuple):
                                 if not advance_state[index]:
                                     continue
                                 next_states[index] = self._rollout_state_from_prediction(
@@ -1387,7 +1435,7 @@ class CIDTrainer:
                                     batch_index=index,
                                 )
                             rollout_states = next_states
-                        del output, training_batch, losses, samples
+                        del output, training_batch, losses, samples, samples_tuple
         finally:
             self.generator.set_state(generator_state)
             self.shuffle_rng.setstate(shuffle_state)
@@ -1403,11 +1451,7 @@ class CIDTrainer:
                 if component_sums
                 else {name: 0.0 for name in CID_LOSS_COMPONENT_NAMES}
             ),
-            behavior_counts=(
-                _metric_tensor_values(behavior_counts)
-                if behavior_counts
-                else {name: 0.0 for name in CID_BEHAVIOR_COUNT_NAMES}
-            ),
+            behavior_counts=_metric_tensor_values(behavior_counts),
         )
 
     def _rollout_microbatches(
@@ -3523,7 +3567,9 @@ class ILLaDATrajectoryTensorizer:
 
         free_slots = [slot for slot in range(slot_count) if not bool(occupied[0, slot])]
         if len(recovery) > len(free_slots):
-            raise ValueError("closed-loop teacher target exceeds available runtime slots")
+            raise CIDRolloutRecoveryError(
+                "closed-loop teacher target exceeds available runtime slots"
+            )
 
         remapped = dict(retained)
         for (_, cell_id), slot in zip(sorted(recovery), free_slots[: len(recovery)], strict=True):
@@ -3534,7 +3580,7 @@ class ILLaDATrajectoryTensorizer:
     def _validate_allocation_targets(input_occupancy: Tensor, allocation_targets: Tensor) -> None:
         target = allocation_targets.bool()
         if int(target.sum().item()) > DEFAULT_MAX_ALLOCATIONS_PER_STEP:
-            raise ValueError("teacher transition exceeds runtime allocation limit")
+            raise CIDRolloutRecoveryError("teacher transition exceeds runtime allocation limit")
         logits = torch.where(
             target,
             torch.full_like(allocation_targets, 20.0),

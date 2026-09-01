@@ -43,6 +43,7 @@ CIDTrainerState = cid_model.CIDTrainerState
 CIDRolloutState = cid_model.CIDRolloutState
 CIDRolloutBindingRoute = cid_model.CIDRolloutBindingRoute
 CIDRolloutWindow = cid_model.CIDRolloutWindow
+CIDRolloutRecoveryError = import_module("cid.model.training").CIDRolloutRecoveryError
 balance_rollout_windows_by_semantic_task = cid_model.balance_rollout_windows_by_semantic_task
 collate_training_steps = cid_model.collate_training_steps
 load_cid_adapter_checkpoint = cid_model.load_cid_adapter_checkpoint
@@ -2037,7 +2038,9 @@ def test_padding_only_shard_returns_zero_train_and_validation_reports() -> None:
     assert validation_report.mean_loss == 0.0
     assert validation_report.raw_mean_loss == 0.0
     assert len(validation_report.component_mean_losses) == 24
-    assert len(validation_report.behavior_counts) == 12
+    assert len(validation_report.behavior_counts) == 14
+    assert validation_report.behavior_counts["rollout_transition_total"] == 0.0
+    assert validation_report.behavior_counts["rollout_recovery_failures"] == 0.0
     assert all(value == 0.0 for value in validation_report.component_mean_losses.values())
     assert all(value == 0.0 for value in validation_report.behavior_counts.values())
 
@@ -3156,6 +3159,53 @@ def test_free_rollout_keeps_supervision_after_model_terminal_decision() -> None:
     assert free_rollout.transitions == 2
     assert free_rollout.behavior_counts["convergence_total"] == 2.0
     assert free_rollout.behavior_counts["convergence_correct"] < 2.0
+
+
+def test_free_rollout_records_unrecoverable_recovery_without_crashing(monkeypatch) -> None:
+    class NonConvergingModel(nn.Module):
+        def __init__(self, adapter) -> None:
+            super().__init__()
+            self.adapter = adapter
+
+        def forward(self, batch):
+            output = self.adapter(batch)
+            output.convergence_logits = torch.full_like(output.convergence_logits, -20.0)
+            output.need_logits = torch.full_like(output.need_logits, -20.0)
+            return output
+
+    adapter = make_adapter(seed=158)
+    tensorizer = ILLaDATrajectoryTensorizer(adapter, TinyTokenizer())
+    trainer = CIDTrainer(
+        adapter,
+        tensorizer,
+        CIDTrainerConfig(
+            timestep_min=0.0,
+            timestep_max=0.0,
+            rollout_horizon=2,
+            teacher_forcing_epochs=0,
+            rollout_ramp_epochs=0,
+        ),
+        forward_model=NonConvergingModel(adapter),
+    )
+    original_tensorize = tensorizer.tensorize
+
+    def fail_closed_loop_recovery(example, source_step, **kwargs):
+        if source_step == 1 and kwargs.get("rollout_state") is not None:
+            raise CIDRolloutRecoveryError("teacher transition exceeds runtime allocation limit")
+        return original_tensorize(example, source_step, **kwargs)
+
+    monkeypatch.setattr(tensorizer, "tensorize", fail_closed_loop_recovery)
+    window = CIDRolloutWindow(
+        example=make_rollout_trajectory(),
+        source_steps=(0, 1),
+    )
+
+    report = trainer.evaluate_rollout_windows((window,), seed=123, rollout_probability=1.0)
+
+    assert report.transitions == 1
+    assert report.behavior_counts["rollout_transition_total"] == 1.0
+    assert report.behavior_counts["rollout_recovery_failures"] == 1.0
+    assert report.behavior_counts["convergence_total"] == 1.0
 
 
 def test_valid_example_accumulation_ignores_masked_rows() -> None:
