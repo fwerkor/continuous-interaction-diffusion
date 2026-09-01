@@ -714,11 +714,14 @@ class CIDTrainer:
         windows: tuple[CIDRolloutWindow, ...],
         *,
         rollout_probability: float,
+        physical_micro_batch_size: int | None = None,
     ) -> tuple[float, float, int, dict[str, Tensor]]:
         if not windows:
             raise ValueError("rollout micro-batch cannot be empty")
         if not 0.0 <= rollout_probability <= 1.0:
             raise ValueError("rollout_probability must be in [0, 1]")
+        if physical_micro_batch_size is not None and physical_micro_batch_size <= 0:
+            raise ValueError("physical micro-batch size must be positive")
         lengths = {len(window.source_steps) for window in windows}
         if len(lengths) != 1:
             raise ValueError("rollout micro-batch windows must have the same length")
@@ -733,6 +736,7 @@ class CIDTrainer:
         transition_count = 0
         component_sums: dict[str, Tensor] = {}
         rollout_length = next(iter(lengths))
+        physical_batch_size = physical_micro_batch_size or len(windows)
         for offset in range(rollout_length):
             use_rollout_flags, sample_mask, advance_state = self._rollout_step_plan(
                 windows,
@@ -740,56 +744,65 @@ class CIDTrainer:
                 rollout_states,
                 rollout_probability=rollout_probability,
             )
-            samples = [
-                self.tensorizer.tensorize(
-                    window.example,
-                    window.source_steps[offset],
-                    timestep=self._sample_timestep(),
-                    generator=self.generator,
-                    rollout_state=(rollout_states[index] if use_rollout_flags[index] else None),
-                    rollout_denoising_steps=self.config.rollout_denoising_steps,
-                )
-                for index, window in enumerate(windows)
-            ]
-            effective_batch_size = sum(sample_mask)
-            # All data-parallel ranks use the same globally valid-example count for
-            # accumulation, including ranks whose local shard contains only padding.
-            global_batch_size = self._distributed_global_batch_size(effective_batch_size)
-            if global_batch_size == 0:
-                continue
-            losses, output, training_batch = self._forward_backward(
-                tuple(samples),
-                loss_scale=loss_weight,
-                sample_mask=sample_mask,
-                allow_optimizer_step=True,
-                global_effective_batch_size=global_batch_size,
-            )
-            raw_loss = float(losses.total.detach().float()) * effective_batch_size
-            raw_loss_sum += raw_loss
-            loss_sum += raw_loss * loss_weight
-            transition_count += effective_batch_size
-            _accumulate_metric_tensors(
-                component_sums,
-                _cid_loss_component_values(losses),
-                scale=effective_batch_size,
-            )
-            # Preserve terminal/quiescent rows exactly as the runtime would: they do
-            # not acquire a new model state until a later scheduled-sampling decision
-            # teacher-forces them or external progress resumes a quiescent rollout.
-            if offset + 1 < rollout_length and rollout_probability > 0.0:
-                next_states = list(rollout_states)
-                for index, sample in enumerate(samples):
-                    if not advance_state[index]:
-                        continue
-                    next_states[index] = self._rollout_state_from_prediction(
-                        sample,
-                        training_batch,
-                        output,
-                        example=windows[index].example,
-                        batch_index=index,
+            next_states = list(rollout_states)
+            for start in range(0, len(windows), physical_batch_size):
+                stop = min(start + physical_batch_size, len(windows))
+                chunk_windows = windows[start:stop]
+                chunk_mask = sample_mask[start:stop]
+                samples = [
+                    self.tensorizer.tensorize(
+                        window.example,
+                        window.source_steps[offset],
+                        timestep=self._sample_timestep(),
+                        generator=self.generator,
+                        rollout_state=(
+                            rollout_states[index] if use_rollout_flags[index] else None
+                        ),
+                        rollout_denoising_steps=self.config.rollout_denoising_steps,
                     )
+                    for index, window in enumerate(chunk_windows, start=start)
+                ]
+                effective_batch_size = sum(chunk_mask)
+                # All data-parallel ranks use the same globally valid-example count for
+                # accumulation, including ranks whose local shard contains only padding.
+                global_batch_size = self._distributed_global_batch_size(effective_batch_size)
+                if global_batch_size == 0:
+                    del samples
+                    continue
+                losses, output, training_batch = self._forward_backward(
+                    tuple(samples),
+                    loss_scale=loss_weight,
+                    sample_mask=chunk_mask,
+                    allow_optimizer_step=True,
+                    global_effective_batch_size=global_batch_size,
+                )
+                raw_loss = float(losses.total.detach().float()) * effective_batch_size
+                raw_loss_sum += raw_loss
+                loss_sum += raw_loss * loss_weight
+                transition_count += effective_batch_size
+                _accumulate_metric_tensors(
+                    component_sums,
+                    _cid_loss_component_values(losses),
+                    scale=effective_batch_size,
+                )
+                # Preserve terminal/quiescent rows exactly as the runtime would: they do
+                # not acquire a new model state until a later scheduled-sampling decision
+                # teacher-forces them or external progress resumes a quiescent rollout.
+                if offset + 1 < rollout_length and rollout_probability > 0.0:
+                    for chunk_index, sample in enumerate(samples):
+                        index = start + chunk_index
+                        if not advance_state[index]:
+                            continue
+                        next_states[index] = self._rollout_state_from_prediction(
+                            sample,
+                            training_batch,
+                            output,
+                            example=windows[index].example,
+                            batch_index=chunk_index,
+                        )
+                del output, training_batch, losses, samples
+            if offset + 1 < rollout_length and rollout_probability > 0.0:
                 rollout_states = next_states
-            del output, training_batch, losses, samples
         return loss_sum, raw_loss_sum, transition_count, component_sums
 
     def _forward_backward(
@@ -1119,6 +1132,7 @@ class CIDTrainer:
         epochs: int = 1,
         shuffle: bool = True,
         preserve_order: bool = False,
+        physical_micro_batch_size: int | None = None,
         progress_every_optimizer_steps: int | None = None,
         progress_callback: Callable[[CIDTrainProgress], None] | None = None,
     ) -> CIDTrainReport:
@@ -1196,6 +1210,7 @@ class CIDTrainer:
                 ) = self._train_rollout_microbatch_with_metrics(
                     microbatch,
                     rollout_probability=rollout_probability,
+                    physical_micro_batch_size=physical_micro_batch_size,
                 )
                 total_loss += loss_sum
                 total_raw_loss += raw_loss_sum

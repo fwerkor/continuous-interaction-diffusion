@@ -1291,6 +1291,54 @@ def test_trainer_uses_configured_micro_batches() -> None:
     assert trainer.state.transitions_seen == 8
 
 
+def test_rollout_physical_micro_batch_preserves_logical_update() -> None:
+    config = CIDTrainerConfig(
+        learning_rate=1e-3,
+        micro_batch_size=2,
+        gradient_accumulation_steps=1,
+        rollout_horizon=2,
+        teacher_forcing_epochs=0,
+        rollout_ramp_epochs=0,
+        timestep_min=0.0,
+        timestep_max=0.0,
+        seed=17,
+    )
+    examples = (
+        make_rollout_trajectory(),
+        replace(make_rollout_trajectory(), example_id="train-physical-microbatch-2"),
+    )
+    windows = trajectory_rollout_windows(examples, max_horizon=2)
+
+    baseline_adapter = make_adapter(seed=178)
+    baseline = CIDTrainer(
+        baseline_adapter,
+        ILLaDATrajectoryTensorizer(baseline_adapter, TinyTokenizer()),
+        config,
+    )
+    baseline_report = baseline.train_rollout_windows(windows, epochs=1, shuffle=False)
+
+    split_adapter = make_adapter(seed=178)
+    split = CIDTrainer(
+        split_adapter,
+        ILLaDATrajectoryTensorizer(split_adapter, TinyTokenizer()),
+        config,
+    )
+    split_report = split.train_rollout_windows(
+        windows,
+        epochs=1,
+        shuffle=False,
+        physical_micro_batch_size=1,
+    )
+
+    assert split_report.transitions == baseline_report.transitions
+    assert split_report.optimizer_steps == baseline_report.optimizer_steps
+    assert split.state == baseline.state
+    baseline_parameters = dict(baseline_adapter.named_parameters())
+    split_parameters = dict(split_adapter.named_parameters())
+    for name in baseline.trainable_parameter_names:
+        torch.testing.assert_close(split_parameters[name], baseline_parameters[name])
+
+
 def test_trainer_preserves_reduced_gradients_across_accumulation() -> None:
     config = CIDTrainerConfig(
         learning_rate=1e-3,

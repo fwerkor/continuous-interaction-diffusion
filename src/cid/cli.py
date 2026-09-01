@@ -1588,6 +1588,8 @@ def _train_stage_a(args: argparse.Namespace) -> None:
             raise ValueError("--log-every-steps must be positive")
         if args.checkpoint_every_steps <= 0:
             raise ValueError("--checkpoint-every-steps must be positive")
+        if args.physical_micro_batch_size is not None and args.physical_micro_batch_size <= 0:
+            raise ValueError("--physical-micro-batch-size must be positive")
         trainable = sum(
             parameter.numel() for parameter in adapter.parameters() if parameter.requires_grad
         )
@@ -1599,6 +1601,7 @@ def _train_stage_a(args: argparse.Namespace) -> None:
                 f"validation_examples={len(validation_examples)} "
                 f"validation_transitions={validation_transition_count_total} "
                 f"trainable_parameters={trainable} effective_batch={effective_batch} "
+                f"physical_micro_batch={args.physical_micro_batch_size or args.micro_batch_size} "
                 f"grouped_moe_layers={grouped_moe_layers}"
             )
 
@@ -1759,6 +1762,7 @@ def _train_stage_a(args: argparse.Namespace) -> None:
                 epochs=1,
                 shuffle=False,
                 preserve_order=True,
+                physical_micro_batch_size=args.physical_micro_batch_size,
                 progress_every_optimizer_steps=args.log_every_steps,
                 progress_callback=report_progress,
             )
@@ -3059,6 +3063,14 @@ def main() -> None:
     train.add_argument("--learning-rate", type=float, default=1e-4)
     train.add_argument("--weight-decay", type=float, default=0.01)
     train.add_argument("--micro-batch-size", type=int, default=1)
+    train.add_argument(
+        "--physical-micro-batch-size",
+        type=int,
+        help=(
+            "execution-only Stage A split that lowers peak memory while preserving logical "
+            "micro-batch and checkpoint geometry"
+        ),
+    )
     train.add_argument("--gradient-accumulation-steps", type=int, default=8)
     train.add_argument("--max-grad-norm", type=float, default=1.0)
     train.add_argument("--warmup-steps", type=int, default=0)
