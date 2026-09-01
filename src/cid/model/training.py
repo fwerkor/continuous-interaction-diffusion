@@ -4240,15 +4240,14 @@ def shard_rollout_windows(
     local_microbatches: list[tuple[CIDRolloutWindow, ...]] = []
     portable_bucket_microbatches: list[list[tuple[CIDRolloutWindow, ...]]] = []
     resume_repair_microbatches: list[tuple[CIDRolloutWindow, ...]] = []
-    keys = sorted({(len(window.source_steps), window.loss_weight) for window in windows})
-    indexed_keys = list(enumerate(keys))
+    buckets: dict[tuple[int, float], list[CIDRolloutWindow]] = {}
+    for window in windows:
+        key = (len(window.source_steps), window.loss_weight)
+        buckets.setdefault(key, []).append(window)
+    indexed_keys = list(enumerate(sorted(buckets)))
     for bucket_index, key in indexed_keys:
         length, loss_weight = key
-        bucket = [
-            window
-            for window in windows
-            if len(window.source_steps) == length and window.loss_weight == loss_weight
-        ]
+        bucket = buckets[key]
         if shuffle:
             random.Random(seed + epoch * 1009 + length * 100_003 + bucket_index).shuffle(bucket)
         if portable_bucket_order and length_aware and len(bucket) > 1:
