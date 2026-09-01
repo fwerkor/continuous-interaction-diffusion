@@ -6,6 +6,7 @@ import math
 import os
 import random
 from collections.abc import Callable, Mapping
+from contextlib import nullcontext
 from dataclasses import asdict, dataclass, field, replace
 from functools import partial
 from inspect import signature
@@ -597,6 +598,7 @@ class CIDTrainer:
         self._pending_accumulation = 0
         self._pending_examples = 0
         self._pending_global_examples = 0
+        self._pending_ddp_unsynced = False
         self._reduced_gradient_accumulator: dict[str, Tensor] = {}
         self.pad_token_id = getattr(tensorizer.tokenizer, "pad_token_id", None)
         if self.pad_token_id is None:
@@ -830,19 +832,32 @@ class CIDTrainer:
             device=training_batch.batch.thought_semantic.device,
         )
         training_batch.batch.sample_mask = valid_rows
-        output = self.forward_model(training_batch.batch)
-        losses = cid_loss(output, training_batch.targets, batch_mask=valid_rows)
-        if not bool(torch.isfinite(losses.total)):
-            names = ", ".join(training_batch.example_ids)
-            raise FloatingPointError(f"non-finite CID loss for training micro-batch: {names}")
         effective_batch_size = int(valid_rows.sum())
         if global_effective_batch_size is None:
             global_effective_batch_size = self._distributed_global_batch_size(effective_batch_size)
         if global_effective_batch_size < effective_batch_size:
             raise ValueError("global valid-example count cannot be below the local count")
+        will_step = (
+            allow_optimizer_step
+            and self._pending_global_examples + global_effective_batch_size
+            >= self._target_global_examples_per_step()
+        )
+        use_stage_a_no_sync = bool(
+            getattr(self.forward_model, "_cid_stage_a_ddp", False)
+            and not will_step
+        )
+        sync_context = self.forward_model.no_sync() if use_stage_a_no_sync else nullcontext()
         if self.preserve_reduced_gradients and self._pending_accumulation:
             self._stash_reduced_gradients()
-        (losses.total * effective_batch_size * loss_scale).backward()
+        with sync_context:
+            output = self.forward_model(training_batch.batch)
+            losses = cid_loss(output, training_batch.targets, batch_mask=valid_rows)
+            if not bool(torch.isfinite(losses.total)):
+                names = ", ".join(training_batch.example_ids)
+                raise FloatingPointError(f"non-finite CID loss for training micro-batch: {names}")
+            (losses.total * effective_batch_size * loss_scale).backward()
+        if getattr(self.forward_model, "_cid_stage_a_ddp", False):
+            self._pending_ddp_unsynced = use_stage_a_no_sync
         self._pending_accumulation += 1
         self._pending_examples += effective_batch_size
         self._pending_global_examples += global_effective_batch_size
@@ -1518,6 +1533,7 @@ class CIDTrainer:
         self._pending_accumulation = 0
         self._pending_examples = 0
         self._pending_global_examples = 0
+        self._pending_ddp_unsynced = False
         self._reduced_gradient_accumulator.clear()
         self.optimizer.zero_grad(set_to_none=True)
 
@@ -1551,6 +1567,7 @@ class CIDTrainer:
         self._pending_accumulation = 0
         self._pending_examples = 0
         self._pending_global_examples = 0
+        self._pending_ddp_unsynced = False
         self._reduced_gradient_accumulator.clear()
         self.data_order_version = int(state.get("data_order_version", 1))
         self.optimizer.zero_grad(set_to_none=True)
@@ -1562,6 +1579,8 @@ class CIDTrainer:
         *,
         dataset_sha256: str | None = None,
     ) -> None:
+        if self._pending_ddp_unsynced:
+            self._sync_pending_stage_a_ddp_gradients()
         destination = Path(path)
         destination.parent.mkdir(parents=True, exist_ok=True)
         trainable_state = {
@@ -1743,8 +1762,11 @@ class CIDTrainer:
             self._pending_examples < 0 or self._pending_global_examples <= 0
         ):
             raise ValueError("checkpoint pending accumulation has an invalid example count")
+        self._pending_ddp_unsynced = False
 
     def _optimizer_step(self) -> None:
+        if self._pending_ddp_unsynced:
+            self._sync_pending_stage_a_ddp_gradients()
         if self.preserve_reduced_gradients:
             self._restore_reduced_gradients()
         normalizer = self._gradient_example_normalizer()
@@ -1787,12 +1809,28 @@ class CIDTrainer:
         self._pending_accumulation = 0
         self._pending_examples = 0
         self._pending_global_examples = 0
+        self._pending_ddp_unsynced = False
         self.state = CIDTrainerState(
             transitions_seen=self.state.transitions_seen,
             optimizer_steps=self.state.optimizer_steps + 1,
             epochs_completed=self.state.epochs_completed,
             rollout_windows_seen_in_epoch=self.state.rollout_windows_seen_in_epoch,
         )
+
+    def _sync_pending_stage_a_ddp_gradients(self) -> None:
+        """Average gradients accumulated under DDP ``no_sync`` exactly once."""
+
+        if not self._pending_ddp_unsynced:
+            return
+        if not torch.distributed.is_available() or not torch.distributed.is_initialized():
+            raise RuntimeError("unsynchronized Stage A DDP gradients require distributed training")
+        world_size = torch.distributed.get_world_size()
+        for _, parameter in self._trainable:
+            if parameter.grad is None:
+                continue
+            torch.distributed.all_reduce(parameter.grad, op=torch.distributed.ReduceOp.SUM)
+            parameter.grad.div_(world_size)
+        self._pending_ddp_unsynced = False
 
     def _gradient_example_normalizer(self) -> float:
         """Return one common per-rank divisor for the global valid-example mean gradient."""
@@ -4375,7 +4413,11 @@ def wrap_stage_a_ddp(
         kwargs["forward_sync_buffers"] = False
     else:
         kwargs["broadcast_buffers"] = False
-    return DistributedDataParallel(adapter, **kwargs)
+    ddp = DistributedDataParallel(adapter, **kwargs)
+    # CIDTrainer uses this marker to suppress redundant gradient reductions during
+    # Stage A accumulation. FSDP/Stage B intentionally keep their existing behavior.
+    ddp._cid_stage_a_ddp = True
+    return ddp
 
 
 def stage_b_gradient_accumulation_steps(

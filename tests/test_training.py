@@ -1922,6 +1922,29 @@ def test_stage_a_ddp_two_rank_mixed_external_graph_smoke() -> None:
     assert completed.returncode == 0, completed.stdout + completed.stderr
 
 
+def test_stage_a_ddp_accumulation_matches_per_microbatch_reduction() -> None:
+    if not dist.is_available():
+        pytest.skip("torch.distributed is unavailable")
+    worker = Path(__file__).with_name("ddp_stage_a_accumulation_worker.py")
+    completed = subprocess.run(
+        [
+            sys.executable,
+            "-m",
+            "torch.distributed.run",
+            "--standalone",
+            "--nproc-per-node=2",
+            str(worker),
+        ],
+        cwd=Path(__file__).resolve().parents[1],
+        capture_output=True,
+        text=True,
+        timeout=60,
+        check=False,
+    )
+
+    assert completed.returncode == 0, completed.stdout + completed.stderr
+
+
 def test_distributed_padding_only_rank_keeps_progress_collectives_aligned() -> None:
     if not dist.is_available():
         pytest.skip("torch.distributed is unavailable")
