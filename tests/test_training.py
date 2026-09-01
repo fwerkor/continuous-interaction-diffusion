@@ -2295,6 +2295,56 @@ def test_rollout_missing_target_cell_is_supervised_for_recovery_allocation() -> 
     ).index(CellLifecycle.ACTIVE)
 
 
+def test_rollout_recovery_allocation_uses_runtime_first_free_prefix() -> None:
+    adapter = make_adapter(seed=113)
+    tensorizer = ILLaDATrajectoryTensorizer(adapter, TinyTokenizer())
+    example = replace(
+        make_rollout_trajectory(),
+        thought_targets=(
+            ThoughtTarget(step=0, slot=0, cell_id="a", semantic_text="A0"),
+            ThoughtTarget(step=0, slot=1, cell_id="b", semantic_text="B0"),
+            ThoughtTarget(step=1, slot=0, cell_id="a", semantic_text="A1"),
+            ThoughtTarget(step=1, slot=1, cell_id="b", semantic_text="B1"),
+            ThoughtTarget(step=2, slot=0, cell_id="a", semantic_text="A2"),
+            ThoughtTarget(step=2, slot=1, cell_id="b", semantic_text="B2"),
+            ThoughtTarget(step=2, slot=2, cell_id="c", semantic_text="C2"),
+        ),
+        binding_targets=(),
+        grounding_targets=(),
+        source_descriptors=(),
+    )
+    teacher = tensorizer.tensorize(example, source_step=1, timestep=0.0)
+    rollout = CIDRolloutState(
+        thought_semantic=teacher.batch.thought_semantic.clone(),
+        role_features=teacher.batch.role_features.clone(),
+        uncertainty=teacher.batch.uncertainty.clone(),
+        lifecycle_features=teacher.batch.lifecycle_features.clone(),
+        slot_occupancy=teacher.batch.slot_occupancy.clone(),
+        local_noise=torch.zeros_like(teacher.batch.local_noise),
+        display_ids=teacher.batch.display_ids.clone(),
+        runtime_cell_ids=teacher.input_runtime_cell_ids,
+        next_cell_serial=teacher.input_next_cell_serial,
+    )
+    # Diverge from teacher layout: slot 1 is missing while slot 2 is occupied by an
+    # unrelated rollout cell. The missing teacher cell must recover into slot 1; a
+    # target on free slot 2 while slot 1 remains free would be unrealizable.
+    rollout.slot_occupancy[0, 1, 0] = 0.0
+    rollout.thought_semantic[0, 1].zero_()
+    rollout.role_features[0, 1].zero_()
+    rollout.lifecycle_features[0, 1].zero_()
+    ids = list(rollout.runtime_cell_ids)
+    ids[1] = None
+    ids[2] = "c99"
+    rollout = replace(rollout, runtime_cell_ids=tuple(ids))
+    rollout.slot_occupancy[0, 2, 0] = 1.0
+
+    sample = tensorizer.tensorize(example, source_step=1, timestep=0.25, rollout_state=rollout)
+
+    assert sample.targets.allocation_targets[0, 1] == 1.0
+    assert sample.targets.allocation_targets[0, 2] == 0.0
+    assert sample.targets.thought_mask[0, 1]
+
+
 def test_rollout_uses_predicted_local_noise_for_next_thought_corruption() -> None:
     adapter = make_adapter(seed=127)
     tensorizer = ILLaDATrajectoryTensorizer(adapter, TinyTokenizer())

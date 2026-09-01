@@ -2101,6 +2101,16 @@ class ILLaDATrajectoryTensorizer:
                 )
             input_retired_at = rollout_state.retired_at
 
+            # Closed-loop rollout can diverge from the teacher's physical slot layout.
+            # Existing occupied slots keep their positional teacher supervision, while
+            # teacher cells missing from the rollout must be allocated into the runtime's
+            # deterministic first-free prefix. Reusing the teacher's original free-slot
+            # indices can otherwise create impossible labels such as allocating slot 3
+            # while slot 1 is still free.
+            target_output_slots = self._runtime_realisable_target_output_slots(
+                target_output_slots, occupancy
+            )
+
         timestep_tensor = torch.tensor([timestep], device=device)
         thought_timesteps = (
             timestep_tensor
@@ -3427,6 +3437,45 @@ class ILLaDATrajectoryTensorizer:
         ]
         epoch_start = max(arrivals, default=0)
         return max(0, source_step - epoch_start)
+
+    @staticmethod
+    def _runtime_realisable_target_output_slots(
+        teacher_slots: Mapping[str, int],
+        input_occupancy: Tensor,
+    ) -> dict[str, int]:
+        """Align closed-loop teacher cells with the runtime's first-free allocator.
+
+        Occupied physical slots retain positional supervision: the model can correct the
+        semantic contents of an already-materialized runtime cell in place. Teacher cells
+        whose original physical slots are currently free are recovery allocations. Those
+        allocations must occupy the first free physical slots in ascending order, matching
+        ``prefix_allocation_mask`` exactly.
+        """
+
+        occupied = input_occupancy.squeeze(-1).bool()
+        if occupied.ndim != 2 or occupied.shape[0] != 1:
+            raise ValueError(
+                "closed-loop target-slot remapping expects occupancy shape [1, slots, 1]"
+            )
+        slot_count = occupied.shape[1]
+        retained: dict[str, int] = {}
+        recovery: list[tuple[int, str]] = []
+        for cell_id, slot in teacher_slots.items():
+            if not 0 <= slot < slot_count:
+                raise ValueError("teacher target slot is outside runtime capacity")
+            if bool(occupied[0, slot]):
+                retained[cell_id] = slot
+            else:
+                recovery.append((slot, cell_id))
+
+        free_slots = [slot for slot in range(slot_count) if not bool(occupied[0, slot])]
+        if len(recovery) > len(free_slots):
+            raise ValueError("closed-loop teacher target exceeds available runtime slots")
+
+        remapped = dict(retained)
+        for (_, cell_id), slot in zip(sorted(recovery), free_slots[: len(recovery)], strict=True):
+            remapped[cell_id] = slot
+        return remapped
 
     @staticmethod
     def _validate_allocation_targets(input_occupancy: Tensor, allocation_targets: Tensor) -> None:
