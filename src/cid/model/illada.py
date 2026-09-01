@@ -271,8 +271,10 @@ class _FrozenNPUGroupedMatmul(torch.autograd.Function):
 
         ctx.save_for_backward(weights)
         ctx.group_list = group_list
+        ctx.input_dtype = inputs.dtype
+        compute_inputs = inputs.to(dtype=weights.dtype)
         return torch_npu.npu_grouped_matmul(
-            [inputs],
+            [compute_inputs],
             list(weights.unbind(0)),
             group_list=list(group_list),
             split_item=3,
@@ -287,12 +289,12 @@ class _FrozenNPUGroupedMatmul(torch.autograd.Function):
 
         (weights,) = ctx.saved_tensors
         grad_inputs = torch_npu.npu_grouped_matmul(
-            [grad_output.contiguous()],
+            [grad_output.to(dtype=weights.dtype).contiguous()],
             list(weights.transpose(1, 2).unbind(0)),
             group_list=list(ctx.group_list),
             split_item=3,
         )[0]
-        return grad_inputs, None, None
+        return grad_inputs.to(dtype=ctx.input_dtype), None, None
 
 
 def _npu_grouped_llada_moe_forward(
