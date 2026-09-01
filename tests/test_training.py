@@ -3208,6 +3208,55 @@ def test_free_rollout_records_unrecoverable_recovery_without_crashing(monkeypatc
     assert report.behavior_counts["convergence_total"] == 1.0
 
 
+def test_training_rollout_masks_unrecoverable_recovery_without_crashing(monkeypatch) -> None:
+    adapter = make_adapter(seed=160)
+    tensorizer = ILLaDATrajectoryTensorizer(adapter, TinyTokenizer())
+    trainer = CIDTrainer(
+        adapter,
+        tensorizer,
+        CIDTrainerConfig(
+            timestep_min=0.0,
+            timestep_max=0.0,
+            rollout_horizon=2,
+            teacher_forcing_epochs=0,
+            rollout_ramp_epochs=0,
+        ),
+    )
+    original_tensorize = tensorizer.tensorize
+
+    def fail_closed_loop_recovery(example, source_step, **kwargs):
+        if (
+            example.example_id == "recovery-fail"
+            and source_step == 1
+            and kwargs.get("rollout_state") is not None
+        ):
+            raise CIDRolloutRecoveryError("teacher transition exceeds runtime allocation limit")
+        return original_tensorize(example, source_step, **kwargs)
+
+    monkeypatch.setattr(tensorizer, "tensorize", fail_closed_loop_recovery)
+    base = make_rollout_trajectory()
+    windows = (
+        CIDRolloutWindow(
+            example=replace(base, example_id="recovery-fail"),
+            source_steps=(0, 1),
+        ),
+        CIDRolloutWindow(
+            example=replace(base, example_id="recovery-ok"),
+            source_steps=(0, 1),
+        ),
+    )
+
+    report = trainer.train_rollout_windows(
+        windows,
+        epochs=1,
+        shuffle=False,
+        physical_micro_batch_size=1,
+    )
+
+    assert report.transitions == 3
+    assert trainer.state.epochs_completed == 1
+
+
 def test_valid_example_accumulation_ignores_masked_rows() -> None:
     adapter = make_adapter(seed=159)
     tensorizer = ILLaDATrajectoryTensorizer(adapter, TinyTokenizer())

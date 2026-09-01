@@ -739,6 +739,7 @@ class CIDTrainer:
         loss_weight = next(iter(loss_weights))
 
         rollout_states: list[CIDRolloutState | None] = [None] * len(windows)
+        failed_rollout_rows = [False] * len(windows)
         loss_sum = 0.0
         raw_loss_sum = 0.0
         transition_count = 0
@@ -752,24 +753,53 @@ class CIDTrainer:
                 rollout_states,
                 rollout_probability=rollout_probability,
             )
+            sample_mask = list(sample_mask)
+            advance_state = list(advance_state)
             next_states = list(rollout_states)
             for start in range(0, len(windows), physical_batch_size):
                 stop = min(start + physical_batch_size, len(windows))
                 chunk_windows = windows[start:stop]
-                chunk_mask = sample_mask[start:stop]
-                samples = [
-                    self.tensorizer.tensorize(
-                        window.example,
-                        window.source_steps[offset],
-                        timestep=self._sample_timestep(),
-                        generator=self.generator,
-                        rollout_state=(
-                            rollout_states[index] if use_rollout_flags[index] else None
-                        ),
-                        rollout_denoising_steps=self.config.rollout_denoising_steps,
+                samples: list[CIDTrainingStep] = []
+                for index, window in enumerate(chunk_windows, start=start):
+                    timestep = self._sample_timestep()
+                    use_rollout = use_rollout_flags[index] and not failed_rollout_rows[index]
+                    if failed_rollout_rows[index]:
+                        sample_mask[index] = False
+                        advance_state[index] = False
+                    generator_state_before_rollout = (
+                        self.generator.get_state().cpu() if use_rollout else None
                     )
-                    for index, window in enumerate(chunk_windows, start=start)
-                ]
+                    try:
+                        sample = self.tensorizer.tensorize(
+                            window.example,
+                            window.source_steps[offset],
+                            timestep=timestep,
+                            generator=self.generator,
+                            rollout_state=(rollout_states[index] if use_rollout else None),
+                            rollout_denoising_steps=self.config.rollout_denoising_steps,
+                        )
+                    except CIDRolloutRecoveryError:
+                        if not use_rollout or not sample_mask[index]:
+                            raise
+                        # Closed-loop state drift can make the teacher transition
+                        # unrecoverable under runtime allocation limits. Mask this row
+                        # from the failed transition onward while keeping a teacher-forced
+                        # placeholder so distributed collation remains shape-consistent.
+                        assert generator_state_before_rollout is not None
+                        self.generator.set_state(generator_state_before_rollout)
+                        failed_rollout_rows[index] = True
+                        sample_mask[index] = False
+                        advance_state[index] = False
+                        sample = self.tensorizer.tensorize(
+                            window.example,
+                            window.source_steps[offset],
+                            timestep=timestep,
+                            generator=self.generator,
+                            rollout_state=None,
+                            rollout_denoising_steps=self.config.rollout_denoising_steps,
+                        )
+                    samples.append(sample)
+                chunk_mask = sample_mask[start:stop]
                 effective_batch_size = sum(chunk_mask)
                 # All data-parallel ranks use the same globally valid-example count for
                 # accumulation, including ranks whose local shard contains only padding.
