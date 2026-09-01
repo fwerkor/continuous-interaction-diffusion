@@ -251,7 +251,106 @@ def _grouped_llada_moe_forward(
     return output.reshape(batch_size, sequence_length, hidden_dim)
 
 
-def _pack_frozen_llada_moe_layer(module: nn.Module) -> None:
+class _FrozenNPUGroupedMatmul(torch.autograd.Function):
+    """Autograd wrapper for torch_npu grouped matmul with frozen weights.
+
+    torch_npu 2.1 exposes ``npu_grouped_matmul`` without an autograd kernel. Stage A
+    freezes the MoE experts, so its backward only needs the input gradient. Reusing
+    the same grouped kernel with transposed expert weights keeps the optimized path
+    differentiable without changing the Stage A objective.
+    """
+
+    @staticmethod
+    def forward(
+        ctx: object,
+        inputs: torch.Tensor,
+        weights: torch.Tensor,
+        group_list: tuple[int, ...],
+    ) -> torch.Tensor:
+        import torch_npu
+
+        ctx.save_for_backward(weights)
+        ctx.group_list = group_list
+        return torch_npu.npu_grouped_matmul(
+            [inputs],
+            list(weights.unbind(0)),
+            group_list=list(group_list),
+            split_item=3,
+        )[0]
+
+    @staticmethod
+    def backward(
+        ctx: object,
+        grad_output: torch.Tensor,
+    ) -> tuple[torch.Tensor, None, None]:
+        import torch_npu
+
+        (weights,) = ctx.saved_tensors
+        grad_inputs = torch_npu.npu_grouped_matmul(
+            [grad_output.contiguous()],
+            list(weights.transpose(1, 2).unbind(0)),
+            group_list=list(ctx.group_list),
+            split_item=3,
+        )[0]
+        return grad_inputs, None, None
+
+
+def _npu_grouped_llada_moe_forward(
+    module: nn.Module,
+    hidden_states: torch.Tensor,
+) -> torch.Tensor:
+    """Evaluate frozen LLaDA-MoE experts with Ascend grouped matmul."""
+    batch_size, sequence_length, hidden_dim = hidden_states.shape
+    flat_hidden = hidden_states.reshape(-1, hidden_dim)
+    router_logits = module.gate(flat_hidden)
+    routing_weights = torch.softmax(router_logits, dim=1, dtype=torch.float32)
+    if module.expert_bias is not None:
+        routing_weights = routing_weights + module.expert_bias
+    routing_weights, selected_experts = torch.topk(
+        routing_weights, module.top_k, dim=-1
+    )
+    if module.norm_topk_prob:
+        routing_weights = routing_weights / routing_weights.sum(
+            dim=-1, keepdim=True
+        )
+    routing_weights = routing_weights.to(flat_hidden.dtype)
+
+    token_count = flat_hidden.shape[0]
+    token_indices = (
+        torch.arange(token_count, device=flat_hidden.device)[:, None]
+        .expand(-1, module.top_k)
+        .reshape(-1)
+    )
+    flat_experts = selected_experts.reshape(-1)
+    order = torch.argsort(flat_experts)
+    sorted_tokens = token_indices[order]
+    sorted_weights = routing_weights.reshape(-1)[order]
+    expert_counts = torch.bincount(flat_experts, minlength=module.num_experts)
+    # torch_npu 2.1 accepts group_list only as a host IntArray. This introduces one
+    # synchronization per MoE layer, replacing 64 expert Python loops and thousands
+    # of tiny GEMM launches in the upstream implementation.
+    group_list = tuple(
+        int(value)
+        for value in expert_counts.cumsum(dim=0, dtype=torch.int32).cpu().tolist()
+    )
+
+    routed = flat_hidden[sorted_tokens]
+    gate = _FrozenNPUGroupedMatmul.apply(routed, module._cid_gate_weights, group_list)
+    up = _FrozenNPUGroupedMatmul.apply(routed, module._cid_up_weights, group_list)
+    routed = module._cid_act_fn(gate) * up
+    routed = _FrozenNPUGroupedMatmul.apply(routed, module._cid_down_weights, group_list)
+    routed = routed * sorted_weights[:, None]
+
+    output = torch.zeros_like(flat_hidden)
+    output.index_add_(0, sorted_tokens, routed)
+    return output.reshape(batch_size, sequence_length, hidden_dim)
+
+
+def _pack_frozen_llada_moe_layer(
+    module: nn.Module,
+    *,
+    backend: str,
+) -> None:
     experts = tuple(module.experts)
     if not experts:
         raise RuntimeError("LLaDA-MoE layer does not expose experts")
@@ -281,7 +380,12 @@ def _pack_frozen_llada_moe_layer(module: nn.Module) -> None:
     )
     module._cid_act_fn = experts[0].act_fn
     module.experts = nn.ModuleList()
-    module.forward = MethodType(_grouped_llada_moe_forward, module)
+    if backend == "torch":
+        module.forward = MethodType(_grouped_llada_moe_forward, module)
+    elif backend == "npu":
+        module.forward = MethodType(_npu_grouped_llada_moe_forward, module)
+    else:
+        raise ValueError(f"unsupported grouped MoE backend: {backend}")
 
 
 def _moe_load_balancing_loss(
@@ -549,17 +653,36 @@ class ILLaDACIDAdapter(nn.Module):
         """
         if not self.is_llada_moe:
             return 0
-        if not hasattr(torch, "_grouped_mm"):
-            return 0
         layers = getattr(self.hidden_backbone(), "layers", None)
         if layers is None:
             raise RuntimeError("LLaDA-MoE decoder does not expose layers")
+        backend = "torch" if hasattr(torch, "_grouped_mm") else None
+        if backend is None:
+            first_moe = next(
+                (
+                    getattr(layer, "mlp", None)
+                    for layer in layers
+                    if hasattr(getattr(layer, "mlp", None), "experts")
+                ),
+                None,
+            )
+            if first_moe is not None:
+                first_parameter = next(first_moe.parameters(), None)
+                if first_parameter is not None and first_parameter.device.type == "npu":
+                    try:
+                        import torch_npu
+                    except ImportError:
+                        torch_npu = None
+                    if torch_npu is not None and hasattr(torch_npu, "npu_grouped_matmul"):
+                        backend = "npu"
+        if backend is None:
+            return 0
         packed = 0
         for layer in layers:
             moe = getattr(layer, "mlp", None)
             if moe is None or not hasattr(moe, "experts"):
                 continue
-            _pack_frozen_llada_moe_layer(moe)
+            _pack_frozen_llada_moe_layer(moe, backend=backend)
             packed += 1
         return packed
 
