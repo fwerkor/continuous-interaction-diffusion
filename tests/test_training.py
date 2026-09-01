@@ -2301,19 +2301,30 @@ def test_rollout_recovery_allocation_uses_runtime_first_free_prefix() -> None:
     example = replace(
         make_rollout_trajectory(),
         thought_targets=(
-            ThoughtTarget(step=0, slot=0, cell_id="a", semantic_text="A0"),
-            ThoughtTarget(step=0, slot=1, cell_id="b", semantic_text="B0"),
-            ThoughtTarget(step=1, slot=0, cell_id="a", semantic_text="A1"),
-            ThoughtTarget(step=1, slot=1, cell_id="b", semantic_text="B1"),
-            ThoughtTarget(step=2, slot=0, cell_id="a", semantic_text="A2"),
-            ThoughtTarget(step=2, slot=1, cell_id="b", semantic_text="B2"),
-            ThoughtTarget(step=2, slot=2, cell_id="c", semantic_text="C2"),
+            ThoughtTarget(step=0, slot=0, cell_id="live", semantic_text="Live0"),
+            ThoughtTarget(
+                step=0,
+                slot=1,
+                cell_id="tombstone",
+                semantic_text="Done",
+                lifecycle=CellLifecycle.RETIRED,
+            ),
+            ThoughtTarget(step=1, slot=0, cell_id="live", semantic_text="Live1"),
+            ThoughtTarget(step=1, slot=2, cell_id="new", semantic_text="New1"),
         ),
         binding_targets=(),
         grounding_targets=(),
         source_descriptors=(),
+        display_targets=(DisplayTarget(step=0, text="37"), DisplayTarget(step=1, text="38")),
+        target_display="38",
     )
-    teacher = tensorizer.tensorize(example, source_step=1, timestep=0.0)
+
+    teacher = tensorizer.tensorize(example, source_step=0, timestep=0.0)
+    # Teacher runtime still carries the retired tombstone in slot 1, so its new cell is
+    # allocated in slot 2. A closed-loop rollout may already have reclaimed that tombstone.
+    assert teacher.input_runtime_cell_ids[:2] == ("c0", "c1")
+    assert teacher.targets.allocation_targets[0, 2] == 1.0
+
     rollout = CIDRolloutState(
         thought_semantic=teacher.batch.thought_semantic.clone(),
         role_features=teacher.batch.role_features.clone(),
@@ -2325,20 +2336,15 @@ def test_rollout_recovery_allocation_uses_runtime_first_free_prefix() -> None:
         runtime_cell_ids=teacher.input_runtime_cell_ids,
         next_cell_serial=teacher.input_next_cell_serial,
     )
-    # Diverge from teacher layout: slot 1 is missing while slot 2 is occupied by an
-    # unrelated rollout cell. The missing teacher cell must recover into slot 1; a
-    # target on free slot 2 while slot 1 remains free would be unrealizable.
     rollout.slot_occupancy[0, 1, 0] = 0.0
     rollout.thought_semantic[0, 1].zero_()
     rollout.role_features[0, 1].zero_()
     rollout.lifecycle_features[0, 1].zero_()
     ids = list(rollout.runtime_cell_ids)
     ids[1] = None
-    ids[2] = "c99"
     rollout = replace(rollout, runtime_cell_ids=tuple(ids))
-    rollout.slot_occupancy[0, 2, 0] = 1.0
 
-    sample = tensorizer.tensorize(example, source_step=1, timestep=0.25, rollout_state=rollout)
+    sample = tensorizer.tensorize(example, source_step=0, timestep=0.25, rollout_state=rollout)
 
     assert sample.targets.allocation_targets[0, 1] == 1.0
     assert sample.targets.allocation_targets[0, 2] == 0.0
