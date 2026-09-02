@@ -204,11 +204,10 @@ def _install_llada_moe_attention_mask_support(backbone: nn.Module) -> tuple[nn.M
     return tuple(attention_modules)
 
 
-def _grouped_llada_moe_forward(
+def _llada_moe_routing(
     module: nn.Module,
     hidden_states: torch.Tensor,
-) -> torch.Tensor:
-    """Evaluate frozen LLaDA-MoE experts with three grouped GEMMs per layer."""
+) -> tuple[int, int, int, torch.Tensor, torch.Tensor, torch.Tensor]:
     batch_size, sequence_length, hidden_dim = hidden_states.shape
     flat_hidden = hidden_states.reshape(-1, hidden_dim)
     router_logits = module.gate(flat_hidden)
@@ -223,6 +222,29 @@ def _grouped_llada_moe_forward(
             dim=-1, keepdim=True
         )
     routing_weights = routing_weights.to(flat_hidden.dtype)
+    return (
+        batch_size,
+        sequence_length,
+        hidden_dim,
+        flat_hidden,
+        routing_weights,
+        selected_experts,
+    )
+
+
+def _grouped_llada_moe_forward(
+    module: nn.Module,
+    hidden_states: torch.Tensor,
+) -> torch.Tensor:
+    """Evaluate frozen LLaDA-MoE experts with three grouped GEMMs per layer."""
+    (
+        batch_size,
+        sequence_length,
+        hidden_dim,
+        flat_hidden,
+        routing_weights,
+        selected_experts,
+    ) = _llada_moe_routing(module, hidden_states)
 
     token_count = flat_hidden.shape[0]
     token_indices = (
@@ -248,6 +270,37 @@ def _grouped_llada_moe_forward(
 
     output = torch.zeros_like(flat_hidden)
     output.index_add_(0, sorted_tokens, routed)
+    return output.reshape(batch_size, sequence_length, hidden_dim)
+
+
+def _packed_llada_moe_forward(
+    module: nn.Module,
+    hidden_states: torch.Tensor,
+) -> torch.Tensor:
+    """Evaluate packed frozen experts when PyTorch has no grouped GEMM kernel."""
+    (
+        batch_size,
+        sequence_length,
+        hidden_dim,
+        flat_hidden,
+        routing_weights,
+        selected_experts,
+    ) = _llada_moe_routing(module, hidden_states)
+
+    output = torch.zeros_like(flat_hidden)
+    expert_mask = torch.nn.functional.one_hot(
+        selected_experts,
+        num_classes=module.num_experts,
+    ).permute(2, 1, 0)
+    for expert_idx in range(module.num_experts):
+        route_idx, token_idx = torch.where(expert_mask[expert_idx])
+        current = flat_hidden[None, token_idx].reshape(-1, hidden_dim)
+        gate = current @ module._cid_gate_weights[expert_idx]
+        up = current @ module._cid_up_weights[expert_idx]
+        current = module._cid_act_fn(gate) * up
+        current = current @ module._cid_down_weights[expert_idx]
+        current = current * routing_weights[token_idx, route_idx, None]
+        output.index_add_(0, token_idx, current.to(flat_hidden.dtype))
     return output.reshape(batch_size, sequence_length, hidden_dim)
 
 
@@ -302,20 +355,14 @@ def _npu_grouped_llada_moe_forward(
     hidden_states: torch.Tensor,
 ) -> torch.Tensor:
     """Evaluate frozen LLaDA-MoE experts with Ascend grouped matmul."""
-    batch_size, sequence_length, hidden_dim = hidden_states.shape
-    flat_hidden = hidden_states.reshape(-1, hidden_dim)
-    router_logits = module.gate(flat_hidden)
-    routing_weights = torch.softmax(router_logits, dim=1, dtype=torch.float32)
-    if module.expert_bias is not None:
-        routing_weights = routing_weights + module.expert_bias
-    routing_weights, selected_experts = torch.topk(
-        routing_weights, module.top_k, dim=-1
-    )
-    if module.norm_topk_prob:
-        routing_weights = routing_weights / routing_weights.sum(
-            dim=-1, keepdim=True
-        )
-    routing_weights = routing_weights.to(flat_hidden.dtype)
+    (
+        batch_size,
+        sequence_length,
+        hidden_dim,
+        flat_hidden,
+        routing_weights,
+        selected_experts,
+    ) = _llada_moe_routing(module, hidden_states)
 
     token_count = flat_hidden.shape[0]
     token_indices = (
@@ -382,8 +429,10 @@ def _pack_frozen_llada_moe_layer(
     )
     module._cid_act_fn = experts[0].act_fn
     module.experts = nn.ModuleList()
-    if backend == "torch":
+    if backend == "torch-grouped":
         module.forward = MethodType(_grouped_llada_moe_forward, module)
+    elif backend == "torch":
+        module.forward = MethodType(_packed_llada_moe_forward, module)
     elif backend == "npu":
         module.forward = MethodType(_npu_grouped_llada_moe_forward, module)
     else:
@@ -648,37 +697,44 @@ class ILLaDACIDAdapter(nn.Module):
         return get_decoder()
 
     def pack_frozen_moe_experts(self) -> int:
-        """Pack frozen MoE experts for PyTorch grouped GEMM execution.
+        """Pack frozen MoE experts for compact Stage A execution.
 
-        This is a Stage A runtime optimization. Packed weights are non-persistent
-        because Stage A checkpoints already contain only trainable CID parameters.
+        CUDA uses PyTorch grouped GEMM when available, Ascend uses its grouped-matmul
+        kernel, and other environments retain the same packed weights with a portable
+        expert-loop fallback. Packed weights are non-persistent because Stage A
+        checkpoints already contain only trainable CID parameters.
         """
         if not self.is_llada_moe:
             return 0
         layers = getattr(self.hidden_backbone(), "layers", None)
         if layers is None:
             raise RuntimeError("LLaDA-MoE decoder does not expose layers")
-        backend = "torch" if hasattr(torch, "_grouped_mm") else None
-        if backend is None:
-            first_moe = next(
-                (
-                    getattr(layer, "mlp", None)
-                    for layer in layers
-                    if hasattr(getattr(layer, "mlp", None), "experts")
-                ),
-                None,
-            )
-            if first_moe is not None:
-                first_parameter = next(first_moe.parameters(), None)
-                if first_parameter is not None and first_parameter.device.type == "npu":
-                    try:
-                        import torch_npu
-                    except ImportError:
-                        torch_npu = None
-                    if torch_npu is not None and hasattr(torch_npu, "npu_grouped_matmul"):
-                        backend = "npu"
-        if backend is None:
+        first_moe = next(
+            (
+                getattr(layer, "mlp", None)
+                for layer in layers
+                if hasattr(getattr(layer, "mlp", None), "experts")
+            ),
+            None,
+        )
+        if first_moe is None:
             return 0
+        first_parameter = next(first_moe.parameters(), None)
+        backend = None
+        if first_parameter is not None and first_parameter.device.type == "npu":
+            try:
+                import torch_npu
+            except ImportError:
+                torch_npu = None
+            if torch_npu is not None and hasattr(torch_npu, "npu_grouped_matmul"):
+                backend = "npu"
+        if backend is None:
+            device_type = first_parameter.device.type if first_parameter is not None else "cpu"
+            backend = (
+                "torch-grouped"
+                if device_type == "cuda" and hasattr(torch, "_grouped_mm")
+                else "torch"
+            )
         packed = 0
         for layer in layers:
             moe = getattr(layer, "mlp", None)

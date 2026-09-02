@@ -269,6 +269,34 @@ def test_llada_moe_grouped_experts_match_reference_outputs_and_input_gradients()
     assert torch.allclose(reference_input.grad, grouped_input.grad, atol=1e-5, rtol=1e-5)
 
 
+def test_llada_moe_private_grouped_kernel_matches_reference(monkeypatch) -> None:
+    illada = import_module("cid.model.illada")
+    backbone = TinyLLaDAMoEBackbone()
+    ILLaDACIDAdapter(backbone, freeze_backbone=True)
+    moe = backbone.decoder.layers[0].mlp
+    reference_input = torch.randn(2, 5, TinyLLaDAMoEConfig.hidden_size, requires_grad=True)
+    grouped_input = reference_input.detach().clone().requires_grad_(True)
+
+    reference_output = moe(reference_input)
+    reference_output.square().sum().backward()
+
+    def grouped_mm(inputs, weights, offsets):
+        outputs = []
+        start = 0
+        for expert_idx, end in enumerate(offsets.tolist()):
+            outputs.append(inputs[start:end] @ weights[expert_idx])
+            start = end
+        return torch.cat(outputs, dim=0)
+
+    monkeypatch.setattr(torch, "_grouped_mm", grouped_mm, raising=False)
+    illada._pack_frozen_llada_moe_layer(moe, backend="torch-grouped")
+    grouped_output = moe(grouped_input)
+    grouped_output.square().sum().backward()
+
+    assert torch.allclose(reference_output, grouped_output, atol=1e-5, rtol=1e-5)
+    assert torch.allclose(reference_input.grad, grouped_input.grad, atol=1e-5, rtol=1e-5)
+
+
 def test_llada_moe_attention_keeps_masked_slots_out_of_key_context() -> None:
     backbone = TinyLLaDAMoEBackbone()
     ILLaDACIDAdapter(backbone, freeze_backbone=True)
