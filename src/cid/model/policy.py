@@ -5,7 +5,7 @@ from typing import Any
 
 import torch
 
-from cid.contracts import ModelContext, ModelUpdate, Percept, SourceDescriptor
+from cid.contracts import ModelContext, ModelUpdate, Percept
 from cid.lifecycle import MODELED_LIFECYCLES
 from cid.model.diffusion import (
     CIDDiffusionScheduler,
@@ -16,7 +16,6 @@ from cid.model.encoding import (
     ILLaDATextEncoder,
     canonical_fact_text,
     canonical_percept_text,
-    canonical_source_text,
 )
 from cid.model.illada import ILLADA_8B_BASE, ILLaDACIDAdapter
 from cid.model.loading import pretrained_revision
@@ -144,8 +143,8 @@ class ILLaDAContextTensorizer:
         percept_thought_mask, percept_display_mask = self._percept_target_masks(
             context, device=device
         )
-        source_memory = self.text_encoder.encode_texts(
-            tuple(self._source_text(item) for item in context.sources),
+        source_memory = self.text_encoder.encode_source_descriptors(
+            context.sources,
             detach=True,
         )
         return CIDTensorBatch(
@@ -197,11 +196,6 @@ class ILLaDAContextTensorizer:
             display_length=len(context.display.token_ids),
             device=device,
         )
-
-    @staticmethod
-    def _source_text(item: SourceDescriptor) -> str:
-        return canonical_source_text(item)
-
 
 @dataclass(frozen=True, slots=True)
 class ILLaDANeuralPolicyConfig:

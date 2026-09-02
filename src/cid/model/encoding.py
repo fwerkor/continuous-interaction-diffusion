@@ -24,6 +24,7 @@ class ILLaDATextEncoder:
     ENCODING_VERSION = 2
     FROZEN_SNAPSHOT_FORMAT_VERSION = 1
     ORDER_MOMENT_SCALE = 0.25
+    SOURCE_IDENTITY_SCALE = 0.25
 
     def __init__(
         self,
@@ -200,9 +201,31 @@ class ILLaDATextEncoder:
         result = pooled.unsqueeze(0)
         return result.detach() if detach else result
 
+    def encode_source_descriptors(
+        self,
+        sources: tuple[SourceDescriptor | Mapping[str, Any], ...],
+        *,
+        detach: bool = False,
+    ) -> Tensor:
+        if not sources:
+            return self.encode_texts((), detach=detach)
+        descriptor_memory = self.encode_texts(
+            tuple(canonical_source_text(source) for source in sources),
+            detach=detach,
+        )
+        identity_memory = self.encode_texts(
+            tuple(source_descriptor_name(source) for source in sources),
+            detach=detach,
+        )
+        return descriptor_memory + self.SOURCE_IDENTITY_SCALE * identity_memory
+
 
 def stable_text(value: Any) -> str:
     return json.dumps(value, ensure_ascii=False, sort_keys=True, default=str, separators=(",", ":"))
+
+
+def source_descriptor_name(item: SourceDescriptor | Mapping[str, Any]) -> str:
+    return item.name if isinstance(item, SourceDescriptor) else str(item.get("name", ""))
 
 
 def canonical_fact_text(
@@ -232,7 +255,7 @@ def canonical_fact_text(
 
 def canonical_source_text(item: SourceDescriptor | Mapping[str, Any]) -> str:
     if isinstance(item, SourceDescriptor):
-        name = item.name
+        name = source_descriptor_name(item)
         description = item.description
         arguments = tuple(
             (argument.name, argument.kind, argument.required) for argument in item.arguments
@@ -244,7 +267,7 @@ def canonical_source_text(item: SourceDescriptor | Mapping[str, Any]) -> str:
         accepts_partial_arguments = item.accepts_partial_arguments
         promote_results_to_fact = item.promote_results_to_fact
     else:
-        name = str(item.get("name", ""))
+        name = source_descriptor_name(item)
         description = str(item.get("description", ""))
         arguments = tuple(
             (

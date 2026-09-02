@@ -53,7 +53,6 @@ from cid.model.encoding import (
     ILLaDATextEncoder,
     canonical_fact_text,
     canonical_percept_text,
-    canonical_source_text,
     stable_text,
 )
 from cid.model.illada import ILLaDACIDAdapter
@@ -2408,8 +2407,8 @@ class ILLaDATrajectoryTensorizer:
             thought_slots=capacity,
             device=device,
         )
-        source_memory = self.text_encoder.encode_texts(
-            tuple(canonical_source_text(descriptor) for descriptor in example.source_descriptors),
+        source_memory = self.text_encoder.encode_source_descriptors(
+            example.source_descriptors,
             detach=True,
         )
 

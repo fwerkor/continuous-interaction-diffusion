@@ -10,6 +10,9 @@ from cid.model.tensors import CIDTensorOutput
 
 NEED_INTENT_TARGET_POSITIVE_MASS = 0.20
 NEED_INTENT_POSITIVE_WEIGHT_CAP = 128.0
+ALLOCATION_TARGET_POSITIVE_MASS = 0.30
+ALLOCATION_POSITIVE_WEIGHT_CAP = 64.0
+REFRESH_FOCAL_GAMMA = 2.0
 
 
 @dataclass(frozen=True, slots=True)
@@ -161,10 +164,12 @@ def cid_loss(
         batch_mask,
         batch_mask=batch_mask,
     )
-    allocation = _balanced_masked_binary_cross_entropy(
+    allocation = _target_positive_mass_binary_cross_entropy(
         output.allocation_logits,
         targets.allocation_targets,
         allocation_mask,
+        target_positive_mass=ALLOCATION_TARGET_POSITIVE_MASS,
+        positive_weight_cap=ALLOCATION_POSITIVE_WEIGHT_CAP,
         batch_mask=batch_mask,
     )
     display = _masked_cross_entropy(
@@ -244,10 +249,11 @@ def cid_loss(
         revision_mask,
         batch_mask=batch_mask,
     )
-    refresh = _masked_cross_entropy(
+    refresh = _masked_focal_cross_entropy(
         output.refresh_logits,
         targets.refresh_targets,
         refresh_mask,
+        gamma=REFRESH_FOCAL_GAMMA,
         batch_mask=batch_mask,
     )
     anchor_presence = _capped_positive_weight_binary_cross_entropy(
@@ -433,42 +439,6 @@ def _masked_vector_mse(
     )
 
 
-def _balanced_masked_binary_cross_entropy(
-    logits: Tensor,
-    target: Tensor,
-    mask: Tensor,
-    *,
-    batch_mask: Tensor | None = None,
-) -> Tensor:
-    """Balance positive/negative allocation supervision within each example.
-
-    Allocation positives are sparse because every free slot after the requested prefix is a
-    negative. A plain masked mean lets those negatives dominate the gradient and can produce a
-    deceptively low loss with probabilities that never cross the runtime allocation threshold.
-    """
-    losses = F.binary_cross_entropy_with_logits(logits, target, reduction="none")
-    if batch_mask is not None and batch_mask.shape != (logits.shape[0],):
-        raise ValueError("component batch_mask must have shape [batch]")
-    rows: list[Tensor] = []
-    for row in range(logits.shape[0]):
-        if batch_mask is not None and not bool(batch_mask[row]):
-            continue
-        valid = mask[row].bool()
-        positive = losses[row][valid & (target[row] >= 0.5)]
-        negative = losses[row][valid & (target[row] < 0.5)]
-        if positive.numel() and negative.numel():
-            rows.append(0.5 * (positive.mean() + negative.mean()))
-        elif positive.numel():
-            rows.append(positive.mean())
-        elif negative.numel():
-            rows.append(negative.mean())
-        elif batch_mask is not None:
-            rows.append(_differentiable_zero(logits[row : row + 1]))
-    if not rows:
-        return _differentiable_zero(logits)
-    return torch.stack(rows).mean()
-
-
 def _capped_positive_weight_binary_cross_entropy(
     logits: Tensor,
     target: Tensor,
@@ -528,12 +498,9 @@ def _target_positive_mass_binary_cross_entropy(
 ) -> Tensor:
     """Keep sparse positives relevant without fully balancing positive and negative classes.
 
-    Need-intent supervision is much sparser than the other CID binary targets.  A small fixed
-    positive-weight cap still lets hundreds of easy negatives dominate a row, while exact
-    inverse-frequency balancing makes false-positive tool calls too cheap.  For rows that contain
-    positives, choose the positive weight that would assign ``target_positive_mass`` of the
-    weighted BCE denominator to the positive class, subject to a safety cap.  Rows with no
-    positives retain ordinary negative BCE supervision.
+    For rows that contain positives, choose the positive weight that would assign
+    ``target_positive_mass`` of the weighted BCE denominator to the positive class, subject to a
+    safety cap. Rows with no positives retain ordinary negative BCE supervision.
     """
     if not 0.0 < target_positive_mass < 0.5:
         raise ValueError("target positive mass must be in (0, 0.5)")
@@ -603,6 +570,38 @@ def _masked_cross_entropy(
         logits.reshape(-1, class_count),
         safe_target.reshape(-1),
         reduction="none",
+    ).reshape(target.shape)
+    return _masked_element_mean(
+        per_element,
+        selected,
+        batch_mask=batch_mask,
+        reference=logits,
+    )
+
+
+def _masked_focal_cross_entropy(
+    logits: Tensor,
+    target: Tensor,
+    mask: Tensor,
+    *,
+    gamma: float,
+    batch_mask: Tensor | None = None,
+) -> Tensor:
+    """Downweight already-easy categorical targets without hard-coded class priors."""
+    if gamma < 0.0:
+        raise ValueError("focal gamma must be non-negative")
+    selected = mask.bool()
+    if not bool(selected.any()):
+        return _differentiable_zero(logits)
+    class_count = logits.shape[-1]
+    safe_target = target.masked_fill(~selected, 0)
+    flat_logits = logits.reshape(-1, class_count)
+    flat_target = safe_target.reshape(-1)
+    log_probabilities = F.log_softmax(flat_logits, dim=-1)
+    target_log_probability = log_probabilities.gather(1, flat_target[:, None]).squeeze(1)
+    target_probability = target_log_probability.exp()
+    per_element = (
+        -((1.0 - target_probability).clamp_min(0.0) ** gamma) * target_log_probability
     ).reshape(target.shape)
     return _masked_element_mean(
         per_element,

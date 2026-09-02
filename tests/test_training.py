@@ -29,7 +29,8 @@ from cid.lifecycle import MODELED_LIFECYCLES
 from cid.state import CellLifecycle, CognitiveField, CognitiveRole
 
 torch = pytest.importorskip("torch")
-ILLaDATextEncoder = import_module("cid.model.encoding").ILLaDATextEncoder
+cid_encoding = import_module("cid.model.encoding")
+ILLaDATextEncoder = cid_encoding.ILLaDATextEncoder
 nn = import_module("torch.nn")
 dist = import_module("torch.distributed")
 cid_model = import_module("cid.model")
@@ -803,6 +804,32 @@ def test_need_intent_loss_keeps_all_negative_rows_as_negative_supervision() -> N
     expected = torch.nn.functional.binary_cross_entropy_with_logits(logits, targets)
 
     assert float(loss.detach()) == pytest.approx(float(expected.detach()), rel=1e-6)
+
+
+def test_source_descriptor_encoding_preserves_source_identity() -> None:
+    adapter = make_adapter(seed=173)
+    encoder = ILLaDATextEncoder(adapter, TinyTokenizer())
+    shared = {
+        "description": "read a keyed value",
+        "arguments": ({"name": "key", "kind": "string", "required": True},),
+        "cacheable": True,
+        "versioned": True,
+    }
+    sources = ({"name": "primary", **shared}, {"name": "secondary", **shared})
+
+    descriptor_only = encoder.encode_texts(
+        tuple(cid_encoding.canonical_source_text(source) for source in sources),
+        detach=True,
+    )[0].float()
+    identity_aware = encoder.encode_source_descriptors(sources, detach=True)[0].float()
+
+    descriptor_cosine = torch.nn.functional.cosine_similarity(
+        descriptor_only[0], descriptor_only[1], dim=0
+    )
+    identity_cosine = torch.nn.functional.cosine_similarity(
+        identity_aware[0], identity_aware[1], dim=0
+    )
+    assert identity_cosine < descriptor_cosine
 
 
 def test_optimizer_step_rejects_nonfinite_gradient_before_parameter_update() -> None:

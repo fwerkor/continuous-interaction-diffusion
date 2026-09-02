@@ -274,6 +274,8 @@ class CIDOutputHeads(nn.Module):
         self.need_cell_route_bias = nn.Parameter(torch.full((max_need_slots,), -2.0))
         self.need_display_route_scale = nn.Parameter(torch.full((max_need_slots,), 4.0))
         self.need_display_route_bias = nn.Parameter(torch.full((max_need_slots,), -2.0))
+        self.need_display_query_scale = nn.Parameter(torch.ones(max_need_slots, d_model))
+        self.need_display_query_bias = nn.Parameter(torch.zeros(max_need_slots, d_model))
         self.argument_presence_head = nn.Linear(
             d_model, max_need_slots * max_argument_slots
         )
@@ -327,9 +329,14 @@ class CIDOutputHeads(nn.Module):
             need_target_cell_logits * self.need_cell_route_scale[None, None, :, None]
             + self.need_cell_route_bias[None, None, :, None]
         )
+        display_query = F.normalize(
+            need_query * self.need_display_query_scale[None, None, :, :]
+            + self.need_display_query_bias[None, None, :, :],
+            dim=-1,
+        )
         normalized_display = F.normalize(display_hidden, dim=-1)
         need_target_display_logits = torch.einsum(
-            "bnkd,bld->bnkl", need_query, normalized_display
+            "bnkd,bld->bnkl", display_query, normalized_display
         )
         need_target_display_logits = (
             need_target_display_logits * self.need_display_route_scale[None, None, :, None]

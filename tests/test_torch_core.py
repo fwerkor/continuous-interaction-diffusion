@@ -11,21 +11,45 @@ TorchCIDConfig = cid_model.TorchCIDConfig
 TorchCIDCore = cid_model.TorchCIDCore
 cid_loss = cid_model.cid_loss
 loss_module = import_module("cid.model.losses")
-balanced_allocation_loss = loss_module._balanced_masked_binary_cross_entropy
 capped_need_loss = loss_module._capped_positive_weight_binary_cross_entropy
+target_positive_mass_loss = loss_module._target_positive_mass_binary_cross_entropy
+focal_cross_entropy = loss_module._masked_focal_cross_entropy
 
 
-def test_allocation_loss_balances_sparse_positive_against_many_negatives() -> None:
+def test_allocation_loss_reserves_thirty_percent_positive_gradient_mass() -> None:
     logits = torch.zeros((1, 4), requires_grad=True)
     targets = torch.tensor([[1.0, 0.0, 0.0, 0.0]])
     mask = torch.ones_like(targets, dtype=torch.bool)
 
-    loss = balanced_allocation_loss(logits, targets, mask)
+    loss = target_positive_mass_loss(
+        logits,
+        targets,
+        mask,
+        target_positive_mass=0.30,
+        positive_weight_cap=64.0,
+    )
     loss.backward()
 
     positive_gradient = logits.grad[0, 0].abs()
-    negative_gradient_sum = logits.grad[0, 1:].abs().sum()
-    assert positive_gradient == pytest.approx(negative_gradient_sum)
+    total_gradient = logits.grad.abs().sum()
+    assert positive_gradient / total_gradient == pytest.approx(0.30, abs=1e-6)
+
+
+def test_refresh_focal_loss_focuses_gradient_on_hard_rare_target() -> None:
+    logits = torch.zeros((1, 41, 3), requires_grad=True)
+    with torch.no_grad():
+        logits[0, :, 0] = 4.0
+    targets = torch.zeros((1, 41), dtype=torch.long)
+    targets[0, 40] = 2
+    mask = torch.ones_like(targets, dtype=torch.bool)
+
+    loss = focal_cross_entropy(logits, targets, mask, gamma=2.0)
+    loss.backward()
+
+    easy_gradient = logits.grad[0, :40].abs().sum()
+    rare_gradient = logits.grad[0, 40].abs().sum()
+    assert rare_gradient > easy_gradient
+    assert torch.isfinite(loss)
 
 
 
@@ -247,6 +271,8 @@ def test_torch_core_shapes_and_backward() -> None:
     assert torch.isfinite(losses.total)
     losses.total.backward()
     assert model.thought_delta.weight.grad is not None
+    assert model.output_heads.need_display_query_scale.grad is not None
+    assert model.output_heads.need_display_query_bias.grad is not None
 
     altered = output.allocation_logits.clone()
     altered[occupied] = altered[occupied] + 1000.0
