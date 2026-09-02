@@ -34,6 +34,22 @@ from cid.data import (
     load_jsonl,
 )
 from cid.dataset import dump_dataset_manifest, inspect_dataset, validate_neural_training_contract
+from cid.defaults import (
+    DEFAULT_ALLOCATION_THRESHOLD,
+    DEFAULT_ANCHOR_PRESENCE_THRESHOLD,
+    DEFAULT_ARGUMENT_PRESENCE_THRESHOLD,
+    DEFAULT_BINDING_THRESHOLD,
+    DEFAULT_CONVERGENCE_THRESHOLD,
+    DEFAULT_DISPLAY_REVISION_FRACTION,
+    DEFAULT_DISPLAY_REVISION_MARGIN,
+    DEFAULT_LINK_PRESENCE_THRESHOLD,
+    DEFAULT_MATERIALIZED_MAX_AGE_S,
+    DEFAULT_MAX_ALLOCATIONS_PER_STEP,
+    DEFAULT_NEED_TARGET_CELL_THRESHOLD,
+    DEFAULT_NEED_TARGET_DISPLAY_THRESHOLD,
+    DEFAULT_NEED_THRESHOLD,
+    DEFAULT_RETRIEVAL_SIMILARITY_THRESHOLD,
+)
 from cid.distill import (
     TeacherScheduleConfig,
     compile_teacher_plans,
@@ -956,6 +972,7 @@ def _benchmark(args: argparse.Namespace) -> None:
     from transformers import AutoTokenizer
 
     from cid.model import (
+        CIDMaterializerConfig,
         ILLaDACIDAdapter,
         ILLaDACIDConfig,
         load_cid_adapter_checkpoint,
@@ -1106,6 +1123,29 @@ def _benchmark(args: argparse.Namespace) -> None:
         if not examples:
             raise ValueError("benchmark dataset is empty")
 
+        materializer_config = CIDMaterializerConfig(
+            allocation_threshold=args.allocation_threshold,
+            convergence_threshold=args.convergence_threshold,
+            need_threshold=args.need_threshold,
+            need_target_cell_threshold=args.need_target_cell_threshold,
+            need_target_display_threshold=args.need_target_display_threshold,
+            argument_presence_threshold=args.argument_presence_threshold,
+            anchor_presence_threshold=args.anchor_presence_threshold,
+            link_presence_threshold=args.link_presence_threshold,
+            retrieval_similarity_threshold=args.retrieval_similarity_threshold,
+            max_allocations_per_step=args.max_allocations_per_step,
+            max_age_s=args.max_age_s,
+        )
+        runtime_config = RuntimeConfig(
+            max_steps=args.max_steps,
+            max_wall_time_s=args.max_wall_time_s,
+            binding_threshold=args.binding_threshold,
+            idle_yield_s=args.idle_yield_s,
+            reclamation_grace_steps=args.reclamation_grace_steps,
+            reclamation_low_watermark=args.reclamation_low_watermark,
+            reclamation_target_watermark=args.reclamation_target_watermark,
+        )
+
         async def run_cases():
             results = []
             for index, example in enumerate(examples, start=1):
@@ -1117,7 +1157,10 @@ def _benchmark(args: argparse.Namespace) -> None:
                     forward_model=forward_model,
                     seed_teacher_state=args.seed_teacher_state,
                     denoising_steps=args.denoising_steps,
-                    max_steps=args.max_steps,
+                    display_revision_fraction=args.display_revision_fraction,
+                    display_revision_margin=args.display_revision_margin,
+                    materializer_config=materializer_config,
+                    runtime_config=runtime_config,
                 )
                 results.append(result)
                 if distributed:
@@ -1529,6 +1572,8 @@ def _train_stage_a(args: argparse.Namespace) -> None:
                 timestep_min=args.timestep_min,
                 timestep_max=args.timestep_max,
                 rollout_horizon=args.rollout_horizon,
+                rollout_allocation_threshold=args.rollout_allocation_threshold,
+                rollout_max_allocations_per_step=args.rollout_max_allocations_per_step,
                 teacher_forcing_epochs=args.teacher_forcing_epochs,
                 rollout_ramp_epochs=args.rollout_ramp_epochs,
                 semantic_pooling=args.semantic_pooling,
@@ -2222,6 +2267,8 @@ def _train_stage_b(args: argparse.Namespace) -> None:
                 timestep_min=args.timestep_min,
                 timestep_max=args.timestep_max,
                 rollout_horizon=args.rollout_horizon,
+                rollout_allocation_threshold=args.rollout_allocation_threshold,
+                rollout_max_allocations_per_step=args.rollout_max_allocations_per_step,
                 teacher_forcing_epochs=args.teacher_forcing_epochs,
                 rollout_ramp_epochs=args.rollout_ramp_epochs,
                 semantic_pooling=args.semantic_pooling,
@@ -3041,8 +3088,89 @@ def main() -> None:
     benchmark.add_argument("--summary-output", required=True)
     benchmark.add_argument("--device", choices=("auto", "cuda", "npu", "cpu"), default="auto")
     benchmark.add_argument("--dtype", choices=("bf16", "fp16", "fp32"), default="bf16")
-    benchmark.add_argument("--denoising-steps", type=int, default=8)
-    benchmark.add_argument("--max-steps", type=int, default=32)
+    policy_tuning = benchmark.add_argument_group("neural policy tuning")
+    policy_tuning.add_argument("--denoising-steps", type=int, default=8)
+    policy_tuning.add_argument(
+        "--display-revision-fraction",
+        type=float,
+        default=DEFAULT_DISPLAY_REVISION_FRACTION,
+    )
+    policy_tuning.add_argument(
+        "--display-revision-margin",
+        type=float,
+        default=DEFAULT_DISPLAY_REVISION_MARGIN,
+    )
+    materializer_tuning = benchmark.add_argument_group("materialization tuning")
+    materializer_tuning.add_argument(
+        "--allocation-threshold", type=float, default=DEFAULT_ALLOCATION_THRESHOLD
+    )
+    materializer_tuning.add_argument(
+        "--convergence-threshold", type=float, default=DEFAULT_CONVERGENCE_THRESHOLD
+    )
+    materializer_tuning.add_argument("--need-threshold", type=float, default=DEFAULT_NEED_THRESHOLD)
+    materializer_tuning.add_argument(
+        "--need-target-cell-threshold",
+        type=float,
+        default=DEFAULT_NEED_TARGET_CELL_THRESHOLD,
+    )
+    materializer_tuning.add_argument(
+        "--need-target-display-threshold",
+        type=float,
+        default=DEFAULT_NEED_TARGET_DISPLAY_THRESHOLD,
+    )
+    materializer_tuning.add_argument(
+        "--argument-presence-threshold",
+        type=float,
+        default=DEFAULT_ARGUMENT_PRESENCE_THRESHOLD,
+    )
+    materializer_tuning.add_argument(
+        "--anchor-presence-threshold",
+        type=float,
+        default=DEFAULT_ANCHOR_PRESENCE_THRESHOLD,
+    )
+    materializer_tuning.add_argument(
+        "--link-presence-threshold",
+        type=float,
+        default=DEFAULT_LINK_PRESENCE_THRESHOLD,
+    )
+    materializer_tuning.add_argument(
+        "--retrieval-similarity-threshold",
+        type=float,
+        default=DEFAULT_RETRIEVAL_SIMILARITY_THRESHOLD,
+    )
+    materializer_tuning.add_argument(
+        "--max-allocations-per-step",
+        type=int,
+        default=DEFAULT_MAX_ALLOCATIONS_PER_STEP,
+    )
+    materializer_tuning.add_argument(
+        "--max-age-s", type=float, default=DEFAULT_MATERIALIZED_MAX_AGE_S
+    )
+    runtime_defaults = RuntimeConfig()
+    runtime_tuning = benchmark.add_argument_group("runtime tuning")
+    runtime_tuning.add_argument("--max-steps", type=int, default=32)
+    runtime_tuning.add_argument(
+        "--max-wall-time-s", type=float, default=runtime_defaults.max_wall_time_s
+    )
+    runtime_tuning.add_argument(
+        "--binding-threshold", type=float, default=DEFAULT_BINDING_THRESHOLD
+    )
+    runtime_tuning.add_argument("--idle-yield-s", type=float, default=runtime_defaults.idle_yield_s)
+    runtime_tuning.add_argument(
+        "--reclamation-grace-steps",
+        type=int,
+        default=runtime_defaults.reclamation_grace_steps,
+    )
+    runtime_tuning.add_argument(
+        "--reclamation-low-watermark",
+        type=float,
+        default=runtime_defaults.reclamation_low_watermark,
+    )
+    runtime_tuning.add_argument(
+        "--reclamation-target-watermark",
+        type=float,
+        default=runtime_defaults.reclamation_target_watermark,
+    )
     benchmark.add_argument("--max-examples", type=int)
     benchmark.add_argument("--progress-every", type=int, default=10)
     benchmark.add_argument("--seed-teacher-state", action="store_true")
@@ -3083,6 +3211,18 @@ def main() -> None:
     train.add_argument("--timestep-min", type=float, default=0.05)
     train.add_argument("--timestep-max", type=float, default=1.0)
     train.add_argument("--rollout-horizon", type=int, default=3)
+    train.add_argument(
+        "--rollout-allocation-threshold",
+        type=float,
+        default=DEFAULT_ALLOCATION_THRESHOLD,
+        help="allocation threshold used by closed-loop training rollouts",
+    )
+    train.add_argument(
+        "--rollout-max-allocations-per-step",
+        type=int,
+        default=DEFAULT_MAX_ALLOCATIONS_PER_STEP,
+        help="maximum new cognitive cells materialized by one training rollout step",
+    )
     train.add_argument(
         "--semantic-pooling",
         choices=("mean-v1", "order-aware-v2"),
@@ -3173,6 +3313,18 @@ def main() -> None:
     train_full.add_argument("--timestep-min", type=float, default=0.05)
     train_full.add_argument("--timestep-max", type=float, default=1.0)
     train_full.add_argument("--rollout-horizon", type=int, default=3)
+    train_full.add_argument(
+        "--rollout-allocation-threshold",
+        type=float,
+        default=DEFAULT_ALLOCATION_THRESHOLD,
+        help="allocation threshold used by closed-loop training rollouts",
+    )
+    train_full.add_argument(
+        "--rollout-max-allocations-per-step",
+        type=int,
+        default=DEFAULT_MAX_ALLOCATIONS_PER_STEP,
+        help="maximum new cognitive cells materialized by one training rollout step",
+    )
     train_full.add_argument(
         "--semantic-pooling",
         choices=("mean-v1", "order-aware-v2"),

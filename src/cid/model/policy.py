@@ -6,6 +6,7 @@ from typing import Any
 import torch
 
 from cid.contracts import ModelContext, ModelUpdate, Percept
+from cid.defaults import DEFAULT_DISPLAY_REVISION_FRACTION, DEFAULT_DISPLAY_REVISION_MARGIN
 from cid.lifecycle import MODELED_LIFECYCLES
 from cid.model.diffusion import (
     CIDDiffusionScheduler,
@@ -200,8 +201,8 @@ class ILLaDAContextTensorizer:
 @dataclass(frozen=True, slots=True)
 class ILLaDANeuralPolicyConfig:
     denoising_steps: int = 8
-    display_revision_fraction: float = 0.125
-    display_revision_margin: float = 0.15
+    display_revision_fraction: float = DEFAULT_DISPLAY_REVISION_FRACTION
+    display_revision_margin: float = DEFAULT_DISPLAY_REVISION_MARGIN
     seed: int = 0
 
     def __post_init__(self) -> None:

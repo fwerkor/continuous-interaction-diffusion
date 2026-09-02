@@ -571,6 +571,16 @@ The summary reports convergence, exact display accuracy, observation coverage/st
 latent-to-executable delay, binding-to-observation delay, and observation-to-projection lag. Stage B
 benchmark loading restores model shards only; it does not construct or load optimizer state.
 
+Runtime decision thresholds are policy knobs rather than fixed checkpoint contracts. `cid benchmark`
+exposes the recommended defaults through CLI options such as `--need-threshold`,
+`--convergence-threshold`, `--allocation-threshold`, `--binding-threshold`, routing/presence
+thresholds, retrieval similarity, reclamation watermarks, and display-revision controls. Override them
+for calibration or deployment-specific latency/recall trade-offs; omitting them uses the recommended
+defaults shared by the Python runtime. Run `cid benchmark --help` for the complete set. Stage A
+and Stage B training also expose `--rollout-allocation-threshold` and
+`--rollout-max-allocations-per-step` so closed-loop training can record the same runtime policy
+explicitly.
+
 ## Quick demo
 
 ```bash

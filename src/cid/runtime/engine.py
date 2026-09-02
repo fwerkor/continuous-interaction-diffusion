@@ -8,6 +8,7 @@ from dataclasses import dataclass
 from typing import Any
 
 from cid.contracts import CIDPolicy, FreshnessDemand, ModelContext, Observation, Percept
+from cid.defaults import DEFAULT_BINDING_THRESHOLD
 from cid.grounding import STRONG_LINK_RELATIONS, ClosedWorldGrounder, ObjectKind, ObjectRef
 from cid.lifecycle import LifecycleTransitionController, LifecycleTransitionSignals
 from cid.reclamation import (
@@ -33,7 +34,7 @@ from cid.state import CellLifecycle, CognitiveField, DisplayCanvas, FactItem, Fa
 class RuntimeConfig:
     max_steps: int = 64
     max_wall_time_s: float | None = 300.0
-    binding_threshold: float = 0.55
+    binding_threshold: float = DEFAULT_BINDING_THRESHOLD
     idle_yield_s: float = 0.001
     reclamation_grace_steps: int = DEFAULT_RECLAMATION_GRACE_STEPS
     reclamation_low_watermark: float = DEFAULT_RECLAMATION_LOW_WATERMARK

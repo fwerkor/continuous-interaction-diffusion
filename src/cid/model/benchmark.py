@@ -1,6 +1,6 @@
 from __future__ import annotations
 
-from dataclasses import asdict, dataclass
+from dataclasses import asdict, dataclass, replace
 from typing import Any
 
 import torch
@@ -13,6 +13,8 @@ from cid.model.illada import ILLaDACIDAdapter
 from cid.model.materialize import (
     AnchorCandidate,
     ArgumentCandidate,
+    CIDMaterializer,
+    CIDMaterializerConfig,
     ClosedWorldMaterializationCatalog,
     ObjectCandidate,
 )
@@ -54,6 +56,10 @@ async def run_neural_benchmark_case(
     forward_model: torch.nn.Module | None = None,
     seed_teacher_state: bool = False,
     denoising_steps: int = 8,
+    display_revision_fraction: float = 0.125,
+    display_revision_margin: float = 0.15,
+    materializer_config: CIDMaterializerConfig | None = None,
+    runtime_config: RuntimeConfig | None = None,
     max_steps: int | None = None,
 ) -> NeuralBenchmarkCaseResult:
     encoder = text_encoder or ILLaDATextEncoder(adapter, tokenizer)
@@ -65,8 +71,13 @@ async def run_neural_benchmark_case(
     policy = ILLaDANeuralPolicy(
         adapter,
         tensorizer,
+        materializer=CIDMaterializer(materializer_config),
         catalog=build_materialization_catalog(example, encoder),
-        config=ILLaDANeuralPolicyConfig(denoising_steps=denoising_steps),
+        config=ILLaDANeuralPolicyConfig(
+            denoising_steps=denoising_steps,
+            display_revision_fraction=display_revision_fraction,
+            display_revision_margin=display_revision_margin,
+        ),
         forward_model=forward_model,
     )
     expected_ids_tensor = encoder.tokenize(example.target_display, add_special_tokens=False)
@@ -88,13 +99,19 @@ async def run_neural_benchmark_case(
         mask_token_id=adapter.mask_token_id,
         eos_token_id=adapter.eos_token_id,
     )
+    effective_runtime_config = runtime_config
+    if max_steps is not None:
+        effective_runtime_config = replace(
+            runtime_config or RuntimeConfig(),
+            max_steps=max_steps,
+        )
     replay: ReplayEvaluationResult = await run_replay_case(
         policy,
         example,
         thought=thought,
         display=display,
         expected_display_ids=expected_ids,
-        runtime_config=(None if max_steps is None else RuntimeConfig(max_steps=max_steps)),
+        runtime_config=effective_runtime_config,
     )
     final_ids = tuple(int(token) for token in replay.runtime.display.visible_token_ids)
     return NeuralBenchmarkCaseResult(

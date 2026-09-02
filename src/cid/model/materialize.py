@@ -14,12 +14,22 @@ from cid.contracts import (
     ModelUpdate,
     SourceDescriptor,
 )
+from cid.defaults import (
+    DEFAULT_ALLOCATION_THRESHOLD,
+    DEFAULT_ANCHOR_PRESENCE_THRESHOLD,
+    DEFAULT_ARGUMENT_PRESENCE_THRESHOLD,
+    DEFAULT_CONVERGENCE_THRESHOLD,
+    DEFAULT_LINK_PRESENCE_THRESHOLD,
+    DEFAULT_MATERIALIZED_MAX_AGE_S,
+    DEFAULT_MAX_ALLOCATIONS_PER_STEP,
+    DEFAULT_NEED_TARGET_CELL_THRESHOLD,
+    DEFAULT_NEED_TARGET_DISPLAY_THRESHOLD,
+    DEFAULT_NEED_THRESHOLD,
+    DEFAULT_RETRIEVAL_SIMILARITY_THRESHOLD,
+)
 from cid.grounding import Anchor, AnchorKind, CognitiveLink, LinkRelation, ObjectKind, ObjectRef
 from cid.lifecycle import MODELED_LIFECYCLES
-from cid.model.allocation import (
-    DEFAULT_MAX_ALLOCATIONS_PER_STEP,
-    prefix_allocation_mask,
-)
+from cid.model.allocation import prefix_allocation_mask
 from cid.model.tensors import CIDTensorOutput
 from cid.state import CellLifecycle, CognitiveField, CognitiveRole, DisplayCanvas
 
@@ -104,17 +114,17 @@ class ClosedWorldMaterializationCatalog:
 
 @dataclass(frozen=True, slots=True)
 class CIDMaterializerConfig:
-    allocation_threshold: float = 0.8
-    convergence_threshold: float = 0.5
-    need_threshold: float = 0.6
-    need_target_cell_threshold: float = 0.5
-    need_target_display_threshold: float = 0.5
-    argument_presence_threshold: float = 0.5
-    anchor_presence_threshold: float = 0.5
-    link_presence_threshold: float = 0.5
-    retrieval_similarity_threshold: float = 0.2
+    allocation_threshold: float = DEFAULT_ALLOCATION_THRESHOLD
+    convergence_threshold: float = DEFAULT_CONVERGENCE_THRESHOLD
+    need_threshold: float = DEFAULT_NEED_THRESHOLD
+    need_target_cell_threshold: float = DEFAULT_NEED_TARGET_CELL_THRESHOLD
+    need_target_display_threshold: float = DEFAULT_NEED_TARGET_DISPLAY_THRESHOLD
+    argument_presence_threshold: float = DEFAULT_ARGUMENT_PRESENCE_THRESHOLD
+    anchor_presence_threshold: float = DEFAULT_ANCHOR_PRESENCE_THRESHOLD
+    link_presence_threshold: float = DEFAULT_LINK_PRESENCE_THRESHOLD
+    retrieval_similarity_threshold: float = DEFAULT_RETRIEVAL_SIMILARITY_THRESHOLD
     max_allocations_per_step: int = DEFAULT_MAX_ALLOCATIONS_PER_STEP
-    max_age_s: float = 5.0
+    max_age_s: float = DEFAULT_MATERIALIZED_MAX_AGE_S
 
     def __post_init__(self) -> None:
         for name in (

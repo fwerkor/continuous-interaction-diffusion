@@ -3,7 +3,7 @@ from __future__ import annotations
 import torch
 from torch import Tensor
 
-DEFAULT_MAX_ALLOCATIONS_PER_STEP = 32
+from cid.defaults import DEFAULT_MAX_ALLOCATIONS_PER_STEP as DEFAULT_MAX_ALLOCATIONS_PER_STEP
 
 
 def prefix_allocation_mask(

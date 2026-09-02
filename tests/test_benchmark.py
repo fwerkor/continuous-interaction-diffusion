@@ -6,7 +6,17 @@ from types import SimpleNamespace
 import pytest
 
 from cid.data import BindingTarget, ExternalEvent, ThoughtTarget, TrajectoryExample
+from cid.defaults import (
+    DEFAULT_ALLOCATION_THRESHOLD,
+    DEFAULT_BINDING_THRESHOLD,
+    DEFAULT_CONVERGENCE_THRESHOLD,
+    DEFAULT_DISPLAY_REVISION_FRACTION,
+    DEFAULT_DISPLAY_REVISION_MARGIN,
+    DEFAULT_MAX_ALLOCATIONS_PER_STEP,
+    DEFAULT_NEED_THRESHOLD,
+)
 from cid.grounding import ObjectRef
+from cid.runtime import RuntimeConfig
 from cid.state import CellLifecycle, CognitiveRole
 
 torch = pytest.importorskip("torch")
@@ -14,7 +24,9 @@ nn = import_module("torch.nn")
 benchmark_module = import_module("cid.model.benchmark")
 cid_model = import_module("cid.model")
 
+CIDMaterializerConfig = cid_model.CIDMaterializerConfig
 ILLaDACIDAdapter = cid_model.ILLaDACIDAdapter
+ILLaDANeuralPolicyConfig = cid_model.ILLaDANeuralPolicyConfig
 run_neural_benchmark_case = benchmark_module.run_neural_benchmark_case
 build_materialization_catalog = benchmark_module.build_materialization_catalog
 teacher_seed_thought = benchmark_module.teacher_seed_thought
@@ -149,6 +161,20 @@ def make_example() -> TrajectoryExample:
             ),
         ),
     )
+
+
+def test_recommended_runtime_defaults_are_shared_across_configs() -> None:
+    materializer = CIDMaterializerConfig()
+    policy = ILLaDANeuralPolicyConfig()
+    runtime = RuntimeConfig()
+
+    assert materializer.allocation_threshold == DEFAULT_ALLOCATION_THRESHOLD
+    assert materializer.convergence_threshold == DEFAULT_CONVERGENCE_THRESHOLD
+    assert materializer.need_threshold == DEFAULT_NEED_THRESHOLD
+    assert materializer.max_allocations_per_step == DEFAULT_MAX_ALLOCATIONS_PER_STEP
+    assert policy.display_revision_fraction == DEFAULT_DISPLAY_REVISION_FRACTION
+    assert policy.display_revision_margin == DEFAULT_DISPLAY_REVISION_MARGIN
+    assert runtime.binding_threshold == DEFAULT_BINDING_THRESHOLD
 
 
 def configured_adapter(
