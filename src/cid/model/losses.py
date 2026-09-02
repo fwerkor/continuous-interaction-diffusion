@@ -8,6 +8,9 @@ from torch.nn import functional as F
 
 from cid.model.tensors import CIDTensorOutput
 
+NEED_INTENT_TARGET_POSITIVE_MASS = 0.20
+NEED_INTENT_POSITIVE_WEIGHT_CAP = 128.0
+
 
 @dataclass(frozen=True, slots=True)
 class CIDLossWeights:
@@ -194,11 +197,12 @@ def cid_loss(
         lifecycle_mask,
         batch_mask=batch_mask,
     )
-    intent = _capped_positive_weight_binary_cross_entropy(
+    intent = _target_positive_mass_binary_cross_entropy(
         output.need_logits,
         targets.need_targets,
         thought_mask.unsqueeze(-1).expand_as(output.need_logits),
-        positive_weight_cap=8.0,
+        target_positive_mass=NEED_INTENT_TARGET_POSITIVE_MASS,
+        positive_weight_cap=NEED_INTENT_POSITIVE_WEIGHT_CAP,
         batch_mask=batch_mask,
     )
     source = _masked_cross_entropy(
@@ -511,6 +515,60 @@ def _capped_positive_weight_binary_cross_entropy(
     if not bool(active_rows.any()):
         return _differentiable_zero(logits)
     return row_losses[active_rows].mean()
+
+
+def _target_positive_mass_binary_cross_entropy(
+    logits: Tensor,
+    target: Tensor,
+    mask: Tensor,
+    *,
+    target_positive_mass: float,
+    positive_weight_cap: float,
+    batch_mask: Tensor | None = None,
+) -> Tensor:
+    """Keep sparse positives relevant without fully balancing positive and negative classes.
+
+    Need-intent supervision is much sparser than the other CID binary targets.  A small fixed
+    positive-weight cap still lets hundreds of easy negatives dominate a row, while exact
+    inverse-frequency balancing makes false-positive tool calls too cheap.  For rows that contain
+    positives, choose the positive weight that would assign ``target_positive_mass`` of the
+    weighted BCE denominator to the positive class, subject to a safety cap.  Rows with no
+    positives retain ordinary negative BCE supervision.
+    """
+    if not 0.0 < target_positive_mass < 0.5:
+        raise ValueError("target positive mass must be in (0, 0.5)")
+    if positive_weight_cap < 1.0:
+        raise ValueError("positive_weight_cap must be at least 1")
+    if batch_mask is not None and batch_mask.shape != (logits.shape[0],):
+        raise ValueError("component batch_mask must have shape [batch]")
+
+    flat_logits = logits.flatten(start_dim=1)
+    flat_target = target.flatten(start_dim=1)
+    flat_valid = mask.bool().flatten(start_dim=1)
+    positive = flat_valid & (flat_target >= 0.5)
+    negative = flat_valid & ~positive
+    positive_count = positive.sum(dim=1)
+    negative_count = negative.sum(dim=1)
+
+    class_odds = target_positive_mass / (1.0 - target_positive_mass)
+    ratio = negative_count.to(dtype=logits.dtype) / positive_count.clamp_min(1).to(
+        dtype=logits.dtype
+    )
+    positive_weight = (ratio * class_odds).clamp(min=1.0, max=positive_weight_cap)
+
+    weights = torch.ones_like(flat_target)
+    weights = torch.where(positive, positive_weight.unsqueeze(1), weights)
+    weights = weights * flat_valid.to(dtype=weights.dtype)
+    losses = F.binary_cross_entropy_with_logits(flat_logits, flat_target, reduction="none")
+    denominator = weights.sum(dim=1)
+    row_losses = (losses * weights).sum(dim=1) / denominator.clamp_min(1.0)
+
+    valid_rows = denominator > 0
+    if batch_mask is not None:
+        valid_rows = valid_rows & batch_mask.bool()
+    if not bool(valid_rows.any()):
+        return _differentiable_zero(logits)
+    return row_losses[valid_rows].mean()
 
 
 def _masked_binary_cross_entropy(

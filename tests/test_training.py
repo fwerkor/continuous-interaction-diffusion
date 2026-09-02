@@ -33,6 +33,7 @@ ILLaDATextEncoder = import_module("cid.model.encoding").ILLaDATextEncoder
 nn = import_module("torch.nn")
 dist = import_module("torch.distributed")
 cid_model = import_module("cid.model")
+cid_losses = import_module("cid.model.losses")
 
 ILLaDACIDAdapter = cid_model.ILLaDACIDAdapter
 ILLaDACIDConfig = cid_model.ILLaDACIDConfig
@@ -63,6 +64,7 @@ trajectory_transitions = cid_model.trajectory_transitions
 wrap_stage_a_ddp = cid_model.wrap_stage_a_ddp
 wrap_stage_b_fsdp = cid_model.wrap_stage_b_fsdp
 cid_loss = cid_model.cid_loss
+target_positive_mass_bce = cid_losses._target_positive_mass_binary_cross_entropy
 chunked_illada_mlp_forward = import_module("cid.model.illada")._chunked_illada_mlp_forward
 chunked_illada_rms_norm_forward = import_module("cid.model.illada")._chunked_illada_rms_norm_forward
 
@@ -764,6 +766,43 @@ def test_trajectory_tensorizer_runs_full_optimizer_step() -> None:
 
     assert not torch.equal(before, adapter.output_heads.allocation_head.weight)
     assert all(parameter.grad is None for parameter in adapter.backbone.parameters())
+
+
+def test_need_intent_loss_reserves_bounded_positive_gradient_mass() -> None:
+    logits = torch.zeros((1, 128, 4), requires_grad=True)
+    targets = torch.zeros_like(logits)
+    targets[0, 0, 0] = 1.0
+    mask = torch.ones_like(logits, dtype=torch.bool)
+
+    loss = target_positive_mass_bce(
+        logits,
+        targets,
+        mask,
+        target_positive_mass=0.20,
+        positive_weight_cap=128.0,
+    )
+    loss.backward()
+
+    positive_gradient = logits.grad[0, 0, 0].abs()
+    total_gradient = logits.grad.abs().sum()
+    assert positive_gradient / total_gradient == pytest.approx(0.20, abs=1e-4)
+
+
+def test_need_intent_loss_keeps_all_negative_rows_as_negative_supervision() -> None:
+    logits = torch.tensor([[[0.0, 1.0, -1.0, 2.0]]], requires_grad=True)
+    targets = torch.zeros_like(logits)
+    mask = torch.ones_like(logits, dtype=torch.bool)
+
+    loss = target_positive_mass_bce(
+        logits,
+        targets,
+        mask,
+        target_positive_mass=0.20,
+        positive_weight_cap=128.0,
+    )
+    expected = torch.nn.functional.binary_cross_entropy_with_logits(logits, targets)
+
+    assert float(loss.detach()) == pytest.approx(float(expected.detach()), rel=1e-6)
 
 
 def test_optimizer_step_rejects_nonfinite_gradient_before_parameter_update() -> None:
