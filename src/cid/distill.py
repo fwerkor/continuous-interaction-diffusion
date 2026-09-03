@@ -19,7 +19,7 @@ from cid.data import (
     GroundingTarget,
     ThoughtTarget,
     TrajectoryExample,
-    is_legacy_display_status,
+    is_display_process_status,
 )
 from cid.grounding import Anchor, CognitiveLink, GroundingEntry, ObjectRef
 from cid.python_review import python_public_test_reason
@@ -1199,7 +1199,7 @@ def _teacher_quality_reasons(
     if "final" in frame_by_phase:
         semantic_frames.append(frame_by_phase["final"])
     for frame in semantic_frames[:-1]:
-        if is_legacy_display_status(frame.display):
+        if is_display_process_status(frame.display):
             reasons.append(
                 f"display in phase {frame.phase!r} narrates process status instead of the current "
                 "answer draft"

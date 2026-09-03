@@ -207,7 +207,7 @@ cid prepare-public-distillation
 
 Released CID datasets are published on Hugging Face at `fwerkor/CID-Dataset`; the GitHub
 repository intentionally does not track release data or release manifests. The local `data/` tree is
-a gitignored build/training workspace. **v12, v13, v14, and v15 are preserved as complete releases**
+a gitignored build/training workspace. **v12, v13, v14, v15, and v16 are preserved as complete releases**
 so training artifacts do not skip a version.
 
 - **v12:** 132,122 semantic tasks, 305,948 trajectories, 2,303,169 training transitions;
@@ -216,21 +216,27 @@ so training artifacts do not skip a version.
   materialized SHA-256 `fcda158c66f911b9521e37ffcbdba038710bde607a4762f498b0e70bd99f5de2`.
 - **v14:** 192,297 semantic tasks, 421,798 trajectories, 3,011,462 training transitions. It is the
   last release using the pre-v3 need-routing data ABI.
-- **v15 (latest published v3 release):** keeps the exact v14 semantic tasks, schedules, trajectories,
-  prompts, answers, evidence, and transition count, while rematerializing them for neural contract
-  v3. Every binding
-  has an explicit stable owner; affected-cell supervision is conservatively derived from live state
-  changes around the matching observation; display routing receives a tokenizer-independent first-
-  position positive when the displayed answer changes; and protected-result promotion is an explicit
-  source-owned policy. Exact v15 bytes and hashes are pinned by the Hugging Face release manifest.
+- **v15:** keeps the exact v14 semantic tasks, schedules, trajectories, prompts, answers, evidence,
+  and transition count while rematerializing them for neural contract v3. Every binding has an
+  explicit stable owner; affected-cell supervision is derived conservatively from matching
+  observations, and protected-result promotion is explicit source-owned metadata.
+- **v16 (current neural-contract-v4 release):** 192,729 semantic tasks, 422,230 trajectories,
+  2,724,556 adjacent transitions, and 3,146,786 total training transitions. It adds 432
+  hand-authored/high-control curriculum trajectories, rematerializes process-only Display targets as
+  unresolved state, and adds 133,308 stable-tail transitions. Canonical SHA-256:
+  `76980590fb21d75d3dfe466e8b39716362bc249bad73416bcb690f7a59155e6b`.
 
 The current source tree defines **neural contract v4** for new training runs. Display state is now a
 continuously revisable answer draft: unresolved answer content is represented by the model MASK
 state, EOS may move across the fixed physical canvas, and semantic equilibrium does not terminate a
 trajectory until the materialized display is resolved and stable for a subsequent step. Generic
 process-status supervision such as `Reasoning.` or `Retrieving evidence.` is rejected. Consequently,
-v3 checkpoints are intentionally incompatible with v4, and the published v15 trajectories must be
-rebuilt from their semantic sources before they are used for a final v4 training run.
+v3 checkpoints are intentionally incompatible with v4. Dataset release **v16** performs that
+rematerialization, preserves answer-bearing intermediate drafts, replaces process-only narration with
+`<|cid_unknown|>`, and guarantees that every trajectory reaches the complete answer before a separate
+stable terminal step. It also adds a small high-weight hand-authored curriculum covering partial
+answers, multi-hop tool assimilation, streaming, refresh, correction, tool restraint, and Chinese
+interaction while retaining the broad v14/v15 semantic corpus.
 
 v14 introduced **51,500 independent train-only natural public tasks**: 30,000 Natural Questions Open
 queries, 15,000 MultiDoc2Dial document-grounded dialogue turns, 4,500 high-quality human OASST1

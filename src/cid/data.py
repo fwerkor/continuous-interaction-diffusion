@@ -1,6 +1,7 @@
 from __future__ import annotations
 
 import json
+import re
 from collections.abc import Iterable, Mapping
 from dataclasses import dataclass, field
 from pathlib import Path
@@ -33,8 +34,34 @@ LEGACY_DISPLAY_STATUS_TEXTS = frozenset(
 )
 
 
+_DISPLAY_PROCESS_STATUS_PATTERNS = tuple(
+    re.compile(pattern, re.IGNORECASE)
+    for pattern in (
+        r"^gathering (?:task-local )?evidence[.! ]*$",
+        r"^relevant documents? identified; reading supporting evidence[.! ]*$",
+        r"^integrated evidence from .+; continuing[.! ]*$",
+        r"^integrated the latest external result; continuing[.! ]*$",
+        r"^reading the requested documented value[.! ]*$",
+        r"^waiting for the requested value[.! ]*$",
+        r"^collecting the stream in order[.! ]*$",
+        r"^reading primary and secondary values under the source-priority rule[.! ]*$",
+        r"^observing the live counter[.! ]*$",
+        r"^retrieving the first source[.! ]*$",
+    )
+)
+
+
 def is_legacy_display_status(text: str) -> bool:
     return text.strip().casefold().rstrip(".!? ") in LEGACY_DISPLAY_STATUS_TEXTS
+
+
+def is_display_process_status(text: str) -> bool:
+    """Whether text only narrates internal/runtime progress instead of the current answer draft."""
+
+    if is_legacy_display_status(text):
+        return True
+    normalized = " ".join(text.strip().split())
+    return any(pattern.fullmatch(normalized) for pattern in _DISPLAY_PROCESS_STATUS_PATTERNS)
 
 
 @dataclass(frozen=True, slots=True)

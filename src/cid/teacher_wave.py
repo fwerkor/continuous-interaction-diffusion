@@ -10,7 +10,7 @@ from pathlib import Path
 from typing import Any
 
 from cid.contracts import FreshnessDemand
-from cid.data import DISPLAY_UNKNOWN_MARKER, is_legacy_display_status
+from cid.data import DISPLAY_UNKNOWN_MARKER, is_display_process_status
 from cid.distill import (
     TeacherCellPlan,
     TeacherFrame,
@@ -688,7 +688,7 @@ def validate_teacher_stage_tct_quality(
 
 
 def _validate_stage_display(stage: Mapping[str, Any], output: TeacherStageOutput) -> None:
-    if is_legacy_display_status(output.display):
+    if is_display_process_status(output.display):
         raise ValueError(
             "teacher stage display narrates process status instead of the current answer draft"
         )

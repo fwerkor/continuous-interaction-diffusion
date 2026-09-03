@@ -848,6 +848,62 @@ def _build_contract_v3_validation(args: argparse.Namespace) -> None:
     )
 
 
+def _migrate_dataset_contract_v4(args: argparse.Namespace) -> None:
+    from cid.dataset_contract_v4 import migrate_dataset_contract_v4
+
+    manifest = migrate_dataset_contract_v4(
+        args.data,
+        args.output,
+        args.manifest_output,
+        curated_path=args.curated_data,
+    )
+    print(
+        f"examples={manifest['examples']} base={manifest['base_examples']} "
+        f"curated={manifest['curated_examples']} rewrites={manifest['status_rewrites']} "
+        f"settle_steps={manifest['appended_settle_steps']} sha256={manifest['sha256']} "
+        f"path={args.output}"
+    )
+
+
+def _build_contract_v4_validation(args: argparse.Namespace) -> None:
+    from cid.validation_dataset_v4 import build_contract_v4_validation
+
+    manifest = build_contract_v4_validation(
+        args.reasoning_source,
+        args.output,
+        args.manifest_output,
+        total_examples=args.examples,
+        tool_examples=args.tool_examples,
+        curated_examples=args.curated_examples,
+        seed=args.seed,
+    )
+    print(
+        f"examples={manifest['examples']} tool_examples={manifest['tool_examples']} "
+        f"tool_fraction={manifest['tool_fraction']:.4f} sha256={manifest['sha256']} "
+        f"path={args.output}"
+    )
+
+
+def _build_curated_v4_training(args: argparse.Namespace) -> None:
+    from cid.curated_v4_training import CuratedV4Config, build_curated_v4_training
+
+    manifest = build_curated_v4_training(
+        args.output,
+        args.manifest_output,
+        CuratedV4Config(
+            count_per_family=args.count_per_family,
+            seed=args.seed,
+            thought_capacity=args.thought_capacity,
+            training_weight=args.training_weight,
+        ),
+    )
+    print(
+        f"examples={manifest['examples']} archetypes={manifest['hand_authored_archetypes']} "
+        f"training_weight={manifest['training_weight']} sha256={manifest['sha256']} "
+        f"path={args.output}"
+    )
+
+
 def _materialize_trajectory_mixture(args: argparse.Namespace) -> None:
     from cid.trajectory_mixture import materialize_trajectory_mixture
 
@@ -2985,6 +3041,40 @@ def main() -> None:
     validation_v3.add_argument("--examples", type=int, default=512)
     validation_v3.add_argument("--tool-examples", type=int, default=96)
     validation_v3.add_argument("--seed", type=int, default=20260829)
+    migrate_v4 = subparsers.add_parser(
+        "migrate-dataset-contract-v4",
+        help="rematerialize trajectories for continuous answer-draft Display supervision",
+    )
+    migrate_v4.add_argument("--data", required=True)
+    migrate_v4.add_argument("--output", required=True)
+    migrate_v4.add_argument("--manifest-output", required=True)
+    migrate_v4.add_argument("--curated-data")
+    validation_v4 = subparsers.add_parser(
+        "build-contract-v4-validation",
+        help="build v4 OOD reasoning and held-out tool validation with Display audits",
+    )
+    validation_v4.add_argument("--reasoning-source", required=True)
+    validation_v4.add_argument("--output", required=True)
+    validation_v4.add_argument("--manifest-output", required=True)
+    validation_v4.add_argument("--examples", type=int, default=512)
+    validation_v4.add_argument("--tool-examples", type=int, default=96)
+    validation_v4.add_argument("--curated-examples", type=int, default=48)
+    validation_v4.add_argument("--seed", type=int, default=20260903)
+    curated_v4 = subparsers.add_parser(
+        "build-curated-v4-training",
+        help="build the hand-authored v4 Display/TCT curriculum",
+    )
+    curated_v4.add_argument(
+        "--output", default="data/generated/curated-v4/curated-v4-trajectories.jsonl"
+    )
+    curated_v4.add_argument(
+        "--manifest-output",
+        default="data/generated/curated-v4/curated-v4-trajectories.manifest.json",
+    )
+    curated_v4.add_argument("--count-per-family", type=int, default=48)
+    curated_v4.add_argument("--seed", type=int, default=20260903)
+    curated_v4.add_argument("--thought-capacity", type=int, default=8)
+    curated_v4.add_argument("--training-weight", type=float, default=4.0)
     trajectory_mixture = subparsers.add_parser(
         "materialize-trajectory-mixture",
         help="verify and concatenate pinned CID trajectory components into one training JSONL",
@@ -3400,6 +3490,12 @@ def main() -> None:
         _migrate_dataset_contract_v3(args)
     elif args.command == "build-contract-v3-validation":
         _build_contract_v3_validation(args)
+    elif args.command == "migrate-dataset-contract-v4":
+        _migrate_dataset_contract_v4(args)
+    elif args.command == "build-contract-v4-validation":
+        _build_contract_v4_validation(args)
+    elif args.command == "build-curated-v4-training":
+        _build_curated_v4_training(args)
     elif args.command == "materialize-trajectory-mixture":
         _materialize_trajectory_mixture(args)
     elif args.command == "audit-training-data":

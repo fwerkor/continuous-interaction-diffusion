@@ -26,7 +26,7 @@ from cid.data import (
     ThoughtTarget,
     TrajectoryExample,
     TrajectoryExampleIndex,
-    is_legacy_display_status,
+    is_display_process_status,
     load_indexed_jsonl,
     training_transition_source_steps,
 )
@@ -3943,7 +3943,7 @@ class ILLaDATrajectoryTensorizer:
     def _display_text(self, example: TrajectoryExample, step: int) -> str:
         for target in example.display_targets:
             if target.step == step:
-                if target.text != example.target_display and is_legacy_display_status(target.text):
+                if target.text != example.target_display and is_display_process_status(target.text):
                     raise ValueError(
                         "neural contract v4 rejects process-status Display supervision; rebuild "
                         f"example {example.example_id!r} with answer-draft/unresolved Display "

@@ -423,15 +423,25 @@ Display supervision maps to the backbone MASK token and may remain unresolved un
 external observation supplies the missing content. The convergence head denotes semantic
 equilibrium; runtime terminal convergence additionally requires the materialized Display to contain
 no unresolved MASK positions and to remain unchanged for one step. Teacher review and the training
-tensorizer reject the legacy generic status targets used by older data (for example `Reasoning.` and
-`Retrieving evidence.`), and v3 checkpoints fail the v4 neural-contract compatibility check.
+tensorizer reject legacy generic status targets such as `Reasoning.` and `Retrieving evidence.`.
 
-The accompanying `evaluation/validation-v3/validation-512.jsonl` is intentionally mixed rather than
-no-tool-only: 416 examples are deterministically sampled from the disjoint compositional/OOD probe and
-96 are disjoint synthetic tool-required interactions. The 18.75% tool slice is large enough for
-per-epoch validation to exercise source selection, binding, observation assimilation, and v3
-multi-region routing while leaving OOD reasoning as the majority. This file is for training/runtime
-validation and does not replace the formal benchmark suite.
+**Dataset release v16** applies this contract to the v14/v15 semantic corpus. The rematerializer keeps
+answer-bearing intermediate content, maps process-only narration to unresolved Display state, carries
+the latest answer draft across logical steps without an explicit Display target, and adds exactly one
+stable terminal step when the complete answer first appears only at the old terminal frame. A separate
+hand-authored v4 curriculum supplies high-weight examples for single- and multi-hop tool use, parallel
+sources, streaming evidence, dynamic refresh, authoritative correction, no-tool reasoning, tool
+restraint, and Chinese interaction. The v4 validation split combines OOD reasoning, held-out synthetic
+tool interactions, and independent-seed curated contract probes so partial-answer revision is measured
+explicitly rather than inferred from final exact-match alone. v3 checkpoints fail the v4
+neural-contract compatibility check.
+
+The current `evaluation/validation-v4/validation-512.jsonl` contains **368** held-out OOD reasoning
+examples, **96** held-out synthetic tool-required interactions, and **48** independent-seed curated
+contract probes. The curated slice explicitly covers unresolved→partial→final Display revision,
+correction, streaming, refresh, tool restraint, and stable terminal state. All 512 examples pass the
+v4 Display-contract audit. `validation-v3` remains a historical v3-compatible validation artifact and
+is not the validation split for new v4 training runs.
 
 The four v14 natural sources contribute 51,500 new independent semantic tasks; together with the
 16,102 existing public-source tasks, the release contains **67,602 public-source semantic tasks**
