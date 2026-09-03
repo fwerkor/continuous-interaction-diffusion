@@ -32,6 +32,52 @@ _STREAM_PARTIAL = _re.compile(
 _PENDING = _re.compile(r"\bpending\b", _re.IGNORECASE)
 _ELLIPSIS_PLACEHOLDER = _re.compile(r"(?<!\.)\.\.\.(?!\.)")
 
+_SUPPORT_FACT_PREFIXES = (
+    "Available evidence: ",
+    "Current observation: ",
+    "Observed state: ",
+    "Evidence summary: ",
+    "Percept state: ",
+)
+
+
+def _user_visible_support_partial(
+    source: Mapping[str, Any],
+    *,
+    step: int,
+) -> str | None:
+    """Recover conservative multi-hop answer content already supported at ``step``."""
+
+    metadata = source.get("metadata", {})
+    if str(metadata.get("task_kind", "")) != "multi_hop_qa":
+        return None
+
+    facts: list[str] = []
+    for item in source.get("thought_targets", ()):
+        if int(item.get("step", -1)) != step:
+            continue
+        if not str(item.get("cell_id", "")).startswith("support-"):
+            continue
+        text = str(item.get("semantic_text", "")).strip()
+        for prefix in _SUPPORT_FACT_PREFIXES:
+            if text.startswith(prefix):
+                text = text[len(prefix) :].strip()
+                break
+        lowered = text.casefold()
+        if (
+            not text
+            or " — " not in text
+            or lowered.startswith(("need ", "pending ", "unresolved ", "required ", "open need"))
+        ):
+            continue
+        text = text.rstrip(". ")
+        if text and text not in facts:
+            facts.append(text)
+
+    if not facts:
+        return None
+    return f"Known: {'; '.join(facts[:3])}. Answer: {DISPLAY_UNKNOWN_MARKER}"
+
 
 def rematerialize_display_text_v4(text: str, *, final_answer: str) -> str:
     """Map one legacy display snapshot to the v4 answer-draft contract.
@@ -131,6 +177,7 @@ def rematerialize_trajectory_contract_v4(
     status_rewrites = 0
     placeholder_rewrites = 0
     preserved_partial = 0
+    derived_partial = 0
     for step in steps:
         original = explicit_display.get(step)
         if original is not None:
@@ -146,6 +193,19 @@ def rematerialize_trajectory_contract_v4(
                 and original.strip() != final_answer.strip()
             )
             current = rewritten
+
+        support_partial = (
+            None if step == steps[-1] else _user_visible_support_partial(source, step=step)
+        )
+        if support_partial is not None and (
+            current == DISPLAY_UNKNOWN_MARKER
+            or current.startswith("Known: ")
+            or (original is not None and is_display_process_status(original))
+        ):
+            if current != support_partial:
+                derived_partial += 1
+            current = support_partial
+
         if step == steps[-1]:
             current = final_answer
         display_targets.append({"step": step, "text": current})
@@ -168,7 +228,7 @@ def rematerialize_trajectory_contract_v4(
 
     metadata = dict(source.get("metadata", {}))
     metadata["neural_contract_version"] = 4
-    metadata["display_contract"] = "continuous-answer-draft-v1"
+    metadata["display_contract"] = "continuous-answer-draft-v2"
     source["metadata"] = metadata
     source["thought_targets"] = thought_targets
     source["display_targets"] = display_targets
@@ -178,6 +238,7 @@ def rematerialize_trajectory_contract_v4(
         "status_rewrites": status_rewrites,
         "placeholder_rewrites": placeholder_rewrites,
         "preserved_partial_targets": preserved_partial,
+        "derived_partial_targets": derived_partial,
         "appended_settle_steps": appended_settle_step,
     }
 
@@ -272,7 +333,7 @@ def migrate_dataset_contract_v4(
         raise ValueError(f"v4 dataset audit failed: {audit['violations']}")
     manifest = {
         "format_version": 1,
-        "name": "cid-dataset-v16",
+        "name": "cid-dataset-v17",
         "neural_contract_version": 4,
         "input": str(source),
         "input_sha256": input_digest.hexdigest(),
@@ -285,8 +346,9 @@ def migrate_dataset_contract_v4(
         "status_rewrites": counters["status_rewrites"],
         "placeholder_rewrites": counters["placeholder_rewrites"],
         "preserved_partial_targets": counters["preserved_partial_targets"],
+        "derived_partial_targets": counters["derived_partial_targets"],
         "appended_settle_steps": counters["appended_settle_steps"],
-        "display_contract": "continuous-answer-draft-v1",
+        "display_contract": "continuous-answer-draft-v2",
         "audit": audit,
     }
     manifest_path.write_text(

@@ -425,16 +425,15 @@ equilibrium; runtime terminal convergence additionally requires the materialized
 no unresolved MASK positions and to remain unchanged for one step. Teacher review and the training
 tensorizer reject legacy generic status targets such as `Reasoning.` and `Retrieving evidence.`.
 
-**Dataset release v16** applies this contract to the v14/v15 semantic corpus. The rematerializer keeps
-answer-bearing intermediate content, maps process-only narration to unresolved Display state, carries
-the latest answer draft across logical steps without an explicit Display target, and adds exactly one
-stable terminal step when the complete answer first appears only at the old terminal frame. A separate
-hand-authored v4 curriculum supplies high-weight examples for single- and multi-hop tool use, parallel
-sources, streaming evidence, dynamic refresh, authoritative correction, no-tool reasoning, tool
-restraint, and Chinese interaction. The v4 validation split combines OOD reasoning, held-out synthetic
-tool interactions, and independent-seed curated contract probes so partial-answer revision is measured
-explicitly rather than inferred from final exact-match alone. v3 checkpoints fail the v4
-neural-contract compatibility check.
+**Dataset release v16** introduced this contract over the v14/v15 semantic corpus and added the
+hand-authored high-weight v4 curriculum. **v17 is the current training release.** It preserves exactly
+the same semantic tasks, trajectories, and transition count, but tightens Display contract v2: 31,260
+previously under-detected process-status target occurrences are removed, while 40,158 grounded partial
+answer targets are derived only for multi-hop QA steps whose `support-*` facts are already present in
+the TCT. Internal dependency curricula are not exposed as user-visible partial answers. The v4
+validation split combines OOD reasoning, held-out synthetic tool interactions, and independent-seed
+curated contract probes so partial-answer revision is measured explicitly rather than inferred from
+final exact-match alone. v3 checkpoints fail the v4 neural-contract compatibility check.
 
 The current `evaluation/validation-v4/validation-512.jsonl` contains **368** held-out OOD reasoning
 examples, **96** held-out synthetic tool-required interactions, and **48** independent-seed curated

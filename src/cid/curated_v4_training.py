@@ -111,7 +111,7 @@ def _metadata(config: CuratedV4Config, family: str, index: int) -> dict[str, obj
         else ("no_tool" if family == "no_tool_reasoning" else "tools_available_unnecessary"),
         "curation": "hand-authored-v4-archetype",
         "neural_contract_version": 4,
-        "display_contract": "continuous-answer-draft-v1",
+        "display_contract": "continuous-answer-draft-v2",
     }
 
 

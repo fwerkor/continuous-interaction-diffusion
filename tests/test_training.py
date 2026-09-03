@@ -46,7 +46,8 @@ CIDTrainerState = cid_model.CIDTrainerState
 CIDRolloutState = cid_model.CIDRolloutState
 CIDRolloutBindingRoute = cid_model.CIDRolloutBindingRoute
 CIDRolloutWindow = cid_model.CIDRolloutWindow
-CIDRolloutRecoveryError = import_module("cid.model.training").CIDRolloutRecoveryError
+cid_training = import_module("cid.model.training")
+CIDRolloutRecoveryError = cid_training.CIDRolloutRecoveryError
 balance_rollout_windows_by_semantic_task = cid_model.balance_rollout_windows_by_semantic_task
 collate_training_steps = cid_model.collate_training_steps
 load_cid_adapter_checkpoint = cid_model.load_cid_adapter_checkpoint
@@ -1779,6 +1780,41 @@ def test_rollout_training_reports_interval_progress() -> None:
     assert trainer.state.rollout_windows_seen_in_epoch == 0
 
 
+def test_validation_behavior_distinguishes_raw_logits_from_materialized_display() -> None:
+    adapter = make_adapter(seed=800)
+    tensorizer = ILLaDATrajectoryTensorizer(adapter, TinyTokenizer())
+    sample = tensorizer.tensorize(make_trajectory(), source_step=0, timestep=1.0)
+    batch = collate_training_steps((sample,), pad_token_id=1)
+    output = adapter(batch.batch)
+    output.display_logits.fill_(-20.0)
+    display_mask = batch.targets.display_ids != -100
+    for position in display_mask[0].nonzero(as_tuple=False).flatten().tolist():
+        target_id = int(batch.targets.display_ids[0, position])
+        output.display_logits[0, position, target_id] = 20.0
+
+    materialized_targets = torch.full_like(batch.targets.display_ids, -100)
+    target_text_ids = tensorizer._encode_display_text(
+        tensorizer._display_text(make_trajectory(), sample.target_step)
+    )
+    target_length = target_text_ids.shape[1]
+    materialized_targets[:, :target_length] = target_text_ids
+    materialized_targets[:, target_length] = tensorizer.eos_token_id
+    counts = cid_training._cid_behavior_counts(
+        output,
+        batch.targets,
+        need_threshold=0.6,
+        materialized_display_ids=batch.batch.display_ids,
+        materialized_display_targets=materialized_targets,
+    )
+
+    assert counts["display_token_correct"] == counts["display_token_total"]
+    assert counts["materialized_display_token_correct"] < counts[
+        "materialized_display_token_total"
+    ]
+    assert counts["materialized_display_exact"] == 0.0
+    assert counts["materialized_display_total"] == 1.0
+
+
 def test_validation_loss_is_deterministic_and_preserves_training_state() -> None:
     adapter = make_adapter(seed=801)
     trainer = CIDTrainer(
@@ -2105,7 +2141,7 @@ def test_padding_only_shard_returns_zero_train_and_validation_reports() -> None:
     assert validation_report.mean_loss == 0.0
     assert validation_report.raw_mean_loss == 0.0
     assert len(validation_report.component_mean_losses) == 24
-    assert len(validation_report.behavior_counts) == 14
+    assert len(validation_report.behavior_counts) == 18
     assert validation_report.behavior_counts["rollout_transition_total"] == 0.0
     assert validation_report.behavior_counts["rollout_recovery_failures"] == 0.0
     assert all(value == 0.0 for value in validation_report.component_mean_losses.values())
@@ -4118,6 +4154,72 @@ def test_revision_target_tracks_logical_state_change_not_sampled_diffusion_noise
 
     assert sample.targets.noise_delta[0, 0, 0] == pytest.approx(0.2)
     assert sample.targets.revision_targets[0, 0] == int(cid_model.RevisionAction.STABILIZE)
+
+
+def test_self_rollout_requires_stable_nonempty_eos_display_for_convergence() -> None:
+    adapter = make_adapter(seed=150)
+    tensorizer = ILLaDATrajectoryTensorizer(adapter, TinyTokenizer())
+    trainer = CIDTrainer(
+        adapter,
+        tensorizer,
+        CIDTrainerConfig(timestep_min=0.0, timestep_max=0.0),
+    )
+    example = make_rollout_trajectory()
+    sample = tensorizer.tensorize(example, source_step=1, timestep=0.0)
+    training_batch = collate_training_steps((sample,), pad_token_id=1)
+    output = adapter(training_batch.batch)
+    output.convergence_logits.fill_(20.0)
+    output.allocation_logits.fill_(-20.0)
+    output.need_logits.fill_(-20.0)
+
+    current = training_batch.batch.display_ids[0, : sample.batch.display_ids.shape[1]]
+    logits = torch.full_like(output.display_logits, -20.0)
+    logits.scatter_(-1, training_batch.batch.display_ids.unsqueeze(-1), 20.0)
+    replacement = 6 if int(current[0]) != 6 else 7
+    assert replacement not in {adapter.mask_token_id, adapter.eos_token_id}
+    logits[0, 0, int(current[0])] = -20.0
+    logits[0, 0, replacement] = 20.0
+    output.display_logits = logits
+
+    changed = trainer._rollout_state_from_prediction(
+        sample,
+        training_batch,
+        output,
+        example=example,
+        batch_index=0,
+    )
+    assert not changed.converged
+    assert not changed.terminal
+
+    stable_logits = torch.full_like(output.display_logits, -20.0)
+    stable_logits.scatter_(-1, training_batch.batch.display_ids.unsqueeze(-1), 20.0)
+    output.display_logits = stable_logits
+    stable = trainer._rollout_state_from_prediction(
+        sample,
+        training_batch,
+        output,
+        example=example,
+        batch_index=0,
+    )
+    assert stable.converged
+
+    empty_ids = training_batch.batch.display_ids.clone()
+    empty_ids[:, 0] = adapter.eos_token_id
+    empty_ids[:, 1:] = adapter.mask_token_id
+    empty_batch = replace(training_batch.batch, display_ids=empty_ids)
+    empty_training_batch = replace(training_batch, batch=empty_batch)
+    empty_logits = torch.full_like(output.display_logits, -20.0)
+    empty_logits.scatter_(-1, empty_ids.unsqueeze(-1), 20.0)
+    output.display_logits = empty_logits
+    empty = trainer._rollout_state_from_prediction(
+        sample,
+        empty_training_batch,
+        output,
+        example=example,
+        batch_index=0,
+    )
+    assert not empty.converged
+    assert not empty.terminal
 
 
 def test_self_rollout_applies_runtime_stable_reopen_gate() -> None:

@@ -207,8 +207,8 @@ cid prepare-public-distillation
 
 Released CID datasets are published on Hugging Face at `fwerkor/CID-Dataset`; the GitHub
 repository intentionally does not track release data or release manifests. The local `data/` tree is
-a gitignored build/training workspace. **v12, v13, v14, v15, and v16 are preserved as complete releases**
-so training artifacts do not skip a version.
+a gitignored build/training workspace. **v12 through v17 are preserved as complete releases** so
+training artifacts do not skip a version.
 
 - **v12:** 132,122 semantic tasks, 305,948 trajectories, 2,303,169 training transitions;
   materialized SHA-256 `2f2da01e3963b4ac758e023dcb8659afc2d81999c88fd9df361ec058112f3478`.
@@ -220,23 +220,27 @@ so training artifacts do not skip a version.
   and transition count while rematerializing them for neural contract v3. Every binding has an
   explicit stable owner; affected-cell supervision is derived conservatively from matching
   observations, and protected-result promotion is explicit source-owned metadata.
-- **v16 (current neural-contract-v4 release):** 192,729 semantic tasks, 422,230 trajectories,
-  2,724,556 adjacent transitions, and 3,146,786 total training transitions. It adds 432
-  hand-authored/high-control curriculum trajectories, rematerializes process-only Display targets as
-  unresolved state, and adds 133,308 stable-tail transitions. Canonical SHA-256:
+- **v16:** 192,729 semantic tasks, 422,230 trajectories, 2,724,556 adjacent transitions, and
+  3,146,786 total training transitions. It introduced the neural-contract-v4 materialization, 432
+  high-control curriculum trajectories, and stable terminal tails. Canonical SHA-256:
   `76980590fb21d75d3dfe466e8b39716362bc249bad73416bcb690f7a59155e6b`.
+- **v17 (current):** keeps exactly the same 192,729 semantic tasks, 422,230 trajectories, and
+  3,146,786 training transitions while tightening Display contract v2. It removes 31,260 previously
+  under-detected process-status target occurrences and derives 40,158 grounded partial-answer targets
+  only from already-supported multi-hop QA facts. Canonical SHA-256:
+  `07662203cc23f5ee628623090ad029740e51b3d6efb13466a6dcad23a2a3b143`.
 
 The current source tree defines **neural contract v4** for new training runs. Display state is now a
 continuously revisable answer draft: unresolved answer content is represented by the model MASK
 state, EOS may move across the fixed physical canvas, and semantic equilibrium does not terminate a
 trajectory until the materialized display is resolved and stable for a subsequent step. Generic
 process-status supervision such as `Reasoning.` or `Retrieving evidence.` is rejected. Consequently,
-v3 checkpoints are intentionally incompatible with v4. Dataset release **v16** performs that
-rematerialization, preserves answer-bearing intermediate drafts, replaces process-only narration with
-`<|cid_unknown|>`, and guarantees that every trajectory reaches the complete answer before a separate
-stable terminal step. It also adds a small high-weight hand-authored curriculum covering partial
-answers, multi-hop tool assimilation, streaming, refresh, correction, tool restraint, and Chinese
-interaction while retaining the broad v14/v15 semantic corpus.
+v3 checkpoints are intentionally incompatible with v4. Dataset release **v16** introduced that
+rematerialization and the high-weight v4 curriculum. **v17** tightens the same semantic corpus without
+adding or dropping tasks: residual process narration missed by the original detector is replaced by
+`<|cid_unknown|>`, and multi-hop QA states expose a conservative `Known: ... Answer:
+<|cid_unknown|>` draft only when the corresponding `support-*` facts are already present in that
+step's TCT. Internal dependency curricula do not receive this derived user-visible partial.
 
 v14 introduced **51,500 independent train-only natural public tasks**: 30,000 Natural Questions Open
 queries, 15,000 MultiDoc2Dial document-grounded dialogue turns, 4,500 high-quality human OASST1
@@ -258,9 +262,9 @@ example:
 hf download fwerkor/CID-Dataset \
   release/training-trajectories.jsonl \
   release/materialized-manifest.json \
-  evaluation/validation-v3/validation-512.jsonl \
-  evaluation/validation-v3/validation-512.manifest.json \
-  --repo-type dataset --local-dir .cid/hf-v15
+  evaluation/validation-v4/validation-512.jsonl \
+  evaluation/validation-v4/validation-512.manifest.json \
+  --repo-type dataset --local-dir .cid/hf-v17
 ```
 
 v15 is reproducible from the verified v14 materialization with `cid migrate-dataset-contract-v3`.

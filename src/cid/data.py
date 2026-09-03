@@ -40,6 +40,7 @@ _DISPLAY_PROCESS_STATUS_PATTERNS = tuple(
         r"^gathering (?:task-local )?evidence[.! ]*$",
         r"^relevant documents? identified; reading supporting evidence[.! ]*$",
         r"^integrated evidence from .+; continuing[.! ]*$",
+        r"^evidence from .+ incorporated; continuing with remaining evidence[.! ]*$",
         r"^integrated the latest external result; continuing[.! ]*$",
         r"^reading the requested documented value[.! ]*$",
         r"^waiting for the requested value[.! ]*$",

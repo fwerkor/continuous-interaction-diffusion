@@ -67,7 +67,7 @@ def test_materializer_creates_cells_arguments_anchors_links_and_revisions() -> N
     context = ModelContext(
         facts=FactStore().snapshot(),
         thought=field,
-        display=DisplayCanvas.masked(length=3, mask_token_id=5),
+        display=DisplayCanvas.masked(length=3, mask_token_id=5, eos_token_id=2),
         sources=(
             SourceDescriptor(
                 name="lookup",
@@ -130,7 +130,7 @@ def test_materializer_creates_cells_arguments_anchors_links_and_revisions() -> N
         output,
         context,
         catalog=catalog,
-        display_token_ids=(7, 8, 9),
+        display_token_ids=(7, 8, 2),
     )
 
     assert update.thought.step == 1
@@ -149,7 +149,7 @@ def test_materializer_creates_cells_arguments_anchors_links_and_revisions() -> N
     assert update.needs[0].selected_source() == "lookup"
     assert update.needs[0].target_cells == (ObjectRef.cell(first),)
     assert update.reopen_cells == (ObjectRef.cell(first),)
-    assert update.display.token_ids == (7, 8, 9)
+    assert update.display.token_ids == (7, 8, 2)
     assert update.equilibrium
     assert not update.converged
 
@@ -157,9 +157,77 @@ def test_materializer_creates_cells_arguments_anchors_links_and_revisions() -> N
         output,
         replace(context, display=update.display),
         catalog=catalog,
-        display_token_ids=(7, 8, 9),
+        display_token_ids=(7, 8, 2),
     )
     assert settled.converged
+
+
+def test_materializer_requires_nonempty_eos_terminated_display_for_v4_convergence() -> None:
+    field = CognitiveField.empty(capacity=3, width=4)
+    source = (SourceDescriptor(name="unused", description="unused"),)
+    output = make_output()
+    output.allocation_logits.fill_(-10.0)
+    output.need_logits.fill_(-10.0)
+    materializer = CIDMaterializer()
+
+    empty = DisplayCanvas(
+        token_ids=(2, 5, 5),
+        mask_token_id=5,
+        eos_token_id=2,
+    )
+    empty_update = materializer.materialize(
+        output,
+        ModelContext(
+            facts=FactStore().snapshot(),
+            thought=field,
+            display=empty,
+            sources=source,
+            percepts=(),
+            step=0,
+        ),
+        display_token_ids=empty.token_ids,
+    )
+    assert empty_update.display.unresolved == 0
+    assert not empty_update.converged
+
+    unterminated = DisplayCanvas(
+        token_ids=(7, 8, 9),
+        mask_token_id=5,
+        eos_token_id=2,
+    )
+    unterminated_update = materializer.materialize(
+        output,
+        ModelContext(
+            facts=FactStore().snapshot(),
+            thought=field,
+            display=unterminated,
+            sources=source,
+            percepts=(),
+            step=0,
+        ),
+        display_token_ids=unterminated.token_ids,
+    )
+    assert unterminated_update.display.unresolved == 0
+    assert not unterminated_update.converged
+
+    complete = DisplayCanvas(
+        token_ids=(7, 2, 5),
+        mask_token_id=5,
+        eos_token_id=2,
+    )
+    complete_update = materializer.materialize(
+        output,
+        ModelContext(
+            facts=FactStore().snapshot(),
+            thought=field,
+            display=complete,
+            sources=source,
+            percepts=(),
+            step=0,
+        ),
+        display_token_ids=complete.token_ids,
+    )
+    assert complete_update.converged
 
 
 def test_materializer_never_resolves_cell_link_from_closed_world_catalog() -> None:

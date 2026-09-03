@@ -1,6 +1,7 @@
 from __future__ import annotations
 
 from importlib import import_module
+from inspect import signature
 from types import SimpleNamespace
 
 import pytest
@@ -174,6 +175,15 @@ def test_recommended_runtime_defaults_are_shared_across_configs() -> None:
     assert materializer.max_allocations_per_step == DEFAULT_MAX_ALLOCATIONS_PER_STEP
     assert policy.display_revision_fraction == DEFAULT_DISPLAY_REVISION_FRACTION
     assert policy.display_revision_margin == DEFAULT_DISPLAY_REVISION_MARGIN
+    benchmark_signature = signature(run_neural_benchmark_case)
+    assert (
+        benchmark_signature.parameters["display_revision_fraction"].default
+        == DEFAULT_DISPLAY_REVISION_FRACTION
+    )
+    assert (
+        benchmark_signature.parameters["display_revision_margin"].default
+        == DEFAULT_DISPLAY_REVISION_MARGIN
+    )
     assert runtime.binding_threshold == DEFAULT_BINDING_THRESHOLD
 
 

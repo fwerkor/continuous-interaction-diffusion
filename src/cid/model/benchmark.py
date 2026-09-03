@@ -6,6 +6,7 @@ from typing import Any
 import torch
 
 from cid.data import TrajectoryExample
+from cid.defaults import DEFAULT_DISPLAY_REVISION_FRACTION, DEFAULT_DISPLAY_REVISION_MARGIN
 from cid.evaluation import ReplayEvaluationResult, RuntimeTaskEvaluation, run_replay_case
 from cid.grounding import ObjectKind, ObjectRef
 from cid.model.encoding import ILLaDATextEncoder, stable_text
@@ -56,8 +57,8 @@ async def run_neural_benchmark_case(
     forward_model: torch.nn.Module | None = None,
     seed_teacher_state: bool = False,
     denoising_steps: int = 8,
-    display_revision_fraction: float = 0.125,
-    display_revision_margin: float = 0.15,
+    display_revision_fraction: float = DEFAULT_DISPLAY_REVISION_FRACTION,
+    display_revision_margin: float = DEFAULT_DISPLAY_REVISION_MARGIN,
     materializer_config: CIDMaterializerConfig | None = None,
     runtime_config: RuntimeConfig | None = None,
     max_steps: int | None = None,

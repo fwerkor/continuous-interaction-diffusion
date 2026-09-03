@@ -450,6 +450,10 @@ CID_BEHAVIOR_COUNT_NAMES = (
     "lifecycle_total",
     "display_token_correct",
     "display_token_total",
+    "materialized_display_token_correct",
+    "materialized_display_token_total",
+    "materialized_display_exact",
+    "materialized_display_total",
     "rollout_transition_total",
     "rollout_recovery_failures",
 )
@@ -498,6 +502,8 @@ def _cid_behavior_counts(
     *,
     need_threshold: float,
     batch_mask: Tensor | None = None,
+    materialized_display_ids: Tensor | None = None,
+    materialized_display_targets: Tensor | None = None,
 ) -> dict[str, Tensor]:
     zero = output.need_logits.new_zeros((), dtype=torch.float32)
     if batch_mask is None:
@@ -548,6 +554,38 @@ def _cid_behavior_counts(
         ((display_prediction == targets.display_ids) & display_mask).sum().float()
     )
     counts["display_token_total"] = display_mask.sum().float()
+
+    materialized_correct = zero
+    materialized_total = zero
+    materialized_exact = zero
+    materialized_rows = zero
+    if materialized_display_ids is not None:
+        if materialized_display_targets is None:
+            raise ValueError("materialized display targets are required with materialized IDs")
+        if (
+            materialized_display_ids.shape != targets.display_ids.shape
+            or materialized_display_targets.shape != targets.display_ids.shape
+        ):
+            raise ValueError("materialized display tensors must match display target shape")
+        materialized_mask = (materialized_display_targets != -100) & row[:, None]
+        materialized_correct = (
+            (materialized_display_ids == materialized_display_targets) & materialized_mask
+        ).sum().float()
+        materialized_total = materialized_mask.sum().float()
+        rows_with_display = materialized_mask.any(dim=1) & row
+        exact_rows = (
+            (
+                (materialized_display_ids == materialized_display_targets)
+                | ~materialized_mask
+            ).all(dim=1)
+            & rows_with_display
+        )
+        materialized_exact = exact_rows.sum().float()
+        materialized_rows = rows_with_display.sum().float()
+    counts["materialized_display_token_correct"] = materialized_correct
+    counts["materialized_display_token_total"] = materialized_total
+    counts["materialized_display_exact"] = materialized_exact
+    counts["materialized_display_total"] = materialized_rows
     return counts
 
 
@@ -978,8 +1016,11 @@ class CIDTrainer:
         )[0]
 
         display_length = sample.batch.display_ids.shape[1]
+        previous_display_ids = input_batch.display_ids[
+            batch_index : batch_index + 1, :display_length
+        ]
         display_ids = self.tensorizer.scheduler.refine_display(
-            input_batch.display_ids[batch_index : batch_index + 1, :display_length],
+            previous_display_ids,
             output.display_logits[batch_index : batch_index + 1, :display_length],
             reveal_fraction=denoising_reveal_fraction(
                 sample.diffusion_step, self.config.rollout_denoising_steps
@@ -1105,7 +1146,16 @@ class CIDTrainer:
         display_unresolved = bool(
             (display_ids[0, :display_active_length] == self.adapter.mask_token_id).any()
         )
-        converged = equilibrium and not display_unresolved
+        display_stable = torch.equal(display_ids, previous_display_ids)
+        display_has_boundary = bool(eos_positions.numel())
+        display_nonempty = display_has_boundary and int(eos_positions[0]) > 0
+        converged = (
+            equilibrium
+            and not display_unresolved
+            and display_stable
+            and display_has_boundary
+            and display_nonempty
+        )
         unresolved_binding = any(
             route.runtime_active and route.need_id not in observed_binding_ids
             for route in binding_routes
@@ -1445,6 +1495,53 @@ class CIDTrainer:
                             _cid_loss_component_values(losses),
                             scale=batch_size,
                         )
+                        materialized_display_ids = training_batch.batch.display_ids.clone()
+                        materialized_display_targets = torch.full_like(
+                            training_batch.targets.display_ids,
+                            -100,
+                        )
+                        for row_index, sample in enumerate(samples_tuple):
+                            if not execute_rows[row_index]:
+                                continue
+                            display_length = sample.batch.display_ids.shape[1]
+                            materialized_display_ids[
+                                row_index : row_index + 1, :display_length
+                            ] = self.tensorizer.scheduler.refine_display(
+                                training_batch.batch.display_ids[
+                                    row_index : row_index + 1, :display_length
+                                ],
+                                output.display_logits[
+                                    row_index : row_index + 1, :display_length
+                                ],
+                                reveal_fraction=denoising_reveal_fraction(
+                                    sample.diffusion_step,
+                                    self.config.rollout_denoising_steps,
+                                ),
+                                revision_fraction=self.config.rollout_display_revision_fraction,
+                                revision_margin=self.config.rollout_display_revision_margin,
+                            )
+                            example = microbatch[row_index].example
+                            if not isinstance(example, TrajectoryExample):
+                                raise TypeError(
+                                    "validation rollout windows must materialize "
+                                    "trajectory examples"
+                                )
+                            target_text = self.tensorizer._display_text(
+                                example,
+                                sample.target_step,
+                            )
+                            target_text_ids = self.tensorizer._encode_display_text(target_text)
+                            target_length = target_text_ids.shape[1]
+                            if target_length >= display_length:
+                                raise ValueError(
+                                    "validation target display exceeds its physical canvas"
+                                )
+                            materialized_display_targets[
+                                row_index : row_index + 1, :target_length
+                            ] = target_text_ids
+                            materialized_display_targets[
+                                row_index, target_length
+                            ] = self.tensorizer.eos_token_id
                         _accumulate_metric_tensors(
                             behavior_counts,
                             _cid_behavior_counts(
@@ -1452,6 +1549,8 @@ class CIDTrainer:
                                 training_batch.targets,
                                 need_threshold=need_threshold,
                                 batch_mask=batch_mask,
+                                materialized_display_ids=materialized_display_ids,
+                                materialized_display_targets=materialized_display_targets,
                             ),
                         )
                         if offset + 1 < rollout_length and rollout_probability > 0.0:

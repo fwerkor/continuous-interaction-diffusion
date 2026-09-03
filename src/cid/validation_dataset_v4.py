@@ -131,7 +131,7 @@ def build_contract_v4_validation(
             "and independent-seed curated contract probes"
         ),
         "curated_generation_seed": seed ^ 0xC1D4,
-        "display_contract": "continuous-answer-draft-v1",
+        "display_contract": "continuous-answer-draft-v2",
         "audit": audit,
     }
     manifest_path.write_text(

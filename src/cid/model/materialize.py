@@ -207,6 +207,10 @@ class CIDMaterializer:
         )
         convergence = float(torch.sigmoid(output.convergence_logits[batch_index]).detach())
         display_stable = display.token_ids == context.display.token_ids
+        display_has_boundary = (
+            display.eos_token_id is None or display.eos_token_id in display.token_ids
+        )
+        display_nonempty = display.realized_length > 0
 
         return ModelUpdate(
             thought=thought,
@@ -217,6 +221,8 @@ class CIDMaterializer:
             converged=(
                 display.unresolved == 0
                 and display_stable
+                and display_has_boundary
+                and display_nonempty
                 and convergence >= self.config.convergence_threshold
             ),
         )

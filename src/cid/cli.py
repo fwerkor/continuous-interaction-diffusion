@@ -1447,6 +1447,14 @@ def _aggregate_validation_report(
             behavior_counts.get("display_token_correct", 0.0),
             behavior_counts.get("display_token_total", 0.0),
         ),
+        "materialized_display_token_accuracy": safe_ratio(
+            behavior_counts.get("materialized_display_token_correct", 0.0),
+            behavior_counts.get("materialized_display_token_total", 0.0),
+        ),
+        "materialized_display_exact_rate": safe_ratio(
+            behavior_counts.get("materialized_display_exact", 0.0),
+            behavior_counts.get("materialized_display_total", 0.0),
+        ),
         "rollout_recovery_failure_rate": safe_ratio(
             behavior_counts.get("rollout_recovery_failures", 0.0),
             behavior_counts.get("rollout_transition_total", 0.0),
