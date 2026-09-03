@@ -10,6 +10,32 @@ from cid.contracts import FreshnessDemand
 from cid.grounding import Anchor, CognitiveLink, GroundingEntry, ObjectKind, ObjectRef
 from cid.state import CellLifecycle, CognitiveRole
 
+DISPLAY_UNKNOWN_MARKER = "<|cid_unknown|>"
+LEGACY_DISPLAY_STATUS_TEXTS = frozenset(
+    {
+        "reasoning",
+        "planning",
+        "pending",
+        "conflict",
+        "preparing response",
+        "planning retrieval",
+        "retrieving evidence",
+        "gathering evidence",
+        "planning tool use",
+        "gathering required evidence",
+        "computing with the required external tool",
+        "evidence integrated",
+        "planning dependent tool reads",
+        "resolving available root evidence",
+        "bridge evidence resolved",
+        "cross-language evidence integrated",
+    }
+)
+
+
+def is_legacy_display_status(text: str) -> bool:
+    return text.strip().casefold().rstrip(".!? ") in LEGACY_DISPLAY_STATUS_TEXTS
+
 
 @dataclass(frozen=True, slots=True)
 class ExternalEvent:

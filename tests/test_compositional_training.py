@@ -11,7 +11,7 @@ from cid.compositional_training import (
     CompositionalTrainingConfig,
     build_compositional_training_streaming,
 )
-from cid.data import load_jsonl
+from cid.data import DISPLAY_UNKNOWN_MARKER, is_legacy_display_status, load_jsonl
 from cid.distill import load_teacher_tasks
 
 
@@ -77,3 +77,13 @@ def test_compositional_trajectories_stay_within_declared_capacity_bucket(tmp_pat
         capacity = int(task.metadata["thought_capacity_bucket"])
         assert all(target.slot < capacity for target in trajectory.thought_targets)
         assert int(trajectory.metadata["thought_capacity_bucket"]) == capacity
+
+
+def test_compositional_display_is_unresolved_then_settles_on_real_answer(tmp_path) -> None:
+    _, _, _, train_trajectories, _ = _build(tmp_path)
+
+    for trajectory in train_trajectories:
+        displays = [target.text for target in trajectory.display_targets]
+        assert DISPLAY_UNKNOWN_MARKER in displays
+        assert not any(is_legacy_display_status(text) for text in displays)
+        assert displays[-2:] == [trajectory.target_display, trajectory.target_display]

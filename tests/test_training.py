@@ -14,6 +14,7 @@ import pytest
 
 from cid.contracts import FreshnessDemand
 from cid.data import (
+    DISPLAY_UNKNOWN_MARKER,
     BindingTarget,
     DisplayTarget,
     ExternalEvent,
@@ -1684,7 +1685,7 @@ def test_stage_a_checkpoint_rejects_previous_neural_contract(tmp_path) -> None:
     trainer.save_checkpoint(path)
     payload = torch.load(path, map_location="cpu", weights_only=False)
 
-    payload["neural_contract_version"] = 2
+    payload["neural_contract_version"] = 3
     incompatible = tmp_path / "old-contract.pt"
     torch.save(payload, incompatible)
 
@@ -2180,7 +2181,7 @@ def test_stage_b_fsdp_runs_full_parameter_optimizer_step_on_cpu(tmp_path) -> Non
         )
         metadata = json.loads((checkpoint / "metadata.json").read_text(encoding="utf-8"))
         assert metadata["format_version"] == 6
-        assert metadata["neural_contract_version"] == 3
+        assert metadata["neural_contract_version"] == 4
         assert metadata["semantic_embedding_snapshot"]["file"] == "semantic-embedding.pt"
 
         restored_adapter = make_adapter(seed=91)
@@ -4152,7 +4153,7 @@ def test_self_rollout_applies_runtime_stable_reopen_gate() -> None:
     assert int(reopened.lifecycle_features[0, 0].argmax()) == active_index
 
 
-def test_training_display_masks_physical_tail_after_visible_eos() -> None:
+def test_training_display_keeps_physical_tail_available_after_visible_eos() -> None:
     adapter = make_adapter(seed=147)
     tensorizer = ILLaDATrajectoryTensorizer(adapter, TinyTokenizer())
 
@@ -4163,12 +4164,47 @@ def test_training_display_masks_physical_tail_after_visible_eos() -> None:
     ).flatten()
     assert eos_positions.numel() == 1
     eos = int(eos_positions[0])
-    assert not sample.batch.display_padding_mask[0, : eos + 1].any()
-    assert sample.batch.display_padding_mask[0, eos + 1 :].all()
-    assert sample.batch.display_noise[0, eos + 1 :].eq(0).all()
+    assert not sample.batch.display_padding_mask[0].any()
+    assert sample.batch.display_ids.shape[1] > eos + 1
 
     collated = collate_training_steps((sample,), pad_token_id=1)
     assert torch.equal(collated.batch.display_padding_mask[0], sample.batch.display_padding_mask[0])
+
+
+def test_training_display_unknown_marker_maps_to_model_mask_token() -> None:
+    adapter = make_adapter(seed=148)
+    tensorizer = ILLaDATrajectoryTensorizer(adapter, TinyTokenizer())
+    example = replace(
+        make_trajectory(),
+        display_targets=(DisplayTarget(step=1, text=DISPLAY_UNKNOWN_MARKER),),
+    )
+
+    sample = tensorizer.tensorize(example, source_step=0, timestep=0.0)
+
+    assert sample.batch.display_ids[0, 0] == adapter.mask_token_id
+    assert sample.batch.display_ids[0, 1] == tensorizer.eos_token_id
+    assert not sample.batch.display_padding_mask.any()
+
+
+def test_training_rejects_legacy_process_status_display_targets() -> None:
+    adapter = make_adapter(seed=149)
+    tensorizer = ILLaDATrajectoryTensorizer(adapter, TinyTokenizer())
+    base = make_trajectory()
+    step_one = tuple(target for target in base.thought_targets if target.step == 1)
+    example = replace(
+        base,
+        thought_targets=(
+            *base.thought_targets,
+            *(replace(target, step=2) for target in step_one),
+        ),
+        display_targets=(
+            DisplayTarget(step=1, text="Reasoning."),
+            DisplayTarget(step=2, text=base.target_display),
+        ),
+    )
+
+    with pytest.raises(ValueError, match="process-status Display supervision"):
+        tensorizer.tensorize(example, source_step=0, timestep=0.0)
 
 
 def test_binding_lifecycle_cells_marks_once_observation_targets_available() -> None:

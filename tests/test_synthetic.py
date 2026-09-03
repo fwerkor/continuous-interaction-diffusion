@@ -1,4 +1,4 @@
-from cid.data import dump_jsonl, load_jsonl
+from cid.data import DISPLAY_UNKNOWN_MARKER, dump_jsonl, is_legacy_display_status, load_jsonl
 from cid.synthetic import SyntheticConfig, SyntheticFamily, generate_synthetic
 
 
@@ -55,6 +55,33 @@ def test_synthetic_seed_changes_physical_slot_placement() -> None:
         }
 
     assert placements(left) != placements(right)
+
+
+def test_synthetic_display_uses_unresolved_slots_and_real_partial_answers() -> None:
+    examples = generate_synthetic(
+        SyntheticConfig(count_per_family=2, seed=31, thought_capacity=8)
+    )
+
+    for example in examples:
+        displays = [target.text for target in example.display_targets]
+        assert DISPLAY_UNKNOWN_MARKER in displays
+        assert not any(is_legacy_display_status(text) for text in displays)
+
+    streaming = next(
+        example
+        for example in examples
+        if example.metadata["family"] == SyntheticFamily.STREAMING_EVIDENCE.value
+    )
+    partial = streaming.display_targets[-2].text
+    first_observation = str(streaming.events[0].value)
+    assert partial == f"{first_observation} {DISPLAY_UNKNOWN_MARKER}"
+
+    competing = next(
+        example
+        for example in examples
+        if example.metadata["family"] == SyntheticFamily.COMPETING_SOURCES.value
+    )
+    assert competing.display_targets[-2].text == competing.target_display
 
 
 def test_large_synthetic_build_keeps_semantic_instances_unique() -> None:

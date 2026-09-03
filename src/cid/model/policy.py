@@ -127,10 +127,9 @@ class ILLaDAContextTensorizer:
         display_noise = torch.full(
             (*display_ids.shape, 1), display_noise_level, device=device, dtype=dtype
         )
+        # The physical tail after EOS stays latent so later diffusion steps can move EOS and
+        # expand the visible answer without changing the display canvas capacity.
         display_padding_mask = torch.zeros_like(display_ids, dtype=torch.bool)
-        if context.display.active_span_length < len(context.display.token_ids):
-            display_padding_mask[:, context.display.active_span_length :] = True
-            display_noise[:, context.display.active_span_length :] = 0.0
         prompt_ids = self.text_encoder.tokenize(context.prompt, add_special_tokens=True)
 
         fact_memory = self.text_encoder.encode_texts(

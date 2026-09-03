@@ -206,6 +206,7 @@ class CIDMaterializer:
             batch_index=batch_index,
         )
         convergence = float(torch.sigmoid(output.convergence_logits[batch_index]).detach())
+        display_stable = display.token_ids == context.display.token_ids
 
         return ModelUpdate(
             thought=thought,
@@ -214,7 +215,9 @@ class CIDMaterializer:
             reopen_cells=reopen_cells,
             equilibrium=convergence >= self.config.convergence_threshold,
             converged=(
-                display.unresolved == 0 and convergence >= self.config.convergence_threshold
+                display.unresolved == 0
+                and display_stable
+                and convergence >= self.config.convergence_threshold
             ),
         )
 

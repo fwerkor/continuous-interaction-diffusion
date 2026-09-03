@@ -1,3 +1,4 @@
+from cid.data import DISPLAY_UNKNOWN_MARKER
 from cid.distill import TeacherScheduleConfig, compile_teacher_plans, review_teacher_plans
 from cid.natural_public_training import _plan_for_task, _record_to_task
 
@@ -24,6 +25,11 @@ def test_natural_public_tool_task_builds_grounded_causal_plan() -> None:
 
     task = _record_to_task(record, source)
     plan = _plan_for_task(task, record)
+    assert [frame.display for frame in plan.frames[:2]] == [
+        DISPLAY_UNKNOWN_MARKER,
+        DISPLAY_UNKNOWN_MARKER,
+    ]
+    assert plan.frames[-2].display == record["answer"]
     (review,) = review_teacher_plans((task,), (plan,))
     assert review.accepted
 
@@ -58,6 +64,7 @@ def test_natural_public_no_tool_task_preserves_human_target() -> None:
     plan = _plan_for_task(task, record)
     (review,) = review_teacher_plans((task,), (plan,))
     assert review.accepted
+    assert plan.frames[0].display == DISPLAY_UNKNOWN_MARKER
     assert plan.final_answer == record["answer"]
     assert not plan.needs
 

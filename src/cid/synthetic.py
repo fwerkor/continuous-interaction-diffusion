@@ -6,6 +6,7 @@ from dataclasses import dataclass
 from cid._compat import StrEnum
 from cid.contracts import FreshnessDemand
 from cid.data import (
+    DISPLAY_UNKNOWN_MARKER,
     BindingTarget,
     DisplayTarget,
     ExternalEvent,
@@ -167,7 +168,7 @@ def _static_copy(
             ),
         ),
         display_targets=(
-            DisplayTarget(step=1, text="pending"),
+            DisplayTarget(step=1, text=DISPLAY_UNKNOWN_MARKER),
             DisplayTarget(step=2, text=f"{value} ms"),
         ),
         metadata=_metadata(config, family),
@@ -269,8 +270,8 @@ def _delayed_retrieval(
             ),
         ),
         display_targets=(
-            DisplayTarget(1, "pending"),
-            DisplayTarget(2, "pending"),
+            DisplayTarget(1, DISPLAY_UNKNOWN_MARKER),
+            DisplayTarget(2, DISPLAY_UNKNOWN_MARKER),
             DisplayTarget(3, value),
         ),
         metadata={**_metadata(config, family), "delay_steps": 2},
@@ -395,7 +396,7 @@ def _dynamic_state(
             ),
         ),
         display_targets=(
-            DisplayTarget(1, "pending"),
+            DisplayTarget(1, DISPLAY_UNKNOWN_MARKER),
             DisplayTarget(2, str(first)),
             DisplayTarget(3, str(first)),
             DisplayTarget(4, str(second)),
@@ -486,8 +487,8 @@ def _streaming_evidence(
             ),
         ),
         display_targets=(
-            DisplayTarget(1, "pending"),
-            DisplayTarget(2, f"{first} ..."),
+            DisplayTarget(1, DISPLAY_UNKNOWN_MARKER),
+            DisplayTarget(2, f"{first} {DISPLAY_UNKNOWN_MARKER}"),
             DisplayTarget(3, f"{first} {second}"),
         ),
         metadata=_metadata(config, family),
@@ -617,8 +618,8 @@ def _competing_sources(
             ),
         ),
         display_targets=(
-            DisplayTarget(1, "pending"),
-            DisplayTarget(2, "conflict"),
+            DisplayTarget(1, DISPLAY_UNKNOWN_MARKER),
+            DisplayTarget(2, str(primary_value)),
             DisplayTarget(3, str(primary_value)),
         ),
         metadata=_metadata(config, family),

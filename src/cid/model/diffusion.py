@@ -193,30 +193,10 @@ class CIDDiffusionScheduler:
         confidence = torch.empty(token_ids.shape, dtype=torch.float32, device=logits.device)
         predicted = torch.empty(token_ids.shape, dtype=torch.long, device=logits.device)
         current_confidence = torch.empty(token_ids.shape, dtype=torch.float32, device=logits.device)
-        mutable = torch.ones_like(token_ids, dtype=torch.bool)
-        if self.eos_token_id is not None:
-            for batch_index in range(token_ids.shape[0]):
-                eos_positions = torch.nonzero(
-                    token_ids[batch_index] == self.eos_token_id, as_tuple=False
-                ).flatten()
-                if eos_positions.numel():
-                    mutable[batch_index, int(eos_positions[0]) + 1 :] = False
-            masked = (token_ids == self.mask_token_id) & mutable
-            prior_mask_count = masked.cumsum(dim=1) - masked.to(dtype=torch.int64)
-            eos_allowed = mutable & prior_mask_count.eq(0)
-        else:
-            eos_allowed = mutable
         token_chunk_size = 32
         for start in range(0, token_ids.shape[1], token_chunk_size):
             stop = min(token_ids.shape[1], start + token_chunk_size)
             filtered_logits = logits[:, start:stop].float().clone()
-            if self.mask_token_id < filtered_logits.shape[-1]:
-                filtered_logits[..., self.mask_token_id] = torch.finfo(filtered_logits.dtype).min
-            if self.eos_token_id is not None and self.eos_token_id < filtered_logits.shape[-1]:
-                eos_logits = filtered_logits[..., self.eos_token_id]
-                eos_logits.masked_fill_(
-                    ~eos_allowed[:, start:stop], torch.finfo(filtered_logits.dtype).min
-                )
             probabilities = torch.softmax(filtered_logits, dim=-1)
             chunk_confidence, chunk_predicted = probabilities.max(dim=-1)
             confidence[:, start:stop] = chunk_confidence
@@ -229,7 +209,7 @@ class CIDDiffusionScheduler:
         result = token_ids.clone()
         for batch_index in range(token_ids.shape[0]):
             masked_positions = torch.nonzero(
-                (token_ids[batch_index] == self.mask_token_id) & mutable[batch_index],
+                token_ids[batch_index] == self.mask_token_id,
                 as_tuple=False,
             ).flatten()
             if masked_positions.numel() and reveal_fraction:
@@ -243,7 +223,7 @@ class CIDDiffusionScheduler:
             if revision_fraction == 0.0:
                 continue
             visible_positions = torch.nonzero(
-                (token_ids[batch_index] != self.mask_token_id) & mutable[batch_index],
+                token_ids[batch_index] != self.mask_token_id,
                 as_tuple=False,
             ).flatten()
             if visible_positions.numel() == 0:

@@ -5,7 +5,7 @@ from dataclasses import replace
 import pytest
 
 from cid.contracts import FreshnessDemand
-from cid.data import dump_jsonl, load_jsonl
+from cid.data import DISPLAY_UNKNOWN_MARKER, dump_jsonl, load_jsonl
 from cid.distill import (
     TeacherCellPlan,
     TeacherEvidence,
@@ -72,7 +72,7 @@ def make_teacher_task_and_plan() -> tuple[TeacherTask, TeacherPlan]:
     )
     initial = TeacherFrame(
         phase="initial",
-        display="pending",
+        display=DISPLAY_UNKNOWN_MARKER,
         cells=(
             TeacherCellPlan(
                 cell_id="plan",
@@ -83,7 +83,7 @@ def make_teacher_task_and_plan() -> tuple[TeacherTask, TeacherPlan]:
     )
     pre = TeacherFrame(
         phase="pre",
-        display="pending",
+        display=DISPLAY_UNKNOWN_MARKER,
         cells=(
             TeacherCellPlan(
                 cell_id="plan",
@@ -266,7 +266,7 @@ def test_teacher_compiler_supports_no_tool_refinement_phases() -> None:
     frames = (
         TeacherFrame(
             phase="initial",
-            display="Reasoning.",
+            display=DISPLAY_UNKNOWN_MARKER,
             cells=(
                 TeacherCellPlan(
                     cell_id="state",
@@ -278,7 +278,7 @@ def test_teacher_compiler_supports_no_tool_refinement_phases() -> None:
         ),
         TeacherFrame(
             phase="refine:0",
-            display="Reasoning.",
+            display=DISPLAY_UNKNOWN_MARKER,
             cells=(
                 TeacherCellPlan(
                     cell_id="state",
@@ -290,7 +290,7 @@ def test_teacher_compiler_supports_no_tool_refinement_phases() -> None:
         ),
         TeacherFrame(
             phase="refine:1",
-            display="Reasoning.",
+            display="entailed",
             cells=(
                 TeacherCellPlan(
                     cell_id="state",
@@ -322,12 +322,43 @@ def test_teacher_compiler_supports_no_tool_refinement_phases() -> None:
 
     assert [target.step for target in trajectory.display_targets] == [0, 1, 2, 3]
     assert [target.text for target in trajectory.display_targets] == [
-        "Reasoning.",
-        "Reasoning.",
-        "Reasoning.",
+        DISPLAY_UNKNOWN_MARKER,
+        DISPLAY_UNKNOWN_MARKER,
+        "entailed",
         "entailed",
     ]
     assert review_teacher_plans((task,), (plan,))[0].accepted
+
+
+def test_teacher_review_rejects_process_status_as_display_supervision() -> None:
+    task = TeacherTask(
+        task_id="status-display",
+        prompt="Return the result.",
+        metadata={"training_mode": "no_tool"},
+        reference_answer="done",
+    )
+    cell = TeacherCellPlan(
+        cell_id="state",
+        semantic_text="The task state is represented compactly.",
+        roles={CognitiveRole.PLAN: 1.0},
+    )
+    plan = TeacherPlan(
+        task_id=task.task_id,
+        final_answer="done",
+        frames=(
+            TeacherFrame("initial", "Reasoning.", (cell,)),
+            TeacherFrame(
+                "final",
+                "done",
+                (replace(cell, roles={CognitiveRole.CONCLUSION: 1.0}),),
+            ),
+        ),
+    )
+
+    review = review_teacher_plans((task,), (plan,))[0]
+
+    assert not review.accepted
+    assert any("process status" in reason for reason in review.reasons)
 
 
 def test_teacher_compiler_rejects_refinement_phases_with_external_evidence() -> None:
@@ -386,10 +417,14 @@ def test_teacher_slot_allocator_recycles_retired_annotation_slots() -> None:
         )
 
     frames = [
-        TeacherFrame(phase="initial", display="pending", cells=(cell("a", CellLifecycle.ACTIVE),)),
+        TeacherFrame(
+            phase="initial",
+            display=DISPLAY_UNKNOWN_MARKER,
+            cells=(cell("a", CellLifecycle.ACTIVE),),
+        ),
         TeacherFrame(
             phase="p1",
-            display="pending",
+            display=DISPLAY_UNKNOWN_MARKER,
             cells=(
                 cell("a", CellLifecycle.RETIRED),
                 cell("b", CellLifecycle.ACTIVE),
@@ -687,7 +722,7 @@ def test_teacher_quality_review_allows_repeated_future_evidence_value() -> None:
     frames = (
         TeacherFrame(
             phase="initial",
-            display="pending",
+            display=DISPLAY_UNKNOWN_MARKER,
             cells=(
                 TeacherCellPlan(
                     cell_id="stream",
@@ -949,7 +984,7 @@ def test_teacher_quality_review_does_not_match_numeric_future_value_as_substring
         frames=(
             TeacherFrame(
                 phase="initial",
-                display="pending",
+                display=DISPLAY_UNKNOWN_MARKER,
                 cells=(
                     TeacherCellPlan(
                         cell_id="work",

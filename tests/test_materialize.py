@@ -1,5 +1,6 @@
 from __future__ import annotations
 
+from dataclasses import replace
 from importlib import import_module
 
 import pytest
@@ -149,7 +150,16 @@ def test_materializer_creates_cells_arguments_anchors_links_and_revisions() -> N
     assert update.needs[0].target_cells == (ObjectRef.cell(first),)
     assert update.reopen_cells == (ObjectRef.cell(first),)
     assert update.display.token_ids == (7, 8, 9)
-    assert update.converged
+    assert update.equilibrium
+    assert not update.converged
+
+    settled = materializer.materialize(
+        output,
+        replace(context, display=update.display),
+        catalog=catalog,
+        display_token_ids=(7, 8, 9),
+    )
+    assert settled.converged
 
 
 def test_materializer_never_resolves_cell_link_from_closed_world_catalog() -> None:

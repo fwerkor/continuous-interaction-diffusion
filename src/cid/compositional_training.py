@@ -10,7 +10,7 @@ from dataclasses import dataclass
 from pathlib import Path
 from typing import Any
 
-from cid.data import TrajectoryExample, trajectory_to_dict
+from cid.data import DISPLAY_UNKNOWN_MARKER, TrajectoryExample, trajectory_to_dict
 from cid.distill import (
     TeacherCellPlan,
     TeacherFrame,
@@ -338,7 +338,7 @@ def _plan_for(case: GeneratedCase, rng: random.Random) -> TeacherPlan:
     frames: list[TeacherFrame] = [
         TeacherFrame(
             phase="initial",
-            display="Reasoning.",
+            display=DISPLAY_UNKNOWN_MARKER,
             cells=tuple(
                 base(
                     case.initial_hypothesis, 0.82 if case.correction else 0.74, CellLifecycle.ACTIVE
@@ -387,7 +387,11 @@ def _plan_for(case: GeneratedCase, rng: random.Random) -> TeacherPlan:
         frames.append(
             TeacherFrame(
                 phase=f"refine:{frame_index}",
-                display="Reasoning.",
+                display=(
+                    str(case.task.reference_answer)
+                    if frame_index + 1 == refine_count
+                    else DISPLAY_UNKNOWN_MARKER
+                ),
                 cells=tuple(
                     base(
                         hypothesis,

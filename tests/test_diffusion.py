@@ -94,7 +94,7 @@ def test_display_reveal_commits_highest_confidence_masked_tokens_first() -> None
     assert all_tokens.tolist() == [[7, 8, 9, 6]]
 
 
-def test_display_refinement_can_revise_visible_tokens_without_emitting_mask() -> None:
+def test_display_refinement_can_preserve_an_unresolved_mask() -> None:
     scheduler = CIDDiffusionScheduler(mask_token_id=5)
     tokens = torch.tensor([[5, 9, 10, 11]])
     logits = torch.zeros(1, 4, 16)
@@ -112,11 +112,11 @@ def test_display_refinement_can_revise_visible_tokens_without_emitting_mask() ->
         revision_margin=0.1,
     )
 
-    assert refined[0, 0] == 7
+    assert refined[0, 0] == 5
     assert refined[0, 1] == 12
     assert refined[0, 2] == 10
     assert refined[0, 3] == 13
-    assert not refined.eq(5).any()
+    assert refined.eq(5).sum() == 1
 
 
 def test_chunked_display_refinement_matches_full_softmax_reference() -> None:
@@ -126,9 +126,7 @@ def test_chunked_display_refinement_matches_full_softmax_reference() -> None:
     tokens[:, ::5] = 5
     logits = torch.randn(2, 73, 64, generator=generator)
 
-    filtered_logits = logits.float().clone()
-    filtered_logits[..., 5] = torch.finfo(filtered_logits.dtype).min
-    probabilities = torch.softmax(filtered_logits, dim=-1)
+    probabilities = torch.softmax(logits.float(), dim=-1)
     confidence, predicted = probabilities.max(dim=-1)
     expected = tokens.clone()
     for batch_index in range(tokens.shape[0]):
@@ -177,12 +175,14 @@ def test_diffusion_scheduler_validates_timestep_range() -> None:
         scheduler.corrupt_display(torch.tensor([[1, 2]]), torch.tensor([1.2]))
 
 
-def test_display_eos_is_revealed_only_at_the_leftmost_unresolved_frontier() -> None:
+def test_display_reveal_can_place_eos_after_parallel_mask_resolution() -> None:
     scheduler = CIDDiffusionScheduler(mask_token_id=5, eos_token_id=2)
     tokens = torch.tensor([[9, 5, 5, 5]])
     logits = torch.zeros(1, 4, 16)
-    logits[..., 2] = 20.0
-    logits[..., 7] = 10.0
+    logits[0, 0, 9] = 20.0
+    logits[0, 1, 7] = 20.0
+    logits[0, 2, 8] = 20.0
+    logits[0, 3, 2] = 20.0
 
     refined = scheduler.refine_display(
         tokens,
@@ -192,15 +192,17 @@ def test_display_eos_is_revealed_only_at_the_leftmost_unresolved_frontier() -> N
         revision_margin=0.0,
     )
 
-    assert refined.tolist() == [[9, 2, 5, 5]]
+    assert refined.tolist() == [[9, 7, 8, 2]]
 
 
-def test_display_refinement_never_mutates_tail_after_existing_eos() -> None:
+def test_display_refinement_can_move_existing_eos_and_expand_tail() -> None:
     scheduler = CIDDiffusionScheduler(mask_token_id=5, eos_token_id=2)
     tokens = torch.tensor([[9, 2, 5, 5]])
     logits = torch.zeros(1, 4, 16)
-    logits[..., 7] = 20.0
-    logits[0, 1, 2] = 30.0
+    logits[0, 0, 9] = 30.0
+    logits[0, 1, 7] = 30.0
+    logits[0, 2, 8] = 30.0
+    logits[0, 3, 2] = 30.0
 
     refined = scheduler.refine_display(
         tokens,
@@ -210,7 +212,7 @@ def test_display_refinement_never_mutates_tail_after_existing_eos() -> None:
         revision_margin=0.0,
     )
 
-    assert refined.tolist() == [[7, 2, 5, 5]]
+    assert refined.tolist() == [[9, 7, 8, 2]]
 
 
 def test_visible_replacement_corruption_never_injects_eos() -> None:

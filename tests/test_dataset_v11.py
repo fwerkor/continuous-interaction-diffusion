@@ -2,6 +2,7 @@ from __future__ import annotations
 
 from collections import Counter
 
+from cid.data import DISPLAY_UNKNOWN_MARKER
 from cid.deep_restraint_training import (
     DeepToolRestraintConfig,
     generate_deep_tool_restraint_examples,
@@ -151,12 +152,12 @@ def test_surface_v3_retries_only_collided_semantic_wrapper(tmp_path) -> None:
     )
     initial = TeacherFrame(
         "initial",
-        "pending",
+        DISPLAY_UNKNOWN_MARKER,
         (TeacherCellPlan("plan", "Plan a documentation lookup.", {CognitiveRole.PLAN: 1.0}),),
     )
     pre = TeacherFrame(
         "pre",
-        "pending",
+        DISPLAY_UNKNOWN_MARKER,
         (
             TeacherCellPlan(
                 "plan",

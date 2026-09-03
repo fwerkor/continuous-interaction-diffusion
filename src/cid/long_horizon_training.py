@@ -13,7 +13,7 @@ from pathlib import Path
 from typing import Any
 
 from cid.causal_distill import build_causal_teacher_job, dump_causal_teacher_jobs
-from cid.data import dump_jsonl
+from cid.data import DISPLAY_UNKNOWN_MARKER, dump_jsonl
 from cid.dataset import dump_dataset_manifest, inspect_dataset
 from cid.distill import (
     TeacherCellPlan,
@@ -844,12 +844,12 @@ def _plan_for(case: _Case) -> TeacherPlan:
     frames: list[TeacherFrame] = [
         TeacherFrame(
             phase="initial",
-            display="Planning dependent tool reads.",
+            display=DISPLAY_UNKNOWN_MARKER,
             cells=(_goal_cell(case.goal), _state_cell(case.state_summaries[0], ())),
         ),
         TeacherFrame(
             phase="pre",
-            display="Resolving available root evidence.",
+            display=DISPLAY_UNKNOWN_MARKER,
             cells=_cells_for_phase(case, activation_phase, 0, "pre"),
         ),
     ]
@@ -860,7 +860,7 @@ def _plan_for(case: _Case) -> TeacherPlan:
                 phase=phase,
                 display=str(task.reference_answer)
                 if index == len(task.evidence) - 1
-                else "Evidence integrated.",
+                else DISPLAY_UNKNOWN_MARKER,
                 cells=_cells_for_phase(case, activation_phase, index + 1, phase),
             )
         )

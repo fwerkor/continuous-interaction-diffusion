@@ -16,7 +16,7 @@ import sympy as sp
 
 from cid.causal_distill import build_causal_teacher_job, dump_causal_teacher_jobs
 from cid.computational_training import calculator_descriptor, record_lookup_descriptor
-from cid.data import dump_jsonl
+from cid.data import DISPLAY_UNKNOWN_MARKER, dump_jsonl
 from cid.distill import (
     TeacherCellPlan,
     TeacherEvidence,
@@ -835,7 +835,7 @@ def _plan_for(case: _Case) -> TeacherPlan:
     frames: list[TeacherFrame] = [
         TeacherFrame(
             phase="initial",
-            display="Planning tool use.",
+            display=DISPLAY_UNKNOWN_MARKER,
             cells=(
                 _goal_cell(case.goal),
                 _state_cell(case.summaries[0], arrived_ids=()),
@@ -846,14 +846,16 @@ def _plan_for(case: _Case) -> TeacherPlan:
     frames.append(
         TeacherFrame(
             phase="pre",
-            display="Gathering required evidence.",
+            display=DISPLAY_UNKNOWN_MARKER,
             cells=_cells_for_phase(case, activation_phase, arrived_count=0, phase="pre"),
         )
     )
     for index, item in enumerate(task.evidence):
         phase = f"after:{item.evidence_id}"
         display = (
-            task.reference_answer if index == len(task.evidence) - 1 else "Evidence integrated."
+            task.reference_answer
+            if index == len(task.evidence) - 1
+            else DISPLAY_UNKNOWN_MARKER
         )
         frames.append(
             TeacherFrame(

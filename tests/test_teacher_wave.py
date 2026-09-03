@@ -3,6 +3,7 @@ import json
 import pytest
 
 from cid.causal_distill import dump_causal_teacher_jobs
+from cid.data import DISPLAY_UNKNOWN_MARKER
 from cid.distill import (
     TeacherEvidence,
     TeacherScheduleConfig,
@@ -140,7 +141,7 @@ def test_teacher_wave_round_trip_and_resume(tmp_path) -> None:
 
     outputs = {
         "initial": {
-            "display": "pending",
+            "display": DISPLAY_UNKNOWN_MARKER,
             "cells": [
                 _cell(
                     "search",
@@ -159,7 +160,7 @@ def test_teacher_wave_round_trip_and_resume(tmp_path) -> None:
             ],
         },
         "after:search-results": {
-            "display": "pending",
+            "display": DISPLAY_UNKNOWN_MARKER,
             "cells": [
                 _cell(
                     "search",
@@ -187,7 +188,7 @@ def test_teacher_wave_round_trip_and_resume(tmp_path) -> None:
             ],
         },
         "after:support-a": {
-            "display": "A: 2001; B: pending",
+            "display": f"A: 2001; B: {DISPLAY_UNKNOWN_MARKER}",
             "cells": [
                 _cell(
                     "search",
@@ -333,7 +334,7 @@ def test_teacher_wave_import_is_idempotent_but_rejects_changed_output(tmp_path) 
     export_teacher_wave(jobs_path, state_path, requests_path)
     request = json.loads(requests_path.read_text())
     output = {
-        "display": "pending",
+        "display": DISPLAY_UNKNOWN_MARKER,
         "cells": [
             _cell(
                 "search",
@@ -369,7 +370,7 @@ def test_teacher_wave_rejects_missing_or_extra_evidence_needs(tmp_path) -> None:
     export_teacher_wave(jobs_path, state_path, requests_path)
     request = json.loads(requests_path.read_text())
     bad = {
-        "display": "pending",
+        "display": DISPLAY_UNKNOWN_MARKER,
         "cells": [_cell("plan", "No need.", {"plan": 1.0})],
         "needs": [],
     }
@@ -420,7 +421,7 @@ def test_teacher_agent_workspace_resumes_commits_and_advances(tmp_path) -> None:
     ]
 
     bad_response = {
-        "display": "pending",
+        "display": DISPLAY_UNKNOWN_MARKER,
         "cells": [_cell("plan", "No need yet.", {"plan": 1.0})],
         "needs": [],
     }
@@ -435,7 +436,7 @@ def test_teacher_agent_workspace_resumes_commits_and_advances(tmp_path) -> None:
     response_path.write_text(
         json.dumps(
             {
-                "display": "pending",
+                "display": DISPLAY_UNKNOWN_MARKER,
                 "cells": [
                     {
                         **_cell(

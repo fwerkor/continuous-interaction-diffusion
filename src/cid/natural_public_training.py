@@ -13,7 +13,7 @@ from dataclasses import dataclass
 from pathlib import Path
 from typing import Any
 
-from cid.data import dump_jsonl
+from cid.data import DISPLAY_UNKNOWN_MARKER, dump_jsonl
 from cid.dataset import dump_dataset_manifest, inspect_dataset
 from cid.distill import (
     TeacherCellPlan,
@@ -540,7 +540,7 @@ def _plan_for_task(task: TeacherTask, record: Mapping[str, Any]) -> TeacherPlan:
             task_id=task.task_id,
             final_answer=str(task.reference_answer),
             frames=(
-                TeacherFrame(phase="initial", display="Preparing response.", cells=(goal,)),
+                TeacherFrame(phase="initial", display=DISPLAY_UNKNOWN_MARKER, cells=(goal,)),
                 TeacherFrame(
                     phase="final", display=str(task.reference_answer), cells=(goal, answer)
                 ),
@@ -606,8 +606,8 @@ def _plan_for_task(task: TeacherTask, record: Mapping[str, Any]) -> TeacherPlan:
         task_id=task.task_id,
         final_answer=str(task.reference_answer),
         frames=(
-            TeacherFrame(phase="initial", display="Planning retrieval.", cells=(goal,)),
-            TeacherFrame(phase="pre", display="Retrieving evidence.", cells=(goal, need)),
+            TeacherFrame(phase="initial", display=DISPLAY_UNKNOWN_MARKER, cells=(goal,)),
+            TeacherFrame(phase="pre", display=DISPLAY_UNKNOWN_MARKER, cells=(goal, need)),
             TeacherFrame(
                 phase="after:evidence",
                 display=str(task.reference_answer),

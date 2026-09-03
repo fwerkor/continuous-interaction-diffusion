@@ -1,5 +1,6 @@
 import pytest
 
+from cid.data import DISPLAY_UNKNOWN_MARKER
 from cid.teacher_wave import (
     TEACHER_SOFT_QUALITY_GUIDANCE,
     TeacherStageOutput,
@@ -44,6 +45,28 @@ def test_teacher_stage_prompt_contains_soft_compactness_and_grounding_guidance()
     assert "Never paste a whole source sentence or paragraph" in prompt
     assert "entity:alice-example" in prompt
     assert '"relation":"observes"' in prompt
+    assert DISPLAY_UNKNOWN_MARKER in prompt
+    assert "current user-visible answer draft" in prompt
+
+
+def test_interactive_display_contract_rejects_status_and_unresolved_terminal() -> None:
+    status = TeacherStageOutput.from_dict(
+        {"display": "pending", "cells": [], "needs": []}
+    )
+    with pytest.raises(ValueError, match="process status"):
+        validate_teacher_stage_tct_quality(
+            {"arrived_evidence": None, "available_evidence": [], "terminal": False},
+            status,
+        )
+
+    unresolved = TeacherStageOutput.from_dict(
+        {"display": DISPLAY_UNKNOWN_MARKER, "cells": [], "needs": []}
+    )
+    with pytest.raises(ValueError, match="unresolved answer content"):
+        validate_teacher_stage_tct_quality(
+            {"arrived_evidence": None, "available_evidence": [], "terminal": True},
+            unresolved,
+        )
 
 
 def test_teacher_soft_quality_warnings_are_non_blocking_observability() -> None:
@@ -108,7 +131,7 @@ def test_interactive_tct_quality_requires_requests_link_for_need() -> None:
     }
     output = TeacherStageOutput.from_dict(
         {
-            "display": "pending",
+            "display": DISPLAY_UNKNOWN_MARKER,
             "cells": [_cell("search", "Need evidence.", role="information_need")],
             "needs": [{"evidence_id": "search-results", "cell_id": "search"}],
         }
@@ -148,7 +171,7 @@ def test_interactive_tct_quality_requires_grounded_observed_percept() -> None:
 def test_interactive_tct_quality_rejects_long_or_verbatim_semantics() -> None:
     long_output = TeacherStageOutput.from_dict(
         {
-            "display": "pending",
+            "display": DISPLAY_UNKNOWN_MARKER,
             "cells": [_cell("state", "x" * 193, role="plan")],
             "needs": [],
         }

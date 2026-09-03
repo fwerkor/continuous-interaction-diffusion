@@ -216,12 +216,21 @@ so training artifacts do not skip a version.
   materialized SHA-256 `fcda158c66f911b9521e37ffcbdba038710bde607a4762f498b0e70bd99f5de2`.
 - **v14:** 192,297 semantic tasks, 421,798 trajectories, 3,011,462 training transitions. It is the
   last release using the pre-v3 need-routing data ABI.
-- **v15 (current):** keeps the exact v14 semantic tasks, schedules, trajectories, prompts, answers,
-  evidence, and transition count, while rematerializing them for neural contract v3. Every binding
+- **v15 (latest published v3 release):** keeps the exact v14 semantic tasks, schedules, trajectories,
+  prompts, answers, evidence, and transition count, while rematerializing them for neural contract
+  v3. Every binding
   has an explicit stable owner; affected-cell supervision is conservatively derived from live state
   changes around the matching observation; display routing receives a tokenizer-independent first-
   position positive when the displayed answer changes; and protected-result promotion is an explicit
   source-owned policy. Exact v15 bytes and hashes are pinned by the Hugging Face release manifest.
+
+The current source tree defines **neural contract v4** for new training runs. Display state is now a
+continuously revisable answer draft: unresolved answer content is represented by the model MASK
+state, EOS may move across the fixed physical canvas, and semantic equilibrium does not terminate a
+trajectory until the materialized display is resolved and stable for a subsequent step. Generic
+process-status supervision such as `Reasoning.` or `Retrieving evidence.` is rejected. Consequently,
+v3 checkpoints are intentionally incompatible with v4, and the published v15 trajectories must be
+rebuilt from their semantic sources before they are used for a final v4 training run.
 
 v14 introduced **51,500 independent train-only natural public tasks**: 30,000 Natural Questions Open
 queries, 15,000 MultiDoc2Dial document-grounded dialogue turns, 4,500 high-quality human OASST1
@@ -355,7 +364,10 @@ cid review-distillation \
 ```
 
 The review rejects future-evidence leakage, required-argument mismatches, missing final conclusion
-state, and exact semantic duplicates before the plans reach training.
+state, legacy process-status Display targets, and exact semantic duplicates before the plans reach
+training. Intermediate Display frames describe the current user-visible answer draft and use
+`<|cid_unknown|>` wherever answer content is not yet resolved; the trainer maps that marker to the
+backbone MASK token rather than tokenizing it as literal text.
 
 ```bash
 cid compile-distillation \

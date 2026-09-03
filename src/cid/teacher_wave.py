@@ -10,6 +10,7 @@ from pathlib import Path
 from typing import Any
 
 from cid.contracts import FreshnessDemand
+from cid.data import DISPLAY_UNKNOWN_MARKER, is_legacy_display_status
 from cid.distill import (
     TeacherCellPlan,
     TeacherFrame,
@@ -51,6 +52,16 @@ Link example:
 
 TEACHER_SEMANTIC_TEXT_PREFERRED_MAX_CHARS = TEACHER_SEMANTIC_TEXT_MAX_CHARS
 TEACHER_PREFERRED_LIVE_CELLS = 6
+
+TEACHER_DISPLAY_GUIDANCE = f"""Display supervision rules:
+- `display` is the current user-visible answer draft. It must not narrate hidden reasoning,
+  retrieval, tool progress, or generic status such as `pending`, `Reasoning`, `Planning`,
+  `Retrieving`, `Gathering`, or `Evidence integrated`.
+- Represent answer content that is not known yet with the exact marker
+  `{DISPLAY_UNKNOWN_MARKER}`. Preserve any answer content already supported around that marker.
+- A terminal stage must contain the fully resolved final answer and must not contain the unresolved
+  marker.
+"""
 
 
 @dataclass(frozen=True, slots=True)
@@ -520,6 +531,8 @@ remain live for later refreshes or stream chunks.
 
 {TEACHER_SOFT_QUALITY_GUIDANCE}
 
+{TEACHER_DISPLAY_GUIDANCE}
+
 Output schema:
 {{
   "display":"non-empty current display state",
@@ -563,6 +576,7 @@ def _validate_stage_output(
     output: TeacherStageOutput,
     previous: TeacherStageOutput | None,
 ) -> None:
+    _validate_stage_display(stage, output)
     current_ids = {cell.cell_id for cell in output.cells}
     if previous is not None:
         previous_ids = {cell.cell_id for cell in previous.cells}
@@ -605,6 +619,8 @@ def validate_teacher_stage_tct_quality(
     output: TeacherStageOutput,
 ) -> None:
     """Hard TCT quality guard used by the interactive teacher adapter."""
+
+    _validate_stage_display(stage, output)
 
     for cell in output.cells:
         if len(cell.semantic_text) > TEACHER_SEMANTIC_TEXT_MAX_CHARS:
@@ -669,6 +685,15 @@ def validate_teacher_stage_tct_quality(
             raise ValueError(
                 "terminal conclusion must carry a derived_from link to visible percept evidence"
             )
+
+
+def _validate_stage_display(stage: Mapping[str, Any], output: TeacherStageOutput) -> None:
+    if is_legacy_display_status(output.display):
+        raise ValueError(
+            "teacher stage display narrates process status instead of the current answer draft"
+        )
+    if bool(stage.get("terminal", False)) and DISPLAY_UNKNOWN_MARKER in output.display:
+        raise ValueError("terminal teacher stage display cannot contain unresolved answer content")
 
 
 def _has_source_link(cell: TeacherCellPlan, relation: LinkRelation, source: str) -> bool:

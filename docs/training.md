@@ -415,6 +415,17 @@ materialized as a runtime-owned policy. Prompts, answers, external events, thoug
 multiplicity, and the 3,011,462-transition training mass are unchanged from v14. Exact v15 hashes and
 routing counts are pinned by `release/materialized-manifest.json` in the dataset repository.
 
+Neural contract **v4** is the current training/runtime contract in the source tree and deliberately
+requires a fresh Display rematerialization rather than treating v15 as compatible. In v4 the Display
+canvas is a fixed-capacity latent field whose positions remain available after the current EOS, so a
+later diffusion step can move EOS and expand or rewrite the answer. `<|cid_unknown|>` in semantic
+Display supervision maps to the backbone MASK token and may remain unresolved until reasoning or an
+external observation supplies the missing content. The convergence head denotes semantic
+equilibrium; runtime terminal convergence additionally requires the materialized Display to contain
+no unresolved MASK positions and to remain unchanged for one step. Teacher review and the training
+tensorizer reject the legacy generic status targets used by older data (for example `Reasoning.` and
+`Retrieving evidence.`), and v3 checkpoints fail the v4 neural-contract compatibility check.
+
 The accompanying `evaluation/validation-v3/validation-512.jsonl` is intentionally mixed rather than
 no-tool-only: 416 examples are deterministically sampled from the disjoint compositional/OOD probe and
 96 are disjoint synthetic tool-required interactions. The 18.75% tool slice is large enough for

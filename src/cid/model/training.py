@@ -22,12 +22,15 @@ from cid.contracts import (
     SourceDescriptor,
 )
 from cid.data import (
+    DISPLAY_UNKNOWN_MARKER,
     ThoughtTarget,
     TrajectoryExample,
     TrajectoryExampleIndex,
+    is_legacy_display_status,
     load_indexed_jsonl,
     training_transition_source_steps,
 )
+from cid.defaults import DEFAULT_DISPLAY_REVISION_FRACTION, DEFAULT_DISPLAY_REVISION_MARGIN
 from cid.grounding import (
     STRONG_LINK_RELATIONS,
     AnchorKind,
@@ -75,7 +78,7 @@ from cid.state import (
     DisplayCanvas,
 )
 
-CID_NEURAL_CONTRACT_VERSION = 3
+CID_NEURAL_CONTRACT_VERSION = 4
 STAGE_B_SEMANTIC_SNAPSHOT_FILENAME = "semantic-embedding.pt"
 
 
@@ -334,8 +337,8 @@ class CIDTrainerConfig:
     rollout_allocation_threshold: float = 0.8
     rollout_max_allocations_per_step: int = DEFAULT_MAX_ALLOCATIONS_PER_STEP
     rollout_denoising_steps: int = 8
-    rollout_display_revision_fraction: float = 0.125
-    rollout_display_revision_margin: float = 0.15
+    rollout_display_revision_fraction: float = DEFAULT_DISPLAY_REVISION_FRACTION
+    rollout_display_revision_margin: float = DEFAULT_DISPLAY_REVISION_MARGIN
     semantic_pooling: str = "order-aware-v2"
     seed: int = 0
 
@@ -2279,7 +2282,7 @@ class ILLaDATrajectoryTensorizer:
 
         prompt_ids = self.text_encoder.tokenize(example.prompt, add_special_tokens=True)
         target_display = self._display_text(example, target_step)
-        target_text_ids = self.text_encoder.tokenize(target_display, add_special_tokens=False)
+        target_text_ids = self._encode_display_text(target_display)
         realized_tokens = target_text_ids.shape[1]
         display_canvas_tokens = self._display_canvas_size(
             realized_tokens + 1,
@@ -2412,13 +2415,10 @@ class ILLaDATrajectoryTensorizer:
             detach=True,
         )
 
+        # Post-EOS positions remain latent display capacity rather than padding. Runtime may move
+        # EOS on a later diffusion step, so training must expose the same positions and position
+        # IDs.
         display_padding_mask = torch.zeros_like(display_input_ids, dtype=torch.bool)
-        eos_positions = torch.nonzero(
-            display_input_ids[0] == self.eos_token_id, as_tuple=False
-        ).flatten()
-        if eos_positions.numel():
-            display_padding_mask[:, int(eos_positions[0]) + 1 :] = True
-            display_noise = display_noise.masked_fill(display_padding_mask.unsqueeze(-1), 0.0)
 
         batch = CIDTensorBatch(
             thought_semantic=thought_corruption.semantic,
@@ -3943,8 +3943,34 @@ class ILLaDATrajectoryTensorizer:
     def _display_text(self, example: TrajectoryExample, step: int) -> str:
         for target in example.display_targets:
             if target.step == step:
+                if target.text != example.target_display and is_legacy_display_status(target.text):
+                    raise ValueError(
+                        "neural contract v4 rejects process-status Display supervision; rebuild "
+                        f"example {example.example_id!r} with answer-draft/unresolved Display "
+                        "targets"
+                    )
                 return target.text
         return example.target_display
+
+    def _encode_display_text(self, text: str) -> Tensor:
+        if DISPLAY_UNKNOWN_MARKER not in text:
+            return self.text_encoder.tokenize(text, add_special_tokens=False)
+        parts = text.split(DISPLAY_UNKNOWN_MARKER)
+        encoded: list[Tensor] = []
+        for index, part in enumerate(parts):
+            if part:
+                encoded.append(self.text_encoder.tokenize(part, add_special_tokens=False))
+            if index + 1 < len(parts):
+                encoded.append(
+                    torch.tensor(
+                        [[self.adapter.mask_token_id]],
+                        dtype=torch.long,
+                        device=self.text_encoder.device,
+                    )
+                )
+        if not encoded:
+            raise ValueError("display text must contain visible text or an unresolved marker")
+        return torch.cat(encoded, dim=1)
 
 
 def _cat_targets(steps: tuple[CIDTrainingStep, ...], name: str) -> Tensor:

@@ -12,12 +12,14 @@ from typing import Any
 
 from cid.contracts import FreshnessDemand
 from cid.data import (
+    DISPLAY_UNKNOWN_MARKER,
     BindingTarget,
     DisplayTarget,
     ExternalEvent,
     GroundingTarget,
     ThoughtTarget,
     TrajectoryExample,
+    is_legacy_display_status,
 )
 from cid.grounding import Anchor, CognitiveLink, GroundingEntry, ObjectRef
 from cid.python_review import python_public_test_reason
@@ -438,6 +440,11 @@ CELL schema:
 }}
 
 Rules:
+- `display` is the current user-visible answer draft, not a narration of hidden reasoning or tool
+  progress. Never use status text such as "Reasoning", "Planning", "Retrieving", or "Gathering".
+- Represent answer content that is not yet known with the exact marker
+  `{DISPLAY_UNKNOWN_MARKER}`. Keep any already-known answer content around that marker and replace
+  the marker as evidence or internal reasoning resolves it.
 - Preserve every previously introduced cell in later frames; retire it explicitly if obsolete.
 - `initial` must be first. Use `pre` before external evidence if the task needs tools.
 - No-tool tasks may use contiguous `refine:0`, `refine:1`, ... frames for internal semantic
@@ -1191,6 +1198,12 @@ def _teacher_quality_reasons(
     )
     if "final" in frame_by_phase:
         semantic_frames.append(frame_by_phase["final"])
+    for frame in semantic_frames[:-1]:
+        if is_legacy_display_status(frame.display):
+            reasons.append(
+                f"display in phase {frame.phase!r} narrates process status instead of the current "
+                "answer draft"
+            )
     try:
         _validate_monotonic_cells(semantic_frames)
     except ValueError as exc:

@@ -8,7 +8,7 @@ from dataclasses import dataclass
 from pathlib import Path
 from typing import Any
 
-from cid.data import dump_jsonl
+from cid.data import DISPLAY_UNKNOWN_MARKER, dump_jsonl
 from cid.dataset import dump_dataset_manifest, inspect_dataset
 from cid.distill import (
     TeacherCellPlan,
@@ -431,20 +431,20 @@ def _plan_for(task: TeacherTask) -> TeacherPlan:
         task_id=task.task_id,
         final_answer=answer,
         frames=(
-            TeacherFrame(phase="initial", display="Planning.", cells=(goal,)),
+            TeacherFrame(phase="initial", display=DISPLAY_UNKNOWN_MARKER, cells=(goal,)),
             TeacherFrame(
                 phase="pre",
-                display="Retrieving the first source.",
+                display=DISPLAY_UNKNOWN_MARKER,
                 cells=(goal, first_need),
             ),
             TeacherFrame(
                 phase="after:bridge",
-                display="Bridge evidence resolved.",
+                display=DISPLAY_UNKNOWN_MARKER,
                 cells=(goal, first_percept, second_need),
             ),
             TeacherFrame(
                 phase="after:answer",
-                display="Cross-language evidence integrated.",
+                display=answer,
                 cells=(goal, first_percept, second_percept),
             ),
             TeacherFrame(
