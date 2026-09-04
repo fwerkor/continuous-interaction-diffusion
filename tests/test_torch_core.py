@@ -5,6 +5,7 @@ import pytest
 
 torch = pytest.importorskip("torch")
 cid_model = import_module("cid.model")
+CIDOutputHeads = import_module("cid.model.components").CIDOutputHeads
 CIDTargets = cid_model.CIDTargets
 CIDTensorBatch = cid_model.CIDTensorBatch
 TorchCIDConfig = cid_model.TorchCIDConfig
@@ -14,6 +15,42 @@ loss_module = import_module("cid.model.losses")
 capped_need_loss = loss_module._capped_positive_weight_binary_cross_entropy
 target_positive_mass_loss = loss_module._target_positive_mass_binary_cross_entropy
 focal_cross_entropy = loss_module._masked_focal_cross_entropy
+
+
+def test_need_decoding_depends_on_provisional_thought_state() -> None:
+    heads = CIDOutputHeads(
+        d_model=8,
+        num_roles=3,
+        num_lifecycles=4,
+        num_anchor_kinds=2,
+        num_link_relations=2,
+        num_object_kinds=2,
+        num_refresh_actions=3,
+        max_need_slots=2,
+        max_argument_slots=2,
+        max_anchor_slots=2,
+        max_link_slots=2,
+    )
+    base_thought = torch.zeros(1, 2, 8)
+    thought_hidden = torch.randn(1, 2, 8)
+    thought_occupancy = torch.tensor([[[1.0], [0.0]]])
+    display_hidden = torch.randn(1, 3, 8)
+    display_logits = torch.randn(1, 3, 16)
+    source_memory = torch.randn(1, 2, 8)
+
+    output = heads(
+        base_thought=base_thought,
+        thought_hidden=thought_hidden,
+        thought_occupancy=thought_occupancy,
+        display_hidden=display_hidden,
+        display_logits=display_logits,
+        source_memory=source_memory,
+    )
+    output.need_logits[0, 1, 0].backward()
+
+    gradient = heads.thought_delta.weight.grad
+    assert gradient is not None
+    assert gradient.abs().sum() > 0
 
 
 def test_allocation_loss_reserves_thirty_percent_positive_gradient_mass() -> None:

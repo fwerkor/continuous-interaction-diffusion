@@ -305,6 +305,11 @@ class CIDOutputHeads(nn.Module):
         source_padding_mask: Tensor | None = None,
     ) -> CIDTensorOutput:
         batch_size, thought_slots, _ = thought_hidden.shape
+        provisional_thought = base_thought + self.thought_delta(thought_hidden)
+        need_hidden = F.layer_norm(
+            thought_hidden + provisional_thought,
+            (self.d_model,),
+        )
         occupancy_weight = thought_occupancy.to(dtype=thought_hidden.dtype).clamp(0.0, 1.0)
         occupied_count = occupancy_weight.sum(dim=1)
         occupied_summary = (thought_hidden * occupancy_weight).sum(dim=1)
@@ -315,13 +320,13 @@ class CIDOutputHeads(nn.Module):
             occupied_summary,
             fallback_summary,
         )
-        need_query = self.source_query(thought_hidden).view(
+        need_query = self.source_query(need_hidden).view(
             batch_size, thought_slots, self.max_need_slots, self.d_model
         )
         need_query = F.normalize(need_query, dim=-1)
         normalized_sources = F.normalize(source_memory, dim=-1)
         source_logits = torch.einsum("bnkd,bsd->bnks", need_query, normalized_sources)
-        normalized_thought = F.normalize(thought_hidden, dim=-1)
+        normalized_thought = F.normalize(provisional_thought, dim=-1)
         need_target_cell_logits = torch.einsum(
             "bnkd,bmd->bnkm", need_query, normalized_thought
         )
@@ -348,17 +353,17 @@ class CIDOutputHeads(nn.Module):
                 torch.finfo(source_logits.dtype).min,
             )
 
-        argument_presence_logits = self.argument_presence_head(thought_hidden).view(
+        argument_presence_logits = self.argument_presence_head(need_hidden).view(
             batch_size, thought_slots, self.max_need_slots, self.max_argument_slots
         )
-        argument_query = self.argument_query(thought_hidden).view(
+        argument_query = self.argument_query(need_hidden).view(
             batch_size,
             thought_slots,
             self.max_need_slots,
             self.max_argument_slots,
             self.d_model,
         )
-        refresh_logits = self.refresh_head(thought_hidden).view(
+        refresh_logits = self.refresh_head(need_hidden).view(
             batch_size, thought_slots, self.max_need_slots, self.num_refresh_actions
         )
 
@@ -394,7 +399,7 @@ class CIDOutputHeads(nn.Module):
         )
 
         return CIDTensorOutput(
-            thought_semantic=base_thought + self.thought_delta(thought_hidden),
+            thought_semantic=provisional_thought,
             convergence_logits=self.convergence_head(summary).squeeze(-1),
             allocation_logits=self.allocation_head(thought_hidden).squeeze(-1),
             role_logits=self.role_head(thought_hidden),
@@ -402,7 +407,7 @@ class CIDOutputHeads(nn.Module):
             noise_delta=torch.tanh(self.noise_head(thought_hidden)),
             lifecycle_logits=self.lifecycle_head(thought_hidden),
             display_logits=display_logits,
-            need_logits=self.need_head(thought_hidden),
+            need_logits=self.need_head(need_hidden),
             source_logits=source_logits,
             need_target_cell_logits=need_target_cell_logits,
             need_target_display_logits=need_target_display_logits,
