@@ -3417,7 +3417,7 @@ def main() -> None:
     )
     runtime_defaults = RuntimeConfig()
     runtime_tuning = benchmark.add_argument_group("runtime tuning")
-    runtime_tuning.add_argument("--max-steps", type=int, default=32)
+    runtime_tuning.add_argument("--max-steps", type=int, default=runtime_defaults.max_steps)
     runtime_tuning.add_argument(
         "--max-wall-time-s", type=float, default=runtime_defaults.max_wall_time_s
     )
