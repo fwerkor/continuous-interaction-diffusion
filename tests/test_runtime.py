@@ -366,11 +366,23 @@ async def test_incomplete_candidate_does_not_block_convergence_or_start_io() -> 
     assert result.bindings[0].status.value == "candidate"
     assert result.thought.cells[0].lifecycle is CellLifecycle.ACTIVE
     finished = next(event for event in result.trace.events if event.kind == "model_step_finished")
-    assert finished.payload["display_token_ids"] == [-1]
-    assert finished.payload["display_visible_token_ids"] == [-1]
-    assert finished.payload["display_unresolved"] == 1
-    assert finished.payload["display_realized_length"] == 1
-    assert finished.payload["display_active_span_length"] == 1
+    assert "display_token_ids" not in finished.payload
+
+    traced = await CIDRuntime(
+        registry, RuntimeConfig(max_steps=4, trace_display=True)
+    ).run(
+        IncompleteCandidatePolicy(),
+        thought=thought,
+        display=DisplayCanvas.masked(1, -1),
+    )
+    traced_finished = next(
+        event for event in traced.trace.events if event.kind == "model_step_finished"
+    )
+    assert traced_finished.payload["display_token_ids"] == [-1]
+    assert traced_finished.payload["display_visible_token_ids"] == [-1]
+    assert traced_finished.payload["display_unresolved"] == 1
+    assert traced_finished.payload["display_realized_length"] == 1
+    assert traced_finished.payload["display_active_span_length"] == 1
 
 
 async def test_model_compute_overlaps_source_wait() -> None:

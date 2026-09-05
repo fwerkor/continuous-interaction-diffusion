@@ -1214,6 +1214,7 @@ def _benchmark(args: argparse.Namespace) -> None:
             max_wall_time_s=args.max_wall_time_s,
             binding_threshold=args.binding_threshold,
             idle_yield_s=args.idle_yield_s,
+            trace_display=args.trace_display,
             reclamation_grace_steps=args.reclamation_grace_steps,
             reclamation_low_watermark=args.reclamation_low_watermark,
             reclamation_target_watermark=args.reclamation_target_watermark,
@@ -2029,6 +2030,7 @@ def _train_stage_a(args: argparse.Namespace) -> None:
                         runtime_config = RuntimeConfig(
                             max_steps=args.runtime_validation_max_steps,
                             max_wall_time_s=args.runtime_validation_max_wall_time_s,
+                            trace_display=True,
                         )
                         for example in runtime_validation_examples:
                             results.append(
@@ -3426,6 +3428,14 @@ def main() -> None:
         "--binding-threshold", type=float, default=DEFAULT_BINDING_THRESHOLD
     )
     runtime_tuning.add_argument("--idle-yield-s", type=float, default=runtime_defaults.idle_yield_s)
+    runtime_tuning.add_argument(
+        "--trace-display",
+        action="store_true",
+        help=(
+            "record per-model-step Display snapshots in trace events; disabled by default "
+            "to avoid instrumentation overhead in latency/throughput benchmarks"
+        ),
+    )
     runtime_tuning.add_argument(
         "--reclamation-grace-steps",
         type=int,

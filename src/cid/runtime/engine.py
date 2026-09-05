@@ -36,6 +36,7 @@ class RuntimeConfig:
     max_wall_time_s: float | None = 300.0
     binding_threshold: float = DEFAULT_BINDING_THRESHOLD
     idle_yield_s: float = 0.001
+    trace_display: bool = False
     reclamation_grace_steps: int = DEFAULT_RECLAMATION_GRACE_STEPS
     reclamation_low_watermark: float = DEFAULT_RECLAMATION_LOW_WATERMARK
     reclamation_target_watermark: float = DEFAULT_RECLAMATION_TARGET_WATERMARK
@@ -224,19 +225,21 @@ class CIDRuntime:
                     runtime_step=self._runtime_step,
                 )
                 update = await asyncio.to_thread(policy.step, context)
-                self.trace.emit(
-                    "model_step_finished",
-                    step,
-                    needs=len(update.needs),
-                    equilibrium=update.equilibrium,
-                    converged=update.converged,
-                    runtime_step=self._runtime_step,
-                    display_token_ids=list(update.display.token_ids),
-                    display_visible_token_ids=list(update.display.visible_token_ids),
-                    display_unresolved=update.display.unresolved,
-                    display_realized_length=update.display.realized_length,
-                    display_active_span_length=update.display.active_span_length,
-                )
+                finished_payload: dict[str, Any] = {
+                    "needs": len(update.needs),
+                    "equilibrium": update.equilibrium,
+                    "converged": update.converged,
+                    "runtime_step": self._runtime_step,
+                }
+                if self.config.trace_display:
+                    finished_payload.update(
+                        display_token_ids=list(update.display.token_ids),
+                        display_visible_token_ids=list(update.display.visible_token_ids),
+                        display_unresolved=update.display.unresolved,
+                        display_realized_length=update.display.realized_length,
+                        display_active_span_length=update.display.active_span_length,
+                    )
+                self.trace.emit("model_step_finished", step, **finished_payload)
                 completed_steps += 1
                 epoch_steps += 1
                 proposed_thought = update.thought

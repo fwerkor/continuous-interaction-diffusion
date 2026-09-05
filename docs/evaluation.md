@@ -41,11 +41,12 @@ actual execution behavior on a fixed evaluation setup.
 
 Each neural benchmark JSONL row includes `trace_events`. Timestamps are seconds relative to the
 trajectory's first trace event rather than process-global monotonic timestamps. Each
-`model_step_finished` event also records the full and visible Display token IDs, unresolved-token
-count, realized/active-span lengths, and tokenizer-decoded Display text. This preserves both the
-Display refinement trajectory and the event stream needed to recompute alternate latency,
-concurrency, cache, deduplication, lifecycle, or interaction statistics after a benchmark has
-completed. Stage A epoch-end runtime validation persists the same trace events.
+`model_step_finished` events can also record the full and visible Display token IDs, unresolved-token
+count, realized/active-span lengths, and tokenizer-decoded Display text. This richer instrumentation
+is disabled by default for `cid benchmark` so latency/throughput measurements do not pay the
+per-step Display snapshot cost; pass `--trace-display` when Display evolution is being analyzed.
+Stage A epoch-end runtime validation enables Display tracing automatically and persists the same
+trace events.
 
 ## Task-level freshness and display metrics
 

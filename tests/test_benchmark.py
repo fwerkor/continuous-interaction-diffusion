@@ -294,7 +294,7 @@ async def test_neural_benchmark_case_runs_replay_and_scores_display() -> None:
         display_only,
         seed_teacher_state=True,
         denoising_steps=1,
-        max_steps=4,
+        runtime_config=RuntimeConfig(max_steps=4, trace_display=True),
     )
 
     assert result.example_id == "bench-1"
