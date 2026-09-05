@@ -306,6 +306,15 @@ async def test_neural_benchmark_case_runs_replay_and_scores_display() -> None:
     assert payload["trace_events"][0]["kind"] == "trajectory_started"
     assert any(event["kind"] == "trajectory_finished" for event in payload["trace_events"])
     assert all(event["timestamp_s"] >= 0 for event in payload["trace_events"])
+    model_events = [
+        event for event in payload["trace_events"] if event["kind"] == "model_step_finished"
+    ]
+    assert model_events
+    for event in model_events:
+        assert "display_token_ids" in event["payload"]
+        assert "display_visible_token_ids" in event["payload"]
+        assert "display_text" in event["payload"]
+        assert "display_materialized_text" in event["payload"]
 
 
 async def test_neural_benchmark_expands_display_bucket_for_longer_target() -> None:

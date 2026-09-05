@@ -121,8 +121,32 @@ async def run_neural_benchmark_case(
         final_display_ids=final_ids,
         runtime_steps=replay.runtime.steps,
         evaluation=replay.evaluation,
-        trace_events=replay.runtime.trace.to_dicts(),
+        trace_events=_decode_display_trace_events(replay.runtime.trace.to_dicts(), tokenizer),
     )
+
+
+def _decode_display_trace_events(
+    events: tuple[dict[str, Any], ...],
+    tokenizer: Any,
+) -> tuple[dict[str, Any], ...]:
+    decoded: list[dict[str, Any]] = []
+    for event in events:
+        item = dict(event)
+        payload = dict(item.get("payload", {}))
+        visible_ids = payload.get("display_visible_token_ids")
+        if visible_ids is not None:
+            token_ids = list(visible_ids)
+            payload["display_text"] = tokenizer.decode(
+                token_ids,
+                skip_special_tokens=False,
+            )
+            payload["display_materialized_text"] = tokenizer.decode(
+                token_ids,
+                skip_special_tokens=True,
+            )
+        item["payload"] = payload
+        decoded.append(item)
+    return tuple(decoded)
 
 
 def _benchmark_display_canvas_tokens(adapter: ILLaDACIDAdapter, required_tokens: int) -> int:

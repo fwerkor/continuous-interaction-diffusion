@@ -365,6 +365,12 @@ async def test_incomplete_candidate_does_not_block_convergence_or_start_io() -> 
     assert source.reads == 0
     assert result.bindings[0].status.value == "candidate"
     assert result.thought.cells[0].lifecycle is CellLifecycle.ACTIVE
+    finished = next(event for event in result.trace.events if event.kind == "model_step_finished")
+    assert finished.payload["display_token_ids"] == [-1]
+    assert finished.payload["display_visible_token_ids"] == [-1]
+    assert finished.payload["display_unresolved"] == 1
+    assert finished.payload["display_realized_length"] == 1
+    assert finished.payload["display_active_span_length"] == 1
 
 
 async def test_model_compute_overlaps_source_wait() -> None:

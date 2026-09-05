@@ -231,6 +231,11 @@ class CIDRuntime:
                     equilibrium=update.equilibrium,
                     converged=update.converged,
                     runtime_step=self._runtime_step,
+                    display_token_ids=list(update.display.token_ids),
+                    display_visible_token_ids=list(update.display.visible_token_ids),
+                    display_unresolved=update.display.unresolved,
+                    display_realized_length=update.display.realized_length,
+                    display_active_span_length=update.display.active_span_length,
                 )
                 completed_steps += 1
                 epoch_steps += 1

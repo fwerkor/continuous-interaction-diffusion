@@ -2076,6 +2076,7 @@ def _train_stage_a(args: argparse.Namespace) -> None:
                                         "target_display": example.target_display,
                                         "final_text": result.final_text,
                                         "runtime_steps": result.runtime_steps,
+                                        "trace_events": list(result.trace_events),
                                         "converged": evaluation.converged,
                                         "exact_display": evaluation.exact_display,
                                         "observation_coverage": evaluation.observation_coverage,
