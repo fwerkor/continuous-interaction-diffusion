@@ -114,6 +114,7 @@ class CIDTrainingStep:
     example_id: str
     source_step: int
     target_step: int
+    supervision_step: int
     diffusion_step: int
     next_diffusion_step: int
     batch: CIDTensorBatch
@@ -121,6 +122,7 @@ class CIDTrainingStep:
     promoted_fact_texts: tuple[str, ...] = ()
     observed_binding_ids: tuple[str, ...] = ()
     binding_observation_steps: tuple[tuple[str, int], ...] = ()
+    replay_observation_steps: tuple[tuple[str, int], ...] = ()
     terminal_validated_binding_ids: tuple[str, ...] = ()
     input_binding_routes: tuple[CIDRolloutBindingRoute, ...] = ()
     input_runtime_cell_ids: tuple[str | None, ...] = ()
@@ -171,6 +173,7 @@ class CIDRolloutState:
     executable_binding_ids: tuple[str, ...] = ()
     binding_routes: tuple[CIDRolloutBindingRoute, ...] = ()
     binding_observation_steps: tuple[tuple[str, int], ...] = ()
+    replay_observation_steps: tuple[tuple[str, int], ...] = ()
     terminal_validated_binding_ids: tuple[str, ...] = ()
     promoted_fact_texts: tuple[str, ...] = ()
     retired_at: tuple[tuple[str, int], ...] = ()
@@ -1140,7 +1143,7 @@ class CIDTrainer:
 
         materializer_config = CIDMaterializerConfig()
         equilibrium = (
-            float(torch.sigmoid(output.convergence_logits[batch_index]).detach())
+            float(torch.sigmoid(output.convergence_logits[batch_index].float()).detach())
             >= materializer_config.convergence_threshold
         )
         display_unresolved = bool(
@@ -1188,7 +1191,7 @@ class CIDTrainer:
                 batch_index : batch_index + 1, slot_slice
             ].detach(),
             role_features=torch.sigmoid(
-                output.role_logits[batch_index : batch_index + 1, slot_slice]
+                output.role_logits[batch_index : batch_index + 1, slot_slice].float()
             ).detach(),
             uncertainty=output.uncertainty[batch_index : batch_index + 1, slot_slice].detach(),
             lifecycle_features=lifecycle_features.detach(),
@@ -1205,6 +1208,7 @@ class CIDTrainer:
             executable_binding_ids=executable_binding_ids,
             binding_routes=binding_routes,
             binding_observation_steps=tuple(sorted(observation_steps.items())),
+            replay_observation_steps=sample.replay_observation_steps,
             terminal_validated_binding_ids=tuple(sorted(terminal_validated_ids)),
             promoted_fact_texts=sample.promoted_fact_texts,
             retired_at=tuple(sorted(retired_at.items())),
@@ -2266,7 +2270,6 @@ class ILLaDATrajectoryTensorizer:
         target_step = source_step + 1
         transition = self._teacher_runtime_transition(example, source_step)
         current = transition.current
-        target = transition.target
 
         device = self.text_encoder.device
         dtype = self.text_encoder.dtype
@@ -2274,12 +2277,8 @@ class ILLaDATrajectoryTensorizer:
         if rollout_state is not None:
             self._validate_rollout_state(rollout_state, capacity)
             rollout_state = self._reclaim_rollout_state(rollout_state, step=target_step)
-        target_by_id = {cell.cell_id: cell for cell in target}
-        target_output_slots = dict(transition.target_output_slots)
-        teacher_runtime_ids = dict(transition.runtime_ids_by_teacher)
 
         current_vectors = self._semantic_vectors(current)
-        target_vectors = self._semantic_vectors(target)
         thought_semantic = torch.zeros(
             (1, capacity, self.adapter.d_model), device=device, dtype=dtype
         )
@@ -2329,16 +2328,6 @@ class ILLaDATrajectoryTensorizer:
                 )
             input_retired_at = rollout_state.retired_at
 
-            # Closed-loop rollout can diverge from the teacher's physical slot layout.
-            # Existing occupied slots keep their positional teacher supervision, while
-            # teacher cells missing from the rollout must be allocated into the runtime's
-            # deterministic first-free prefix. Reusing the teacher's original free-slot
-            # indices can otherwise create impossible labels such as allocating slot 3
-            # while slot 1 is still free.
-            target_output_slots = self._runtime_realisable_target_output_slots(
-                target_output_slots, occupancy
-            )
-
         timestep_tensor = torch.tensor([timestep], device=device)
         thought_timesteps = (
             timestep_tensor
@@ -2361,6 +2350,38 @@ class ILLaDATrajectoryTensorizer:
             target_step,
             rollout_state=rollout_state,
         )
+        replay_observation_steps = dict(
+            () if rollout_state is None else rollout_state.replay_observation_steps
+        )
+        for binding, event in percept_projections:
+            replay_observation_steps[binding.need_id] = max(
+                replay_observation_steps.get(binding.need_id, -1),
+                int(event.arrival_step),
+            )
+        supervision_step = self._causal_supervision_step(
+            example,
+            target_step,
+            rollout_state=rollout_state,
+            replay_observation_steps=tuple(sorted(replay_observation_steps.items())),
+        )
+        supervision_transition = (
+            transition
+            if supervision_step == target_step
+            else self._teacher_runtime_transition(example, supervision_step - 1)
+        )
+        target = supervision_transition.target
+        target_by_id = {cell.cell_id: cell for cell in target}
+        target_output_slots = dict(supervision_transition.target_output_slots)
+        teacher_runtime_ids = dict(supervision_transition.runtime_ids_by_teacher)
+        target_vectors = self._semantic_vectors(target)
+        if rollout_state is not None:
+            # Closed-loop rollout can diverge from the teacher's physical slot layout.
+            # Existing occupied slots keep their positional teacher supervision, while
+            # teacher cells missing from the causally reachable supervision state must be
+            # allocated into the runtime's deterministic first-free prefix.
+            target_output_slots = self._runtime_realisable_target_output_slots(
+                target_output_slots, occupancy
+            )
         if rollout_state is None or rollout_state.diffusion_step is None:
             diffusion_step = self._runtime_diffusion_step(example, source_step)
             next_diffusion_step = self._runtime_diffusion_step(example, target_step)
@@ -2380,7 +2401,7 @@ class ILLaDATrajectoryTensorizer:
             )
 
         prompt_ids = self.text_encoder.tokenize(example.prompt, add_special_tokens=True)
-        target_display = self._display_text(example, target_step)
+        target_display = self._display_text(example, supervision_step)
         target_text_ids = self._encode_display_text(target_display)
         realized_tokens = target_text_ids.shape[1]
         display_canvas_tokens = self._display_canvas_size(
@@ -2406,7 +2427,26 @@ class ILLaDATrajectoryTensorizer:
         display_supervision_mask = torch.zeros_like(target_display_ids, dtype=torch.bool)
         display_supervision_mask[:, : realized_tokens + 1] = True
 
-        if rollout_state is None:
+        if rollout_state is None and source_step == -1:
+            # The virtual bootstrap transition must match inference exactly: an empty
+            # TCT plus one unresolved Display token followed by EOS, with the rest of
+            # the physical canvas kept as latent capacity.  Corrupting the teacher's
+            # step-0 answer draft here leaks a much easier initialization distribution
+            # than the runtime ever receives.
+            display_input_ids = torch.full_like(
+                target_display_ids,
+                self.adapter.mask_token_id,
+            )
+            display_input_ids[:, 1] = self.eos_token_id
+            display_labels = target_display_ids.clone()
+            display_labels[~display_supervision_mask] = -100
+            display_labels[display_input_ids == target_display_ids] = -100
+            display_noise = torch.ones(
+                (*display_input_ids.shape, 1),
+                device=device,
+                dtype=dtype,
+            )
+        elif rollout_state is None:
             display_corruption = self.scheduler.corrupt_display(
                 target_display_ids,
                 timestep_tensor,
@@ -2540,7 +2580,7 @@ class ILLaDATrajectoryTensorizer:
         targets = self._targets(
             example=example,
             source_step=source_step,
-            target_step=target_step,
+            target_step=supervision_step,
             target_by_id=target_by_id,
             target_output_slots=target_output_slots,
             target_vectors=target_vectors,
@@ -2568,6 +2608,7 @@ class ILLaDATrajectoryTensorizer:
             example_id=example.example_id,
             source_step=source_step,
             target_step=target_step,
+            supervision_step=supervision_step,
             diffusion_step=diffusion_step,
             next_diffusion_step=next_diffusion_step,
             batch=batch,
@@ -2575,6 +2616,7 @@ class ILLaDATrajectoryTensorizer:
             promoted_fact_texts=promoted_fact_texts,
             observed_binding_ids=tuple(observed_binding_ids),
             binding_observation_steps=binding_observation_steps,
+            replay_observation_steps=tuple(sorted(replay_observation_steps.items())),
             terminal_validated_binding_ids=terminal_validated_binding_ids,
             input_binding_routes=(() if rollout_state is None else rollout_state.binding_routes),
             input_runtime_cell_ids=input_runtime_cell_ids,
@@ -2703,6 +2745,46 @@ class ILLaDATrajectoryTensorizer:
             tuple(sorted(observation_steps.items())),
             tuple(sorted(validated)),
         )
+
+    def _causal_supervision_step(
+        self,
+        example: TrajectoryExample,
+        target_step: int,
+        *,
+        rollout_state: CIDRolloutState | None,
+        replay_observation_steps: tuple[tuple[str, int], ...],
+    ) -> int:
+        """Clamp closed-loop supervision to evidence the rollout actually obtained.
+
+        Teacher trajectories advance when replay observations arrive.  A model rollout may
+        fail to materialize the corresponding need/source/arguments, so that observation is
+        not causally available to the model.  Supervising the later teacher state anyway
+        teaches the model to hallucinate tool-derived facts.  Hold supervision at the latest
+        teacher step before the first missing observation until the runtime route really
+        obtains it.
+        """
+
+        if rollout_state is None:
+            return target_step
+
+        observed_by_replay = dict(replay_observation_steps)
+
+        supervision_step = target_step
+        for binding in example.binding_targets:
+            matching = self._matching_binding_events(example, binding, target_step)
+            if not matching:
+                continue
+            observed_step = observed_by_replay.get(binding.need_id, -1)
+            missing_steps = tuple(
+                event.arrival_step for event in matching if event.arrival_step > observed_step
+            )
+            if missing_steps:
+                supervision_step = min(supervision_step, min(missing_steps) - 1)
+
+        # Neural-contract-v4 datasets currently place external observations after step 0.
+        # Keep the guard explicit so malformed/legacy data cannot request a nonexistent
+        # teacher target at step -1.
+        return max(0, supervision_step)
 
     def rollout_external_progress(
         self,
@@ -3234,6 +3316,11 @@ class ILLaDATrajectoryTensorizer:
             raise ValueError("rollout display noise level must be in [0, 1]")
         if state.diffusion_step is not None and state.diffusion_step < 0:
             raise ValueError("rollout diffusion step must be non-negative when set")
+        replay_observations = dict(state.replay_observation_steps)
+        if len(replay_observations) != len(state.replay_observation_steps):
+            raise ValueError("rollout replay-observation history must have unique binding IDs")
+        if any(step < 0 for step in replay_observations.values()):
+            raise ValueError("rollout replay-observation steps must be non-negative")
         if state.next_cell_serial < 0:
             raise ValueError("rollout next cell serial must be non-negative")
         if state.runtime_cell_ids:

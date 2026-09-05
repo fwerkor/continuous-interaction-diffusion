@@ -215,6 +215,49 @@ def test_display_refinement_can_move_existing_eos_and_expand_tail() -> None:
     assert refined.tolist() == [[9, 7, 8, 2]]
 
 
+def test_display_refinement_keeps_post_eos_tail_latent_when_boundary_is_stable() -> None:
+    scheduler = CIDDiffusionScheduler(mask_token_id=5, eos_token_id=2)
+    tokens = torch.tensor([[5, 2, 5, 5, 5, 5]])
+    logits = torch.zeros(1, 6, 16)
+    logits[0, 0, 9] = 30.0
+    logits[0, 1, 2] = 30.0
+    logits[0, 2, 7] = 30.0
+    logits[0, 3, 8] = 30.0
+    logits[0, 4, 10] = 30.0
+    logits[0, 5, 11] = 30.0
+
+    refined = scheduler.refine_display(
+        tokens,
+        logits,
+        reveal_fraction=1.0,
+        revision_fraction=1.0,
+        revision_margin=0.0,
+    )
+
+    assert refined.tolist() == [[9, 2, 5, 5, 5, 5]]
+
+
+def test_display_refinement_bounds_eos_expansion_per_step() -> None:
+    scheduler = CIDDiffusionScheduler(mask_token_id=5, eos_token_id=2)
+    tokens = torch.tensor([[9, 2, 5, 5, 5, 5, 5, 5]])
+    logits = torch.zeros(1, 8, 16)
+    logits[0, 0, 9] = 30.0
+    logits[0, 1, 7] = 30.0
+    logits[0, 2, 8] = 30.0
+    logits[0, 3, 10] = 30.0
+    logits[0, 7, 2] = 30.0
+
+    refined = scheduler.refine_display(
+        tokens,
+        logits,
+        reveal_fraction=0.125,
+        revision_fraction=1.0,
+        revision_margin=0.0,
+    )
+
+    assert refined.tolist() == [[9, 7, 2, 5, 5, 5, 5, 5]]
+
+
 def test_visible_replacement_corruption_never_injects_eos() -> None:
     scheduler = CIDDiffusionScheduler(mask_token_id=5, eos_token_id=2)
     tokens = torch.tensor([[10, 11, 12, 13]])

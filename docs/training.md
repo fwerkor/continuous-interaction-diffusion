@@ -113,10 +113,12 @@ different ABI.
 Both training stages accept `--validation-data <trajectory.jsonl>`. If it is omitted and the main
 trajectory JSONL contains `metadata.split` labels, `train` examples are used for optimization,
 `validation` examples are held out, and `test` examples are excluded. Validation runs once after
-every completed epoch with a fixed diffusion RNG seed and teacher-forced inputs, so the resulting
-loss is comparable across epochs even while Stage A changes its rollout curriculum. Metrics are
-appended to `validation_metrics.jsonl`; validation never performs an optimizer step or automatic
-early stopping.
+every completed epoch with a fixed diffusion RNG seed. The teacher-forced and detached free-rollout
+metrics in `validation_metrics.jsonl` are per-transition head diagnostics, not end-to-end task
+success. Stage A additionally runs a small deterministic, family-diverse subset through the real
+CID runtime from an empty TCT and canonical unresolved Display; those task-level results are stored
+in `runtime_validation_metrics.jsonl` and summarized under `end_to_end_runtime`. Validation never
+performs an optimizer step or automatic early stopping.
 
 `cid train` runs this path on one device. Under `torchrun`, it switches to DDP automatically. Each
 rank receives the same shuffled transition order and a padded equal-length shard so every rank
@@ -144,17 +146,22 @@ with teacher-forced inputs, then scheduled sampling linearly increases the chanc
 detached model/runtime state replaces the next transition's source state, and finally reaches
 self-rollout. Detaching after each transition keeps memory bounded without resetting long trajectories
 back to teacher state. The carried state includes TCT/display tensors, predicted binding/executable
-state, and promoted facts. External events are still supplied by the teacher schedule, but during
-self-rollout they are exposed only when the preceding model output produced the matching executable
-binding. ONCE observations retire from percept memory after consumption, while source-owned promoted
-facts persist. Allocation, revision, lifecycle, and ONCE-need targets are resolved against the state
-actually fed to the model so rollout errors receive recovery supervision instead of contradictory
-teacher-state labels.
+state, observation history, and promoted facts. External events are still supplied by the teacher
+schedule, but during self-rollout they are exposed only when the preceding model output produced the
+matching executable binding. ONCE observations retire from percept memory after consumption, while
+source-owned promoted facts and replay-observation history persist. If the rollout misses a required
+observation, thought and Display supervision are clamped to the latest causally reachable teacher
+state rather than exposing a future tool-derived fact. Allocation, revision, lifecycle, and ONCE-need
+targets are resolved against the state actually fed to the model so rollout errors receive recovery
+supervision instead of contradictory or non-causal teacher-state labels.
 
 Stage A stores the frozen backbone at the requested low precision but recasts trainable CID-only
 modules to FP32 and runs the forward pass under autocast. AdamW therefore maintains FP32 parameters
 and moments, avoiding BF16 update quantization for initialized gates and routing scales. Stage A
-checkpoints also bind resume cursors to the exact training JSONL SHA-256.
+benchmark/inference uses the same contract: low-precision backbone compute under autocast with CID
+modules retained in FP32, and thresholded runtime probabilities are evaluated in FP32. The virtual
+bootstrap transition also uses the same canonical Display as runtime (`MASK`, `EOS`, then latent
+capacity). Stage A checkpoints bind resume cursors to the exact training JSONL SHA-256.
 
 This DDP path is for the frozen-backbone Stage A phase.
 

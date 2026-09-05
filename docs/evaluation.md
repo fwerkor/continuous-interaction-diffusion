@@ -2,7 +2,10 @@
 
 CID evaluation separates model/output quality from interaction behavior. Runtime traces are the
 source of truth for interaction timing; task datasets define expected external observations and,
-when a tokenizer-specific harness is available, expected display tokens.
+when a tokenizer-specific harness is available, expected display tokens. Teacher-forced and detached
+free-rollout metrics produced by the trainer are per-transition head diagnostics; they must not be
+reported as end-to-end task success. Stage A therefore also runs a bounded set of held-out examples
+through the actual runtime from an empty TCT and canonical unresolved Display after each epoch.
 
 ## Per-runtime interaction metrics
 

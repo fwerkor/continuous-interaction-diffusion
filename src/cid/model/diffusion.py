@@ -208,8 +208,20 @@ class CIDDiffusionScheduler:
             ).squeeze(-1)
         result = token_ids.clone()
         for batch_index in range(token_ids.shape[0]):
+            eos_position: int | None = None
+            if self.eos_token_id is not None:
+                current_eos = torch.nonzero(
+                    token_ids[batch_index] == self.eos_token_id,
+                    as_tuple=False,
+                ).flatten()
+                if current_eos.numel():
+                    eos_position = int(current_eos[0])
+
+            active_content_stop = (
+                eos_position if eos_position is not None else token_ids.shape[1]
+            )
             masked_positions = torch.nonzero(
-                token_ids[batch_index] == self.mask_token_id,
+                token_ids[batch_index, :active_content_stop] == self.mask_token_id,
                 as_tuple=False,
             ).flatten()
             if masked_positions.numel() and reveal_fraction:
@@ -223,28 +235,57 @@ class CIDDiffusionScheduler:
             if revision_fraction == 0.0:
                 continue
             visible_positions = torch.nonzero(
-                token_ids[batch_index] != self.mask_token_id,
+                token_ids[batch_index, :active_content_stop] != self.mask_token_id,
                 as_tuple=False,
             ).flatten()
-            if visible_positions.numel() == 0:
-                continue
-            current_ids = token_ids[batch_index, visible_positions]
-            visible_confidence = current_confidence[batch_index, visible_positions]
-            gains = confidence[batch_index, visible_positions] - visible_confidence
-            candidates = (predicted[batch_index, visible_positions] != current_ids) & (
-                gains >= revision_margin
-            )
-            candidate_positions = visible_positions[candidates]
-            if candidate_positions.numel() == 0:
-                continue
-            candidate_gains = gains[candidates]
-            revision_count = min(
-                candidate_positions.numel(),
-                math.ceil(visible_positions.numel() * revision_fraction),
-            )
-            ranked = candidate_positions[candidate_gains.argsort(descending=True)]
-            selected = ranked[:revision_count]
-            result[batch_index, selected] = predicted[batch_index, selected]
+            if visible_positions.numel():
+                current_ids = token_ids[batch_index, visible_positions]
+                visible_confidence = current_confidence[batch_index, visible_positions]
+                gains = confidence[batch_index, visible_positions] - visible_confidence
+                candidates = (predicted[batch_index, visible_positions] != current_ids) & (
+                    gains >= revision_margin
+                )
+                candidate_positions = visible_positions[candidates]
+                if candidate_positions.numel():
+                    candidate_gains = gains[candidates]
+                    revision_count = min(
+                        candidate_positions.numel(),
+                        math.ceil(visible_positions.numel() * revision_fraction),
+                    )
+                    ranked = candidate_positions[candidate_gains.argsort(descending=True)]
+                    selected = ranked[:revision_count]
+                    result[batch_index, selected] = predicted[batch_index, selected]
+
+            # Positions after EOS are latent capacity, not unresolved answer tokens.  The
+            # boundary may still move to the right, but only when the model explicitly
+            # prefers replacing the current EOS and only by a bounded denoising budget.
+            # This prevents one refinement step from revealing an arbitrary canvas tail.
+            if eos_position is not None and eos_position + 1 < token_ids.shape[1]:
+                eos_prediction = int(predicted[batch_index, eos_position])
+                eos_gain = float(
+                    confidence[batch_index, eos_position]
+                    - current_confidence[batch_index, eos_position]
+                )
+                if eos_prediction != self.eos_token_id and eos_gain >= revision_margin:
+                    expansion_budget = max(
+                        1,
+                        math.ceil(max(1, eos_position + 1) * reveal_fraction),
+                    )
+                    new_eos = min(
+                        token_ids.shape[1] - 1,
+                        eos_position + expansion_budget,
+                    )
+                    predicted_tail_eos = torch.nonzero(
+                        predicted[batch_index, eos_position + 1 : new_eos + 1]
+                        == self.eos_token_id,
+                        as_tuple=False,
+                    ).flatten()
+                    if predicted_tail_eos.numel():
+                        new_eos = eos_position + 1 + int(predicted_tail_eos[0])
+                    result[batch_index, eos_position:new_eos] = predicted[
+                        batch_index, eos_position:new_eos
+                    ]
+                    result[batch_index, new_eos] = self.eos_token_id
 
         if self.eos_token_id is not None:
             for batch_index in range(result.shape[0]):

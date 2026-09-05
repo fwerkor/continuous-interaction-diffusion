@@ -298,7 +298,7 @@ async def test_neural_benchmark_case_runs_replay_and_scores_display() -> None:
     )
 
     assert result.example_id == "bench-1"
-    assert result.final_display_ids == (7,) * 8
+    assert result.final_display_ids == (7,) * 7
     assert result.evaluation.exact_display is False
     assert result.evaluation.expected_observations == 0
     assert result.evaluation.observation_coverage == 1.0
@@ -327,4 +327,4 @@ async def test_neural_benchmark_expands_display_bucket_for_longer_target() -> No
         max_steps=4,
     )
 
-    assert len(result.final_display_ids) == 16
+    assert len(result.final_display_ids) == 15

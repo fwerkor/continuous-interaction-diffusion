@@ -95,7 +95,7 @@ async def run_neural_benchmark_case(
             width=adapter.d_model,
         )
     )
-    display = DisplayCanvas.masked(
+    display = DisplayCanvas.initial_unresolved(
         length=canvas_tokens,
         mask_token_id=adapter.mask_token_id,
         eos_token_id=adapter.eos_token_id,

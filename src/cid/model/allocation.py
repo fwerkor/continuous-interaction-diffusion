@@ -35,7 +35,10 @@ def prefix_allocation_mask(
         raise ValueError("max_allocations must be positive")
 
     occupied = occupancy.bool()
-    eligible = torch.sigmoid(allocation_logits) >= threshold
+    # Allocation is a discrete runtime decision.  Evaluate its probability in
+    # FP32 even when the model forward runs under BF16/FP16 autocast so small
+    # rounding differences near the threshold do not change the allocation path.
+    eligible = torch.sigmoid(allocation_logits.float()) >= threshold
     free = ~occupied
 
     # A low-confidence free slot terminates the first-free prefix. Occupied

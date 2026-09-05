@@ -560,7 +560,9 @@ configuration once it starts.
 `cid benchmark` runs a trained CID checkpoint through the same step-exact replay sources used by the
 runtime evaluator and writes both per-case JSONL and an aggregate JSON summary. The benchmark uses
 the same coarse display buckets as training, expanding from the checkpoint's minimum canvas up to
-`max_display_tokens` when a target requires it. The default starts from an empty TCT;
+`max_display_tokens` when a target requires it. The default starts from an empty TCT and the
+canonical unresolved Display state (`MASK`, `EOS`, then latent capacity), matching the neural
+training representation of `<|cid_unknown|>` while leaving room for EOS to move as the answer grows;
 `--seed-teacher-state` is available only as a diagnostic that isolates downstream interaction
 behavior from initial cognitive allocation.
 
@@ -590,8 +592,14 @@ torchrun --standalone --nproc-per-node=${WORLD_SIZE} -m cid.cli benchmark \
 ```
 
 The summary reports convergence, exact display accuracy, observation coverage/staleness,
-latent-to-executable delay, binding-to-observation delay, and observation-to-projection lag. Stage B
-benchmark loading restores model shards only; it does not construct or load optimizer state.
+latent-to-executable delay, binding-to-observation delay, and observation-to-projection lag. For
+Stage A, `--dtype bf16` means BF16 backbone/compute under autocast while CID-specific parameters stay
+FP32, matching training; thresholded runtime probabilities are evaluated in FP32. Stage B benchmark
+loading restores model shards only; it does not construct or load optimizer state.
+
+The teacher-forced/free-rollout metrics written during training are per-transition head diagnostics.
+Stage A also runs a bounded family-diverse subset through the actual replay runtime after each epoch,
+recording end-to-end task results separately in `runtime_validation_metrics.jsonl`.
 
 Runtime decision thresholds are policy knobs rather than fixed checkpoint contracts. `cid benchmark`
 exposes the recommended defaults through CLI options such as `--need-threshold`,

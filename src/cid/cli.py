@@ -1165,11 +1165,28 @@ def _benchmark(args: argparse.Namespace) -> None:
                     else adapter
                 )
         else:
+            if dtype is not torch.float32:
+                # Stage A keeps trainable CID modules in FP32 even though the frozen
+                # backbone is stored and computed in low precision.
+                adapter.set_cid_modules_dtype(torch.float32)
             load_cid_adapter_checkpoint(adapter, checkpoint)
             text_encoder = ILLaDATextEncoder(
                 adapter, tokenizer, pooling_mode=semantic_pooling
             )
-            forward_model = adapter
+            # Stage A is trained with a low-precision frozen backbone, FP32 CID
+            # parameters, and low-precision autocast.  Keep the exact same numeric
+            # contract at inference time: casting the CID heads/fusion modules down
+            # to BF16 can move thresholded allocation/need/convergence decisions and
+            # send the closed-loop runtime down a completely different trajectory.
+            if dtype is not torch.float32:
+                forward_model = wrap_torch_autocast(
+                    torch,
+                    adapter,
+                    device_type=device_type,
+                    dtype=dtype,
+                )
+            else:
+                forward_model = adapter
 
         adapter.eval()
         forward_model.eval()
@@ -1242,6 +1259,12 @@ def _benchmark(args: argparse.Namespace) -> None:
                 "checkpoint": str(checkpoint),
                 "checkpoint_kind": args.checkpoint_kind,
                 "model": args.model,
+                "precision": {
+                    "backbone_compute_dtype": args.dtype,
+                    "cid_parameter_dtype": (
+                        "fp32" if args.checkpoint_kind == "stage-a" else "checkpoint"
+                    ),
+                },
                 "seed_teacher_state": args.seed_teacher_state,
                 "metrics": asdict(summary),
             }
@@ -1499,6 +1522,39 @@ def _stage_a_completed_epoch_data_order_version(data_order_version: int) -> int:
     return max(data_order_version, 4)
 
 
+def _select_end_to_end_validation_examples(
+    examples: tuple[TrajectoryExample, ...],
+    limit: int,
+) -> tuple[TrajectoryExample, ...]:
+    """Pick a deterministic, family-diverse subset for real runtime validation."""
+
+    if limit <= 0 or not examples:
+        return ()
+    selected: list[TrajectoryExample] = []
+    selected_ids: set[str] = set()
+    seen_groups: set[str] = set()
+    for example in examples:
+        group = str(
+            example.metadata.get("family")
+            or example.metadata.get("semantic_task_id")
+            or example.example_id
+        )
+        if group in seen_groups:
+            continue
+        seen_groups.add(group)
+        selected.append(example)
+        selected_ids.add(example.example_id)
+        if len(selected) >= limit:
+            return tuple(selected)
+    for example in examples:
+        if example.example_id in selected_ids:
+            continue
+        selected.append(example)
+        if len(selected) >= limit:
+            break
+    return tuple(selected)
+
+
 def _train_stage_a(args: argparse.Namespace) -> None:
     import torch
     import torch.distributed as dist
@@ -1519,6 +1575,7 @@ def _train_stage_a(args: argparse.Namespace) -> None:
         trajectory_rollout_windows,
         wrap_stage_a_ddp,
     )
+    from cid.model.benchmark import run_neural_benchmark_case
     from cid.model.encoding import ILLaDATextEncoder
     from cid.model.loading import pretrained_revision
 
@@ -1697,12 +1754,23 @@ def _train_stage_a(args: argparse.Namespace) -> None:
         )
         rank_zero_metrics_path = output_dir / "train_metrics.jsonl"
         validation_metrics_path = output_dir / "validation_metrics.jsonl"
+        runtime_validation_metrics_path = output_dir / "runtime_validation_metrics.jsonl"
         if args.log_every_steps <= 0:
             raise ValueError("--log-every-steps must be positive")
         if args.checkpoint_every_steps <= 0:
             raise ValueError("--checkpoint-every-steps must be positive")
         if args.physical_micro_batch_size is not None and args.physical_micro_batch_size <= 0:
             raise ValueError("--physical-micro-batch-size must be positive")
+        if args.runtime_validation_examples < 0:
+            raise ValueError("--runtime-validation-examples must be non-negative")
+        if args.runtime_validation_max_steps <= 0:
+            raise ValueError("--runtime-validation-max-steps must be positive")
+        if args.runtime_validation_max_wall_time_s <= 0:
+            raise ValueError("--runtime-validation-max-wall-time-s must be positive")
+        runtime_validation_examples = _select_end_to_end_validation_examples(
+            validation_examples,
+            args.runtime_validation_examples,
+        )
         trainable = sum(
             parameter.numel() for parameter in adapter.parameters() if parameter.requires_grad
         )
@@ -1936,6 +2004,99 @@ def _train_stage_a(args: argparse.Namespace) -> None:
                 validation_mean_loss = float(teacher_forced["mean_loss"])
                 validation_raw_mean_loss = float(teacher_forced["raw_mean_loss"])
                 validation_transitions = int(teacher_forced["transitions"])
+                runtime_validation = None
+                if distributed:
+                    dist.barrier()
+                if rank == 0 and runtime_validation_examples:
+                    was_training = adapter.training
+                    adapter.eval()
+                    runtime_forward_model = (
+                        adapter
+                        if dtype is torch.float32
+                        else wrap_torch_autocast(
+                            torch,
+                            adapter,
+                            device_type=device_type,
+                            dtype=dtype,
+                        )
+                    )
+                    runtime_forward_model.eval()
+
+                    async def run_runtime_validation_cases(
+                        runtime_forward_model=runtime_forward_model,
+                    ):
+                        results = []
+                        runtime_config = RuntimeConfig(
+                            max_steps=args.runtime_validation_max_steps,
+                            max_wall_time_s=args.runtime_validation_max_wall_time_s,
+                        )
+                        for example in runtime_validation_examples:
+                            results.append(
+                                await run_neural_benchmark_case(
+                                    adapter,
+                                    tokenizer,
+                                    example,
+                                    text_encoder=text_encoder,
+                                    forward_model=runtime_forward_model,
+                                    seed_teacher_state=False,
+                                    denoising_steps=trainer.config.rollout_denoising_steps,
+                                    runtime_config=runtime_config,
+                                )
+                            )
+                        return tuple(results)
+
+                    try:
+                        runtime_results = asyncio.run(run_runtime_validation_cases())
+                    finally:
+                        adapter.train(was_training)
+                    runtime_summary = summarize_evaluations(
+                        tuple(result.evaluation for result in runtime_results)
+                    )
+                    runtime_validation = {
+                        "examples": len(runtime_results),
+                        "max_steps": args.runtime_validation_max_steps,
+                        "max_wall_time_s": args.runtime_validation_max_wall_time_s,
+                        "metrics": asdict(runtime_summary),
+                    }
+                    with runtime_validation_metrics_path.open("a", encoding="utf-8") as handle:
+                        for example, result in zip(
+                            runtime_validation_examples,
+                            runtime_results,
+                            strict=True,
+                        ):
+                            evaluation = result.evaluation
+                            handle.write(
+                                json.dumps(
+                                    {
+                                        "timestamp": time.time(),
+                                        "epoch": epoch,
+                                        "optimizer_steps": trainer.state.optimizer_steps,
+                                        "example_id": example.example_id,
+                                        "family": example.metadata.get("family"),
+                                        "target_display": example.target_display,
+                                        "final_text": result.final_text,
+                                        "runtime_steps": result.runtime_steps,
+                                        "converged": evaluation.converged,
+                                        "exact_display": evaluation.exact_display,
+                                        "observation_coverage": evaluation.observation_coverage,
+                                        "expected_observations": evaluation.expected_observations,
+                                        "observed_work_items": evaluation.observed_work_items,
+                                        "missing_observations": evaluation.missing_observations,
+                                    },
+                                    ensure_ascii=False,
+                                    sort_keys=True,
+                                )
+                                + "\n"
+                            )
+                    print(
+                        f"runtime_validation epoch={epoch} tasks={runtime_summary.tasks} "
+                        f"exact={runtime_summary.exact_display_accuracy:.4f} "
+                        f"converged={runtime_summary.convergence_rate:.4f} "
+                        f"coverage={runtime_summary.observation_coverage:.4f}",
+                        flush=True,
+                    )
+                if distributed:
+                    dist.barrier()
                 if rank == 0:
                     validation_record = {
                         "timestamp": time.time(),
@@ -1948,8 +2109,10 @@ def _train_stage_a(args: argparse.Namespace) -> None:
                         "validation_raw_mean_loss": validation_raw_mean_loss,
                         "validation_seed": args.seed + 1_000_003,
                         "objective": "teacher_forced_and_free_rollout_fixed_noise",
+                        "metric_scope": "per_transition_head_diagnostics",
                         "teacher_forced": teacher_forced,
                         "free_rollout": free_rollout,
+                        "end_to_end_runtime": runtime_validation,
                         "checkpoint": str(checkpoint),
                     }
                     with validation_metrics_path.open("a", encoding="utf-8") as handle:
@@ -3185,7 +3348,15 @@ def main() -> None:
     benchmark.add_argument("--output", required=True)
     benchmark.add_argument("--summary-output", required=True)
     benchmark.add_argument("--device", choices=("auto", "cuda", "npu", "cpu"), default="auto")
-    benchmark.add_argument("--dtype", choices=("bf16", "fp16", "fp32"), default="bf16")
+    benchmark.add_argument(
+        "--dtype",
+        choices=("bf16", "fp16", "fp32"),
+        default="bf16",
+        help=(
+            "backbone/compute dtype; Stage A CID modules remain FP32 and low-precision "
+            "execution uses autocast to match the training contract"
+        ),
+    )
     policy_tuning = benchmark.add_argument_group("neural policy tuning")
     policy_tuning.add_argument("--denoising-steps", type=int, default=8)
     policy_tuning.add_argument(
@@ -3283,6 +3454,27 @@ def main() -> None:
             "optional held-out trajectory JSONL; when omitted, validation examples are "
             "taken from --data entries with metadata.split=validation"
         ),
+    )
+    train.add_argument(
+        "--runtime-validation-examples",
+        type=int,
+        default=8,
+        help=(
+            "number of family-diverse held-out examples to run through the real CID runtime "
+            "after each epoch; set to 0 to disable"
+        ),
+    )
+    train.add_argument(
+        "--runtime-validation-max-steps",
+        type=int,
+        default=24,
+        help="per-case compute-step budget for end-to-end runtime validation",
+    )
+    train.add_argument(
+        "--runtime-validation-max-wall-time-s",
+        type=float,
+        default=5.0,
+        help="per-case wall-clock budget for end-to-end runtime validation",
     )
     train.add_argument("--output-dir", required=True)
     train.add_argument("--model", default="GSAI-ML/iLLaDA-8B-Base")

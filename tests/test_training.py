@@ -968,6 +968,10 @@ def test_bootstrap_transition_trains_single_snapshot_from_empty_tct() -> None:
     sample = tensorizer.tensorize(single, source_step=-1, timestep=1.0)
 
     assert not sample.batch.slot_occupancy.any()
+    assert sample.batch.display_ids[0, 0] == adapter.mask_token_id
+    assert sample.batch.display_ids[0, 1] == tensorizer.eos_token_id
+    assert (sample.batch.display_ids[0, 2:] == adapter.mask_token_id).all()
+    assert (sample.batch.display_noise == 1.0).all()
     assert sample.targets.allocation_targets[0, 0] == 1
     assert sample.targets.allocation_mask[0, 0]
     assert sample.targets.thought_mask[0, 0]
@@ -3551,6 +3555,89 @@ def test_closed_loop_diffusion_reset_requires_actual_replayed_observation() -> N
     assert with_progress.diffusion_step == 0
     assert with_progress.next_diffusion_step == 1
     assert dict(with_progress.binding_observation_steps)[runtime_need_id] == 2
+
+
+def test_closed_loop_supervision_does_not_jump_past_missing_observation() -> None:
+    adapter = make_adapter(seed=169)
+    tensorizer = ILLaDATrajectoryTensorizer(adapter, TinyTokenizer())
+    base = make_rollout_trajectory()
+    binding = base.binding_targets[0]
+    example = replace(
+        base,
+        display_targets=(
+            DisplayTarget(step=1, text=DISPLAY_UNKNOWN_MARKER),
+            DisplayTarget(step=2, text="38"),
+        ),
+        events=(
+            ExternalEvent(
+                source=binding.source,
+                value="38",
+                arrival_step=2,
+                arguments=binding.arguments,
+            ),
+        ),
+    )
+    teacher = tensorizer.tensorize(example, source_step=1, timestep=0.0)
+    base_state = CIDRolloutState(
+        thought_semantic=teacher.batch.thought_semantic.clone(),
+        role_features=teacher.batch.role_features.clone(),
+        uncertainty=teacher.batch.uncertainty.clone(),
+        lifecycle_features=teacher.batch.lifecycle_features.clone(),
+        slot_occupancy=teacher.batch.slot_occupancy.clone(),
+        local_noise=teacher.batch.local_noise.clone(),
+        display_ids=teacher.batch.display_ids.clone(),
+        runtime_cell_ids=teacher.input_runtime_cell_ids,
+        next_cell_serial=teacher.input_next_cell_serial,
+    )
+
+    missing = tensorizer.tensorize(
+        example,
+        source_step=1,
+        timestep=0.0,
+        rollout_state=base_state,
+    )
+
+    runtime_need_id = "need:c1:0"
+    matched_state = replace(
+        base_state,
+        active_binding_ids=(runtime_need_id,),
+        executable_binding_ids=(runtime_need_id,),
+        binding_routes=(
+            CIDRolloutBindingRoute(
+                need_id=runtime_need_id,
+                target_cells=binding.target_cells,
+                target_display=binding.target_display,
+                source=binding.source,
+                replay_binding_id=binding.need_id,
+                arguments=binding.arguments,
+            ),
+        ),
+    )
+    observed = tensorizer.tensorize(
+        example,
+        source_step=1,
+        timestep=0.0,
+        rollout_state=matched_state,
+    )
+    remembered = tensorizer.tensorize(
+        example,
+        source_step=1,
+        timestep=0.0,
+        rollout_state=replace(
+            base_state,
+            replay_observation_steps=((binding.need_id, 2),),
+        ),
+    )
+
+    assert missing.target_step == 2
+    assert missing.supervision_step == 1
+    assert float(missing.targets.need_targets.sum()) > 0.0
+    assert observed.target_step == 2
+    assert observed.supervision_step == 2
+    assert binding.need_id in observed.observed_binding_ids
+    assert dict(observed.binding_observation_steps)[runtime_need_id] == 2
+    assert dict(observed.replay_observation_steps)[binding.need_id] == 2
+    assert remembered.supervision_step == 2
 
 
 def test_wrong_source_need_has_runtime_binding_consequences() -> None:

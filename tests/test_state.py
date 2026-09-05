@@ -131,3 +131,13 @@ def test_display_canvas_uses_eos_for_visible_length_and_unresolved_span() -> Non
     assert updated.active_span_length == 3
     assert updated.unresolved == 0
     assert len(updated.token_ids) == 6
+
+
+def test_unresolved_display_bootstrap_has_mask_and_eos_boundary() -> None:
+    canvas = DisplayCanvas.initial_unresolved(length=6, mask_token_id=5, eos_token_id=2)
+
+    assert canvas.token_ids == (5, 2, 5, 5, 5, 5)
+    assert canvas.visible_token_ids == (5,)
+    assert canvas.realized_length == 1
+    assert canvas.active_span_length == 2
+    assert canvas.unresolved == 1

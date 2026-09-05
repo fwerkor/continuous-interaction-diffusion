@@ -362,6 +362,35 @@ class DisplayCanvas:
             eos_token_id=eos_token_id,
         )
 
+    @classmethod
+    def initial_unresolved(
+        cls,
+        length: int,
+        mask_token_id: int,
+        *,
+        eos_token_id: int,
+    ) -> DisplayCanvas:
+        """Create the canonical unresolved CID display with an EOS boundary.
+
+        The first token is unresolved answer content, the second token is the
+        current logical end of the answer, and the remaining physical canvas is
+        latent capacity.  This matches the neural training representation of
+        ``<|cid_unknown|>`` while still allowing later diffusion steps to revise
+        or move EOS and grow the answer.
+        """
+
+        if length < 2:
+            raise ValueError("unresolved display requires capacity for MASK and EOS")
+        if eos_token_id < 0:
+            raise ValueError("EOS token ID must be non-negative")
+        if eos_token_id == mask_token_id:
+            raise ValueError("EOS and MASK token IDs must differ")
+        return cls(
+            token_ids=(mask_token_id, eos_token_id) + (mask_token_id,) * (length - 2),
+            mask_token_id=mask_token_id,
+            eos_token_id=eos_token_id,
+        )
+
     @property
     def active_span_length(self) -> int:
         if self.eos_token_id is None:

@@ -205,7 +205,9 @@ class CIDMaterializer:
             thought=thought,
             batch_index=batch_index,
         )
-        convergence = float(torch.sigmoid(output.convergence_logits[batch_index]).detach())
+        convergence = float(
+            torch.sigmoid(output.convergence_logits[batch_index].float()).detach()
+        )
         display_stable = display.token_ids == context.display.token_ids
         display_has_boundary = (
             display.eos_token_id is None or display.eos_token_id in display.token_ids
@@ -253,7 +255,7 @@ class CIDMaterializer:
         cells = list(field.cells)
         role_order = tuple(CognitiveRole)
         lifecycle_order = MODELED_LIFECYCLES
-        role_probs = torch.sigmoid(output.role_logits[batch_index]).detach()
+        role_probs = torch.sigmoid(output.role_logits[batch_index].float()).detach()
         uncertainty = output.uncertainty[batch_index].detach()
         noise_delta = output.noise_delta[batch_index].detach()
         lifecycle = output.lifecycle_logits[batch_index].argmax(dim=-1).detach()
@@ -292,9 +294,11 @@ class CIDMaterializer:
         batch_index: int,
     ) -> CognitiveField:
         cells = list(thought.cells)
-        anchor_presence = torch.sigmoid(output.anchor_presence_logits[batch_index]).detach()
+        anchor_presence = torch.sigmoid(
+            output.anchor_presence_logits[batch_index].float()
+        ).detach()
         anchor_kinds = output.anchor_kind_logits[batch_index].argmax(dim=-1).detach()
-        link_presence = torch.sigmoid(output.link_presence_logits[batch_index]).detach()
+        link_presence = torch.sigmoid(output.link_presence_logits[batch_index].float()).detach()
         link_relations = output.link_relation_logits[batch_index].argmax(dim=-1).detach()
         link_kinds = output.link_target_kind_logits[batch_index].argmax(dim=-1).detach()
         anchor_order = tuple(AnchorKind)
@@ -397,9 +401,11 @@ class CIDMaterializer:
         if not sources:
             return ()
         catalog = catalog or ClosedWorldMaterializationCatalog()
-        need_probs = torch.sigmoid(output.need_logits[batch_index]).detach()
-        source_probs = torch.softmax(output.source_logits[batch_index], dim=-1).detach()
-        argument_presence = torch.sigmoid(output.argument_presence_logits[batch_index]).detach()
+        need_probs = torch.sigmoid(output.need_logits[batch_index].float()).detach()
+        source_probs = torch.softmax(output.source_logits[batch_index].float(), dim=-1).detach()
+        argument_presence = torch.sigmoid(
+            output.argument_presence_logits[batch_index].float()
+        ).detach()
         refresh_actions = output.refresh_logits[batch_index].argmax(dim=-1).detach()
         freshness_order = tuple(FreshnessDemand)
         needs: list[InformationNeed] = []
@@ -472,7 +478,7 @@ class CIDMaterializer:
         if not owner.live or owner.cell_id is None:
             return ()
         probabilities = torch.sigmoid(
-            output.need_target_cell_logits[batch_index, slot, need_slot]
+            output.need_target_cell_logits[batch_index, slot, need_slot].float()
         ).detach()
         targets = [ObjectRef.cell(owner.cell_id)]
         for target_slot, target_cell in enumerate(thought.cells):
@@ -496,7 +502,7 @@ class CIDMaterializer:
         batch_index: int,
     ) -> tuple[ObjectRef, ...]:
         probabilities = torch.sigmoid(
-            output.need_target_display_logits[batch_index, slot, need_slot]
+            output.need_target_display_logits[batch_index, slot, need_slot].float()
         ).detach()
         return decode_need_target_display(
             probabilities,
