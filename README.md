@@ -423,7 +423,9 @@ cid train \
   --dtype bf16
 ```
 
-With six GPUs, use `torchrun`; the command detects the distributed environment automatically:
+With multiple GPUs, use `torchrun`; the command detects the distributed environment automatically.
+For elastic production runs, prefer a fixed target global batch instead of pinning accumulation to one
+world size:
 
 ```bash
 torchrun --standalone --nproc-per-node=6 -m cid.cli train \
@@ -432,7 +434,7 @@ torchrun --standalone --nproc-per-node=6 -m cid.cli train \
   --thought-capacity 128 \
   --display-canvas-tokens 64 \
   --micro-batch-size 2 \
-  --gradient-accumulation-steps 8 \
+  --target-global-batch-size 96 \
   --dtype bf16
 ```
 
@@ -466,9 +468,12 @@ then the configured maximum, 1536 by default). The realized text is terminated b
 after EOS receive no token loss. This avoids paying for a 1536-token canvas on short examples while
 keeping every released target representable without truncation. Within self-rollout a display bucket
 may grow but never shrink. Gradient checkpointing is enabled by default for the native iLLaDA stack
-and can be disabled with `--no-gradient-checkpointing`. With the six-GPU example above, the effective
-transition batch is `2 × 8 × 6 = 96`; start at micro-batch 1 if the real trajectory lengths are
-substantially larger.
+and can be disabled with `--no-gradient-checkpointing`. `--target-global-batch-size` recomputes
+accumulation from the actual world size: at micro-batch 1 and target 96, four ranks use accumulation
+24 and eight ranks use 12. This lets an 8B Stage A run move between 4 and 8 GPUs at a completed-epoch
+checkpoint without doubling or halving its optimization batch. World-size changes remain forbidden
+inside a partially completed epoch. `--gradient-accumulation-steps` is still available as an explicit
+override; when neither option is supplied, the historical default of 8 accumulation steps is kept.
 
 Stage A keeps the frozen backbone in the requested BF16/FP16 storage precision but keeps trainable
 CID modules and AdamW state in FP32; autocast supplies low-precision forward compute without losing
@@ -476,7 +481,9 @@ sub-ULP optimizer updates. Stage A checkpoints contain trainable CID parameters,
 progress, RNG state, and the training-dataset SHA-256; they
 do not duplicate the frozen backbone. At every completed epoch, the trainer writes a permanent
 `stage-a-epoch-XXXX.pt` snapshot; `stage-a-latest.pt` and the corresponding step name are compatibility
-symlinks to that epoch snapshot. Resume with `--resume <checkpoint>`. When held-out trajectories are
+symlinks to that epoch snapshot. Resume with `--resume <checkpoint>`. A clean epoch-boundary resume
+may change DDP world size when the resolved global effective batch is unchanged; partial-epoch
+checkpoints must resume with their original world size. When held-out trajectories are
 provided with `--validation-data` (or are present in `--data` with `metadata.split=validation`), the
 trainer computes a deterministic teacher-forced validation loss after every epoch and appends it to
 `validation_metrics.jsonl`. The fixed validation RNG seed makes the values comparable across epochs;

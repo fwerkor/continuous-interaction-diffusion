@@ -1839,7 +1839,16 @@ class CIDTrainer:
         saved_trainer_config = dict(checkpoint["trainer_config"])
         saved_trainer_config.setdefault("semantic_pooling", "mean-v1")
         current_trainer_config = asdict(self.config)
-        if saved_trainer_config != current_trainer_config:
+        saved_world_size = checkpoint.get("world_size")
+        current_world_size = (
+            torch.distributed.get_world_size()
+            if torch.distributed.is_available() and torch.distributed.is_initialized()
+            else 1
+        )
+        world_size_changed = (
+            saved_world_size is not None and int(saved_world_size) != current_world_size
+        )
+        if saved_trainer_config != current_trainer_config or world_size_changed:
             saved_geometry = (
                 int(saved_trainer_config.get("micro_batch_size", 1)),
                 int(saved_trainer_config.get("gradient_accumulation_steps", 1)),
@@ -1859,9 +1868,19 @@ class CIDTrainer:
                 and int(checkpoint.get("pending_examples", 0)) == 0
                 and int(checkpoint.get("pending_global_examples", 0)) == 0
             )
-            equivalent_geometry = (
-                saved_geometry[0] * saved_geometry[1] == current_geometry[0] * current_geometry[1]
-            )
+            if saved_world_size is None:
+                # Legacy epoch-boundary checkpoints predate world-size metadata. Preserve their
+                # historical local-geometry compatibility rule; partial-epoch legacy checkpoints
+                # are rejected above because their global data cursor cannot be reconstructed.
+                equivalent_geometry = (
+                    saved_geometry[0] * saved_geometry[1]
+                    == current_geometry[0] * current_geometry[1]
+                )
+            else:
+                equivalent_geometry = (
+                    saved_geometry[0] * saved_geometry[1] * int(saved_world_size)
+                    == current_geometry[0] * current_geometry[1] * current_world_size
+                )
             if not (
                 clean_epoch_boundary
                 and equivalent_geometry
@@ -4705,6 +4724,32 @@ def wrap_stage_a_ddp(
     # Stage A accumulation. FSDP/Stage B intentionally keep their existing behavior.
     ddp._cid_stage_a_ddp = True
     return ddp
+
+
+def stage_a_gradient_accumulation_steps(
+    *,
+    world_size: int,
+    micro_batch_size: int,
+    target_global_batch_size: int | None = None,
+    explicit_steps: int | None = None,
+) -> int:
+    """Resolve Stage A accumulation while keeping clean elastic resumes batch-stable."""
+
+    if world_size <= 0 or micro_batch_size <= 0:
+        raise ValueError("Stage A batch dimensions must be positive")
+    if explicit_steps is not None:
+        if explicit_steps <= 0:
+            raise ValueError("explicit Stage A gradient accumulation must be positive")
+        return explicit_steps
+    if target_global_batch_size is None:
+        return 8
+    if target_global_batch_size <= 0:
+        raise ValueError("Stage A target global batch size must be positive")
+    data_parallel_micro_batch = world_size * micro_batch_size
+    return max(
+        1,
+        math.floor(target_global_batch_size / data_parallel_micro_batch + 0.5),
+    )
 
 
 def stage_b_gradient_accumulation_steps(

@@ -1573,6 +1573,7 @@ def _train_stage_a(args: argparse.Namespace) -> None:
         load_cid_adapter_from_pretrained,
         materialize_indexed_rollout_windows,
         shard_rollout_windows,
+        stage_a_gradient_accumulation_steps,
         trajectory_rollout_windows,
         wrap_stage_a_ddp,
     )
@@ -1618,6 +1619,18 @@ def _train_stage_a(args: argparse.Namespace) -> None:
         )
     else:
         device = device_type
+
+    if args.target_global_batch_size is not None and args.target_global_batch_size <= 0:
+        raise ValueError("--target-global-batch-size must be positive")
+    if args.gradient_accumulation_steps is not None and args.gradient_accumulation_steps <= 0:
+        raise ValueError("--gradient-accumulation-steps must be positive")
+    gradient_accumulation_steps = stage_a_gradient_accumulation_steps(
+        world_size=world_size,
+        micro_batch_size=args.micro_batch_size,
+        target_global_batch_size=args.target_global_batch_size,
+        explicit_steps=args.gradient_accumulation_steps,
+    )
+    effective_batch = args.micro_batch_size * gradient_accumulation_steps * world_size
 
     try:
         def load_adapter() -> ILLaDACIDAdapter:
@@ -1686,7 +1699,7 @@ def _train_stage_a(args: argparse.Namespace) -> None:
                 learning_rate=args.learning_rate,
                 weight_decay=args.weight_decay,
                 micro_batch_size=args.micro_batch_size,
-                gradient_accumulation_steps=args.gradient_accumulation_steps,
+                gradient_accumulation_steps=gradient_accumulation_steps,
                 max_grad_norm=args.max_grad_norm,
                 warmup_steps=args.warmup_steps,
                 lr_decay_steps=args.lr_decay_steps,
@@ -1776,13 +1789,14 @@ def _train_stage_a(args: argparse.Namespace) -> None:
             parameter.numel() for parameter in adapter.parameters() if parameter.requires_grad
         )
         if rank == 0:
-            effective_batch = args.micro_batch_size * args.gradient_accumulation_steps * world_size
             print(
                 f"device={device} world_size={world_size} dtype={args.dtype} "
                 f"examples={len(examples)} transitions={transition_count_total} "
                 f"validation_examples={len(validation_examples)} "
                 f"validation_transitions={validation_transition_count_total} "
                 f"trainable_parameters={trainable} effective_batch={effective_batch} "
+                f"target_global_batch={args.target_global_batch_size or 'legacy'} "
+                f"grad_accum={gradient_accumulation_steps} "
                 f"physical_micro_batch={args.physical_micro_batch_size or args.micro_batch_size} "
                 f"grouped_moe_layers={grouped_moe_layers}"
             )
@@ -3599,7 +3613,23 @@ def main() -> None:
             "micro-batch and checkpoint geometry"
         ),
     )
-    train.add_argument("--gradient-accumulation-steps", type=int, default=8)
+    train.add_argument(
+        "--target-global-batch-size",
+        type=int,
+        help=(
+            "target effective transition batch across all Stage A ranks; when set, gradient "
+            "accumulation is recomputed from the current world size so clean epoch-boundary "
+            "4/8-GPU resumes preserve batch semantics"
+        ),
+    )
+    train.add_argument(
+        "--gradient-accumulation-steps",
+        type=int,
+        help=(
+            "explicit Stage A accumulation override; takes precedence over "
+            "--target-global-batch-size. When neither is set, the legacy default is 8"
+        ),
+    )
     train.add_argument("--max-grad-norm", type=float, default=1.0)
     train.add_argument("--warmup-steps", type=int, default=0)
     train.add_argument("--lr-decay-steps", type=int, default=0)

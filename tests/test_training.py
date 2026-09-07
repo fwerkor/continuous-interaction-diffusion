@@ -58,6 +58,7 @@ load_stage_b_semantic_encoder = cid_model.load_stage_b_semantic_encoder
 save_stage_b_checkpoint = cid_model.save_stage_b_checkpoint
 shard_rollout_windows = cid_model.shard_rollout_windows
 shard_transitions = cid_model.shard_transitions
+stage_a_gradient_accumulation_steps = cid_model.stage_a_gradient_accumulation_steps
 stage_b_adamw_parameter_groups = cid_model.stage_b_adamw_parameter_groups
 stage_b_consumed_windows_by_bucket = cid_model.stage_b_consumed_windows_by_bucket
 stage_b_gradient_accumulation_steps = cid_model.stage_b_gradient_accumulation_steps
@@ -3941,6 +3942,35 @@ def test_rollout_sharding_repeats_singleton_bucket_across_all_ranks() -> None:
             assert sum(not shard[0].is_padding for shard in shards) == 1
 
 
+def test_stage_a_target_batch_preserves_global_batch_across_four_and_eight_ranks() -> None:
+    four_rank_steps = stage_a_gradient_accumulation_steps(
+        world_size=4,
+        micro_batch_size=1,
+        target_global_batch_size=96,
+    )
+    eight_rank_steps = stage_a_gradient_accumulation_steps(
+        world_size=8,
+        micro_batch_size=1,
+        target_global_batch_size=96,
+    )
+    assert four_rank_steps == 24
+    assert eight_rank_steps == 12
+    assert 4 * four_rank_steps == 8 * eight_rank_steps == 96
+
+
+def test_stage_a_explicit_accumulation_overrides_target_and_legacy_default_is_stable() -> None:
+    assert (
+        stage_a_gradient_accumulation_steps(
+            world_size=8,
+            micro_batch_size=1,
+            target_global_batch_size=96,
+            explicit_steps=7,
+        )
+        == 7
+    )
+    assert stage_a_gradient_accumulation_steps(world_size=4, micro_batch_size=1) == 8
+
+
 def test_stage_b_batch_resolution_is_stable_across_four_and_six_ranks() -> None:
     assert (
         stage_b_gradient_accumulation_steps(
@@ -4558,12 +4588,14 @@ def test_checkpoint_rejects_legacy_partial_epoch_without_world_size(tmp_path) ->
         restored.load_checkpoint(checkpoint)
 
 
-def test_checkpoint_allows_world_size_change_at_epoch_boundary(tmp_path) -> None:
+def test_checkpoint_allows_world_size_change_at_epoch_boundary_when_global_batch_matches(
+    tmp_path,
+) -> None:
     adapter = make_adapter(seed=325)
     trainer = CIDTrainer(
         adapter,
         ILLaDATrajectoryTensorizer(adapter, TinyTokenizer()),
-        CIDTrainerConfig(),
+        CIDTrainerConfig(micro_batch_size=1, gradient_accumulation_steps=2),
     )
     trainer.state = CIDTrainerState(epochs_completed=1, rollout_windows_seen_in_epoch=0)
     checkpoint = tmp_path / "epoch-boundary-world-size.pt"
@@ -4576,11 +4608,58 @@ def test_checkpoint_allows_world_size_change_at_epoch_boundary(tmp_path) -> None
     restored = CIDTrainer(
         restored_adapter,
         ILLaDATrajectoryTensorizer(restored_adapter, TinyTokenizer()),
-        CIDTrainerConfig(),
+        CIDTrainerConfig(micro_batch_size=1, gradient_accumulation_steps=8),
     )
     restored.load_checkpoint(checkpoint)
     assert restored.state.epochs_completed == 1
     assert restored.state.rollout_windows_seen_in_epoch == 0
+
+
+def test_checkpoint_rejects_world_size_change_at_epoch_boundary_when_global_batch_changes(
+    tmp_path,
+) -> None:
+    adapter = make_adapter(seed=326)
+    trainer = CIDTrainer(
+        adapter,
+        ILLaDATrajectoryTensorizer(adapter, TinyTokenizer()),
+        CIDTrainerConfig(micro_batch_size=1, gradient_accumulation_steps=2),
+    )
+    trainer.state = CIDTrainerState(epochs_completed=1, rollout_windows_seen_in_epoch=0)
+    checkpoint = tmp_path / "epoch-boundary-world-size-mismatch.pt"
+    trainer.save_checkpoint(checkpoint)
+    payload = torch.load(checkpoint, map_location="cpu", weights_only=False)
+    payload["world_size"] = 4
+    torch.save(payload, checkpoint)
+
+    restored_adapter = make_adapter(seed=326)
+    restored = CIDTrainer(
+        restored_adapter,
+        ILLaDATrajectoryTensorizer(restored_adapter, TinyTokenizer()),
+        CIDTrainerConfig(micro_batch_size=1, gradient_accumulation_steps=4),
+    )
+    with pytest.raises(ValueError, match="trainer configuration"):
+        restored.load_checkpoint(checkpoint)
+
+
+def test_checkpoint_rejects_world_size_change_with_unchanged_local_geometry(tmp_path) -> None:
+    adapter = make_adapter(seed=327)
+    config = CIDTrainerConfig(micro_batch_size=1, gradient_accumulation_steps=8)
+    trainer = CIDTrainer(adapter, ILLaDATrajectoryTensorizer(adapter, TinyTokenizer()), config)
+    trainer.state = CIDTrainerState(epochs_completed=1, rollout_windows_seen_in_epoch=0)
+    checkpoint = tmp_path / "epoch-boundary-unchanged-local-geometry.pt"
+    trainer.save_checkpoint(checkpoint)
+    payload = torch.load(checkpoint, map_location="cpu", weights_only=False)
+    payload["world_size"] = 4
+    torch.save(payload, checkpoint)
+
+    restored_adapter = make_adapter(seed=327)
+    restored = CIDTrainer(
+        restored_adapter,
+        ILLaDATrajectoryTensorizer(restored_adapter, TinyTokenizer()),
+        config,
+    )
+    with pytest.raises(ValueError, match="trainer configuration"):
+        restored.load_checkpoint(checkpoint)
 
 
 def test_checkpoint_rejects_batch_geometry_change_mid_epoch(tmp_path) -> None:

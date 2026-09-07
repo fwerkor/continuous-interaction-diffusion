@@ -131,15 +131,24 @@ the GPUs.
 adapter's configured `max_thought_slots`; occupancy is dynamic but tensor geometry does not shrink
 per trajectory. `collate_training_steps()` pads prompt, display, fact, percept, and source dimensions
 into a variable-length micro-batch and supplies the corresponding attention/padding masks.
-`CIDTrainerConfig.micro_batch_size` controls this local batch;
-gradient accumulation then scales the effective batch independently. Accumulated gradients are
-normalized by the number of examples rather than by the number of micro-batches, so a smaller final
-micro-batch is not overweighted. Native backbone gradient checkpointing is enabled by the launcher
+`CIDTrainerConfig.micro_batch_size` controls this local batch. For elastic distributed Stage A,
+`--target-global-batch-size` is the preferred accumulation policy: the launcher resolves gradient
+accumulation from the actual world size while keeping the global effective transition batch stable.
+For example, micro-batch 1 with target batch 96 resolves to accumulation 24 on four ranks and 12 on
+eight ranks. `--gradient-accumulation-steps` remains an explicit override, and omitting both options
+keeps the legacy default of eight accumulation steps. Accumulated gradients are normalized by the
+number of examples rather than by the number of micro-batches, so a smaller final micro-batch is not
+overweighted. Native backbone gradient checkpointing is enabled by the launcher
 by default to reduce activation
 memory while retaining gradients to CID inputs through the frozen backbone. The adapter also
 constructs per-sample position IDs from valid prompt and
 display lengths. Padding introduced by another sample therefore does not alter the logical
 positions of a trajectory's display tokens.
+
+A Stage A DDP world-size change is supported only from a clean completed-epoch checkpoint. The
+checkpoint loader compares the saved and current **global** effective batch, so a 4->8 GPU resume is
+accepted when accumulation is reduced accordingly. A partial-epoch checkpoint remains bound to its
+original world size and is rejected before any training continues if the rank count changes.
 
 Adjacent transitions are grouped into full contiguous `CIDRolloutWindow` sequences. Training starts
 with teacher-forced inputs, then scheduled sampling linearly increases the chance that the previous
