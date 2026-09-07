@@ -493,9 +493,15 @@ offload semantics. With the current 8.25B iLLaDA checkpoint plus roughly 0.45B C
 FP32 parameter/gradient/Adam state alone is about 32 GiB per rank at world size 4 and 22 GiB at
 world size 6 before activations and FSDP all-gathers.
 
-The default profile is quality-first:
+The default profile remains quality-first for large backbones, while compact LFM2 Stage B uses a
+throughput-oriented auto profile when CUDA memory is at least 40 GiB:
 
-- FSDP `FULL_SHARD`, FP32 master parameters, BF16 forward/reduction, gradient checkpointing enabled;
+- FSDP `FULL_SHARD` and FP32 master parameters are used in both profiles. Large models and
+  low-memory devices keep BF16 forward/reduction with gradient checkpointing enabled and
+  micro-batch 1;
+- compact LFM2 on >=40 GiB CUDA defaults to micro-batch 4, gradient checkpointing disabled,
+  MLP chunk 512, and norm chunk 1024. With four ranks and target batch 32, this reduces gradient
+  accumulation from 8 to 2 while preserving the same effective transition batch;
 - AdamW with `weight_decay=0.01` on matrix/tensor weights and zero decay on one-dimensional
   norm/bias parameters;
 - peak CID learning rate `1e-5`; the pretrained iLLaDA backbone uses a conservative `0.5` multiplier
@@ -504,7 +510,7 @@ The default profile is quality-first:
 - full rollout from the first Stage B batch (`teacher_forcing_epochs=0`, `rollout_ramp_epochs=0`),
   because the curriculum has already been completed in Stage A;
 - target effective transition batch 32. Gradient accumulation is resolved automatically from the
-  world size: with micro-batch 1 this is 8 on four GPUs and 5 on six GPUs (effective batch 30);
+  world size and the selected micro-batch;
 - one **target total** epoch by default. On resume, `--epochs 1` means finish epoch 1 rather than add
   another epoch.
 
@@ -550,10 +556,11 @@ torchrun --standalone --nproc-per-node=${WORLD_SIZE} -m cid.cli train-full \
   --dtype bf16
 ```
 
-The defaults can be overridden for controlled ablations with `--learning-rate`,
-`--backbone-lr-scale`, `--target-global-batch-size`, `--gradient-accumulation-steps`,
-`--warmup-ratio`, and `--min-learning-rate-ratio`, but the release run should keep one frozen
-configuration once it starts.
+The auto profile can be overridden for controlled ablations with `--micro-batch-size`,
+`--[no-]gradient-checkpointing`, `--mlp-chunk-size`, and `--norm-chunk-size`. Optimization defaults
+can likewise be overridden with `--learning-rate`, `--backbone-lr-scale`,
+`--target-global-batch-size`, `--gradient-accumulation-steps`, `--warmup-ratio`, and
+`--min-learning-rate-ratio`, but the release run should keep one frozen configuration once it starts.
 
 ### Neural replay benchmark
 

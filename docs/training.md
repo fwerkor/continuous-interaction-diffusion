@@ -209,8 +209,12 @@ learning rate (`1e-5` by default), while iLLaDA backbone groups use `backbone_lr
 and embedding weights receive `weight_decay=0.01`; one-dimensional norm weights and biases receive
 zero decay. The trainer preserves these group multipliers through a 3% linear warmup and cosine
 decay to 10% of peak. The default target transition batch is 32 and gradient accumulation is derived
-from the actual world size unless explicitly overridden. At micro-batch 1 this resolves to 8
-accumulation steps on four ranks and 5 on six ranks.
+from the actual world size and resolved micro-batch unless explicitly overridden. Large backbones,
+low-memory CUDA, CPU-offload, NPU, and CPU use the memory-safe defaults: micro-batch 1, MLP/norm
+chunks 256, and activation checkpointing enabled. Compact LFM2 on CUDA devices with at least 40 GiB
+uses the throughput profile by default: micro-batch 4, MLP chunk 512, norm chunk 1024, and activation
+checkpointing disabled. On four ranks this keeps effective batch 32 while reducing accumulation from
+8 backward cycles to 2. Every auto-selected value remains individually overridable from the CLI.
 
 Stage B starts at rollout probability 1.0 by default. Stage A has already performed the
 teacher-forcing-to-rollout curriculum, so restarting that curriculum after unfreezing the backbone

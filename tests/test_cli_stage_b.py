@@ -8,6 +8,76 @@ import pytest
 cli = import_module("cid.cli")
 
 
+def test_stage_b_compact_high_memory_profile_prioritizes_throughput() -> None:
+    profile = cli._resolve_stage_b_performance_profile(
+        model_type="lfm2",
+        device_type="cuda",
+        accelerator_memory_bytes=48 * 1024**3,
+        cpu_offload=False,
+        micro_batch_size=None,
+        mlp_chunk_size=None,
+        norm_chunk_size=None,
+        gradient_checkpointing=None,
+    )
+    assert profile.name == "compact-high-memory"
+    assert profile.micro_batch_size == 4
+    assert profile.mlp_chunk_size == 512
+    assert profile.norm_chunk_size == 1024
+    assert profile.gradient_checkpointing is False
+
+
+def test_stage_b_large_model_keeps_memory_safe_profile() -> None:
+    profile = cli._resolve_stage_b_performance_profile(
+        model_type="llada",
+        device_type="cuda",
+        accelerator_memory_bytes=48 * 1024**3,
+        cpu_offload=False,
+        micro_batch_size=None,
+        mlp_chunk_size=None,
+        norm_chunk_size=None,
+        gradient_checkpointing=None,
+    )
+    assert profile.name == "memory-safe"
+    assert profile.micro_batch_size == 1
+    assert profile.mlp_chunk_size == 256
+    assert profile.norm_chunk_size == 256
+    assert profile.gradient_checkpointing is True
+
+
+def test_stage_b_performance_profile_preserves_explicit_overrides() -> None:
+    profile = cli._resolve_stage_b_performance_profile(
+        model_type="lfm2",
+        device_type="cuda",
+        accelerator_memory_bytes=48 * 1024**3,
+        cpu_offload=False,
+        micro_batch_size=2,
+        mlp_chunk_size=384,
+        norm_chunk_size=640,
+        gradient_checkpointing=True,
+    )
+    assert profile.micro_batch_size == 2
+    assert profile.mlp_chunk_size == 384
+    assert profile.norm_chunk_size == 640
+    assert profile.gradient_checkpointing is True
+
+
+def test_stage_b_compact_profile_stays_conservative_on_low_memory_or_offload() -> None:
+    for memory, cpu_offload in ((24 * 1024**3, False), (48 * 1024**3, True)):
+        profile = cli._resolve_stage_b_performance_profile(
+            model_type="lfm2",
+            device_type="cuda",
+            accelerator_memory_bytes=memory,
+            cpu_offload=cpu_offload,
+            micro_batch_size=None,
+            mlp_chunk_size=None,
+            norm_chunk_size=None,
+            gradient_checkpointing=None,
+        )
+        assert profile.name == "memory-safe"
+        assert profile.micro_batch_size == 1
+        assert profile.gradient_checkpointing is True
+
+
 def test_stage_b_cpu_target_uses_gloo_without_gpu_rank_minimum() -> None:
     assert cli._stage_b_execution_target(
         "cpu",

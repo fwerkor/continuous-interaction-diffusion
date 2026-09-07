@@ -7,7 +7,7 @@ import os
 import shutil
 import tempfile
 import time
-from dataclasses import asdict
+from dataclasses import asdict, dataclass
 from pathlib import Path
 
 from cid.accelerator import (
@@ -2216,6 +2216,73 @@ def _init_stage_b_process_group(
     )
     return rendezvous_dir
 
+
+@dataclass(frozen=True)
+class _StageBPerformanceProfile:
+    name: str
+    micro_batch_size: int
+    mlp_chunk_size: int
+    norm_chunk_size: int
+    gradient_checkpointing: bool
+
+
+def _resolve_stage_b_performance_profile(
+    *,
+    model_type: str,
+    device_type: str,
+    accelerator_memory_bytes: int | None,
+    cpu_offload: bool,
+    micro_batch_size: int | None,
+    mlp_chunk_size: int | None,
+    norm_chunk_size: int | None,
+    gradient_checkpointing: bool | None,
+) -> _StageBPerformanceProfile:
+    """Resolve Stage B throughput defaults while preserving the large-model safety path."""
+
+    if accelerator_memory_bytes is not None and accelerator_memory_bytes <= 0:
+        raise ValueError("accelerator memory must be positive when provided")
+
+    compact_high_memory_cuda = (
+        model_type == "lfm2"
+        and device_type == "cuda"
+        and not cpu_offload
+        and accelerator_memory_bytes is not None
+        and accelerator_memory_bytes >= 40 * 1024**3
+    )
+    if compact_high_memory_cuda:
+        name = "compact-high-memory"
+        default_micro_batch = 4
+        default_mlp_chunk = 512
+        default_norm_chunk = 1024
+        default_gradient_checkpointing = False
+    else:
+        name = "memory-safe"
+        default_micro_batch = 1
+        default_mlp_chunk = 256
+        default_norm_chunk = 256
+        default_gradient_checkpointing = True
+
+    resolved_micro_batch = default_micro_batch if micro_batch_size is None else micro_batch_size
+    resolved_mlp_chunk = default_mlp_chunk if mlp_chunk_size is None else mlp_chunk_size
+    resolved_norm_chunk = default_norm_chunk if norm_chunk_size is None else norm_chunk_size
+    resolved_gradient_checkpointing = (
+        default_gradient_checkpointing
+        if gradient_checkpointing is None
+        else gradient_checkpointing
+    )
+    if resolved_micro_batch <= 0:
+        raise ValueError("--micro-batch-size must be positive")
+    if resolved_mlp_chunk <= 0 or resolved_norm_chunk <= 0:
+        raise ValueError("Stage B chunk sizes must be positive")
+    return _StageBPerformanceProfile(
+        name=name,
+        micro_batch_size=resolved_micro_batch,
+        mlp_chunk_size=resolved_mlp_chunk,
+        norm_chunk_size=resolved_norm_chunk,
+        gradient_checkpointing=resolved_gradient_checkpointing,
+    )
+
+
 def _train_stage_b(args: argparse.Namespace) -> None:
     import torch
     import torch.distributed as dist
@@ -2252,13 +2319,18 @@ def _train_stage_b(args: argparse.Namespace) -> None:
         raise ValueError("Stage B requires --init-cid-checkpoint unless --resume is used")
     if args.epochs <= 0:
         raise ValueError("--epochs must be positive")
-    if args.micro_batch_size <= 0:
+    if args.micro_batch_size is not None and args.micro_batch_size <= 0:
         raise ValueError("--micro-batch-size must be positive")
     if args.target_global_batch_size <= 0:
         raise ValueError("--target-global-batch-size must be positive")
     if args.gradient_accumulation_steps is not None and args.gradient_accumulation_steps <= 0:
         raise ValueError("--gradient-accumulation-steps must be positive")
-    if args.mlp_chunk_size <= 0 or args.norm_chunk_size <= 0:
+    if (
+        args.mlp_chunk_size is not None
+        and args.mlp_chunk_size <= 0
+        or args.norm_chunk_size is not None
+        and args.norm_chunk_size <= 0
+    ):
         raise ValueError("Stage B chunk sizes must be positive")
     if not 0.0 <= args.warmup_ratio < 1.0:
         raise ValueError("--warmup-ratio must be in [0, 1)")
@@ -2279,16 +2351,6 @@ def _train_stage_b(args: argparse.Namespace) -> None:
         cpu_offload=args.fsdp_cpu_offload,
     )
 
-    gradient_accumulation_steps = stage_b_gradient_accumulation_steps(
-        world_size=world_size,
-        micro_batch_size=args.micro_batch_size,
-        target_global_batch_size=args.target_global_batch_size,
-        explicit_steps=args.gradient_accumulation_steps,
-    )
-    effective_batch = (
-        args.micro_batch_size * gradient_accumulation_steps * world_size
-    )
-
     compute_dtype = torch.bfloat16
     if device_type in {"cuda", "npu"}:
         assert device_index is not None
@@ -2296,8 +2358,38 @@ def _train_stage_b(args: argparse.Namespace) -> None:
         device = torch.device(device_type, device_index)
     else:
         device = torch.device("cpu")
+
+    model_type = backbone_model_type(args.model)
+    accelerator_memory_bytes = (
+        int(torch.cuda.get_device_properties(device_index).total_memory)
+        if device_type == "cuda" and device_index is not None
+        else None
+    )
+    performance_profile = _resolve_stage_b_performance_profile(
+        model_type=model_type,
+        device_type=device_type,
+        accelerator_memory_bytes=accelerator_memory_bytes,
+        cpu_offload=args.fsdp_cpu_offload,
+        micro_batch_size=args.micro_batch_size,
+        mlp_chunk_size=args.mlp_chunk_size,
+        norm_chunk_size=args.norm_chunk_size,
+        gradient_checkpointing=args.gradient_checkpointing,
+    )
+    args.micro_batch_size = performance_profile.micro_batch_size
+    args.mlp_chunk_size = performance_profile.mlp_chunk_size
+    args.norm_chunk_size = performance_profile.norm_chunk_size
+    args.gradient_checkpointing = performance_profile.gradient_checkpointing
+
+    gradient_accumulation_steps = stage_b_gradient_accumulation_steps(
+        world_size=world_size,
+        micro_batch_size=args.micro_batch_size,
+        target_global_batch_size=args.target_global_batch_size,
+        explicit_steps=args.gradient_accumulation_steps,
+    )
+    effective_batch = args.micro_batch_size * gradient_accumulation_steps * world_size
+
     single_npu_stage_b = device_type == "npu" and world_size == 1
-    if single_npu_stage_b and backbone_model_type(args.model) != "lfm2":
+    if single_npu_stage_b and model_type != "lfm2":
         raise RuntimeError(
             "single-NPU Stage B is supported only for the compact LFM2 CID-v1-0.4B backbone; "
             "larger backbones require at least four NPU ranks"
@@ -2560,9 +2652,12 @@ def _train_stage_b(args: argparse.Namespace) -> None:
                 f"optimizer=adamw examples={len(examples)} transitions={transition_count_total} "
                 f"validation_examples={len(validation_examples)} "
                 f"validation_transitions={validation_transition_count_total} "
+                f"performance_profile={performance_profile.name} "
+                f"micro_batch={args.micro_batch_size} "
                 f"target_global_batch={args.target_global_batch_size} "
                 f"effective_batch={effective_batch} grad_accum={gradient_accumulation_steps} "
                 f"mlp_chunk={args.mlp_chunk_size} norm_chunk={args.norm_chunk_size} "
+                f"gradient_checkpointing={int(args.gradient_checkpointing)} "
                 f"peak_cid_lr={args.learning_rate:.3e} "
                 f"peak_backbone_lr={args.learning_rate * args.backbone_lr_scale:.3e} "
                 f"warmup_steps={warmup_steps} lr_decay_steps={lr_decay_steps} "
@@ -3588,7 +3683,14 @@ def main() -> None:
         help="backbone LR multiplier; use a lower value for small-model retention when needed",
     )
     train_full.add_argument("--weight-decay", type=float, default=0.01)
-    train_full.add_argument("--micro-batch-size", type=int, default=1)
+    train_full.add_argument(
+        "--micro-batch-size",
+        type=int,
+        help=(
+            "per-rank rollout micro-batch; auto-selects 4 for compact LFM2 on >=40 GiB CUDA "
+            "and 1 for the memory-safe profile"
+        ),
+    )
     train_full.add_argument(
         "--target-global-batch-size",
         type=int,
@@ -3599,14 +3701,18 @@ def main() -> None:
     train_full.add_argument(
         "--mlp-chunk-size",
         type=int,
-        default=256,
-        help="token chunk size for exact iLLaDA MLP evaluation",
+        help=(
+            "token chunk size for exact backbone MLP evaluation; auto-selects 512 for the "
+            "compact high-memory profile and 256 otherwise"
+        ),
     )
     train_full.add_argument(
         "--norm-chunk-size",
         type=int,
-        default=256,
-        help="token chunk size for exact iLLaDA RMSNorm evaluation",
+        help=(
+            "token chunk size for exact backbone RMSNorm evaluation; auto-selects 1024 for the "
+            "compact high-memory profile and 256 otherwise"
+        ),
     )
     train_full.add_argument("--warmup-ratio", type=float, default=0.03)
     train_full.add_argument("--min-learning-rate-ratio", type=float, default=0.1)
@@ -3655,7 +3761,11 @@ def main() -> None:
     train_full.add_argument(
         "--gradient-checkpointing",
         action=argparse.BooleanOptionalAction,
-        default=True,
+        default=None,
+        help=(
+            "activation checkpointing policy; auto-disables it for compact LFM2 on >=40 GiB "
+            "CUDA and enables it for the memory-safe profile"
+        ),
     )
     args = parser.parse_args()
     if args.command == "demo":
