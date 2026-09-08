@@ -1031,8 +1031,10 @@ def _benchmark(args: argparse.Namespace) -> None:
         CIDMaterializerConfig,
         ILLaDACIDAdapter,
         ILLaDACIDConfig,
+        gather_stage_b_parameter_state,
         load_cid_adapter_checkpoint,
         load_cid_adapter_from_pretrained,
+        load_cid_adapter_parameter_state,
         load_stage_b_model_checkpoint,
         load_stage_b_semantic_encoder,
         wrap_stage_b_fsdp,
@@ -1157,7 +1159,43 @@ def _benchmark(args: argparse.Namespace) -> None:
                 )
             if text_encoder is None:
                 raise RuntimeError("failed to restore Stage B semantic encoder")
-            if not stage_b_sharded:
+            if stage_b_sharded:
+                parameter_state = gather_stage_b_parameter_state(forward_model, adapter)
+                dist.barrier()
+                dist.destroy_process_group()
+                distributed = False
+                if rank != 0:
+                    return
+                if parameter_state is None:
+                    raise RuntimeError("rank 0 did not receive the gathered Stage B state")
+
+                import gc
+
+                del forward_model, adapter
+                gc.collect()
+                accelerator = getattr(torch, device_type, None)
+                empty_cache = getattr(accelerator, "empty_cache", None)
+                if callable(empty_cache):
+                    empty_cache()
+
+                adapter = load_adapter()
+                adapter.set_backbone_trainable(True)
+                if device_type == "npu":
+                    adapter.set_device_value_validation(False)
+                load_cid_adapter_parameter_state(adapter, parameter_state)
+                del parameter_state
+                if device_type == "npu":
+                    forward_model = wrap_npu_autocast(torch, adapter, dtype=dtype)
+                elif dtype is not torch.float32:
+                    forward_model = wrap_torch_autocast(
+                        torch,
+                        adapter,
+                        device_type=device_type,
+                        dtype=dtype,
+                    )
+                else:
+                    forward_model = adapter
+            else:
                 load_cid_adapter_checkpoint(adapter, checkpoint)
                 forward_model = (
                     wrap_npu_autocast(torch, adapter, dtype=dtype)

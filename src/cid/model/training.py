@@ -2159,15 +2159,7 @@ def load_cid_adapter_checkpoint(
     if checkpoint["adapter_config"] != asdict(adapter.config):
         raise ValueError("checkpoint CID adapter configuration does not match this adapter")
 
-    parameters = dict(adapter.named_parameters())
-    with torch.no_grad():
-        for name, saved in checkpoint["model_state"].items():
-            parameter = parameters.get(name)
-            if parameter is None:
-                raise ValueError(f"checkpoint parameter is missing from adapter: {name}")
-            if tuple(parameter.shape) != tuple(saved.shape):
-                raise ValueError(f"checkpoint parameter shape mismatch: {name}")
-            parameter.copy_(saved.to(device=parameter.device, dtype=parameter.dtype))
+    load_cid_adapter_parameter_state(adapter, checkpoint["model_state"])
     state = checkpoint["trainer_state"]
     return CIDTrainerState(
         transitions_seen=int(state["transitions_seen"]),
@@ -2175,6 +2167,64 @@ def load_cid_adapter_checkpoint(
         epochs_completed=int(state.get("epochs_completed", 0)),
         rollout_windows_seen_in_epoch=int(state.get("rollout_windows_seen_in_epoch", 0)),
     )
+
+
+def load_cid_adapter_parameter_state(
+    adapter: ILLaDACIDAdapter,
+    model_state: Mapping[str, Tensor],
+) -> None:
+    parameters = dict(adapter.named_parameters())
+    with torch.no_grad():
+        for name, saved in model_state.items():
+            parameter = parameters.get(name)
+            if parameter is None:
+                raise ValueError(f"checkpoint parameter is missing from adapter: {name}")
+            if tuple(parameter.shape) != tuple(saved.shape):
+                raise ValueError(f"checkpoint parameter shape mismatch: {name}")
+            parameter.copy_(saved.to(device=parameter.device, dtype=parameter.dtype))
+
+
+def gather_stage_b_parameter_state(
+    model: torch.nn.Module,
+    adapter: ILLaDACIDAdapter,
+) -> dict[str, Tensor] | None:
+    import torch.distributed as dist
+    from torch.distributed.fsdp import (
+        FullStateDictConfig,
+        FullyShardedDataParallel,
+        StateDictType,
+    )
+
+    if not dist.is_initialized():
+        raise RuntimeError("Stage B parameter gathering requires an initialized process group")
+    if not isinstance(model, FullyShardedDataParallel):
+        raise TypeError("Stage B parameter gathering requires an FSDP model")
+
+    parameter_names = tuple(
+        name.replace("._fsdp_wrapped_module.", ".").removeprefix("_fsdp_wrapped_module.")
+        for name, _ in adapter.named_parameters()
+    )
+    if len(parameter_names) != len(set(parameter_names)):
+        raise RuntimeError("FSDP parameter names are ambiguous after unwrapping")
+    parameter_device = next(adapter.parameters()).device
+    with FullyShardedDataParallel.state_dict_type(
+        model,
+        StateDictType.FULL_STATE_DICT,
+        FullStateDictConfig(
+            offload_to_cpu=parameter_device.type != "cpu",
+            rank0_only=True,
+        ),
+    ):
+        full_state = model.state_dict()
+
+    if dist.get_rank() != 0:
+        return None
+    missing = [name for name in parameter_names if name not in full_state]
+    if missing:
+        raise RuntimeError(
+            f"full Stage B state is missing adapter parameters: {missing[:8]}"
+        )
+    return {name: full_state[name].detach().cpu() for name in parameter_names}
 
 
 def load_stage_b_semantic_encoder(

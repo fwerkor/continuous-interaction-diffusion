@@ -13,6 +13,8 @@ from cid.model import (
     CIDTensorBatch,
     ILLaDACIDAdapter,
     ILLaDACIDConfig,
+    gather_stage_b_parameter_state,
+    load_cid_adapter_parameter_state,
     load_stage_b_checkpoint,
     load_stage_b_model_checkpoint,
     save_stage_b_checkpoint,
@@ -261,8 +263,22 @@ def main() -> None:
         )
         assert inference_encoder is not None
         inference(make_batch())
-    finally:
+
+        parameter_state = gather_stage_b_parameter_state(inference, inference_adapter)
+        dist.barrier()
         dist.destroy_process_group()
+        if parameter_state is not None:
+            local_adapter = ILLaDACIDAdapter(
+                TinyBackbone(),
+                ILLaDACIDConfig(max_thought_slots=4, max_display_tokens=16),
+                freeze_backbone=False,
+            )
+            load_cid_adapter_parameter_state(local_adapter, parameter_state)
+            local_adapter(make_batch())
+            local_adapter(make_batch())
+    finally:
+        if dist.is_initialized():
+            dist.destroy_process_group()
 
 
 if __name__ == "__main__":
