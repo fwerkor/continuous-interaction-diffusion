@@ -4539,6 +4539,54 @@ def test_checkpoint_allows_equivalent_batch_geometry_at_clean_epoch_boundary(tmp
     assert restored.state.rollout_windows_seen_in_epoch == 0
 
 
+def test_local_progress_restore_allows_equivalent_batch_geometry_at_epoch_boundary() -> None:
+    adapter = make_adapter(seed=328)
+    trainer = CIDTrainer(
+        adapter,
+        ILLaDATrajectoryTensorizer(adapter, TinyTokenizer()),
+        CIDTrainerConfig(micro_batch_size=1, gradient_accumulation_steps=8),
+    )
+    trainer.state = CIDTrainerState(
+        transitions_seen=96,
+        optimizer_steps=3,
+        epochs_completed=1,
+        rollout_windows_seen_in_epoch=0,
+    )
+    state = trainer.local_progress_state()
+
+    restored_adapter = make_adapter(seed=328)
+    restored = CIDTrainer(
+        restored_adapter,
+        ILLaDATrajectoryTensorizer(restored_adapter, TinyTokenizer()),
+        CIDTrainerConfig(micro_batch_size=4, gradient_accumulation_steps=2),
+    )
+    restored.restore_local_progress_state(state)
+
+    assert restored.state.epochs_completed == 1
+    assert restored.state.optimizer_steps == 3
+    assert restored.state.rollout_windows_seen_in_epoch == 0
+
+
+def test_local_progress_restore_rejects_batch_geometry_change_mid_epoch() -> None:
+    adapter = make_adapter(seed=329)
+    trainer = CIDTrainer(
+        adapter,
+        ILLaDATrajectoryTensorizer(adapter, TinyTokenizer()),
+        CIDTrainerConfig(micro_batch_size=1, gradient_accumulation_steps=8),
+    )
+    trainer.state = CIDTrainerState(rollout_windows_seen_in_epoch=5)
+    state = trainer.local_progress_state()
+
+    restored_adapter = make_adapter(seed=329)
+    restored = CIDTrainer(
+        restored_adapter,
+        ILLaDATrajectoryTensorizer(restored_adapter, TinyTokenizer()),
+        CIDTrainerConfig(micro_batch_size=4, gradient_accumulation_steps=2),
+    )
+    with pytest.raises(ValueError, match="trainer configuration"):
+        restored.restore_local_progress_state(state)
+
+
 def test_checkpoint_rejects_world_size_change_mid_epoch(tmp_path) -> None:
     adapter = make_adapter(seed=323)
     trainer = CIDTrainer(

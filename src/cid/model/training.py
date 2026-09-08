@@ -1695,9 +1695,35 @@ class CIDTrainer:
     def restore_local_progress_state(self, state: Mapping[str, Any]) -> None:
         saved_config = dict(state["trainer_config"])
         saved_config.setdefault("semantic_pooling", "mean-v1")
-        if saved_config != asdict(self.config):
-            raise ValueError("checkpoint trainer configuration does not match this trainer")
+        current_config = asdict(self.config)
         trainer_state = state["trainer_state"]
+        if saved_config != current_config:
+            saved_geometry = (
+                int(saved_config.get("micro_batch_size", 1)),
+                int(saved_config.get("gradient_accumulation_steps", 1)),
+            )
+            current_geometry = (
+                int(current_config.get("micro_batch_size", 1)),
+                int(current_config.get("gradient_accumulation_steps", 1)),
+            )
+            saved_without_geometry = dict(saved_config)
+            current_without_geometry = dict(current_config)
+            for key in ("micro_batch_size", "gradient_accumulation_steps"):
+                saved_without_geometry.pop(key, None)
+                current_without_geometry.pop(key, None)
+            clean_epoch_boundary = int(
+                trainer_state.get("rollout_windows_seen_in_epoch", 0)
+            ) == 0
+            equivalent_geometry = (
+                saved_geometry[0] * saved_geometry[1]
+                == current_geometry[0] * current_geometry[1]
+            )
+            if not (
+                clean_epoch_boundary
+                and equivalent_geometry
+                and saved_without_geometry == current_without_geometry
+            ):
+                raise ValueError("checkpoint trainer configuration does not match this trainer")
         self.state = CIDTrainerState(
             transitions_seen=int(trainer_state["transitions_seen"]),
             optimizer_steps=int(trainer_state["optimizer_steps"]),
