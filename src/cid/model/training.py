@@ -4790,6 +4790,8 @@ def wrap_stage_a_ddp(
     kwargs: dict[str, object] = {
         "device_ids": device_ids,
         "find_unused_parameters": False,
+        "gradient_as_bucket_view": True,
+        "bucket_cap_mb": 128,
     }
     if "forward_sync_buffers" in signature(DistributedDataParallel).parameters:
         kwargs["forward_sync_buffers"] = False
@@ -4989,6 +4991,7 @@ def wrap_stage_b_fsdp(
     device_id: int | torch.device,
     compute_dtype: torch.dtype = torch.bfloat16,
     cpu_offload: bool = False,
+    throughput_optimized: bool = False,
 ) -> torch.nn.Module:
     from torch.distributed.fsdp import (
         BackwardPrefetch,
@@ -5020,7 +5023,12 @@ def wrap_stage_b_fsdp(
         device_id=device_id,
         cpu_offload=CPUOffload(offload_params=cpu_offload),
         sync_module_states=False,
-        backward_prefetch=BackwardPrefetch.BACKWARD_POST,
+        backward_prefetch=(
+            BackwardPrefetch.BACKWARD_PRE
+            if throughput_optimized
+            else BackwardPrefetch.BACKWARD_POST
+        ),
+        forward_prefetch=throughput_optimized,
         limit_all_gathers=True,
         use_orig_params=True,
     )

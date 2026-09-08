@@ -1730,6 +1730,12 @@ def _train_stage_a(args: argparse.Namespace) -> None:
                 device_type=device_type,
                 dtype=dtype,
             )
+        stage_a_optimizer = torch.optim.AdamW(
+            (parameter for parameter in adapter.parameters() if parameter.requires_grad),
+            lr=args.learning_rate,
+            weight_decay=args.weight_decay,
+            fused=device_type == "cuda",
+        )
         trainer = CIDTrainer(
             adapter,
             tensorizer,
@@ -1752,6 +1758,7 @@ def _train_stage_a(args: argparse.Namespace) -> None:
                 semantic_pooling=args.semantic_pooling,
                 seed=args.seed,
             ),
+            optimizer=stage_a_optimizer,
             forward_model=forward_model,
         )
         if args.resume:
@@ -2294,19 +2301,26 @@ def _resolve_stage_b_performance_profile(
     if accelerator_memory_bytes is not None and accelerator_memory_bytes <= 0:
         raise ValueError("accelerator memory must be positive when provided")
 
-    compact_high_memory_cuda = (
-        model_type == "lfm2"
-        and device_type == "cuda"
+    high_memory_cuda = (
+        device_type == "cuda"
         and not cpu_offload
         and accelerator_memory_bytes is not None
         and accelerator_memory_bytes >= 40 * 1024**3
     )
+    compact_high_memory_cuda = model_type == "lfm2" and high_memory_cuda
+    illada_high_memory_cuda = model_type == "illada" and high_memory_cuda
     if compact_high_memory_cuda:
         name = "compact-high-memory"
         default_micro_batch = 4
         default_mlp_chunk = 512
         default_norm_chunk = 1024
         default_gradient_checkpointing = False
+    elif illada_high_memory_cuda:
+        name = "illada-high-memory"
+        default_micro_batch = 1
+        default_mlp_chunk = 512
+        default_norm_chunk = 1024
+        default_gradient_checkpointing = True
     else:
         name = "memory-safe"
         default_micro_batch = 1
@@ -2612,6 +2626,7 @@ def _train_stage_b(args: argparse.Namespace) -> None:
                 device_id=device,
                 compute_dtype=compute_dtype,
                 cpu_offload=args.fsdp_cpu_offload,
+                throughput_optimized=performance_profile.name == "illada-high-memory",
             )
             gradient_clipper = training_model.clip_grad_norm_
         optimizer = torch.optim.AdamW(

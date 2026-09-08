@@ -34,6 +34,7 @@ cid_encoding = import_module("cid.model.encoding")
 ILLaDATextEncoder = cid_encoding.ILLaDATextEncoder
 nn = import_module("torch.nn")
 dist = import_module("torch.distributed")
+BackwardPrefetch = import_module("torch.distributed.fsdp").BackwardPrefetch
 cid_model = import_module("cid.model")
 cid_losses = import_module("cid.model.losses")
 
@@ -2181,7 +2182,10 @@ def test_stage_b_fsdp_runs_full_parameter_optimizer_step_on_cpu(tmp_path) -> Non
             adapter,
             device_id=torch.device("cpu"),
             compute_dtype=torch.bfloat16,
+            throughput_optimized=True,
         )
+        assert fsdp.backward_prefetch is BackwardPrefetch.BACKWARD_PRE
+        assert fsdp.forward_prefetch is True
         optimizer = torch.optim.AdamW(optimizer_groups, lr=1e-3)
         trainer = CIDTrainer(
             adapter,
