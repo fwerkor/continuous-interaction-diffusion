@@ -1269,6 +1269,7 @@ def _benchmark(args: argparse.Namespace) -> None:
                     forward_model=forward_model,
                     seed_teacher_state=args.seed_teacher_state,
                     denoising_steps=args.denoising_steps,
+                    display_canvas_tokens=args.display_canvas_tokens,
                     display_revision_fraction=args.display_revision_fraction,
                     display_revision_margin=args.display_revision_margin,
                     materializer_config=materializer_config,
@@ -1305,6 +1306,11 @@ def _benchmark(args: argparse.Namespace) -> None:
                     ),
                 },
                 "seed_teacher_state": args.seed_teacher_state,
+                "display_canvas_tokens": (
+                    adapter.config.display_canvas_tokens
+                    if args.display_canvas_tokens is None
+                    else args.display_canvas_tokens
+                ),
                 "metrics": asdict(summary),
             }
             summary_output.write_text(
@@ -3524,6 +3530,14 @@ def main() -> None:
     )
     policy_tuning = benchmark.add_argument_group("neural policy tuning")
     policy_tuning.add_argument("--denoising-steps", type=int, default=8)
+    policy_tuning.add_argument(
+        "--display-canvas-tokens",
+        type=int,
+        help=(
+            "fixed physical Display capacity for every benchmark task; defaults to the "
+            "checkpoint display_canvas_tokens and never depends on target-answer length"
+        ),
+    )
     policy_tuning.add_argument(
         "--display-revision-fraction",
         type=float,

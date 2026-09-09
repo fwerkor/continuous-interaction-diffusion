@@ -57,6 +57,7 @@ async def run_neural_benchmark_case(
     forward_model: torch.nn.Module | None = None,
     seed_teacher_state: bool = False,
     denoising_steps: int = 8,
+    display_canvas_tokens: int | None = None,
     display_revision_fraction: float = DEFAULT_DISPLAY_REVISION_FRACTION,
     display_revision_margin: float = DEFAULT_DISPLAY_REVISION_MARGIN,
     materializer_config: CIDMaterializerConfig | None = None,
@@ -85,7 +86,7 @@ async def run_neural_benchmark_case(
     expected_ids = tuple(int(token) for token in expected_ids_tensor[0].tolist())
     if not expected_ids:
         raise ValueError("benchmark target display must tokenize to at least one token")
-    canvas_tokens = _benchmark_display_canvas_tokens(adapter, len(expected_ids) + 1)
+    canvas_tokens = _benchmark_display_canvas_tokens(adapter, display_canvas_tokens)
 
     thought = (
         teacher_seed_thought(example, adapter, encoder)
@@ -149,19 +150,21 @@ def _decode_display_trace_events(
     return tuple(decoded)
 
 
-def _benchmark_display_canvas_tokens(adapter: ILLaDACIDAdapter, required_tokens: int) -> int:
-    """Choose the same coarse expandable display bucket used during training."""
+def _benchmark_display_canvas_tokens(
+    adapter: ILLaDACIDAdapter,
+    configured_tokens: int | None,
+) -> int:
+    """Resolve benchmark Display capacity without consulting the ground-truth answer."""
 
-    if required_tokens <= 0:
-        raise ValueError("benchmark display requires at least one token")
-    maximum = adapter.config.max_display_tokens
-    if required_tokens > maximum:
+    canvas = (
+        int(adapter.config.display_canvas_tokens)
+        if configured_tokens is None
+        else int(configured_tokens)
+    )
+    if not 1 < canvas <= adapter.config.max_display_tokens:
         raise ValueError(
-            "benchmark target display plus EOS exceeds the checkpoint maximum display capacity"
+            "benchmark display canvas must be in [2, adapter max_display_tokens]"
         )
-    canvas = adapter.config.display_canvas_tokens
-    while canvas < required_tokens:
-        canvas = min(maximum, canvas * 2)
     return canvas
 
 

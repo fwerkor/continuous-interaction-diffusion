@@ -317,11 +317,11 @@ async def test_neural_benchmark_case_runs_replay_and_scores_display() -> None:
         assert "display_materialized_text" in event["payload"]
 
 
-async def test_neural_benchmark_expands_display_bucket_for_longer_target() -> None:
+async def test_neural_benchmark_canvas_does_not_depend_on_target_length() -> None:
     adapter = configured_adapter(max_display_tokens=16, display_canvas_tokens=4)
     base = make_example()
     example = TrajectoryExample(
-        example_id="bench-expanded-display",
+        example_id="bench-fixed-display",
         prompt="p",
         target_display="abcdefgh",
         thought_targets=base.thought_targets,
@@ -333,7 +333,38 @@ async def test_neural_benchmark_expands_display_bucket_for_longer_target() -> No
         example,
         seed_teacher_state=True,
         denoising_steps=1,
-        max_steps=4,
+        runtime_config=RuntimeConfig(max_steps=4, trace_display=True),
     )
 
-    assert len(result.final_display_ids) == 15
+    model_events = [
+        event for event in result.trace_events if event["kind"] == "model_step_finished"
+    ]
+    assert model_events
+    assert all(len(event["payload"]["display_token_ids"]) == 4 for event in model_events)
+
+
+async def test_neural_benchmark_accepts_explicit_fixed_display_capacity() -> None:
+    adapter = configured_adapter(max_display_tokens=16, display_canvas_tokens=4)
+    base = make_example()
+    example = TrajectoryExample(
+        example_id="bench-fixed-display-override",
+        prompt="p",
+        target_display="abcdefgh",
+        thought_targets=base.thought_targets,
+    )
+
+    result = await run_neural_benchmark_case(
+        adapter,
+        TinyTokenizer(),
+        example,
+        seed_teacher_state=True,
+        denoising_steps=1,
+        display_canvas_tokens=8,
+        runtime_config=RuntimeConfig(max_steps=4, trace_display=True),
+    )
+
+    model_events = [
+        event for event in result.trace_events if event["kind"] == "model_step_finished"
+    ]
+    assert model_events
+    assert all(len(event["payload"]["display_token_ids"]) == 8 for event in model_events)
