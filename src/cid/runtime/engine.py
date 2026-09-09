@@ -346,6 +346,11 @@ class CIDRuntime:
                     continue
 
                 self._launch_due_jobs(step)
+                # Launching due work can resolve an active binding synchronously
+                # from the runtime cache. Re-check after the launch so a stale
+                # pre-launch unresolved flag cannot send an already-satisfied
+                # equilibrium into an external-progress wait with no work left.
+                unresolved = self._has_unresolved_active_binding()
                 if settled and unresolved:
                     self.trace.emit(
                         "quiescence_started",

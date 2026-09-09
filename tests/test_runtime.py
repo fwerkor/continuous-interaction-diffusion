@@ -103,6 +103,38 @@ class PersistentNeedPolicy:
         )
 
 
+class CacheReuseAtEquilibriumPolicy:
+    def step(self, context: ModelContext) -> ModelUpdate:
+        cell_id = context.thought.live_cell_ids[0]
+        if context.step == 0:
+            need_id = "prime-cache"
+            equilibrium = False
+            converged = False
+        elif context.step == 1:
+            need_id = "reuse-cache"
+            equilibrium = True
+            converged = False
+        else:
+            need_id = "reuse-cache"
+            equilibrium = True
+            converged = bool(context.percepts)
+        need = InformationNeed(
+            need_id=need_id,
+            source_scores={"source": 1.0},
+            arguments={"key": "same"},
+            confidence=1.0,
+            freshness=FreshnessDemand.ONCE,
+            target_cells=(ObjectRef.cell(cell_id),),
+        )
+        return ModelUpdate(
+            thought=context.thought.advance(context.thought.cells),
+            display=context.display.advance(context.display.token_ids),
+            needs=(need,),
+            equilibrium=equilibrium,
+            converged=converged,
+        )
+
+
 class IncompleteCandidatePolicy:
     def step(self, context: ModelContext) -> ModelUpdate:
         target_cell = context.thought.live_cell_ids[0]
@@ -545,6 +577,27 @@ async def test_quiescence_waits_without_consuming_the_refinement_epoch_budget() 
     starts = tuple(event for event in result.trace.events if event.kind == "quiescence_started")
     assert any(event.payload["reason"] == "current_information_equilibrium" for event in starts)
     assert result.trace.count("compute_budget_exhausted") == 0
+
+
+async def test_cache_hit_at_equilibrium_does_not_wait_for_nonexistent_external_progress() -> None:
+    source = CountingSource()
+    registry = SourceRegistry()
+    registry.register(source)
+    runtime = CIDRuntime(
+        registry,
+        RuntimeConfig(max_steps=20, max_wall_time_s=0.2),
+    )
+
+    result = await runtime.run(
+        CacheReuseAtEquilibriumPolicy(),
+        thought=seeded_thought(1),
+        display=DisplayCanvas.masked(1, -1),
+    )
+
+    assert result.converged
+    assert source.reads == 1
+    assert result.trace.count("cache_hit") == 1
+    assert result.trace.count("wall_clock_budget_exhausted") == 0
 
 
 async def test_observation_anchor_routes_percept_to_related_cognitive_cell() -> None:
