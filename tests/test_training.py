@@ -3477,16 +3477,17 @@ def test_stage_a_legacy_resume_repair_is_limited_to_pre_v2_checkpoints() -> None
     assert not needs_repair(data_order_version=2, windows_seen_in_epoch=3)
     assert not needs_repair(data_order_version=3, windows_seen_in_epoch=3)
     assert not needs_repair(data_order_version=4, windows_seen_in_epoch=3)
+    assert not needs_repair(data_order_version=5, windows_seen_in_epoch=3)
     assert not needs_repair(data_order_version=1, windows_seen_in_epoch=0)
 
 
 def test_stage_a_legacy_order_upgrades_only_at_completed_epoch_boundary() -> None:
     completed_version = import_module("cid.cli")._stage_a_completed_epoch_data_order_version
 
-    assert completed_version(1) == 4
-    assert completed_version(2) == 4
-    assert completed_version(3) == 4
-    assert completed_version(4) == 4
+    assert completed_version(1) == 5
+    assert completed_version(2) == 5
+    assert completed_version(3) == 5
+    assert completed_version(4) == 5
     assert completed_version(5) == 5
 
 
@@ -3917,6 +3918,95 @@ def test_rollout_sharding_globally_mixes_weighted_microbatches() -> None:
     assert sum(left != right for left, right in zip(sequence, sequence[1:], strict=False)) >= 2
 
 
+def test_balanced_rollout_sharding_spreads_small_bucket_across_epoch() -> None:
+    base = make_trajectory()
+    windows = tuple(
+        CIDRolloutWindow(
+            example=replace(base, example_id=f"large-bucket-{index}"),
+            source_steps=(0,),
+            loss_weight=1.0,
+        )
+        for index in range(96)
+    ) + tuple(
+        CIDRolloutWindow(
+            example=replace(base, example_id=f"small-bucket-{index}"),
+            source_steps=(0,),
+            loss_weight=2.0,
+        )
+        for index in range(24)
+    )
+
+    shard = shard_rollout_windows(
+        windows,
+        world_size=1,
+        rank=0,
+        seed=11,
+        epoch=1,
+        micro_batch_size=1,
+        portable_bucket_order=True,
+        balanced_bucket_order=True,
+    )
+    weights = tuple(window.loss_weight for window in shard)
+    midpoint = len(weights) // 2
+    first_small = sum(weight == 2.0 for weight in weights[:midpoint])
+    second_small = sum(weight == 2.0 for weight in weights[midpoint:])
+
+    assert first_small >= 6
+    assert second_small >= 6
+    assert first_small + second_small == 24
+
+
+def test_balanced_portable_length_order_randomizes_fixed_geometry_bands() -> None:
+    base = make_trajectory()
+    windows = tuple(
+        CIDRolloutWindow(
+            example=replace(
+                base,
+                example_id=f"length-band-{length}",
+                prompt="x" * length,
+            ),
+            source_steps=(0,),
+            loss_weight=1.0,
+        )
+        for length in range(1, 257)
+    )
+
+    shard = shard_rollout_windows(
+        windows,
+        world_size=1,
+        rank=0,
+        seed=7,
+        epoch=1,
+        micro_batch_size=1,
+        length_aware=True,
+        portable_bucket_order=True,
+        balanced_bucket_order=True,
+    )
+    lengths = [len(window.example.prompt) for window in shard]
+
+    assert lengths != sorted(lengths)
+    for start in range(0, len(lengths), 64):
+        band = lengths[start : start + 64]
+        assert max(band) - min(band) <= 63
+
+
+def test_balanced_bucket_order_requires_portable_order() -> None:
+    window = CIDRolloutWindow(
+        example=make_trajectory(),
+        source_steps=(0,),
+        loss_weight=1.0,
+    )
+    with pytest.raises(ValueError, match="requires portable bucket order"):
+        shard_rollout_windows(
+            (window,),
+            world_size=1,
+            rank=0,
+            seed=0,
+            epoch=1,
+            balanced_bucket_order=True,
+        )
+
+
 def test_rollout_sharding_repeats_singleton_bucket_across_all_ranks() -> None:
     window = CIDRolloutWindow(
         example=replace(make_trajectory(), example_id="singleton"),
@@ -4070,6 +4160,7 @@ def test_stage_b_portable_cursor_handles_padded_bucket_prefix_exactly() -> None:
             length_aware=True,
             zero_gradient_padding=True,
             portable_bucket_order=True,
+            balanced_bucket_order=True,
         )
         for rank in range(4)
     )
@@ -4098,6 +4189,7 @@ def test_stage_b_portable_cursor_handles_padded_bucket_prefix_exactly() -> None:
             length_aware=True,
             zero_gradient_padding=True,
             portable_bucket_order=True,
+            balanced_bucket_order=True,
         )
         for rank in range(2)
     )

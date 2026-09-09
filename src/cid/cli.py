@@ -1564,7 +1564,7 @@ def _stage_a_needs_legacy_resume_repair(
 def _stage_a_completed_epoch_data_order_version(data_order_version: int) -> int:
     """Upgrade legacy ordering only after its in-flight epoch has finished."""
 
-    return max(data_order_version, 4)
+    return max(data_order_version, 5)
 
 
 def _select_end_to_end_validation_examples(
@@ -1774,6 +1774,8 @@ def _train_stage_a(args: argparse.Namespace) -> None:
             )
         if distributed:
             trainer.reseed(args.seed + rank + trainer.state.transitions_seen * 104729)
+        if trainer.state.rollout_windows_seen_in_epoch == 0:
+            trainer.data_order_version = max(trainer.data_order_version, 5)
 
         examples, validation_examples = _index_train_and_load_validation_examples(
             args.data,
@@ -1878,6 +1880,7 @@ def _train_stage_a(args: argparse.Namespace) -> None:
                 length_aware=trainer.data_order_version >= 2,
                 zero_gradient_padding=trainer.data_order_version >= 3,
                 portable_bucket_order=trainer.data_order_version >= 4,
+                balanced_bucket_order=trainer.data_order_version >= 5,
             )
             total_local_windows = len(local_windows)
             resumed_windows = trainer.state.rollout_windows_seen_in_epoch
@@ -2539,6 +2542,19 @@ def _train_stage_b(args: argparse.Namespace) -> None:
                 map_location="cpu",
                 weights_only=False,
             )
+        stage_b_data_order_version = (
+            int(resume_rank0_state.get("data_order_version", 1))
+            if resume_rank0_state is not None
+            else 5
+        )
+        if (
+            resume_rank0_state is not None
+            and int(
+                resume_rank0_state["trainer_state"].get("rollout_windows_seen_in_epoch", 0)
+            )
+            == 0
+        ):
+            stage_b_data_order_version = max(stage_b_data_order_version, 5)
 
         lr_decay_steps = max(
             1,
@@ -2553,6 +2569,7 @@ def _train_stage_b(args: argparse.Namespace) -> None:
                     shuffle=not args.no_shuffle,
                     length_aware=True,
                     portable_bucket_order=True,
+                    balanced_bucket_order=stage_b_data_order_version >= 5,
                 )
                 for epoch in range(1, args.epochs + 1)
             ),
@@ -2690,6 +2707,8 @@ def _train_stage_b(args: argparse.Namespace) -> None:
                 )
         else:
             trainer.reseed(args.seed + rank)
+        if trainer.state.rollout_windows_seen_in_epoch == 0:
+            trainer.data_order_version = max(trainer.data_order_version, 5)
 
         saved_world_size = (
             int(loaded_checkpoint_metadata["world_size"])
@@ -2787,6 +2806,7 @@ def _train_stage_b(args: argparse.Namespace) -> None:
                 length_aware=trainer.data_order_version >= 2,
                 zero_gradient_padding=trainer.data_order_version >= 3,
                 portable_bucket_order=trainer.data_order_version >= 4,
+                balanced_bucket_order=trainer.data_order_version >= 5,
             )
             total_local_windows = len(epoch_shard)
             resumed_windows = trainer.state.rollout_windows_seen_in_epoch

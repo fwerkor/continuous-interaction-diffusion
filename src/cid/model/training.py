@@ -80,6 +80,7 @@ from cid.state import (
 
 CID_NEURAL_CONTRACT_VERSION = 4
 STAGE_B_SEMANTIC_SNAPSHOT_FILENAME = "semantic-embedding.pt"
+_PORTABLE_LENGTH_BAND_SIZE = 64
 
 
 class CIDRolloutRecoveryError(ValueError):
@@ -641,9 +642,10 @@ class CIDTrainer:
         self.generator.manual_seed(self.config.seed)
         self.shuffle_rng = random.Random(self.config.seed)
         self.state = CIDTrainerState()
-        # v4 keeps rollout buckets in a world-size-independent canonical order so a
-        # per-bucket consumed prefix is sufficient for safe elastic mid-epoch resume.
-        self.data_order_version = 4
+        # v5 keeps the v4 world-size-independent bucket prefix while randomizing
+        # fixed geometry bands and sampling buckets in proportion to their remaining
+        # microbatches, avoiding systematic task/length drift across an epoch.
+        self.data_order_version = 5
         self._pending_accumulation = 0
         self._pending_examples = 0
         self._pending_global_examples = 0
@@ -4648,6 +4650,7 @@ def shard_rollout_windows(
     length_aware: bool = False,
     zero_gradient_padding: bool = True,
     portable_bucket_order: bool = False,
+    balanced_bucket_order: bool = False,
 ) -> tuple[CIDRolloutWindow, ...]:
     if world_size <= 0:
         raise ValueError("world_size must be positive")
@@ -4655,6 +4658,8 @@ def shard_rollout_windows(
         raise ValueError("rank must be in [0, world_size)")
     if micro_batch_size <= 0:
         raise ValueError("micro_batch_size must be positive")
+    if balanced_bucket_order and not portable_bucket_order:
+        raise ValueError("balanced bucket order requires portable bucket order")
     if not windows:
         return ()
     local_microbatches: list[tuple[CIDRolloutWindow, ...]] = []
@@ -4671,10 +4676,31 @@ def shard_rollout_windows(
         if shuffle:
             random.Random(seed + epoch * 1009 + length * 100_003 + bucket_index).shuffle(bucket)
         if portable_bucket_order and length_aware and len(bucket) > 1:
-            # The deterministic shuffle above randomizes equal-geometry ties. Stable
-            # sorting then defines a canonical order independent of world size; the old
-            # global-microbatch grouping changed order whenever ranks changed.
+            # Keep a canonical order independent of world size. v4 used one global
+            # shortest-to-longest ordering, which made sequence geometry drift over the
+            # epoch. v5 instead shuffles fixed-size length bands (and their contents):
+            # nearby examples still collate efficiently, but short/long bands are spread
+            # throughout training. The fixed band size intentionally does not depend on
+            # world size or micro-batch geometry so per-bucket resume cursors stay portable.
             bucket.sort(key=_rollout_window_length_key)
+            if balanced_bucket_order:
+                bands = [
+                    bucket[start : start + _PORTABLE_LENGTH_BAND_SIZE]
+                    for start in range(0, len(bucket), _PORTABLE_LENGTH_BAND_SIZE)
+                ]
+                band_rng = random.Random(
+                    seed + epoch * 1_000_081 + length * 100_019 + bucket_index * 4_099
+                )
+                for band_index, band in enumerate(bands):
+                    random.Random(
+                        seed
+                        + epoch * 1_000_099
+                        + length * 100_043
+                        + bucket_index * 4_123
+                        + band_index
+                    ).shuffle(band)
+                band_rng.shuffle(bands)
+                bucket = [window for band in bands for window in band]
         portable_key = _stage_b_rollout_bucket_key(bucket[0])
         consumed = int((consumed_windows_by_bucket or {}).get(portable_key, 0))
         if consumed < 0 or consumed > len(bucket):
@@ -4738,30 +4764,48 @@ def shard_rollout_windows(
             local_microbatches.extend(bucket_microbatches)
     if portable_bucket_order:
         if shuffle:
-            # Randomly interleave buckets while only consuming the next microbatch from
-            # each bucket. This keeps the old global mixture diversity without ever
-            # reordering a bucket internally, so a per-bucket prefix remains exact.
             rng = random.Random(seed + epoch * 1_000_003 + 97)
             positions = [0] * len(portable_bucket_microbatches)
-            active = [
-                index for index, batches in enumerate(portable_bucket_microbatches) if batches
-            ]
-            previous_bucket: int | None = None
-            while active:
-                candidate_positions = [
-                    position
-                    for position, bucket_index in enumerate(active)
-                    if bucket_index != previous_bucket
+            if balanced_bucket_order:
+                # A shuffled multiset of bucket ids is equivalent to sampling a bucket
+                # in proportion to its remaining microbatch count at every draw. This
+                # preserves the intended epoch-wide mixture instead of giving a tiny
+                # bucket the same probability as a huge one and exhausting it early.
+                bucket_schedule = [
+                    bucket_index
+                    for bucket_index, batches in enumerate(portable_bucket_microbatches)
+                    for _ in batches
                 ]
-                active_index = rng.choice(candidate_positions or list(range(len(active))))
-                bucket_index = active[active_index]
-                position = positions[bucket_index]
-                batches = portable_bucket_microbatches[bucket_index]
-                local_microbatches.append(batches[position])
-                positions[bucket_index] = position + 1
-                previous_bucket = bucket_index
-                if positions[bucket_index] == len(batches):
-                    active.pop(active_index)
+                rng.shuffle(bucket_schedule)
+                for bucket_index in bucket_schedule:
+                    position = positions[bucket_index]
+                    batches = portable_bucket_microbatches[bucket_index]
+                    local_microbatches.append(batches[position])
+                    positions[bucket_index] = position + 1
+            else:
+                # v4 compatibility: select uniformly among non-empty buckets while
+                # preserving each bucket's canonical prefix for mid-epoch resume.
+                active = [
+                    index
+                    for index, batches in enumerate(portable_bucket_microbatches)
+                    if batches
+                ]
+                previous_bucket: int | None = None
+                while active:
+                    candidate_positions = [
+                        position
+                        for position, bucket_index in enumerate(active)
+                        if bucket_index != previous_bucket
+                    ]
+                    active_index = rng.choice(candidate_positions or list(range(len(active))))
+                    bucket_index = active[active_index]
+                    position = positions[bucket_index]
+                    batches = portable_bucket_microbatches[bucket_index]
+                    local_microbatches.append(batches[position])
+                    positions[bucket_index] = position + 1
+                    previous_bucket = bucket_index
+                    if positions[bucket_index] == len(batches):
+                        active.pop(active_index)
         else:
             local_microbatches.extend(
                 microbatch for batches in portable_bucket_microbatches for microbatch in batches
@@ -4863,6 +4907,7 @@ def stage_b_optimizer_steps_per_epoch(
     shuffle: bool = True,
     length_aware: bool = True,
     portable_bucket_order: bool = False,
+    balanced_bucket_order: bool = False,
 ) -> int:
     """Simulate the exact globally valid-example Stage B accumulation schedule."""
 
@@ -4902,6 +4947,7 @@ def stage_b_optimizer_steps_per_epoch(
                 micro_batch_size=micro_batch_size,
                 length_aware=length_aware,
                 portable_bucket_order=portable_bucket_order,
+                balanced_bucket_order=balanced_bucket_order,
             )
         )
         for rank in range(world_size)
