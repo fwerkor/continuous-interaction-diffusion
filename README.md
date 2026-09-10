@@ -518,9 +518,9 @@ throughput-oriented auto profile when CUDA memory is at least 40 GiB:
   accumulation from 8 to 2 while preserving the same effective transition batch;
 - AdamW with `weight_decay=0.01` on matrix/tensor weights and zero decay on one-dimensional
   norm/bias parameters;
-- peak CID learning rate `1e-5`; the pretrained iLLaDA backbone uses a conservative `0.5` multiplier
+- peak CID learning rate `2e-5`; the pretrained iLLaDA backbone uses a conservative `0.25` multiplier
   (`5e-6` by default);
-- 3% linear warmup followed by cosine decay to 10% of the peak rate over the target Stage B epochs;
+- 1% linear warmup, a WSD stable phase, and a final 10% linear decay to 10% of the peak rate over the target Stage B epochs;
 - full rollout from the first Stage B batch (`teacher_forcing_epochs=0`, `rollout_ramp_epochs=0`),
   because the curriculum has already been completed in Stage A;
 - target effective transition batch 32. Gradient accumulation is resolved automatically from the

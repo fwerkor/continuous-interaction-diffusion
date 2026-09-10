@@ -214,9 +214,9 @@ On a single-process CPU launch, PyTorch may reduce `FULL_SHARD` to `NO_SHARD`; m
 launches retain FSDP sharding.
 
 Stage B separates optimization policy by parameter role. CID modules use the configured peak
-learning rate (`1e-5` by default), while iLLaDA backbone groups use `backbone_lr_scale=0.5`. Matrix
+learning rate (`2e-5` by default), while iLLaDA backbone groups use `backbone_lr_scale=0.25`, keeping the default backbone peak at `5e-6`. Matrix
 and embedding weights receive `weight_decay=0.01`; one-dimensional norm weights and biases receive
-zero decay. The trainer preserves these group multipliers through a 3% linear warmup and cosine
+zero decay. The trainer preserves these group multipliers through a 1% linear warmup, WSD stable phase, and final 10% linear
 decay to 10% of peak. The default target transition batch is 32 and gradient accumulation is derived
 from the actual world size and resolved micro-batch unless explicitly overridden. Large backbones,
 low-memory CUDA, CPU-offload, NPU, and CPU use the memory-safe defaults: micro-batch 1, MLP/norm
@@ -235,7 +235,7 @@ Closed-loop state continuity is independent of optimizer accumulation. A long tr
 its detached predicted T/Y state across many transitions. Terminal or quiescent model decisions do
 not delete later supervision: a blocked transition receives a teacher-input correction loss while
 the blocked rollout state itself is preserved. AdamW accumulation counts globally valid transitions
-rather than backward calls or padded rows, and the Stage B warmup/cosine schedule is precomputed
+rather than backward calls or padded rows, and the Stage B warmup/WSD schedule is precomputed
 with the same valid-transition rule. The target global batch therefore remains meaningful even for
 long trajectories and uneven final shards. Closed-loop display diffusion resets only when a
 materialized predicted binding actually obtains replayed external progress; teacher event timing by

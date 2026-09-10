@@ -332,6 +332,8 @@ class CIDTrainerConfig:
     max_grad_norm: float = 1.0
     warmup_steps: int = 0
     lr_decay_steps: int = 0
+    lr_schedule: str = "cosine"
+    lr_decay_start_steps: int = 0
     min_learning_rate_ratio: float = 0.1
     timestep_min: float = 0.05
     timestep_max: float = 1.0
@@ -357,10 +359,17 @@ class CIDTrainerConfig:
             raise ValueError("gradient_accumulation_steps must be positive")
         if self.max_grad_norm <= 0.0:
             raise ValueError("max_grad_norm must be positive")
-        if self.warmup_steps < 0 or self.lr_decay_steps < 0:
+        if self.warmup_steps < 0 or self.lr_decay_steps < 0 or self.lr_decay_start_steps < 0:
             raise ValueError("learning-rate schedule steps must be non-negative")
         if self.lr_decay_steps and self.warmup_steps > self.lr_decay_steps:
             raise ValueError("warmup_steps cannot exceed lr_decay_steps")
+        if self.lr_schedule not in {"cosine", "wsd-linear"}:
+            raise ValueError("unsupported learning-rate schedule")
+        if self.lr_schedule == "wsd-linear" and self.lr_decay_steps:
+            if not self.warmup_steps <= self.lr_decay_start_steps <= self.lr_decay_steps:
+                raise ValueError(
+                    "WSD decay start must be between warmup and total decay steps"
+                )
         if not 0.0 <= self.min_learning_rate_ratio <= 1.0:
             raise ValueError("min_learning_rate_ratio must be in [0, 1]")
         if not 0.0 <= self.timestep_min <= self.timestep_max <= 1.0:
@@ -1697,6 +1706,8 @@ class CIDTrainer:
     def restore_local_progress_state(self, state: Mapping[str, Any]) -> None:
         saved_config = dict(state["trainer_config"])
         saved_config.setdefault("semantic_pooling", "mean-v1")
+        saved_config.setdefault("lr_schedule", "cosine")
+        saved_config.setdefault("lr_decay_start_steps", 0)
         current_config = asdict(self.config)
         trainer_state = state["trainer_state"]
         if saved_config != current_config:
@@ -1760,6 +1771,8 @@ class CIDTrainer:
 
         saved_config = dict(state["trainer_config"])
         saved_config.setdefault("semantic_pooling", "mean-v1")
+        saved_config.setdefault("lr_schedule", "cosine")
+        saved_config.setdefault("lr_decay_start_steps", 0)
         current_config = asdict(self.config)
         saved_config["gradient_accumulation_steps"] = current_config["gradient_accumulation_steps"]
         if saved_config != current_config:
@@ -2136,14 +2149,31 @@ class CIDTrainer:
         if self.config.warmup_steps and step <= self.config.warmup_steps:
             scale = step / self.config.warmup_steps
         elif self.config.lr_decay_steps:
-            decay_span = max(1, self.config.lr_decay_steps - self.config.warmup_steps)
-            progress = min(
-                1.0,
-                max(0.0, (step - self.config.warmup_steps) / decay_span),
-            )
-            cosine = 0.5 * (1.0 + math.cos(math.pi * progress))
             floor = self.config.min_learning_rate_ratio
-            scale = floor + (1.0 - floor) * cosine
+            if self.config.lr_schedule == "wsd-linear":
+                if step <= self.config.lr_decay_start_steps:
+                    scale = 1.0
+                else:
+                    decay_span = max(
+                        1,
+                        self.config.lr_decay_steps - self.config.lr_decay_start_steps,
+                    )
+                    progress = min(
+                        1.0,
+                        max(
+                            0.0,
+                            (step - self.config.lr_decay_start_steps) / decay_span,
+                        ),
+                    )
+                    scale = 1.0 - (1.0 - floor) * progress
+            else:
+                decay_span = max(1, self.config.lr_decay_steps - self.config.warmup_steps)
+                progress = min(
+                    1.0,
+                    max(0.0, (step - self.config.warmup_steps) / decay_span),
+                )
+                cosine = 0.5 * (1.0 + math.cos(math.pi * progress))
+                scale = floor + (1.0 - floor) * cosine
         else:
             scale = 1.0
         return self.config.learning_rate * scale

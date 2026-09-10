@@ -4304,6 +4304,30 @@ def test_learning_rate_schedule_warms_up_then_cosine_decays() -> None:
     assert trainer._learning_rate_for_step(20) == pytest.approx(1e-4)
 
 
+def test_learning_rate_schedule_wsd_warms_up_stays_stable_then_linearly_decays() -> None:
+    adapter = make_adapter(seed=109)
+    trainer = CIDTrainer(
+        adapter,
+        ILLaDATrajectoryTensorizer(adapter, TinyTokenizer()),
+        CIDTrainerConfig(
+            learning_rate=1e-3,
+            warmup_steps=2,
+            lr_decay_steps=10,
+            lr_schedule="wsd-linear",
+            lr_decay_start_steps=8,
+            min_learning_rate_ratio=0.1,
+        ),
+    )
+
+    assert trainer._learning_rate_for_step(1) == pytest.approx(5e-4)
+    assert trainer._learning_rate_for_step(2) == pytest.approx(1e-3)
+    assert trainer._learning_rate_for_step(7) == pytest.approx(1e-3)
+    assert trainer._learning_rate_for_step(8) == pytest.approx(1e-3)
+    assert trainer._learning_rate_for_step(9) == pytest.approx(5.5e-4)
+    assert trainer._learning_rate_for_step(10) == pytest.approx(1e-4)
+    assert trainer._learning_rate_for_step(20) == pytest.approx(1e-4)
+
+
 def test_rollout_report_keeps_raw_and_weighted_loss_separate() -> None:
     adapter = make_adapter(seed=108)
     trainer = CIDTrainer(

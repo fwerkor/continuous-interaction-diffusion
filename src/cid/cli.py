@@ -2409,6 +2409,11 @@ def _train_stage_b(args: argparse.Namespace) -> None:
         raise ValueError("Stage B chunk sizes must be positive")
     if not 0.0 <= args.warmup_ratio < 1.0:
         raise ValueError("--warmup-ratio must be in [0, 1)")
+    if args.lr_schedule == "wsd-linear":
+        if not 0.0 < args.wsd_decay_ratio < 1.0:
+            raise ValueError("--wsd-decay-ratio must be in (0, 1)")
+        if args.warmup_ratio >= 1.0 - args.wsd_decay_ratio:
+            raise ValueError("WSD warmup and decay ratios leave no stable interval")
     if not 0.0 <= args.min_learning_rate_ratio <= 1.0:
         raise ValueError("--min-learning-rate-ratio must be in [0, 1]")
     if args.backbone_lr_scale <= 0.0:
@@ -2579,10 +2584,18 @@ def _train_stage_b(args: argparse.Namespace) -> None:
             if args.warmup_ratio > 0.0
             else 0
         )
+        lr_schedule = args.lr_schedule
+        lr_decay_start_steps = (
+            max(warmup_steps, round(lr_decay_steps * (1.0 - args.wsd_decay_ratio)))
+            if lr_schedule == "wsd-linear"
+            else 0
+        )
         if resume_rank0_state is not None:
             saved_trainer_config = resume_rank0_state["trainer_config"]
             lr_decay_steps = int(saved_trainer_config["lr_decay_steps"])
             warmup_steps = int(saved_trainer_config["warmup_steps"])
+            lr_schedule = str(saved_trainer_config.get("lr_schedule", "cosine"))
+            lr_decay_start_steps = int(saved_trainer_config.get("lr_decay_start_steps", 0))
 
         tokenizer_kwargs: dict[str, object] = {"trust_remote_code": True}
         revision = pretrained_revision(args.model)
@@ -2675,6 +2688,8 @@ def _train_stage_b(args: argparse.Namespace) -> None:
                 max_grad_norm=args.max_grad_norm,
                 warmup_steps=warmup_steps,
                 lr_decay_steps=lr_decay_steps,
+                lr_schedule=lr_schedule,
+                lr_decay_start_steps=lr_decay_start_steps,
                 min_learning_rate_ratio=args.min_learning_rate_ratio,
                 timestep_min=args.timestep_min,
                 timestep_max=args.timestep_max,
@@ -2752,7 +2767,8 @@ def _train_stage_b(args: argparse.Namespace) -> None:
                 f"gradient_checkpointing={int(args.gradient_checkpointing)} "
                 f"peak_cid_lr={args.learning_rate:.3e} "
                 f"peak_backbone_lr={args.learning_rate * args.backbone_lr_scale:.3e} "
-                f"warmup_steps={warmup_steps} lr_decay_steps={lr_decay_steps} "
+                f"lr_schedule={lr_schedule} warmup_steps={warmup_steps} "
+                f"decay_start_steps={lr_decay_start_steps} lr_decay_steps={lr_decay_steps} "
                 f"target_epochs={args.epochs}",
                 flush=True,
             )
@@ -3790,14 +3806,14 @@ def main() -> None:
     train_full.add_argument(
         "--learning-rate",
         type=float,
-        default=1e-5,
+        default=2e-5,
         help="peak CID-module learning rate; backbone LR is scaled separately",
     )
     train_full.add_argument(
         "--backbone-lr-scale",
         type=float,
-        default=0.5,
-        help="backbone LR multiplier; use a lower value for small-model retention when needed",
+        default=0.25,
+        help="backbone LR multiplier; default keeps the Stage B backbone peak at 5e-6",
     )
     train_full.add_argument("--weight-decay", type=float, default=0.01)
     train_full.add_argument(
@@ -3831,7 +3847,18 @@ def main() -> None:
             "compact high-memory profile and 256 otherwise"
         ),
     )
-    train_full.add_argument("--warmup-ratio", type=float, default=0.03)
+    train_full.add_argument("--warmup-ratio", type=float, default=0.01)
+    train_full.add_argument(
+        "--lr-schedule",
+        choices=("cosine", "wsd-linear"),
+        default="wsd-linear",
+    )
+    train_full.add_argument(
+        "--wsd-decay-ratio",
+        type=float,
+        default=0.1,
+        help="fraction of Stage B reserved for the final linear decay under wsd-linear",
+    )
     train_full.add_argument("--min-learning-rate-ratio", type=float, default=0.1)
     train_full.add_argument("--max-grad-norm", type=float, default=1.0)
     train_full.add_argument("--timestep-min", type=float, default=0.05)
