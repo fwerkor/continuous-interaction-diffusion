@@ -2247,6 +2247,14 @@ def _train_stage_a(args: argparse.Namespace) -> None:
 
                 checkpoint_due = progress.optimizer_steps >= next_checkpoint_step
                 if checkpoint_due and windows_seen < current_total_windows:
+                    # Every rank reaches this callback at the same optimizer step.  Stage A
+                    # can still have locally accumulated DDP gradients at this point, so all
+                    # ranks must join their synchronization before rank 0 alone serializes
+                    # the checkpoint.  Otherwise rank 0 enters gradient all-reduces while
+                    # its peers advance to different collectives and NCCL sequences diverge.
+                    trainer.prepare_checkpoint()
+                    if distributed:
+                        dist.barrier()
                     if rank == 0:
                         checkpoint = output_dir / "stage-a-latest.pt"
                         trainer.save_checkpoint(
@@ -2258,6 +2266,8 @@ def _train_stage_a(args: argparse.Namespace) -> None:
                             f"path={checkpoint}",
                             flush=True,
                         )
+                    if distributed:
+                        dist.barrier()
                     while next_checkpoint_step <= progress.optimizer_steps:
                         next_checkpoint_step += args.checkpoint_every_steps
 

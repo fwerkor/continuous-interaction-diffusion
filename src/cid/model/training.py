@@ -1802,8 +1802,7 @@ class CIDTrainer:
         *,
         dataset_sha256: str | None = None,
     ) -> None:
-        if self._pending_ddp_unsynced:
-            self._sync_pending_stage_a_ddp_gradients()
+        self.prepare_checkpoint()
         destination = Path(path)
         destination.parent.mkdir(parents=True, exist_ok=True)
         trainable_state = {
@@ -1845,6 +1844,18 @@ class CIDTrainer:
         temporary = destination.with_name(f".{destination.name}.tmp")
         torch.save(payload, temporary)
         temporary.replace(destination)
+
+    def prepare_checkpoint(self) -> None:
+        """Make pending Stage A gradient state safe to serialize on one rank.
+
+        DDP accumulation can leave locally accumulated gradients unsynchronized between
+        optimizer steps.  In distributed training every rank must call this method before
+        only rank 0 serializes a checkpoint, otherwise rank 0 enters gradient all-reduces
+        that its peers never join and the collective sequence diverges.
+        """
+
+        if self._pending_ddp_unsynced:
+            self._sync_pending_stage_a_ddp_gradients()
 
     def load_checkpoint(
         self,
