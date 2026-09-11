@@ -104,7 +104,7 @@ run_stage_a() {
     --max-display-tokens 1536 \
     --display-canvas-tokens 64 \
     --log-every-steps 100 \
-    --checkpoint-every-steps 2500
+    --checkpoint-every-steps 1000
 }
 
 run_stage_b() {
@@ -158,7 +158,7 @@ run_stage_b() {
     --max-display-tokens 1536 \
     --display-canvas-tokens 64 \
     --log-every-steps 100 \
-    --checkpoint-every-steps 2500
+    --checkpoint-every-steps 1000
 }
 
 case "$MODE" in
