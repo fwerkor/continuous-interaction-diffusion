@@ -7,6 +7,8 @@ LAUNCHER="${LAUNCHER:-$SCRIPT_DIR/train-cid-v1-8b-8xa6000.sh}"
 
 RESTART_DELAY_S="${RESTART_DELAY_S:-60}"
 GPU_WAIT_S="${GPU_WAIT_S:-60}"
+DISK_WAIT_S="${DISK_WAIT_S:-300}"
+MIN_FREE_GB="${MIN_FREE_GB:-350}"
 MAX_RESTARTS="${MAX_RESTARTS:-0}"
 WAIT_FOR_GPUS="${WAIT_FOR_GPUS:-1}"
 WATCHDOG_LOG="${WATCHDOG_LOG:-$RUN_ROOT/watchdog.log}"
@@ -56,6 +58,20 @@ compute_pid_count() {
     | awk 'NF && $1 ~ /^[0-9]+$/ {count++} END {print count+0}'
 }
 
+wait_for_disk_space() {
+  while true; do
+    local free_kb free_gb
+    free_kb="$(df -Pk "$RUN_ROOT" | awk 'NR==2 {print $4}')"
+    free_gb=$((free_kb / 1024 / 1024))
+    if [[ "$free_gb" -ge "$MIN_FREE_GB" ]]; then
+      return 0
+    fi
+    write_status "waiting_for_disk" "${free_gb}GB free; need ${MIN_FREE_GB}GB" "$restarts"
+    log "only ${free_gb}GB free at $RUN_ROOT; waiting for at least ${MIN_FREE_GB}GB"
+    sleep "$DISK_WAIT_S"
+  done
+}
+
 wait_for_eight_idle_gpus() {
   while true; do
     local gpu_count active
@@ -98,6 +114,7 @@ write_status "ready" "watchdog initialized" "$restarts"
 log "CID 8B watchdog initialized; launcher=$LAUNCHER run_root=$RUN_ROOT"
 
 while true; do
+  wait_for_disk_space
   if [[ "$WAIT_FOR_GPUS" == "1" ]]; then
     wait_for_eight_idle_gpus
   fi
