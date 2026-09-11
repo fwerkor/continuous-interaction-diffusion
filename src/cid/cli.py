@@ -2,9 +2,12 @@ from __future__ import annotations
 
 import argparse
 import asyncio
+import hashlib
 import json
 import os
+import platform
 import shutil
+import subprocess
 import tempfile
 import time
 from dataclasses import asdict, dataclass
@@ -62,7 +65,7 @@ from cid.distill import (
     review_teacher_plans,
     teacher_tasks_from_trajectories,
 )
-from cid.evaluation import summarize_evaluations
+from cid.evaluation import display_exact_match, summarize_evaluations
 from cid.grounding import ObjectRef
 from cid.metrics import summarize_runtime
 from cid.multilingual_training import MultilingualTrainingConfig, build_multilingual_training
@@ -1022,9 +1025,140 @@ def _teacher_agent_commit(args: argparse.Namespace) -> None:
     print(json.dumps(report, ensure_ascii=False, sort_keys=True))
 
 
+def _sha256_file(path: Path) -> str:
+    digest = hashlib.sha256()
+    with path.open("rb") as handle:
+        for chunk in iter(lambda: handle.read(1024 * 1024), b""):
+            digest.update(chunk)
+    return digest.hexdigest()
+
+
+def _benchmark_code_provenance() -> dict[str, object]:
+    root = Path(__file__).resolve().parents[2]
+
+    def git(*args: str) -> str:
+        completed = subprocess.run(
+            ("git", *args),
+            cwd=root,
+            check=False,
+            capture_output=True,
+            text=True,
+        )
+        return completed.stdout.strip() if completed.returncode == 0 else ""
+
+    return {
+        "git_commit": git("rev-parse", "HEAD") or None,
+        "git_dirty": bool(git("status", "--porcelain")),
+    }
+
+
+def _benchmark_device_name(torch_module, device_type: str, device) -> str | None:
+    if device_type == "cuda":
+        return str(torch_module.cuda.get_device_name(device))
+    accelerator = getattr(torch_module, device_type, None)
+    getter = getattr(accelerator, "get_device_name", None)
+    if callable(getter):
+        try:
+            return str(getter(device))
+        except (RuntimeError, TypeError):
+            return None
+    return platform.processor() or None
+
+
+def _benchmark_qa_tokens(value: str) -> tuple[str, ...]:
+    import re
+    import string
+
+    lowered = value.casefold()
+    no_punctuation = "".join(" " if char in string.punctuation else char for char in lowered)
+    tokens = re.sub(r"\b(a|an|the)\b", " ", no_punctuation).split()
+    return tuple(tokens)
+
+
+def _benchmark_qa_f1(prediction: str, reference: str) -> float:
+    from collections import Counter
+
+    predicted = _benchmark_qa_tokens(prediction)
+    expected = _benchmark_qa_tokens(reference)
+    if not predicted or not expected:
+        return float(predicted == expected)
+    overlap = sum((Counter(predicted) & Counter(expected)).values())
+    if overlap == 0:
+        return 0.0
+    precision = overlap / len(predicted)
+    recall = overlap / len(expected)
+    return 2.0 * precision * recall / (precision + recall)
+
+
+def _benchmark_task_metrics(example: TrajectoryExample, prediction: str) -> dict[str, object]:
+    metadata = dict(example.metadata)
+    choices = metadata.get("choices")
+    answer_index = metadata.get("answer_index")
+    result: dict[str, object] = {
+        "answer_exact": display_exact_match(prediction, example.target_display),
+        "qa_f1": _benchmark_qa_f1(prediction, example.target_display),
+    }
+    if isinstance(choices, (list, tuple)) and isinstance(answer_index, int):
+        labels = metadata.get("choice_labels")
+        if not isinstance(labels, (list, tuple)) or len(labels) != len(choices):
+            labels = tuple(chr(ord("A") + index) for index in range(len(choices)))
+        matching = [
+            index
+            for index, (label, choice) in enumerate(zip(labels, choices, strict=True))
+            if display_exact_match(prediction, str(choice))
+            or display_exact_match(prediction, str(label))
+        ]
+        predicted_index = matching[0] if len(matching) == 1 else None
+        result.update(
+            {
+                "choice_scored": True,
+                "choice_prediction_index": predicted_index,
+                "choice_prediction_label": (
+                    str(labels[predicted_index]) if predicted_index is not None else None
+                ),
+                "choice_answer_index": answer_index,
+                "choice_correct": predicted_index == answer_index,
+            }
+        )
+    else:
+        result["choice_scored"] = False
+    return result
+
+
+def _summarize_benchmark_task_metrics(examples, results) -> dict[str, object]:
+    case_metrics = [
+        _benchmark_task_metrics(example, result.final_text)
+        for example, result in zip(examples, results, strict=True)
+    ]
+    choice_rows = [item for item in case_metrics if item["choice_scored"]]
+    return {
+        "answer_exact_accuracy": (
+            sum(bool(item["answer_exact"]) for item in case_metrics) / len(case_metrics)
+            if case_metrics
+            else 0.0
+        ),
+        "mean_qa_f1": (
+            sum(float(item["qa_f1"]) for item in case_metrics) / len(case_metrics)
+            if case_metrics
+            else 0.0
+        ),
+        "choice_tasks": len(choice_rows),
+        "choice_accuracy": (
+            sum(bool(item["choice_correct"]) for item in choice_rows) / len(choice_rows)
+            if choice_rows
+            else None
+        ),
+        "choice_unmapped": sum(
+            item.get("choice_prediction_index") is None for item in choice_rows
+        ),
+    }
+
+
 def _benchmark(args: argparse.Namespace) -> None:
     import torch
     import torch.distributed as dist
+    import transformers
+    from safetensors.torch import load_file as load_safetensors
     from transformers import AutoTokenizer
 
     from cid.model import (
@@ -1044,14 +1178,24 @@ def _benchmark(args: argparse.Namespace) -> None:
     from cid.model.loading import pretrained_revision
 
     checkpoint = Path(args.checkpoint)
-    stage_b = args.checkpoint_kind == "stage-b"
+    release = args.checkpoint_kind == "release"
+    stage_b = args.checkpoint_kind in {"stage-b", "release"}
     stage_b_sharded = stage_b and checkpoint.is_dir()
+    if release:
+        stage_b_sharded = False
     world_size = int(os.environ.get("WORLD_SIZE", "1"))
     rank = int(os.environ.get("RANK", "0"))
     local_rank = int(os.environ.get("LOCAL_RANK", "0"))
     distributed = stage_b_sharded
     device_type = resolve_torch_device_type(torch, args.device)
-    if stage_b_sharded:
+    if release:
+        release_config = json.loads((checkpoint / "cid_config.json").read_text(encoding="utf-8"))
+        adapter_config = ILLaDACIDConfig(**release_config["adapter_config"])
+        semantic_pooling = str(release_config.get("semantic_pooling", "mean-v1"))
+        configure_torch_accelerator(torch, device_type, local_rank)
+        device = torch.device(device_type)
+        model_reference = str(checkpoint)
+    elif stage_b_sharded:
         if world_size < 2:
             raise RuntimeError(
                 "sharded Stage B benchmark must run under multi-accelerator torchrun"
@@ -1083,16 +1227,17 @@ def _benchmark(args: argparse.Namespace) -> None:
         "fp32": torch.float32,
     }[args.dtype]
     tokenizer_kwargs: dict[str, object] = {"trust_remote_code": True}
-    revision = pretrained_revision(args.model)
+    model_reference = str(checkpoint) if release else args.model
+    revision = pretrained_revision(model_reference)
     if revision is not None:
         tokenizer_kwargs["revision"] = revision
-    tokenizer = AutoTokenizer.from_pretrained(args.model, **tokenizer_kwargs)
+    tokenizer = AutoTokenizer.from_pretrained(model_reference, **tokenizer_kwargs)
 
     try:
 
         def load_adapter() -> ILLaDACIDAdapter:
             return load_cid_adapter_from_pretrained(
-                args.model,
+                model_reference,
                 config=adapter_config,
                 freeze_backbone=True,
                 torch_dtype=torch.float32 if stage_b else dtype,
@@ -1110,7 +1255,38 @@ def _benchmark(args: argparse.Namespace) -> None:
         if adapter is None:
             raise RuntimeError("failed to load benchmark CID adapter")
 
-        if stage_b:
+        if release:
+            adapter.set_backbone_trainable(True)
+            if device_type == "npu":
+                adapter.set_device_value_validation(False)
+            load_cid_adapter_parameter_state(
+                adapter,
+                load_safetensors(str(checkpoint / "cid_adapter.safetensors"), device="cpu"),
+            )
+            semantic_state = torch.load(
+                checkpoint / "semantic-embedding.pt",
+                map_location="cpu",
+                weights_only=False,
+            )
+            text_encoder = ILLaDATextEncoder.from_frozen_snapshot_state(
+                adapter,
+                tokenizer,
+                semantic_state,
+                device=device,
+                embedding_device="cpu",
+            )
+            if device_type == "npu":
+                forward_model = wrap_npu_autocast(torch, adapter, dtype=dtype)
+            elif dtype is not torch.float32:
+                forward_model = wrap_torch_autocast(
+                    torch,
+                    adapter,
+                    device_type=device_type,
+                    dtype=dtype,
+                )
+            else:
+                forward_model = adapter
+        elif stage_b:
             has_saved_semantic_snapshot = (
                 isinstance(metadata.get("semantic_embedding_snapshot"), dict)
                 if stage_b_sharded
@@ -1228,7 +1404,8 @@ def _benchmark(args: argparse.Namespace) -> None:
 
         adapter.eval()
         forward_model.eval()
-        examples = load_jsonl(args.data)
+        data_path = Path(args.data)
+        examples = load_jsonl(data_path)
         if args.max_examples is not None:
             examples = examples[: args.max_examples]
         if not examples:
@@ -1274,6 +1451,7 @@ def _benchmark(args: argparse.Namespace) -> None:
                     display_revision_margin=args.display_revision_margin,
                     materializer_config=materializer_config,
                     runtime_config=runtime_config,
+                    seed=args.seed,
                 )
                 results.append(result)
                 if distributed:
@@ -1282,35 +1460,102 @@ def _benchmark(args: argparse.Namespace) -> None:
                     print(f"benchmarked={index}/{len(examples)}")
             return tuple(results)
 
+        if device_type == "cuda":
+            torch.cuda.reset_peak_memory_stats(device)
+        benchmark_started_wall = time.time()
+        benchmark_started_mono = time.monotonic()
         results = asyncio.run(run_cases())
+        benchmark_elapsed_s = time.monotonic() - benchmark_started_mono
+        benchmark_finished_wall = time.time()
         if rank == 0:
             output = Path(args.output)
             summary_output = Path(args.summary_output)
             output.parent.mkdir(parents=True, exist_ok=True)
             summary_output.parent.mkdir(parents=True, exist_ok=True)
             with output.open("w", encoding="utf-8") as handle:
-                for result in results:
+                for example, result in zip(examples, results, strict=True):
+                    record = result.to_dict()
+                    record["target_display"] = example.target_display
+                    record["metadata"] = dict(example.metadata)
+                    record["task_metrics"] = _benchmark_task_metrics(example, result.final_text)
                     handle.write(
-                        json.dumps(result.to_dict(), ensure_ascii=False, separators=(",", ":"))
+                        json.dumps(record, ensure_ascii=False, separators=(",", ":"))
                         + "\n"
                     )
             summary = summarize_evaluations(tuple(result.evaluation for result in results))
+            task_metrics = _summarize_benchmark_task_metrics(examples, results)
+            peak_memory = None
+            if device_type == "cuda":
+                peak_memory = {
+                    "allocated_bytes": int(torch.cuda.max_memory_allocated(device)),
+                    "reserved_bytes": int(torch.cuda.max_memory_reserved(device)),
+                }
             payload = {
                 "checkpoint": str(checkpoint),
                 "checkpoint_kind": args.checkpoint_kind,
-                "model": args.model,
+                "model": model_reference,
+                "code": _benchmark_code_provenance(),
+                "dataset": {
+                    "path": str(data_path),
+                    "sha256": _sha256_file(data_path),
+                    "examples": len(examples),
+                },
+                "environment": {
+                    "python": platform.python_version(),
+                    "torch": str(torch.__version__),
+                    "transformers": str(transformers.__version__),
+                    "device_type": device_type,
+                    "device": str(device),
+                    "device_name": _benchmark_device_name(torch, device_type, device),
+                    "cuda_version": getattr(torch.version, "cuda", None),
+                    "peak_memory": peak_memory,
+                },
                 "precision": {
                     "backbone_compute_dtype": args.dtype,
                     "cid_parameter_dtype": (
                         "fp32" if args.checkpoint_kind == "stage-a" else "checkpoint"
                     ),
                 },
+                "seed": args.seed,
                 "seed_teacher_state": args.seed_teacher_state,
+                "benchmark_config": {
+                    "denoising_steps": args.denoising_steps,
+                    "max_steps": args.max_steps,
+                    "max_wall_time_s": args.max_wall_time_s,
+                    "display_revision_fraction": args.display_revision_fraction,
+                    "display_revision_margin": args.display_revision_margin,
+                    "allocation_threshold": args.allocation_threshold,
+                    "convergence_threshold": args.convergence_threshold,
+                    "need_threshold": args.need_threshold,
+                    "need_target_cell_threshold": args.need_target_cell_threshold,
+                    "need_target_display_threshold": args.need_target_display_threshold,
+                    "argument_presence_threshold": args.argument_presence_threshold,
+                    "anchor_presence_threshold": args.anchor_presence_threshold,
+                    "link_presence_threshold": args.link_presence_threshold,
+                    "retrieval_similarity_threshold": args.retrieval_similarity_threshold,
+                    "max_allocations_per_step": args.max_allocations_per_step,
+                    "max_age_s": args.max_age_s,
+                    "binding_threshold": args.binding_threshold,
+                    "idle_yield_s": args.idle_yield_s,
+                    "trace_display": args.trace_display,
+                    "reclamation_grace_steps": args.reclamation_grace_steps,
+                    "reclamation_low_watermark": args.reclamation_low_watermark,
+                    "reclamation_target_watermark": args.reclamation_target_watermark,
+                },
                 "display_canvas_tokens": (
                     adapter.config.display_canvas_tokens
                     if args.display_canvas_tokens is None
                     else args.display_canvas_tokens
                 ),
+                "timing": {
+                    "started_unix_s": benchmark_started_wall,
+                    "finished_unix_s": benchmark_finished_wall,
+                    "outer_wall_time_s": benchmark_elapsed_s,
+                    "examples_per_second": (
+                        len(results) / benchmark_elapsed_s if benchmark_elapsed_s > 0 else 0.0
+                    ),
+                },
+                "task_metrics": task_metrics,
                 "metrics": asdict(summary),
             }
             summary_output.write_text(
@@ -3548,7 +3793,7 @@ def main() -> None:
     benchmark.add_argument("--checkpoint", required=True)
     benchmark.add_argument(
         "--checkpoint-kind",
-        choices=("stage-a", "stage-b"),
+        choices=("stage-a", "stage-b", "release"),
         default="stage-a",
     )
     benchmark.add_argument("--model", default="GSAI-ML/iLLaDA-8B-Base")
@@ -3665,6 +3910,7 @@ def main() -> None:
     )
     benchmark.add_argument("--max-examples", type=int)
     benchmark.add_argument("--progress-every", type=int, default=10)
+    benchmark.add_argument("--seed", type=int, default=0)
     benchmark.add_argument("--seed-teacher-state", action="store_true")
     train = subparsers.add_parser(
         "train",

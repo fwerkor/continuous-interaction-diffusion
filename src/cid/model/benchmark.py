@@ -70,6 +70,7 @@ async def run_neural_benchmark_case(
     materializer_config: CIDMaterializerConfig | None = None,
     runtime_config: RuntimeConfig | None = None,
     max_steps: int | None = None,
+    seed: int = 0,
 ) -> NeuralBenchmarkCaseResult:
     encoder = text_encoder or ILLaDATextEncoder(adapter, tokenizer)
     tensorizer = ILLaDAContextTensorizer(
@@ -86,6 +87,7 @@ async def run_neural_benchmark_case(
             denoising_steps=denoising_steps,
             display_revision_fraction=display_revision_fraction,
             display_revision_margin=display_revision_margin,
+            seed=seed,
         ),
         forward_model=forward_model,
     )
