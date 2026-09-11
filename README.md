@@ -442,10 +442,13 @@ Each rank loads the pinned 8B backbone serially before moving it to its GPU, avo
 CPU copies during startup. DDP synchronizes only trainable CID state; frozen backbone parameters and
 buffers are excluded from initialization sync.
 
-For 8×A6000 48 GiB iLLaDA-8B production runs, `scripts/train-illada-8b-a6000.sh`
-provides the tuned Stage A, Stage B1, and low-LR Stage B2 launch geometry. B2 is
-started by resuming the completed one-epoch B1 checkpoint so the scheduler stays
-at its floor instead of stretching the original decay across two epochs.
+For 8×A6000 48 GiB iLLaDA-8B production runs, use
+`scripts/train-cid-v1-8b-8xa6000.sh`. It runs the three-epoch Stage A curriculum and a one-epoch
+Stage B continuation with sampler v5, WSD-linear scheduling, CID peak LR `2e-5`, and backbone peak
+LR `5e-6`. Both stages auto-resume their latest clean checkpoint. The companion
+`scripts/watchdog-cid-v1-8b-8xa6000.sh` waits for all eight GPUs to be idle, prevents duplicate
+launches with a file lock, and restarts failed runs from the latest checkpoint until both stages
+complete.
 
 Consecutive trajectory transitions are grouped into full contiguous rollout windows, bucketed by
 window length, padded to equal rank counts, and sharded before training. Rollout state is detached
