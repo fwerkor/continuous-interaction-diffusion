@@ -234,6 +234,68 @@ def test_benchmark_catalog_and_teacher_seed_are_deterministic() -> None:
     assert thought.slot_of("c0") == 0
 
 
+
+def test_workspace_catalog_uses_task_corpus_instead_of_gold_requests() -> None:
+    adapter = configured_adapter()
+    tokenizer = TinyTokenizer()
+    encoder = import_module("cid.model.encoding").ILLaDATextEncoder(adapter, tokenizer)
+    example = TrajectoryExample(
+        example_id="bench-workspace-catalog",
+        prompt="Find information about Scott Derrickson.",
+        target_display="x",
+        source_descriptors=(
+            {
+                "name": "workspace_search",
+                "arguments": ({"name": "query", "required": True},),
+            },
+            {
+                "name": "workspace_read",
+                "arguments": ({"name": "resource_id", "required": True},),
+            },
+        ),
+        binding_targets=(
+            BindingTarget(
+                need_id="gold-search",
+                source="workspace_search",
+                first_need_step=0,
+                executable_step=0,
+                arguments={"query": "gold-only resolved query"},
+            ),
+            BindingTarget(
+                need_id="gold-read",
+                source="workspace_read",
+                first_need_step=0,
+                executable_step=0,
+                arguments={"resource_id": "doc-01"},
+            ),
+        ),
+        metadata={
+            "benchmark_workspace_documents": [
+                {
+                    "resource_id": "doc-00",
+                    "title": "Scott Derrickson",
+                    "sentences": ["Scott Derrickson is an American director."],
+                },
+                {
+                    "resource_id": "doc-01",
+                    "title": "Ed Wood",
+                    "sentences": ["Ed Wood was an American filmmaker."],
+                },
+            ],
+            "benchmark_supporting_resource_ids": ["doc-01"],
+        },
+    )
+
+    catalog = build_materialization_catalog(example, encoder)
+    values = {(item.source, item.name, str(item.value)) for item in catalog.arguments}
+
+    assert ("workspace_search", "query", example.prompt) in values
+    assert ("workspace_search", "query", "Scott Derrickson") in values
+    assert ("workspace_search", "query", "Ed Wood") in values
+    assert ("workspace_read", "resource_id", "doc-00") in values
+    assert ("workspace_read", "resource_id", "doc-01") in values
+    assert ("workspace_search", "query", "gold-only resolved query") not in values
+
 def test_teacher_seed_supports_semantic_cell_ids_and_preserves_slots() -> None:
     adapter = configured_adapter()
     tokenizer = TinyTokenizer()

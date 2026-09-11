@@ -1,10 +1,12 @@
 from __future__ import annotations
 
+import asyncio
 import time
 
 from cid.contracts import FreshnessDemand, InformationNeed, ModelContext, ModelUpdate
 from cid.data import ExternalEvent, TrajectoryExample
 from cid.evaluation import (
+    build_replay_registry,
     display_exact_match,
     evaluate_runtime_result,
     run_replay_case,
@@ -232,3 +234,88 @@ async def test_replay_runner_delivers_dataset_events_on_exact_runtime_steps() ->
     assert replay.evaluation.fresh_observations == 1
     assert replay.evaluation.stale_observations == 0
     assert replay.evaluation.interaction.mean_observation_to_projection_steps == 0.0
+
+
+def _workspace_example() -> TrajectoryExample:
+    return TrajectoryExample(
+        example_id="workspace-retrieval",
+        prompt="Were Scott Derrickson and Ed Wood of the same nationality?",
+        target_display="yes",
+        source_descriptors=(
+            {
+                "name": "workspace_search",
+                "description": "search task-local documents",
+                "arguments": ({"name": "query", "kind": "string", "required": True},),
+            },
+            {
+                "name": "workspace_read",
+                "description": "read a task-local document",
+                "arguments": (
+                    {"name": "resource_id", "kind": "string", "required": True},
+                ),
+            },
+        ),
+        metadata={
+            "benchmark_workspace_documents": [
+                {
+                    "resource_id": "doc-00",
+                    "title": "Vegetable gardening",
+                    "sentences": ["Gardening is the practice of growing plants."],
+                },
+                {
+                    "resource_id": "doc-01",
+                    "title": "Scott Derrickson",
+                    "sentences": ["Scott Derrickson is an American director."],
+                },
+                {
+                    "resource_id": "doc-02",
+                    "title": "Ed Wood",
+                    "sentences": ["Ed Wood was an American filmmaker."],
+                },
+            ],
+            "benchmark_supporting_resource_ids": ["doc-01", "doc-02"],
+            "benchmark_workspace_search_top_k": 2,
+            "benchmark_workspace_latency_steps": 2,
+        },
+    )
+
+
+async def test_task_local_workspace_accepts_non_gold_search_queries_and_reads() -> None:
+    registry = build_replay_registry(_workspace_example())
+    search = registry.get("workspace_search")
+    read = registry.get("workspace_read")
+
+    registry.advance_runtime_step(0)
+    search_task = asyncio.create_task(
+        search.read({"query": "American director Derrickson nationality"})
+    )
+    await asyncio.sleep(0)
+    assert registry.next_runtime_step() == 2
+    registry.advance_runtime_step(2)
+    search_observation = await search_task
+    assert search_observation.value[0] == {
+        "resource_id": "doc-01",
+        "title": "Scott Derrickson",
+    }
+
+    read_task = asyncio.create_task(read.read({"resource_id": "doc-02"}))
+    await asyncio.sleep(0)
+    assert registry.next_runtime_step() == 4
+    registry.advance_runtime_step(4)
+    read_observation = await read_task
+    assert read_observation.value["title"] == "Ed Wood"
+    assert "American filmmaker" in read_observation.value["sentences"][0]
+
+
+async def test_task_local_workspace_invalid_read_returns_error_instead_of_hanging() -> None:
+    registry = build_replay_registry(_workspace_example())
+    read = registry.get("workspace_read")
+    registry.advance_runtime_step(0)
+    task = asyncio.create_task(read.read({"resource_id": "doc-does-not-exist"}))
+    await asyncio.sleep(0)
+    registry.advance_runtime_step(2)
+    observation = await task
+    assert observation.value == {
+        "resource_id": "doc-does-not-exist",
+        "error": "resource_not_found",
+    }

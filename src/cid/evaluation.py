@@ -1,9 +1,11 @@
 from __future__ import annotations
 
 import asyncio
+import math
+import re
 import time
 import unicodedata
-from collections import defaultdict
+from collections import Counter, defaultdict
 from collections.abc import Mapping
 from dataclasses import dataclass
 from typing import Any
@@ -161,19 +163,209 @@ class ScheduledReplaySource:
             await wake.wait()
 
 
+_WORKSPACE_TOKEN = re.compile(r"[\w]+", re.UNICODE)
+
+
+def _workspace_documents(example: TrajectoryExample) -> tuple[dict[str, Any], ...]:
+    raw_documents = example.metadata.get("benchmark_workspace_documents", ())
+    documents: list[dict[str, Any]] = []
+    for item in raw_documents:
+        if not isinstance(item, Mapping):
+            continue
+        resource_id = str(item.get("resource_id", "")).strip()
+        title = str(item.get("title", "")).strip()
+        if not resource_id or not title:
+            continue
+        documents.append(
+            {
+                "resource_id": resource_id,
+                "title": title,
+                "sentences": [str(value) for value in item.get("sentences", ())],
+            }
+        )
+    return tuple(documents)
+
+
+def _search_tokens(value: str) -> tuple[str, ...]:
+    normalized = unicodedata.normalize("NFKC", value).casefold()
+    return tuple(_WORKSPACE_TOKEN.findall(normalized))
+
+
+def _rank_workspace_documents(
+    query: str,
+    documents: tuple[dict[str, Any], ...],
+    *,
+    top_k: int,
+) -> tuple[dict[str, str], ...]:
+    query_tokens = Counter(_search_tokens(query))
+    document_tokens = []
+    document_frequency: Counter[str] = Counter()
+    for document in documents:
+        title_tokens = Counter(_search_tokens(str(document["title"])))
+        body_tokens = Counter(
+            token
+            for sentence in document["sentences"]
+            for token in _search_tokens(str(sentence))
+        )
+        document_tokens.append((title_tokens, body_tokens))
+        document_frequency.update(set(title_tokens) | set(body_tokens))
+
+    total_documents = max(1, len(documents))
+    normalized_query = " ".join(_search_tokens(query))
+    scored: list[tuple[float, int, dict[str, Any]]] = []
+    for index, (document, (title_tokens, body_tokens)) in enumerate(
+        zip(documents, document_tokens, strict=True)
+    ):
+        score = 0.0
+        for token, query_count in query_tokens.items():
+            idf = math.log((total_documents + 1) / (document_frequency[token] + 1)) + 1.0
+            title_weight = 4.0 if title_tokens[token] else 0.0
+            body_weight = min(float(body_tokens[token]), 2.0)
+            score += idf * query_count * (title_weight + body_weight)
+        normalized_title = " ".join(_search_tokens(str(document["title"])))
+        if normalized_query and normalized_title and normalized_title in normalized_query:
+            score += 6.0
+        scored.append((score, -index, document))
+
+    scored.sort(key=lambda item: (item[0], item[1]), reverse=True)
+    limit = max(1, min(int(top_k), len(scored))) if scored else 0
+    return tuple(
+        {"resource_id": str(item[2]["resource_id"]), "title": str(item[2]["title"])}
+        for item in scored[:limit]
+    )
+
+
+class _StepDelayedWorkspaceSource:
+    def __init__(self, descriptor: SourceDescriptor, *, latency_steps: int = 2) -> None:
+        self.descriptor = descriptor
+        self._latency_steps = max(0, int(latency_steps))
+        self._step = 0
+        self._pending: list[tuple[int, asyncio.Event]] = []
+
+    def on_runtime_step(self, step: int) -> None:
+        if step < self._step:
+            raise ValueError("workspace source runtime step cannot move backwards")
+        self._step = step
+        remaining: list[tuple[int, asyncio.Event]] = []
+        for due_step, event in self._pending:
+            if due_step <= step:
+                event.set()
+            else:
+                remaining.append((due_step, event))
+        self._pending = remaining
+
+    def next_runtime_step(self) -> int | None:
+        future = [due_step for due_step, _ in self._pending if due_step > self._step]
+        return min(future) if future else None
+
+    async def _wait_for_latency(self) -> None:
+        if self._latency_steps == 0:
+            await asyncio.sleep(0)
+            return
+        event = asyncio.Event()
+        due_step = self._step + self._latency_steps
+        self._pending.append((due_step, event))
+        await event.wait()
+
+
+class TaskLocalWorkspaceSearchSource(_StepDelayedWorkspaceSource):
+    def __init__(
+        self,
+        descriptor: SourceDescriptor,
+        documents: tuple[dict[str, Any], ...],
+        *,
+        top_k: int = 5,
+        wrap_query: bool = False,
+        latency_steps: int = 2,
+    ) -> None:
+        super().__init__(descriptor, latency_steps=latency_steps)
+        self._documents = documents
+        self._top_k = top_k
+        self._wrap_query = wrap_query
+
+    async def read(self, arguments: Mapping[str, Any]) -> Observation:
+        query = str(arguments.get("query", "")).strip()
+        await self._wait_for_latency()
+        candidates = list(
+            _rank_workspace_documents(query, self._documents, top_k=self._top_k)
+        )
+        value: Any = (
+            {"query": query, "candidates": candidates}
+            if self._wrap_query
+            else candidates
+        )
+        return Observation(
+            value=value,
+            version="workspace-search-v1",
+            provenance="task-local-workspace-search",
+            observed_at=time.monotonic(),
+        )
+
+
+class TaskLocalWorkspaceReadSource(_StepDelayedWorkspaceSource):
+    def __init__(
+        self,
+        descriptor: SourceDescriptor,
+        documents: tuple[dict[str, Any], ...],
+        *,
+        latency_steps: int = 2,
+    ) -> None:
+        super().__init__(descriptor, latency_steps=latency_steps)
+        self._documents = {str(item["resource_id"]): item for item in documents}
+
+    async def read(self, arguments: Mapping[str, Any]) -> Observation:
+        resource_id = str(arguments.get("resource_id", "")).strip()
+        await self._wait_for_latency()
+        document = self._documents.get(resource_id)
+        if document is None:
+            value: Any = {"resource_id": resource_id, "error": "resource_not_found"}
+        else:
+            value = {
+                "resource_id": resource_id,
+                "title": str(document["title"]),
+                "sentences": list(document["sentences"]),
+            }
+        return Observation(
+            value=value,
+            version=f"workspace-read-v1:{resource_id}",
+            provenance=f"task-local-workspace-read:{resource_id}",
+            observed_at=time.monotonic(),
+        )
+
+
 def build_replay_registry(example: TrajectoryExample) -> SourceRegistry:
     registry = SourceRegistry()
     events_by_source: dict[str, list[ExternalEvent]] = defaultdict(list)
     for event in example.events:
         events_by_source[event.source].append(event)
+    workspace_documents = _workspace_documents(example)
+    workspace_top_k = int(example.metadata.get("benchmark_workspace_search_top_k", 5))
+    workspace_latency_steps = int(
+        example.metadata.get("benchmark_workspace_latency_steps", 2)
+    )
+    wrap_query = str(example.metadata.get("interaction_pattern", "")) == "decomposition_dag"
     for raw in example.source_descriptors:
         descriptor = _source_descriptor(raw)
-        registry.register(
-            ScheduledReplaySource(
+        if workspace_documents and descriptor.name == "workspace_search":
+            source = TaskLocalWorkspaceSearchSource(
+                descriptor,
+                workspace_documents,
+                top_k=workspace_top_k,
+                wrap_query=wrap_query,
+                latency_steps=workspace_latency_steps,
+            )
+        elif workspace_documents and descriptor.name == "workspace_read":
+            source = TaskLocalWorkspaceReadSource(
+                descriptor,
+                workspace_documents,
+                latency_steps=workspace_latency_steps,
+            )
+        else:
+            source = ScheduledReplaySource(
                 descriptor,
                 tuple(events_by_source.get(descriptor.name, ())),
             )
-        )
+        registry.register(source)
     return registry
 
 
@@ -224,6 +416,9 @@ def summarize_evaluations(
     display_scored = tuple(item for item in evaluations if item.exact_display is not None)
     expected_observations = sum(item.expected_observations for item in evaluations)
     observed_work_items = sum(item.observed_work_items for item in evaluations)
+    covered_observations = sum(
+        item.expected_observations - item.missing_observations for item in evaluations
+    )
     stale_observations = sum(item.stale_observations for item in evaluations)
     interactions = tuple(item.interaction for item in evaluations)
     total_runtime = sum(item.runtime_wall_time_s for item in interactions)
@@ -252,7 +447,7 @@ def summarize_evaluations(
             else 0.0
         ),
         observation_coverage=(
-            _fraction(observed_work_items, expected_observations)
+            _fraction(covered_observations, expected_observations)
             if expected_observations
             else 1.0
         ),
@@ -300,32 +495,54 @@ def evaluate_runtime_result(
     *,
     expected_display_ids: tuple[int, ...] | None = None,
 ) -> RuntimeTaskEvaluation:
-    expected = _latest_expected_observations(example)
-    observed = {
-        binding.work_key: binding.observation
-        for binding in result.bindings
-        if binding.observation is not None
-    }
-
-    fresh = 0
-    stale = 0
-    missing = 0
-    for work_key, event in expected.items():
-        observation = observed.get(work_key)
-        if observation is None:
-            missing += 1
-        elif _observation_matches(
-            observation.value,
-            observation.version,
-            event.value,
-            event.version,
-        ):
-            fresh += 1
-        else:
-            stale += 1
-
-    expected_count = len(expected)
-    observed_count = fresh + stale
+    supporting_resource_ids = tuple(
+        str(item)
+        for item in example.metadata.get("benchmark_supporting_resource_ids", ())
+        if str(item)
+    )
+    if supporting_resource_ids and _workspace_documents(example):
+        expected_ids = set(supporting_resource_ids)
+        observed_ids = {
+            str(binding.observation.value.get("resource_id"))
+            for binding in result.bindings
+            if binding.source == "workspace_read"
+            and binding.observation is not None
+            and isinstance(binding.observation.value, Mapping)
+            and binding.observation.value.get("error") is None
+            and binding.observation.value.get("resource_id") is not None
+        }
+        fresh = len(expected_ids & observed_ids)
+        stale = len(observed_ids - expected_ids)
+        missing = len(expected_ids - observed_ids)
+        expected_count = len(expected_ids)
+        observed_count = len(observed_ids)
+        observation_coverage = fresh / expected_count if expected_count else 1.0
+    else:
+        expected = _latest_expected_observations(example)
+        observed = {
+            binding.work_key: binding.observation
+            for binding in result.bindings
+            if binding.observation is not None
+        }
+        fresh = 0
+        stale = 0
+        missing = 0
+        for work_key, event in expected.items():
+            observation = observed.get(work_key)
+            if observation is None:
+                missing += 1
+            elif _observation_matches(
+                observation.value,
+                observation.version,
+                event.value,
+                event.version,
+            ):
+                fresh += 1
+            else:
+                stale += 1
+        expected_count = len(expected)
+        observed_count = fresh + stale
+        observation_coverage = observed_count / expected_count if expected_count else 1.0
     exact_display = (
         None
         if expected_display_ids is None
@@ -341,7 +558,7 @@ def evaluate_runtime_result(
         fresh_observations=fresh,
         stale_observations=stale,
         missing_observations=missing,
-        observation_coverage=observed_count / expected_count if expected_count else 1.0,
+        observation_coverage=observation_coverage,
         stale_observation_rate=stale / observed_count if observed_count else 0.0,
         interaction=summarize_runtime(result),
     )

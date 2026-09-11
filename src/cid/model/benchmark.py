@@ -190,21 +190,46 @@ def build_materialization_catalog(
 ) -> ClosedWorldMaterializationCatalog:
     arguments: list[ArgumentCandidate] = []
     seen_arguments: set[tuple[str, str, str]] = set()
-    for binding in example.binding_targets:
-        for name, value in binding.arguments.items():
-            encoded = stable_text(value)
-            key = (binding.source, str(name), encoded)
-            if key in seen_arguments:
-                continue
-            seen_arguments.add(key)
-            arguments.append(
-                ArgumentCandidate(
-                    source=binding.source,
-                    name=str(name),
-                    value=value,
-                    embedding=text_encoder.encode_one(encoded, detach=True),
-                )
+    workspace_documents = tuple(
+        item
+        for item in example.metadata.get("benchmark_workspace_documents", ())
+        if isinstance(item, dict)
+    )
+    has_task_local_workspace = bool(workspace_documents)
+
+    def add_argument(source: str, name: str, value: Any) -> None:
+        encoded = stable_text(value)
+        key = (source, name, encoded)
+        if key in seen_arguments:
+            return
+        seen_arguments.add(key)
+        arguments.append(
+            ArgumentCandidate(
+                source=source,
+                name=name,
+                value=value,
+                embedding=text_encoder.encode_one(encoded, detach=True),
             )
+        )
+
+    for binding in example.binding_targets:
+        if has_task_local_workspace and binding.source in {"workspace_search", "workspace_read"}:
+            continue
+        for name, value in binding.arguments.items():
+            add_argument(binding.source, str(name), value)
+
+    if has_task_local_workspace:
+        # Public retrieval benchmarks expose a task-local corpus, not a gold request list.
+        # Search can be driven by the user question or any document title, and every resource ID
+        # is a legal read target. Gold supporting IDs remain scoring metadata only.
+        add_argument("workspace_search", "query", example.prompt)
+        for document in workspace_documents:
+            title = str(document.get("title", "")).strip()
+            resource_id = str(document.get("resource_id", "")).strip()
+            if title:
+                add_argument("workspace_search", "query", title)
+            if resource_id:
+                add_argument("workspace_read", "resource_id", resource_id)
 
     anchors = tuple(
         AnchorCandidate(

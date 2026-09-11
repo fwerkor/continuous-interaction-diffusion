@@ -864,6 +864,9 @@ class CIDRuntime:
             if self._deadline_expired(deadline):
                 return False
             self._external_progress.clear()
+            # Newly-created source tasks may register runtime-step work on their first turn.
+            # Let them run before deciding that no scheduled external progress exists.
+            await asyncio.sleep(0)
             if self._external_progress_ready():
                 return True
 

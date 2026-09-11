@@ -190,6 +190,24 @@ def _trajectory(record: dict[str, Any]) -> TrajectoryExample:
         record,
         PublicTrainingConfig(split="test", seed=20260911, unnecessary_tool_fraction=0.0),
     )
+    evidence_bank = list(record.get("resources", {}).get("evidence_bank", ()))
+    metadata["benchmark_workspace_documents"] = [
+        {
+            "resource_id": f"doc-{index:02d}",
+            "title": str(resource["title"]),
+            "sentences": [str(sentence) for sentence in resource.get("sentences", ())],
+        }
+        for index, resource in enumerate(evidence_bank)
+    ]
+    metadata["benchmark_workspace_search_top_k"] = 5
+    metadata["benchmark_workspace_latency_steps"] = 2
+    metadata["benchmark_supporting_resource_ids"] = list(
+        dict.fromkeys(
+            str(evidence.arguments["resource_id"])
+            for evidence in task.evidence
+            if evidence.source == "workspace_read" and "resource_id" in evidence.arguments
+        )
+    )
     events: list[ExternalEvent] = []
     bindings: list[BindingTarget] = []
     for index, evidence in enumerate(task.evidence):
@@ -243,7 +261,7 @@ def main() -> None:
     output_dir = Path(args.output_dir)
     output_dir.mkdir(parents=True, exist_ok=True)
     training_ids = _training_semantic_ids(Path(args.training_data))
-    overall: dict[str, Any] = {"format_version": 1, "datasets": {}}
+    overall: dict[str, Any] = {"format_version": 2, "datasets": {}}
 
     for source in SOURCES:
         examples: list[TrajectoryExample] = []
