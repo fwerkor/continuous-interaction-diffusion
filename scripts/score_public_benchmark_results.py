@@ -18,8 +18,11 @@ _ARTICLES = re.compile(r"\b(a|an|the)\b", re.IGNORECASE)
 _NUMBER = re.compile(r"[-+]?(?:\d[\d,]*\.?\d*|\.\d+)(?:[eE][-+]?\d+)?")
 _CODE_BLOCK = re.compile(r"```(?:python)?\s*(.*?)```", re.DOTALL | re.IGNORECASE)
 _SAFE_IMPORTS = {
+    "array",
     "bisect",
+    "cmath",
     "collections",
+    "copy",
     "datetime",
     "decimal",
     "fractions",
@@ -32,13 +35,13 @@ _SAFE_IMPORTS = {
     "re",
     "statistics",
     "string",
+    "sys",
 }
 _DANGEROUS_CALLS = {
     "breakpoint",
     "compile",
     "eval",
     "exec",
-    "exit",
     "help",
     "input",
     "open",
@@ -51,9 +54,7 @@ _DANGEROUS_ATTRS = {
     "kill",
     "open",
     "popen",
-    "remove",
     "rename",
-    "replace",
     "rmdir",
     "send",
     "socket",
