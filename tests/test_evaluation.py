@@ -4,10 +4,39 @@ import time
 
 from cid.contracts import FreshnessDemand, InformationNeed, ModelContext, ModelUpdate
 from cid.data import ExternalEvent, TrajectoryExample
-from cid.evaluation import evaluate_runtime_result, run_replay_case, summarize_evaluations
+from cid.evaluation import (
+    display_exact_match,
+    evaluate_runtime_result,
+    run_replay_case,
+    summarize_evaluations,
+)
 from cid.grounding import ObjectRef
 from cid.runtime import CIDRuntime, RuntimeConfig, SourceRegistry, StaticMappingSource
 from cid.state import CognitiveField, DisplayCanvas
+
+
+def test_display_exact_match_ignores_harmless_surface_variation() -> None:
+    assert display_exact_match(
+        " Shorten the time spent taking a shower",
+        "Shorten the time spent taking a shower.",
+    )
+    assert display_exact_match(
+        "Volvox colonies produce gametes.",
+        "Volvox colonies produce gametes.",
+    )
+    assert display_exact_match(
+        "They would be unable to survive",
+        "They would be unable to survive.",
+    )
+    assert display_exact_match("answer!?", "answer")
+    assert display_exact_match("north  west", "north west")
+
+
+def test_display_exact_match_preserves_semantic_surface_differences() -> None:
+    assert not display_exact_match("velocity", "acceleration")
+    assert not display_exact_match("US", "us")
+    assert not display_exact_match("north-west", "north west")
+    assert not display_exact_match("Answer: yes", "yes")
 
 
 class EvaluationPolicy:

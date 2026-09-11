@@ -7,7 +7,12 @@ import torch
 
 from cid.data import TrajectoryExample
 from cid.defaults import DEFAULT_DISPLAY_REVISION_FRACTION, DEFAULT_DISPLAY_REVISION_MARGIN
-from cid.evaluation import ReplayEvaluationResult, RuntimeTaskEvaluation, run_replay_case
+from cid.evaluation import (
+    ReplayEvaluationResult,
+    RuntimeTaskEvaluation,
+    display_exact_match,
+    run_replay_case,
+)
 from cid.grounding import ObjectKind, ObjectRef
 from cid.model.encoding import ILLaDATextEncoder, stable_text
 from cid.model.illada import ILLaDACIDAdapter
@@ -35,6 +40,7 @@ class NeuralBenchmarkCaseResult:
     final_display_ids: tuple[int, ...]
     runtime_steps: int
     evaluation: RuntimeTaskEvaluation
+    strict_exact_display: bool | None
     trace_events: tuple[dict[str, Any], ...]
 
     def to_dict(self) -> dict[str, Any]:
@@ -44,6 +50,7 @@ class NeuralBenchmarkCaseResult:
             "final_display_ids": list(self.final_display_ids),
             "runtime_steps": self.runtime_steps,
             "evaluation": asdict(self.evaluation),
+            "strict_exact_display": self.strict_exact_display,
             "trace_events": list(self.trace_events),
         }
 
@@ -116,12 +123,19 @@ async def run_neural_benchmark_case(
         runtime_config=effective_runtime_config,
     )
     final_ids = tuple(int(token) for token in replay.runtime.display.visible_token_ids)
+    final_text = tokenizer.decode(list(final_ids), skip_special_tokens=True)
+    strict_exact_display = replay.evaluation.exact_display
+    evaluation = replace(
+        replay.evaluation,
+        exact_display=display_exact_match(final_text, example.target_display),
+    )
     return NeuralBenchmarkCaseResult(
         example_id=example.example_id,
-        final_text=tokenizer.decode(list(final_ids), skip_special_tokens=True),
+        final_text=final_text,
         final_display_ids=final_ids,
         runtime_steps=replay.runtime.steps,
-        evaluation=replay.evaluation,
+        evaluation=evaluation,
+        strict_exact_display=strict_exact_display,
         trace_events=_decode_display_trace_events(replay.runtime.trace.to_dicts(), tokenizer),
     )
 

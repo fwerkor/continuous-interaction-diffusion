@@ -2,6 +2,7 @@ from __future__ import annotations
 
 import asyncio
 import time
+import unicodedata
 from collections import defaultdict
 from collections.abc import Mapping
 from dataclasses import dataclass
@@ -70,6 +71,25 @@ class RuntimeEvaluationSummary:
 class ReplayEvaluationResult:
     runtime: RuntimeResult
     evaluation: RuntimeTaskEvaluation
+
+
+_TERMINAL_DISPLAY_PUNCTUATION = frozenset(".!?。！？")
+
+
+def normalize_display_for_exact_match(value: str) -> str:
+    """Canonicalize harmless surface variation before answer-level exact matching."""
+
+    normalized = unicodedata.normalize("NFKC", str(value))
+    normalized = " ".join(normalized.split()).strip()
+    while normalized and normalized[-1] in _TERMINAL_DISPLAY_PUNCTUATION:
+        normalized = normalized[:-1].rstrip()
+    return normalized
+
+
+def display_exact_match(prediction: str, reference: str) -> bool:
+    return normalize_display_for_exact_match(prediction) == normalize_display_for_exact_match(
+        reference
+    )
 
 
 class ScheduledReplaySource:
