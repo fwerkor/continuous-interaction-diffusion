@@ -664,5 +664,4 @@ Preprint: [arXiv:2608.10438](https://arxiv.org/abs/2608.10438) · DOI: [10.48550
 The v0 runtime intentionally accepts only read-only sources. Side-effecting tools need a
 separate commitment/authorization protocol and are outside this repository's first milestone.
 
-The paper source is maintained separately in
-[`fwerkor/continuous-interaction-diffusion-paper`](https://github.com/fwerkor/continuous-interaction-diffusion-paper).
+[`fwerkor/continuous-interaction-interacti
