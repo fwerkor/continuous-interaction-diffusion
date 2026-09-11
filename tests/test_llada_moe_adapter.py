@@ -185,7 +185,8 @@ def test_llada_moe_adapter_uses_model_tokens_and_router_auxiliary_loss() -> None
     assert backbone.decoder.gate.weight.grad is not None
 
 
-def test_llada_moe_router_auxiliary_loss_uses_moe_gate_logits_when_decoder_output_is_broken() -> None:
+def test_llada_moe_router_auxiliary_loss_uses_moe_gate_logits_when_decoder_output_is_broken(
+) -> None:
     backbone = TinyLLaDAMoEBackbone()
 
     def broken_upstream_forward(
@@ -331,7 +332,6 @@ def test_llada_moe_private_grouped_kernel_matches_reference(monkeypatch) -> None
 def test_llada_moe_trainable_grouped_experts_match_reference_parameter_gradients(
     monkeypatch,
 ) -> None:
-    illada = import_module("cid.model.illada")
     reference_backbone = TinyLLaDAMoEBackbone()
     grouped_backbone = TinyLLaDAMoEBackbone()
     grouped_backbone.load_state_dict(reference_backbone.state_dict())
