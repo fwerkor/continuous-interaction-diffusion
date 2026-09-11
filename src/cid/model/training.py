@@ -365,11 +365,14 @@ class CIDTrainerConfig:
             raise ValueError("warmup_steps cannot exceed lr_decay_steps")
         if self.lr_schedule not in {"cosine", "wsd-linear"}:
             raise ValueError("unsupported learning-rate schedule")
-        if self.lr_schedule == "wsd-linear" and self.lr_decay_steps:
-            if not self.warmup_steps <= self.lr_decay_start_steps <= self.lr_decay_steps:
-                raise ValueError(
-                    "WSD decay start must be between warmup and total decay steps"
-                )
+        if (
+            self.lr_schedule == "wsd-linear"
+            and self.lr_decay_steps
+            and not self.warmup_steps <= self.lr_decay_start_steps <= self.lr_decay_steps
+        ):
+            raise ValueError(
+                "WSD decay start must be between warmup and total decay steps"
+            )
         if not 0.0 <= self.min_learning_rate_ratio <= 1.0:
             raise ValueError("min_learning_rate_ratio must be in [0, 1]")
         if not 0.0 <= self.timestep_min <= self.timestep_max <= 1.0:
