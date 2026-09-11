@@ -4,7 +4,6 @@ from contextlib import nullcontext
 from types import SimpleNamespace
 
 import pytest
-import torch
 
 from cid import accelerator
 
@@ -52,6 +51,7 @@ def test_distributed_backend_mapping() -> None:
 
 
 def test_torch_autocast_preserves_stage_a_ddp_controls() -> None:
+    torch = pytest.importorskip("torch")
     class Wrapped(torch.nn.Module):
         _cid_stage_a_ddp = True
 

@@ -28,6 +28,7 @@ jobs:
       - run: python -m pip install -e '.[dev]'
       - run: >-
           pytest
+          tests/test_accelerator.py
           tests/test_torch_core.py
           tests/test_illada_adapter.py
           tests/test_lfm_adapter.py
