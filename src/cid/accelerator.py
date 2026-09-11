@@ -75,6 +75,10 @@ def wrap_npu_autocast(torch_module: Any, module: Any, *, dtype: Any) -> Any:
         def __init__(self, wrapped: Any) -> None:
             super().__init__()
             self.module = wrapped
+            self._cid_stage_a_ddp = bool(getattr(wrapped, "_cid_stage_a_ddp", False))
+
+        def no_sync(self):
+            return self.module.no_sync()
 
         def forward(self, *args, **kwargs):
             with torch_npu.npu.amp.autocast(dtype=dtype):
@@ -101,6 +105,10 @@ def wrap_torch_autocast(
         def __init__(self, wrapped: Any) -> None:
             super().__init__()
             self.module = wrapped
+            self._cid_stage_a_ddp = bool(getattr(wrapped, "_cid_stage_a_ddp", False))
+
+        def no_sync(self):
+            return self.module.no_sync()
 
         def forward(self, *args, **kwargs):
             with torch_module.autocast(device_type=device_type, dtype=dtype):

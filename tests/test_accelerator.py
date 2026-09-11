@@ -1,8 +1,10 @@
 from __future__ import annotations
 
+from contextlib import nullcontext
 from types import SimpleNamespace
 
 import pytest
+import torch
 
 from cid import accelerator
 
@@ -47,3 +49,25 @@ def test_distributed_backend_mapping() -> None:
     assert accelerator.distributed_backend("cpu") == "gloo"
     with pytest.raises(ValueError, match="unsupported distributed device"):
         accelerator.distributed_backend("mps")
+
+
+def test_torch_autocast_preserves_stage_a_ddp_controls() -> None:
+    class Wrapped(torch.nn.Module):
+        _cid_stage_a_ddp = True
+
+        def forward(self, value):
+            return value
+
+        def no_sync(self):
+            return nullcontext("delegated")
+
+    wrapped = accelerator.wrap_torch_autocast(
+        torch,
+        Wrapped(),
+        device_type="cpu",
+        dtype=torch.bfloat16,
+    )
+
+    assert wrapped._cid_stage_a_ddp is True
+    with wrapped.no_sync() as value:
+        assert value == "delegated"
