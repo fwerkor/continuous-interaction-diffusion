@@ -1405,7 +1405,13 @@ def _benchmark(args: argparse.Namespace) -> None:
         adapter.eval()
         forward_model.eval()
         data_path = Path(args.data)
-        examples = load_jsonl(data_path)
+        all_examples = load_jsonl(data_path)
+        dataset_examples = len(all_examples)
+        if args.shard_count <= 0:
+            raise ValueError("benchmark shard count must be positive")
+        if not 0 <= args.shard_index < args.shard_count:
+            raise ValueError("benchmark shard index must be in [0, shard_count)")
+        examples = all_examples[args.shard_index :: args.shard_count]
         if args.max_examples is not None:
             examples = examples[: args.max_examples]
         if not examples:
@@ -1498,7 +1504,10 @@ def _benchmark(args: argparse.Namespace) -> None:
                 "dataset": {
                     "path": str(data_path),
                     "sha256": _sha256_file(data_path),
+                    "total_examples": dataset_examples,
                     "examples": len(examples),
+                    "shard_index": args.shard_index,
+                    "shard_count": args.shard_count,
                 },
                 "environment": {
                     "python": platform.python_version(),
@@ -3910,6 +3919,8 @@ def main() -> None:
     )
     benchmark.add_argument("--max-examples", type=int)
     benchmark.add_argument("--progress-every", type=int, default=10)
+    benchmark.add_argument("--shard-count", type=int, default=1)
+    benchmark.add_argument("--shard-index", type=int, default=0)
     benchmark.add_argument("--seed", type=int, default=0)
     benchmark.add_argument("--seed-teacher-state", action="store_true")
     train = subparsers.add_parser(
