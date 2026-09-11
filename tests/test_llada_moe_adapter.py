@@ -328,6 +328,70 @@ def test_llada_moe_private_grouped_kernel_matches_reference(monkeypatch) -> None
     assert torch.allclose(reference_input.grad, grouped_input.grad, atol=1e-5, rtol=1e-5)
 
 
+def test_llada_moe_trainable_grouped_experts_match_reference_parameter_gradients(
+    monkeypatch,
+) -> None:
+    illada = import_module("cid.model.illada")
+    reference_backbone = TinyLLaDAMoEBackbone()
+    grouped_backbone = TinyLLaDAMoEBackbone()
+    grouped_backbone.load_state_dict(reference_backbone.state_dict())
+    reference_adapter = ILLaDACIDAdapter(reference_backbone)
+    grouped_adapter = ILLaDACIDAdapter(grouped_backbone)
+    reference_moe = reference_backbone.decoder.layers[0].mlp
+    grouped_moe = grouped_backbone.decoder.layers[0].mlp
+    reference_input = torch.randn(2, 5, TinyLLaDAMoEConfig.hidden_size, requires_grad=True)
+    grouped_input = reference_input.detach().clone().requires_grad_(True)
+
+    reference_output = reference_moe(reference_input)
+    reference_output.square().sum().backward()
+
+    def grouped_mm(inputs, weights, offsets):
+        outputs = []
+        start = 0
+        for expert_idx, end in enumerate(offsets.tolist()):
+            outputs.append(inputs[start:end] @ weights[expert_idx])
+            start = end
+        return torch.cat(outputs, dim=0)
+
+    monkeypatch.setattr(torch, "_grouped_mm", grouped_mm, raising=False)
+    packed_layers = grouped_adapter.pack_trainable_moe_experts()
+    grouped_output = grouped_moe(grouped_input)
+    grouped_output.square().sum().backward()
+
+    assert packed_layers == 1
+    assert len(grouped_moe.experts) == 0
+    assert isinstance(grouped_moe._cid_gate_weights, nn.Parameter)
+    assert isinstance(grouped_moe._cid_up_weights, nn.Parameter)
+    assert isinstance(grouped_moe._cid_down_weights, nn.Parameter)
+    assert torch.allclose(reference_output, grouped_output, atol=1e-5, rtol=1e-5)
+    assert torch.allclose(reference_input.grad, grouped_input.grad, atol=1e-5, rtol=1e-5)
+
+    for expert_idx, expert in enumerate(reference_moe.experts):
+        torch.testing.assert_close(
+            expert.gate_proj.weight.grad,
+            grouped_moe._cid_gate_weights.grad[expert_idx].T,
+            rtol=1e-5,
+            atol=1e-5,
+        )
+        torch.testing.assert_close(
+            expert.up_proj.weight.grad,
+            grouped_moe._cid_up_weights.grad[expert_idx].T,
+            rtol=1e-5,
+            atol=1e-5,
+        )
+        torch.testing.assert_close(
+            expert.down_proj.weight.grad,
+            grouped_moe._cid_down_weights.grad[expert_idx].T,
+            rtol=1e-5,
+            atol=1e-5,
+        )
+
+    # Packing preserves the total trainable parameter count exactly.
+    assert sum(p.numel() for p in reference_adapter.parameters()) == sum(
+        p.numel() for p in grouped_adapter.parameters()
+    )
+
+
 def test_llada_moe_attention_keeps_masked_slots_out_of_key_context() -> None:
     backbone = TinyLLaDAMoEBackbone()
     ILLaDACIDAdapter(backbone, freeze_backbone=True)

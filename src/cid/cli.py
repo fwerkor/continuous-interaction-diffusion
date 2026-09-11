@@ -2897,6 +2897,12 @@ def _train_stage_b(args: argparse.Namespace) -> None:
                 model.set_device_value_validation(False)
                 model = model.to(device)
             model.set_backbone_trainable(True)
+            grouped_moe_layers = (
+                model.pack_trainable_moe_experts()
+                if device_type == "cuda"
+                else 0
+            )
+            model._cid_stage_b_grouped_moe_layers = grouped_moe_layers
             if args.gradient_checkpointing:
                 model.set_gradient_checkpointing(True, use_reentrant=False)
             model.set_mlp_chunk_size(args.mlp_chunk_size)
@@ -2911,6 +2917,7 @@ def _train_stage_b(args: argparse.Namespace) -> None:
             dist.barrier()
         if adapter is None or text_encoder is None:
             raise RuntimeError("failed to load Stage B CID model on this training rank")
+        grouped_moe_layers = int(getattr(adapter, "_cid_stage_b_grouped_moe_layers", 0))
 
         optimizer_groups = stage_b_adamw_parameter_groups(
             adapter,
@@ -3029,6 +3036,7 @@ def _train_stage_b(args: argparse.Namespace) -> None:
                 f"effective_batch={effective_batch} grad_accum={gradient_accumulation_steps} "
                 f"mlp_chunk={args.mlp_chunk_size} norm_chunk={args.norm_chunk_size} "
                 f"gradient_checkpointing={int(args.gradient_checkpointing)} "
+                f"grouped_moe_layers={grouped_moe_layers} "
                 f"peak_cid_lr={args.learning_rate:.3e} "
                 f"peak_backbone_lr={args.learning_rate * args.backbone_lr_scale:.3e} "
                 f"lr_schedule={lr_schedule} warmup_steps={warmup_steps} "

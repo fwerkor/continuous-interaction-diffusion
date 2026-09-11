@@ -443,6 +443,43 @@ def _pack_frozen_llada_moe_layer(
         raise ValueError(f"unsupported grouped MoE backend: {backend}")
 
 
+def _pack_trainable_llada_moe_layer(module: nn.Module) -> None:
+    """Pack trainable LLaDA-MoE expert weights for grouped GEMM execution.
+
+    Stage B needs gradients for the expert matrices, so unlike the Stage A
+    packing path these tensors remain registered ``nn.Parameter`` objects.
+    The parameterization changes from 64 independent Linear weights to three
+    dense expert stacks while preserving the exact values, parameter count,
+    routing function, and gradients. FSDP can then shard/gather the three
+    packed parameters as part of the surrounding decoder layer.
+    """
+
+    experts = tuple(module.experts)
+    if not experts:
+        raise RuntimeError("LLaDA-MoE layer does not expose experts")
+    if any(not parameter.requires_grad for expert in experts for parameter in expert.parameters()):
+        raise RuntimeError("trainable grouped LLaDA-MoE packing requires trainable expert weights")
+    required = ("gate_proj", "up_proj", "down_proj", "act_fn")
+    if any(any(not hasattr(expert, name) for name in required) for expert in experts):
+        raise RuntimeError("unsupported LLaDA-MoE expert implementation")
+
+    gate_weights = nn.Parameter(
+        torch.stack([expert.gate_proj.weight.detach().T for expert in experts]).contiguous()
+    )
+    up_weights = nn.Parameter(
+        torch.stack([expert.up_proj.weight.detach().T for expert in experts]).contiguous()
+    )
+    down_weights = nn.Parameter(
+        torch.stack([expert.down_proj.weight.detach().T for expert in experts]).contiguous()
+    )
+    module.experts = nn.ModuleList()
+    module.register_parameter("_cid_gate_weights", gate_weights)
+    module.register_parameter("_cid_up_weights", up_weights)
+    module.register_parameter("_cid_down_weights", down_weights)
+    module._cid_act_fn = experts[0].act_fn
+    module.forward = MethodType(_grouped_llada_moe_forward, module)
+
+
 def _moe_load_balancing_loss(
     router_logits: tuple[torch.Tensor, ...] | None,
     *,
@@ -762,6 +799,30 @@ class ILLaDACIDAdapter(nn.Module):
             if moe is None or not hasattr(moe, "experts"):
                 continue
             _pack_frozen_llada_moe_layer(moe, backend=backend)
+            packed += 1
+        return packed
+
+    def pack_trainable_moe_experts(self) -> int:
+        """Pack trainable CUDA LLaDA-MoE experts for Stage B grouped GEMM.
+
+        PyTorch 2.9+ provides CUDA grouped GEMM with gradients for both inputs
+        and expert weights on Ampere and newer GPUs. Packing occurs before
+        optimizer construction and FSDP wrapping so the packed matrices are the
+        canonical trainable parameters and participate normally in AdamW,
+        mixed-precision FSDP, checkpoint save, and checkpoint resume.
+        """
+
+        if not self.is_llada_moe or not hasattr(torch, "_grouped_mm"):
+            return 0
+        layers = getattr(self.hidden_backbone(), "layers", None)
+        if layers is None:
+            raise RuntimeError("LLaDA-MoE decoder does not expose layers")
+        packed = 0
+        for layer in layers:
+            moe = getattr(layer, "mlp", None)
+            if moe is None or not hasattr(moe, "experts"):
+                continue
+            _pack_trainable_llada_moe_layer(moe)
             packed += 1
         return packed
 
