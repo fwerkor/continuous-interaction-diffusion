@@ -2,7 +2,7 @@ from __future__ import annotations
 
 import sys
 from importlib import import_module
-from types import ModuleType, SimpleNamespace
+from types import MethodType, ModuleType, SimpleNamespace
 
 import pytest
 
@@ -183,6 +183,37 @@ def test_llada_moe_adapter_uses_model_tokens_and_router_auxiliary_loss() -> None
     assert torch.isfinite(output.auxiliary_loss)
     output.auxiliary_loss.backward()
     assert backbone.decoder.gate.weight.grad is not None
+
+
+def test_llada_moe_router_auxiliary_loss_uses_moe_gate_logits_when_decoder_output_is_broken() -> None:
+    backbone = TinyLLaDAMoEBackbone()
+
+    def broken_upstream_forward(
+        decoder,
+        *,
+        inputs_embeds,
+        attention_mask,
+        position_ids,
+        return_dict,
+        output_router_logits=False,
+    ):
+        del attention_mask, position_ids
+        assert return_dict
+        decoder.last_output_router_logits = bool(output_router_logits)
+        hidden = inputs_embeds + decoder.projection(inputs_embeds)
+        hidden = decoder.layers[0].mlp(hidden)
+        router_logits = (hidden,) if output_router_logits else None
+        return SimpleNamespace(last_hidden_state=hidden, router_logits=router_logits)
+
+    backbone.decoder.forward = MethodType(broken_upstream_forward, backbone.decoder)
+    adapter = ILLaDACIDAdapter(backbone)
+
+    output = adapter(_batch())
+
+    assert output.auxiliary_loss is not None
+    assert torch.isfinite(output.auxiliary_loss)
+    output.auxiliary_loss.backward()
+    assert backbone.decoder.layers[0].mlp.gate.weight.grad is not None
 
 
 def test_llada_moe_stage_a_skips_router_auxiliary_loss() -> None:

@@ -261,7 +261,11 @@ def _grouped_llada_moe_forward(
     )
     offsets = expert_counts.cumsum(dim=0, dtype=torch.int32)
 
-    routed = flat_hidden[sorted_tokens]
+    # ``_grouped_mm`` does not participate in autocast.  Stage A keeps CID
+    # projections in FP32 while the frozen MoE expert weights remain BF16, so
+    # mirror the dtype conversion that nn.Linear/matmul receives under the
+    # surrounding autocast context before entering the grouped kernel.
+    routed = flat_hidden[sorted_tokens].to(dtype=module._cid_gate_weights.dtype)
     gate = torch._grouped_mm(routed, module._cid_gate_weights, offsets)
     up = torch._grouped_mm(routed, module._cid_up_weights, offsets)
     routed = module._cid_act_fn(gate) * up
@@ -601,12 +605,20 @@ class ILLaDACIDAdapter(nn.Module):
             else 0.0
         )
         self._router_aux_loss_enabled = False
+        self._capture_router_logits = False
+        self._captured_router_logits: list[torch.Tensor] = []
         self.validate_device_values = True
         self._llada_moe_attention_modules = (
             _install_llada_moe_attention_mask_support(backbone)
             if self.is_llada_moe
             else ()
         )
+        if self.is_llada_moe:
+            layers = getattr(self.hidden_backbone(), "layers", ())
+            for layer in layers:
+                gate = getattr(getattr(layer, "mlp", None), "gate", None)
+                if gate is not None:
+                    gate.register_forward_hook(self._capture_router_gate_output)
         num_heads = int(backbone_config.num_attention_heads)
         if self.d_model % num_heads:
             raise ValueError("backbone hidden size must be divisible by its attention head count")
@@ -674,6 +686,15 @@ class ILLaDACIDAdapter(nn.Module):
         for parameter in self.backbone.parameters():
             parameter.requires_grad_(trainable)
         self._router_aux_loss_enabled = self.is_llada_moe and trainable
+
+    def _capture_router_gate_output(
+        self,
+        _module: nn.Module,
+        _inputs: tuple[torch.Tensor, ...],
+        output: torch.Tensor,
+    ) -> None:
+        if self._capture_router_logits:
+            self._captured_router_logits.append(output)
 
     def set_cid_modules_dtype(self, dtype: torch.dtype) -> None:
         """Change CID-only module precision without recasting the backbone."""
@@ -897,9 +918,15 @@ class ILLaDACIDAdapter(nn.Module):
             decoder_kwargs["output_router_logits"] = True
         for attention in self._llada_moe_attention_modules:
             attention._cid_key_padding_mask = attention_mask
-        decoder_output = self.hidden_backbone()(
-            **decoder_kwargs,
-        )
+        if self._router_aux_loss_enabled:
+            self._captured_router_logits.clear()
+            self._capture_router_logits = True
+        try:
+            decoder_output = self.hidden_backbone()(
+                **decoder_kwargs,
+            )
+        finally:
+            self._capture_router_logits = False
         hidden = decoder_output.last_hidden_state
 
         thought_weight = neural_occupancy
@@ -941,8 +968,13 @@ class ILLaDACIDAdapter(nn.Module):
                     device=attention_mask.device,
                     dtype=attention_mask.dtype,
                 )
+            router_logits = (
+                tuple(self._captured_router_logits)
+                if self._captured_router_logits
+                else getattr(decoder_output, "router_logits", None)
+            )
             raw_router_loss = _moe_load_balancing_loss(
-                getattr(decoder_output, "router_logits", None),
+                router_logits,
                 num_experts=int(self.backbone.config.num_experts),
                 top_k=int(self.backbone.config.num_experts_per_tok),
                 attention_mask=router_attention_mask,
