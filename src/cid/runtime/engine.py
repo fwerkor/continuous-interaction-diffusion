@@ -33,6 +33,7 @@ from cid.state import CellLifecycle, CognitiveField, DisplayCanvas, FactItem, Fa
 @dataclass(frozen=True, slots=True)
 class RuntimeConfig:
     max_steps: int = 256
+    max_total_steps: int | None = None
     max_wall_time_s: float | None = 300.0
     binding_threshold: float = DEFAULT_BINDING_THRESHOLD
     idle_yield_s: float = 0.001
@@ -44,6 +45,8 @@ class RuntimeConfig:
     def __post_init__(self) -> None:
         if self.max_steps <= 0:
             raise ValueError("max_steps must be positive")
+        if self.max_total_steps is not None and self.max_total_steps <= 0:
+            raise ValueError("max_total_steps must be positive when set")
         if self.max_wall_time_s is not None and self.max_wall_time_s <= 0:
             raise ValueError("max_wall_time_s must be positive when set")
         if not 0.0 <= self.binding_threshold <= 1.0:
@@ -165,6 +168,17 @@ class CIDRuntime:
             while True:
                 if self._deadline_expired(deadline):
                     self.trace.emit("wall_clock_budget_exhausted", completed_steps)
+                    break
+
+                if (
+                    self.config.max_total_steps is not None
+                    and completed_steps >= self.config.max_total_steps
+                ):
+                    self.trace.emit(
+                        "total_compute_budget_exhausted",
+                        completed_steps,
+                        runtime_step=self._runtime_step,
+                    )
                     break
 
                 if epoch_steps >= self.config.max_steps:

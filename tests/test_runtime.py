@@ -579,6 +579,26 @@ async def test_quiescence_waits_without_consuming_the_refinement_epoch_budget() 
     assert result.trace.count("compute_budget_exhausted") == 0
 
 
+async def test_total_step_budget_is_not_reset_by_external_progress() -> None:
+    source = CountingSource(delay_s=0.02)
+    registry = SourceRegistry()
+    registry.register(source)
+    runtime = CIDRuntime(
+        registry,
+        RuntimeConfig(max_steps=1, max_total_steps=1, max_wall_time_s=1.0),
+    )
+
+    result = await runtime.run(
+        QuiescentEvidencePolicy(),
+        thought=seeded_thought(1),
+        display=DisplayCanvas.masked(1, -1),
+    )
+
+    assert not result.converged
+    assert result.steps == 1
+    assert result.trace.count("total_compute_budget_exhausted") == 1
+
+
 async def test_cache_hit_at_equilibrium_does_not_wait_for_nonexistent_external_progress() -> None:
     source = CountingSource()
     registry = SourceRegistry()
