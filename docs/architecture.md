@@ -54,7 +54,7 @@ split, and merge while keeping `N_max` constant.
 
 ### 2.1 Event-aware lifecycle transitions
 
-Lifecycle logits are proposals rather than direct state writes. `LifecycleTransitionController`
+Lifecycle logits are transition proposals. `LifecycleTransitionController`
 combines the proposal with binding and revision state before committing a transition:
 
 - `ACTIVE -> WAITING` is valid only when an unresolved binding targets that cell;
@@ -89,11 +89,11 @@ reclaims, the field is compacted; stable `cell_id` references make this position
 
 ### 2.3 Typed grounding layer
 
-TCT grounding is an explicit ABI rather than an untyped string convention. `ObjectRef` identifies
+TCT grounding uses an explicit typed ABI. `ObjectRef` identifies
 the runtime object being referenced and distinguishes `CELL`, `FACT`, `BINDING`, `SOURCE`,
 `DISPLAY_SPAN`, `ANCHOR`, and external `SYMBOLIC_OBJECT` identities. Information-need targets,
-percept targets, reopen requests, and cognitive links use these references rather than physical
-slot indices or ambiguous strings.
+percept targets, reopen requests, and cognitive links use these references, avoiding physical
+slot indices and ambiguous strings.
 
 An `Anchor` gives a continuous cognitive cell a typed symbolic attachment. The initial schema
 supports entity, number, symbol, span, path, URL, and text anchors, with canonical `object_id`,
@@ -163,7 +163,7 @@ persistent `InformationNeed` objects, and converts revision predictions into typ
 references. Each stable need slot also reuses its latent need query to score live TCT cells and
 display positions. Thresholded scores materialize `target_cells` and contiguous `target_display`
 spans; the need-owning cell is always retained as a target. This makes the paper's affected-region
-link $\chi$ an explicit learned neural/runtime contract instead of a runtime-only field. A separate
+link $\chi$ an explicit learned contract shared by the neural model and runtime. A separate
 convergence head predicts current-information equilibrium. Materialization
 exposes that signal separately from terminal convergence: a fully resolved display plus equilibrium
 forms a terminal candidate, while equilibrium with an unresolved required binding allows the runtime
@@ -201,8 +201,7 @@ separately by binding policy.
 ## 6. Async execution
 
 Model steps run in a worker thread from the asyncio runtime. Read-only source jobs run as asyncio
-tasks. Therefore source latency can overlap actual model compute rather than merely alternating
-between `model.step()` and `await tool()`.
+tasks. Therefore source latency can overlap actual model compute while source work is in flight.
 
 When the model reaches current-information equilibrium while a required observation is outstanding,
 the runtime quiesces: no forward pass is issued and no model-step budget is consumed until external
@@ -218,7 +217,7 @@ motion inside the TCT cannot hide a visibly stalled or oscillating trajectory. R
 or short-period oscillations trigger a rollback to the compatible pre-cycle model state, local
 re-diffusion of the affected TCT slots, re-masking of oscillating Display positions, and a short-lived
 taboo on exact repeated proposals. If recovery attempts are exhausted, the trajectory returns the
-last accepted state instead of spending the remaining compute budget on the loop.
+last accepted state and stops the loop, preserving the remaining compute budget.
 
 A model-declared terminal candidate is also subject to a final freshness barrier. `ONCE` bindings
 are accepted once resolved; due `MAX_AGE` bindings and `ALWAYS` bindings must be refreshed or version
@@ -235,7 +234,7 @@ without requiring a separate support/conflict score head. Runtime-facing policie
 local noise for cells linked to a newly conflicting percept and emit typed cell references through
 `reopen_cells`.
 The transition controller is the gate that permits `STABLE -> ACTIVE`. We keep this mechanism
-explicit instead of hiding it inside a global remasking schedule so RQ4/RQ5 ablations are possible.
+explicit so RQ4/RQ5 ablations can target it directly.
 
 ## 8. Source scope
 

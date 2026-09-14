@@ -38,7 +38,7 @@ Implement the first real model bridge around an existing masked-diffusion LM. Th
 6. expose local revision signals without serializing cognition into text.
 
 The adapter must randomize or compact physical slot placement during training so learned cognitive
-roles attach to cell content and type rather than hard-coded positions.
+roles attach to cell content and type independently of hard-coded positions.
 
 Exit criterion: an untrained or lightly trained adapter can run complete CID trajectories with the
 same runtime used by the oracle policies.
@@ -54,7 +54,7 @@ Status: deterministic mechanism generator and timing-separated teacher compiler 
 Build data generators for the five evaluation families: static copying, delayed retrieval, dynamic
 state tracking, streaming evidence, and competing sources. Every generated sample must include
 arrival timing, closed-world symbolic catalogs, typed grounding targets, and pre-/post-arrival
-states rather than flattening evidence into the prompt.
+states, preserving evidence arrival as structured events.
 
 Exit criterion: millions of reproducible trajectories can be generated with controlled event
 latency, freshness, cache state, and counterfactual arrival schedules.
@@ -94,19 +94,20 @@ selection, argument binding, intent lead time, assimilation lag, exact copying, 
 rate before unfreezing the backbone.
 
 Exit criterion: latent needs reliably precede executable calls and new observations produce local,
-beneficial revisions rather than global corruption.
+beneficial local revisions without global corruption.
 
 ## M4 — joint T/Y training
 
 Unfreeze selected backbone blocks and train coupled thought/display denoising with randomized event
 schedules. Add the paper's ablations: untyped latent state, no anchors, no persistent re-projection,
-no dynamic refresh, global rather than local reopening, and asynchronous autoregressive baselines.
+no dynamic refresh, global reopening as an ablation of locality, and asynchronous autoregressive
+baselines.
 
 Exit criterion: CID demonstrates a measurable quality/latency advantage attributable to revision
-and persistent perception, not only to asynchronous I/O.
+and persistent perception, with gains beyond asynchronous I/O alone.
 
 ## M5 — dedicated small model
 
 Only after M1--M4 establish the mechanism should we train a dedicated ~4B-class CID model. The
-runtime/data contract remains unchanged; scaling should improve the model rather than redefine the
-system around a new checkpoint.
+runtime/data contract remains unchanged; scaling should improve the model while preserving the
+system architecture.

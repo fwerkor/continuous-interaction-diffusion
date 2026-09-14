@@ -40,7 +40,7 @@ actual execution behavior on a fixed evaluation setup.
 ### Raw trace persistence
 
 Each neural benchmark JSONL row includes `trace_events`. Timestamps are seconds relative to the
-trajectory's first trace event rather than process-global monotonic timestamps. Each
+trajectory's first trace event; process-global monotonic timestamps are not serialized. Each
 `model_step_finished` events can also record the full and visible Display token IDs, unresolved-token
 count, realized/active-span lengths, and tokenizer-decoded Display text. This richer instrumentation
 is disabled by default for `cid benchmark` so latency/throughput measurements do not pay the
@@ -66,13 +66,13 @@ trace events.
 
 If a trajectory contains multiple versions for the same source/argument work key, only the event
 with the greatest `arrival_step` is treated as the final freshness target. This makes dynamic and
-streaming tasks measure whether the model/runtime ends on the latest state rather than whether it
-ever observed an earlier valid value.
+streaming tasks measure whether the model/runtime ends on the latest state; observing an earlier
+valid value alone does not satisfy the freshness target.
 
 `RuntimeEvaluationSummary` aggregates task results into convergence rate, exact-display accuracy,
 global observation coverage/staleness, interaction delays, tool-call latency distributions,
 wall-clock wait/overlap ratios, ready-to-bind delay, and concurrency. Ratio aggregation is weighted
-by elapsed time rather than averaging per-task percentages. Exact-display accuracy is computed only
+by elapsed time across tasks. Exact-display accuracy is computed only
 over tasks for which expected display token IDs were supplied.
 
 ## Deterministic dataset replay

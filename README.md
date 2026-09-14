@@ -15,7 +15,7 @@ without repeating I/O, refresh dynamic sources, and re-project the same observat
 cognition changes. Sources may opt into progressive selectors so a binding can begin external work
 before every required argument converges. Version-aware sources use lightweight freshness probes,
 streamable sources feed incremental observations into successive denoising steps, and percept
-cell/display targets become query-specific neural routing masks rather than metadata only.
+cell/display targets become query-specific neural routing masks used directly by the model/runtime.
 
 TCT uses a fixed physical capacity for efficient tensor execution but dynamic logical occupancy.
 Cognitive objects receive stable `cell_id` values, so they can be allocated, retired, reclaimed,
@@ -30,7 +30,7 @@ Bindings and strong live cognitive dependencies pin neural state. Before reclama
 tombstones preserve identity, typed anchors/links, lifecycle timing, and provenance without keeping
 the full semantic vector; weak historical links remain resolvable through this archive.
 
-Grounding is typed rather than encoded as ad-hoc strings. Anchors attach canonical symbolic
+Grounding uses typed structures. Anchors attach canonical symbolic
 objects to cognitive cells, `ObjectRef` distinguishes cells/facts/bindings/sources/display spans,
 and `CognitiveLink` records typed relations between them. The reference neural core predicts
 multiple anchor/link slots per cognitive cell, while a closed-world oracle grounder provides a
@@ -42,7 +42,7 @@ deterministic training and runtime path before open-world entity resolution is i
 
 ## Design goals
 
-1. Make the paper's state machine executable rather than simulate CID with prompt strings.
+1. Make the paper's state machine executable with CID represented directly in runtime state.
 2. Keep model-specific tensor geometry behind a stable CID contract.
 3. Enforce the fact-channel write boundary in the runtime.
 4. Treat repeated information needs as persistent perception while deduplicating external I/O.
@@ -113,12 +113,12 @@ CID supports three production backbone sizes: dense `GSAI-ML/iLLaDA-8B-Base`, sp
 `LiquidAI/LFM2.5-Encoder-350M-Diffusion` used by CID-v1-0.4B. All three keep the pretrained
 masked-token embedding and LM head, run `[TCT | prompt | display]` through their native
 bidirectional sequence model, and attach the same CID external-perception fusion and prediction
-heads. The LFM2 path preserves its original full-attention/short-convolution stack rather than
-converting its weights into an iLLaDA-shaped model. The MoE path keeps its 64-expert/Top-8 routing
+heads. The LFM2 path preserves its original full-attention/short-convolution stack and native
+weight geometry. The MoE path keeps its 64-expert/Top-8 routing
 and adds the upstream load-balancing auxiliary loss only when the backbone is unfrozen in Stage B.
-The immutable prompt remains token-level conditioning rather than being flattened into protected
-Facts. Empty TCT slots are masked as attention keys so they can query context for allocation without
-contaminating the current display.
+The immutable prompt remains token-level conditioning; protected Facts are reserved for externally
+controlled values. Empty TCT slots are masked as attention keys so they can query context for
+allocation without contaminating the current display.
 
 The same model loader and CID training/runtime ABI are used across CPU, NVIDIA CUDA, and Ascend NPU
 backends; backend support is not maintained as separate model forks:
@@ -167,7 +167,7 @@ v1.0; this repository's Apache-2.0 license does not replace the model-weight lic
 masked-display corruption, continuous TCT corruption, confidence-ranked iterative reveal, and
 bounded visible-token revision. Training
 mixes ordinary mask corruption with visible wrong-token replacement so the display head learns to
-correct stale text after new evidence arrives instead of treating every revealed token as final.
+correct stale text after new evidence arrives, including text that was already revealed.
 
 The neural path is executable end to end: `ILLaDAContextTensorizer` converts a runtime
 `ModelContext`, `ILLaDANeuralPolicy` performs a denoising step, and `CIDMaterializer` converts
@@ -179,8 +179,8 @@ arrives. A fully denoised display can terminate only after required bindings are
 final freshness barrier is satisfied; filling the last MASK alone is insufficient.
 Closed-world candidate retrieval is used for the first training stage.
 
-Training data uses typed per-step `ThoughtTarget` and `DisplayTarget` records rather than free-form
-dictionaries. `ILLaDATrajectoryTensorizer` constructs adjacent-step supervision and the CID loss
+Training data uses typed per-step `ThoughtTarget` and `DisplayTarget` records with a fixed schema.
+`ILLaDATrajectoryTensorizer` constructs adjacent-step supervision and the CID loss
 performs permutation-invariant assignment for multi-anchor and multi-link targets. The test suite
 includes a complete tiny-backbone optimizer step with the pretrained backbone frozen.
 
@@ -257,7 +257,7 @@ The trainer first equalizes schedule/trajectory loss mass at semantic-task granu
 applies explicit component `training_weight`. In v14, natural source/augmentation supervision receives
 about 49.0% of effective semantic loss mass and natural tool interaction about 39.0%. Existing
 mechanism, symbolic, correction, long-horizon, compositional, and restraint curricula remain in the
-mixture rather than being replaced by the new natural data.
+mixture alongside the new natural data.
 
 Download the current pinned release into the local gitignored workspace before training, for
 example:
@@ -275,7 +275,7 @@ v15 is reproducible from the verified v14 materialization with `cid migrate-data
 This migration does not relabel task answers or regenerate semantic teacher plans. The separate
 512-example validation set keeps 416 held-out compositional/OOD reasoning trajectories and adds 96
 held-out synthetic tool interactions (18.75%) so per-epoch validation exercises source selection,
-binding, observation assimilation, and the v3 affected-region ABI instead of measuring only no-tool
+binding, observation assimilation, and the v3 affected-region ABI as well as no-tool
 reasoning. It is a training/runtime validation set, not a replacement for the formal benchmark.
 
 The materializer verifies every component SHA/count and global `example_id` uniqueness before
@@ -381,7 +381,7 @@ The review rejects future-evidence leakage, required-argument mismatches, missin
 state, legacy process-status Display targets, and exact semantic duplicates before the plans reach
 training. Intermediate Display frames describe the current user-visible answer draft and use
 `<|cid_unknown|>` wherever answer content is not yet resolved; the trainer maps that marker to the
-backbone MASK token rather than tokenizing it as literal text.
+backbone MASK token directly.
 
 ```bash
 cid compile-distillation \
@@ -428,7 +428,7 @@ cid train \
 ```
 
 With multiple GPUs, use `torchrun`; the command detects the distributed environment automatically.
-For elastic production runs, prefer a fixed target global batch instead of pinning accumulation to one
+For elastic production runs, use a fixed target global batch so accumulation can adapt to the
 world size:
 
 ```bash
@@ -458,11 +458,11 @@ Consecutive trajectory transitions are grouped into full contiguous rollout wind
 window length, padded to equal rank counts, and sharded before training. Rollout state is detached
 after every transition, so preserving a long window does not retain a long BPTT graph.
 
-Training uses scheduled sampling instead of remaining permanently teacher-forced. By default the
+Training uses scheduled sampling. By default the
 first epoch uses teacher inputs, the next two epochs linearly ramp the probability of feeding the
 model's own detached state into the following transition, and later epochs use self-rollout. A
 `--rollout-horizon` value of 1 disables multi-step self-rollout; values greater than 1 preserve the
-full contiguous trajectory rather than injecting periodic teacher resets. The carried rollout state
+full contiguous trajectory with no periodic teacher resets. The carried rollout state
 includes TCT/display state plus runtime-materialized tool bindings, executable-argument state,
 observations, diffusion-epoch position, and promoted facts. Teacher trajectories still define
 next-step supervision and replayable external events, but an event can enter a self-rollout only
@@ -475,7 +475,7 @@ The trainer pads variable-length prompt and external-memory sequences inside eac
 CID v1 uses a fixed physical TCT width of 128 slots in both training and runtime inference. Dataset
 schedule slots are canonicalized to a deterministic first-free layout inside that fixed field; unused
 slots remain empty, and retired slots stay reserved within one supervised trajectory because
-reclamation is runtime-owned rather than a learned transition. The v1 training commands therefore
+reclamation is runtime-owned. The v1 training commands therefore
 require `--thought-capacity 128`. `--display-canvas-tokens` is the minimum display bucket (`64` by
 default); training expands it only when needed through coarse buckets (64, 128, 256, 512, 1024,
 then the configured maximum, 1536 by default). The realized text is terminated by EOS and positions
@@ -509,8 +509,8 @@ validation does not update parameters or trigger automatic early stopping. For i
 After Stage A has learned the CID runtime contract, `train-full` performs one joint full-parameter
 continuation of iLLaDA and the CID modules. The production path is deliberately **AdamW-only** and
 requires at least four GPU ranks for the 8B model. Six 48 GiB A6000s are preferred; four are the
-supported minimum. Two-rank training is rejected rather than silently switching optimizer or CPU
-offload semantics. With the current 8.25B iLLaDA checkpoint plus roughly 0.45B CID parameters, the
+supported minimum. Two-rank training is rejected to keep optimizer and CPU offload semantics
+unchanged. With the current 8.25B iLLaDA checkpoint plus roughly 0.45B CID parameters, the
 FP32 parameter/gradient/Adam state alone is about 32 GiB per rank at world size 4 and 22 GiB at
 world size 6 before activations and FSDP all-gathers.
 
@@ -532,8 +532,8 @@ throughput-oriented auto profile when CUDA memory is at least 40 GiB:
   because the curriculum has already been completed in Stage A;
 - target effective transition batch 32. Gradient accumulation is resolved automatically from the
   world size and the selected micro-batch;
-- one **target total** epoch by default. On resume, `--epochs 1` means finish epoch 1 rather than add
-  another epoch.
+- one **target total** epoch by default. On resume, `--epochs 1` means finish epoch 1, with no
+  additional epoch scheduled.
 
 A completed Stage A CID checkpoint is required for a fresh Stage B launch:
 
@@ -606,7 +606,7 @@ cid benchmark \
   --dtype bf16
 ```
 
-Stage B checkpoints remain sharded, so evaluation uses the original FSDP world size instead of
+Stage B checkpoints remain sharded, so evaluation preserves the original FSDP world size and avoids
 gathering the 8B model onto one rank:
 
 ```bash
@@ -629,8 +629,8 @@ The teacher-forced/free-rollout metrics written during training are per-transiti
 Stage A also runs a bounded family-diverse subset through the actual replay runtime after each epoch,
 recording end-to-end task results separately in `runtime_validation_metrics.jsonl`.
 
-Runtime decision thresholds are policy knobs rather than fixed checkpoint contracts. `cid benchmark`
-exposes the recommended defaults through CLI options such as `--need-threshold`,
+Runtime decision thresholds are deployment policy knobs; checkpoints leave them configurable.
+`cid benchmark` exposes the recommended defaults through CLI options such as `--need-threshold`,
 `--convergence-threshold`, `--allocation-threshold`, `--binding-threshold`, routing/presence
 thresholds, retrieval similarity, reclamation watermarks, and display-revision controls. Override them
 for calibration or deployment-specific latency/recall trade-offs; omitting them uses the recommended

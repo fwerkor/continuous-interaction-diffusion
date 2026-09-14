@@ -156,9 +156,10 @@ public training tasks and the CID compositional generalization probe, then dedup
 sources against one another. All selected tasks pass the normal CID teacher-plan review before
 trajectory compilation.
 
-Natural Questions Open supplies natural question/answer supervision rather than the original full
-Wikipedia evidence bundle, so CID models it as an idealized `knowledge_search` result containing the
-accepted answer aliases. MultiDoc2Dial and QASPER retain explicit document/evidence excerpts. OASST1
+Natural Questions Open supplies natural question/answer supervision. The original full Wikipedia
+evidence bundle is unavailable in this source, so CID models it as an idealized `knowledge_search`
+result containing the accepted answer aliases. MultiDoc2Dial and QASPER retain explicit
+document/evidence excerpts. OASST1
 uses only reviewed, non-synthetic English rank-0 assistant responses with additional quality,
 helpfulness, task-failure, PII, appropriateness, and toxicity filters.
 
@@ -173,8 +174,8 @@ The source-specific quota and canonical local output paths default from the comm
 two independently randomized arrival schedules per task.
 
 The four imported datasets are therefore **training sources**, not eligible unseen benchmark claims
-for the CID paper. Evaluation contamination checks should treat dataset identity, not only exact row
-identity, as the conservative boundary.
+for the CID paper. Evaluation contamination checks use dataset identity as the conservative
+boundary, with exact row identity as a secondary check.
 
 When adding another public dataset, update its registry and this document in the same commit. Prefer
 upstream training splits with clear licensing, preserve provenance, and keep prospective CID benchmark
@@ -183,8 +184,8 @@ families outside the training registry.
 ## Public benchmark tool environment
 
 `scripts/prepare_public_benchmarks.py` materializes unseen public benchmark splits separately from
-the training registries. Benchmark tools reuse the exact schemas used by training rather than
-introducing evaluation-only tool names:
+the training registries. Benchmark tools reuse the exact schemas used by training, avoiding
+evaluation-only tool names:
 
 | Benchmark task | Available tools |
 |---|---|
@@ -198,7 +199,7 @@ The neural argument head uses a closed-world materialization catalog. For benchm
 tools, candidate argument values are therefore generated only from the user-visible prompt plus
 fixed operation names. Reference answers, reference solutions, answer indices, supporting-fact
 labels, and hidden benchmark annotations are never used to construct argument candidates. Retrieval
-benchmarks similarly expose the task-local corpus rather than gold search/read requests.
+benchmarks similarly expose the task-local corpus; gold search/read requests remain hidden.
 
 Regenerate the benchmark JSONL before a new run:
 

@@ -1,7 +1,7 @@
 # Training plan
 
-The implementation is organized for staged conversion rather than immediate from-scratch 4B
-pretraining.
+The implementation uses staged conversion, with from-scratch 4B pretraining deferred until the
+runtime and adapter path are established.
 
 ## Dataset artifact location
 
@@ -52,14 +52,14 @@ sampled corruption level.
 Display corruption also includes visible replacement noise. Some selected target tokens are
 replaced with wrong non-mask vocabulary tokens while the clean token remains the supervision
 target. Synthetic replacements never inject EOS. This teaches the display head to correct
-already-visible stale text after new evidence arrives, rather than learning only MASK-to-token
-completion. At inference, masked positions are revealed by confidence and a bounded fraction of
+already-visible stale text after new evidence arrives while retaining ordinary MASK-to-token
+completion in the objective. At inference, masked positions are revealed by confidence and a bounded fraction of
 visible positions may be rewritten when the best alternative exceeds the current token probability
 by a configured margin. EOS is emitted only at the leftmost unresolved frontier; positions after
 the first EOS remain masked and outside the active display span. The mask token itself is
 excluded from output candidates.
 
-Teacher trajectories should contain pre-arrival and post-arrival states, not only final answers.
+Teacher trajectories should contain pre-arrival states, post-arrival states, and final answers.
 They should also supervise cell creation, retirement, optional split/merge lineage, and stable cell
 identity across physical compaction. Arrival time, source freshness, cache availability, and
 physical slot placement are randomized so a model cannot assign permanent semantics to slot index.
@@ -75,8 +75,8 @@ quiescence when required evidence is pending and as a terminal candidate only wh
 resolved. It therefore does not treat "no MASK tokens remain" as sufficient evidence that the task
 is finished.
 Training rollouts should also randomize slot pressure. Retired cells are archived and reclaimed by
-runtime policy rather than model logits; supervision should not teach the model to encode garbage
-collection decisions in TCT. Reclamation traces can be used to measure whether a trained model
+runtime policy; model logits do not control garbage collection, and supervision should not encode
+those decisions in TCT. Reclamation traces can be used to measure whether a trained model
 creates excessive short-lived cognition or retains cells unnecessarily.
 
 Grounding supervision is multi-valued per cell. Anchor slots learn presence, anchor kind, and a
@@ -107,8 +107,8 @@ the epoch-end step name are compatibility symlinks to that permanent snapshot.
 Checkpoint metadata also carries a neural-contract version. Contract v3 adds learned
 need-to-cell/display routing and source-declared protected-result promotion on top of the unified
 diffusion-state contract. Changes to tensor geometry or train/runtime semantics intentionally bump
-this contract and reject older checkpoints rather than silently loading weights trained against a
-different ABI.
+this contract; incompatible older checkpoints are rejected before weights from a different ABI can
+be loaded.
 
 Both training stages accept `--validation-data <trajectory.jsonl>`. If it is omitted and the main
 trajectory JSONL contains `metadata.split` labels, `train` examples are used for optimization,
@@ -136,9 +136,8 @@ into a variable-length micro-batch and supplies the corresponding attention/padd
 accumulation from the actual world size while keeping the global effective transition batch stable.
 For example, micro-batch 1 with target batch 96 resolves to accumulation 24 on four ranks and 12 on
 eight ranks. `--gradient-accumulation-steps` remains an explicit override, and omitting both options
-keeps the legacy default of eight accumulation steps. Accumulated gradients are normalized by the
-number of examples rather than by the number of micro-batches, so a smaller final micro-batch is not
-overweighted. Native backbone gradient checkpointing is enabled by the launcher
+keeps the legacy default of eight accumulation steps. Accumulated gradients are normalized by
+example count, which prevents a smaller final micro-batch from being overweighted. Native backbone gradient checkpointing is enabled by the launcher
 by default to reduce activation
 memory while retaining gradients to CID inputs through the frozen backbone. The adapter also
 constructs per-sample position IDs from valid prompt and
@@ -160,9 +159,9 @@ schedule, but during self-rollout they are exposed only when the preceding model
 matching executable binding. ONCE observations retire from percept memory after consumption, while
 source-owned promoted facts and replay-observation history persist. If the rollout misses a required
 observation, thought and Display supervision are clamped to the latest causally reachable teacher
-state rather than exposing a future tool-derived fact. Allocation, revision, lifecycle, and ONCE-need
-targets are resolved against the state actually fed to the model so rollout errors receive recovery
-supervision instead of contradictory or non-causal teacher-state labels.
+state, preventing future tool-derived facts from leaking into the target. Allocation, revision, lifecycle, and ONCE-need
+targets are resolved against the state actually fed to the model so rollout errors receive causally
+consistent recovery supervision.
 
 Stage A stores the frozen backbone at the requested low precision but recasts trainable CID-only
 modules to FP32 and runs the forward pass under autocast. AdamW therefore maintains FP32 parameters
@@ -209,7 +208,7 @@ OMP_NUM_THREADS=48 MKL_NUM_THREADS=48 \
   --init-cid-checkpoint /path/to/stage-a-latest.pt
 ```
 
-The thread count and CPU-rank count are deployment tuning parameters rather than model semantics.
+The thread count and CPU-rank count are deployment tuning parameters; they do not affect model semantics.
 On a single-process CPU launch, PyTorch may reduce `FULL_SHARD` to `NO_SHARD`; multi-rank CPU
 launches retain FSDP sharding.
 
@@ -229,14 +228,14 @@ Stage B starts at rollout probability 1.0 by default. Stage A has already perfor
 teacher-forcing-to-rollout curriculum, so restarting that curriculum after unfreezing the backbone
 would train the full model on an easier distribution than the one used at inference. `--epochs` is a
 target-total count: resuming a partially completed one-epoch run with `--epochs 1` finishes that
-same epoch instead of scheduling a second one.
+same epoch, with no second epoch scheduled.
 
 Closed-loop state continuity is independent of optimizer accumulation. A long trajectory may carry
 its detached predicted T/Y state across many transitions. Terminal or quiescent model decisions do
 not delete later supervision: a blocked transition receives a teacher-input correction loss while
-the blocked rollout state itself is preserved. AdamW accumulation counts globally valid transitions
-rather than backward calls or padded rows, and the Stage B warmup/WSD schedule is precomputed
-with the same valid-transition rule. The target global batch therefore remains meaningful even for
+the blocked rollout state itself is preserved. AdamW accumulation counts globally valid
+transitions; backward calls and padded rows do not enter the count. The Stage B warmup/WSD schedule
+uses the same valid-transition rule. The target global batch therefore remains meaningful even for
 long trajectories and uneven final shards. Closed-loop display diffusion resets only when a
 materialized predicted binding actually obtains replayed external progress; teacher event timing by
 itself cannot reset the diffusion epoch.
@@ -258,8 +257,8 @@ diffusion/shuffle RNG, transition and optimizer counts, completed epochs, and th
 cursor. Stage B metadata carries the same neural-contract version as Stage A; incompatible older
 model/optimizer shards fail before loading. New sharded Stage B checkpoints also store the exact
 frozen semantic embedding as `semantic-embedding.pt`; ordinary single-NPU Stage B checkpoints embed
-the same snapshot in the `.pt` payload. Resume and format-6 inference restore this saved snapshot
-rather than rebuilding semantic transport from the already fine-tuned live embedding. The default
+the same snapshot in the `.pt` payload. Resume and format-6 inference restore this saved snapshot,
+keeping semantic transport fixed while the live embedding is fine-tuned. The default
 launcher logs every 100 optimizer steps and writes periodic checkpoints only at
 clean gradient-accumulation boundaries. Every completed epoch is separately retained as
 `stage-b-epoch-XXXX` for sharded training or `stage-b-epoch-XXXX.pt` on the single-NPU compact path;
@@ -301,8 +300,8 @@ reasoning transcripts as a target representation: `semantic_text` is a short sta
 as dataset transport for a latent target.
 
 Teacher plans cannot choose physical TCT slots, diffusion steps, evidence arrival times, or cache
-schedules. The parser rejects those fields and any unknown control fields rather than silently
-discarding them. `compile_teacher_plans()` then independently samples physical slot placement and
+schedules. The parser explicitly rejects those fields and any unknown control fields.
+`compile_teacher_plans()` then independently samples physical slot placement and
 event delays. While a required observation is outstanding, the compiler inserts `WAITING` frames;
 at arrival it forces the affected cell through `ACTIVE` for assimilation before applying a teacher
 state that may become `STABLE`. The result is the same `TrajectoryExample` ABI consumed by the
@@ -375,8 +374,9 @@ these tasks have dependency depth two.
 The pinned self-distillation contains 31,200 causal teacher stages. All 12,000 semantic plans pass
 `review-distillation`; compilation uses two independently sampled timing/slot schedules per semantic
 task, yielding 24,000 `TrajectoryExample` records and 111,609 adjacent supervised transitions.
-`data/computational-teacher-v1.reference-manifest.json` records the exact hashes. Teacher TCT text is
-kept as short semantic state rather than a reasoning transcript; arrived calculator/Python/lookup
+`data/computational-teacher-v1.reference-manifest.json` records the exact hashes. Teacher TCT text
+is kept as short semantic state summaries; reasoning transcripts are excluded; arrived
+calculator/Python/lookup
 percepts carry anchors and `observes` links, executable needs carry `requests` links, and terminal
 conclusions carry `derived_from` links.
 
@@ -410,8 +410,8 @@ the local-correction audit. Exact hashes are pinned by
 The latest semantic mixture remains the v14 mixture published as
 `manifests/training-semantic-mixture-v14.json` on Hugging Face: **192,297 semantic tasks** across 19
 components. Relative to v13 it added 51,500 independent train-only natural public tasks from Natural
-Questions Open, OASST1, MultiDoc2Dial, and QASPER. Their original user-facing prompts are preserved
-rather than wrapped in CID-specific causality instructions. The existing 4,000-task compositional OOD
+Questions Open, OASST1, MultiDoc2Dial, and QASPER. Their original user-facing prompts are
+preserved without CID-specific causality wrappers. The existing 4,000-task compositional OOD
 probe remains excluded from training.
 
 Schedule variants and trajectory length are first balanced at semantic-task granularity; explicit
@@ -435,8 +435,8 @@ materialized as a runtime-owned policy. Prompts, answers, external events, thoug
 multiplicity, and the 3,011,462-transition training mass are unchanged from v14. Exact v15 hashes and
 routing counts are pinned by `release/materialized-manifest.json` in the dataset repository.
 
-Neural contract **v4** is the current training/runtime contract in the source tree and deliberately
-requires a fresh Display rematerialization rather than treating v15 as compatible. In v4 the Display
+Neural contract **v4** is the current training/runtime contract in the source tree and requires a
+fresh Display rematerialization; v15 checkpoints are incompatible. In v4 the Display
 canvas is a fixed-capacity latent field whose positions remain available after the current EOS, so a
 later diffusion step can move EOS and expand or rewrite the answer. `<|cid_unknown|>` in semantic
 Display supervision maps to the backbone MASK token and may remain unresolved until reasoning or an
@@ -452,8 +452,8 @@ previously under-detected process-status target occurrences are removed, while 4
 answer targets are derived only for multi-hop QA steps whose `support-*` facts are already present in
 the TCT. Internal dependency curricula are not exposed as user-visible partial answers. The v4
 validation split combines OOD reasoning, held-out synthetic tool interactions, and independent-seed
-curated contract probes so partial-answer revision is measured explicitly rather than inferred from
-final exact-match alone. v3 checkpoints fail the v4 neural-contract compatibility check.
+curated contract probes so partial-answer revision is measured explicitly alongside final
+exact-match. v3 checkpoints fail the v4 neural-contract compatibility check.
 
 The current `evaluation/validation-v4/validation-512.jsonl` contains **368** held-out OOD reasoning
 examples, **96** held-out synthetic tool-required interactions, and **48** independent-seed curated
@@ -488,10 +488,10 @@ the normal teacher-plan review remains enabled, including duplicate rejection, s
 anchors, and typed cognitive links.
 
 No-tool plans may contain `refine:0`, `refine:1`, ... semantic frames. These frames supervise compact
-TCT state refinement rather than hidden chain-of-thought text, and they are forbidden on plans with
+TCT state refinement; hidden chain-of-thought text is not used, and they are forbidden on plans with
 external evidence. The generalization probe is excluded from training and uses a strictly disjoint
 domain vocabulary plus a heavier depth/capacity tail and denser long-range dependencies. Surface
-rephrasings are measured as a generalization axis rather than claimed as a strict lexical holdout.
+rephrasings are measured as a generalization axis; this is not claimed as a strict lexical holdout.
 
 CID v1 uses 128 as the **fixed physical TCT width** in both training and runtime inference. The
 8/16/32/64/128 labels describe cognitive-load buckets in the teacher trajectories; every transition
@@ -539,8 +539,8 @@ prompt group in either component is 11. All 24,000 replacement plans pass the no
 The new `deep-tool-restraint-v1` component samples 4,000 accepted compositional long-tail tasks with
 dependency depth at least eight. It selects exactly 1,000 tasks from each 16/32/64/128-slot bucket,
 exposes an irrelevant read-only `record_lookup` interface, but provides no external evidence and
-preserves plans with zero tool needs. These hard negatives train tool restraint during genuinely deep
-internal reasoning instead of only on short self-contained questions. They increase the v11
+preserves plans with zero tool needs. These hard negatives extend tool-restraint training to
+genuinely deep internal reasoning and complement the short self-contained questions. They increase the v11
 `tools_available_unnecessary` fraction to 10.176%; 2,611 of the added examples have dependency depth
 at least 16.
 
@@ -552,9 +552,9 @@ cid build-deep-tool-restraint-training
 
 The three release manifests are `data/composed-teacher-v2.reference-manifest.json`,
 `data/long-horizon-teacher-v2.reference-manifest.json`, and
-`data/deep-tool-restraint-v1.reference-manifest.json`. v11 references the v2 replacements instead of
-the corresponding v1 components, so surface augmentation does not double-count the same semantic
-supervision.
+`data/deep-tool-restraint-v1.reference-manifest.json`. v11 references only the v2 replacements;
+the corresponding v1 components are excluded so surface augmentation does not double-count the
+same semantic supervision.
 
 The historical v5 six-component training input is pinned separately by
 `data/training-trajectory-mixture-v5.json`. It preserves every reviewed schedule variant from
@@ -649,8 +649,8 @@ cid teacher-agent-checkout \
 
 The agent reads `.cid/teacher-agent/INSTRUCTIONS.md` and `current/requests/*.json`, then writes the
 stage output directly to `current/responses/<request_id>.json`. Request files contain structured
-`task`, `previous_state`, `arrived_evidence`, and `available_evidence_contracts` fields instead of
-repeating the long worker prompt for every item. They still exclude the reference answer and all
+`task`, `previous_state`, `arrived_evidence`, and `available_evidence_contracts` fields, avoiding
+repetition of the long worker prompt for every item. They still exclude the reference answer and all
 future evidence values.
 
 The interactive adapter treats TCT structure as supervised data, not optional metadata. Its
@@ -692,8 +692,8 @@ cid review-distillation \
 ```
 
 The review gate also checks public reference answers for multi-hop QA, multiple-choice tasks, and
-GSM8K-style numeric tasks. MATH and executable code are intentionally left to task-specific
-equivalence/execution validators rather than unsafe string equality.
+GSM8K-style numeric tasks. MATH and executable code use task-specific equivalence/execution
+validators because raw string equality is unsafe for these tasks.
 
 After semantic plans pass review, runtime counterfactuals require no additional teacher calls.
 Multiple physical-slot and asynchronous-latency variants can be compiled directly:
@@ -716,7 +716,7 @@ sequence. This preserves causal semantic supervision while training actual async
 
 After compilation, `dataset-manifest` records the exact JSONL SHA-256 together with example and
 transition counts, scenario/distillation tags, source names, maximum trajectory depth, and required
-TCT capacity. This gives every training run a deterministic dataset identity instead of relying on
+TCT capacity. This gives every training run a deterministic dataset identity independent of
 mutable filenames.
 
 ## Stage 2 — joint T/Y refinement
@@ -731,7 +731,7 @@ chain-of-thought imitation task.
 
 Only after the runtime and adapter path show measurable intent lead time and useful post-arrival
 revision should we spend compute on a dedicated small model. A 4B-class model can then be trained
-with the same state/data contract rather than changing the system architecture during scaling.
+with the same state/data contract, preserving the system architecture during scaling.
 
 ## Dataset record
 
@@ -756,8 +756,9 @@ which directly supervise need/source/argument/refresh heads. Optional per-argume
 steps let a trajectory supervise partially bound calls before the whole source invocation becomes
 executable.
 
-`ThoughtTarget.semantic_text` is a dataset transport format rather than runtime chain-of-thought.
-The tensorizer embeds it into the latent TCT target; the deployed model only carries continuous
+`ThoughtTarget.semantic_text` is a dataset transport format for latent targets. The deployed runtime
+does not expose it as chain-of-thought. The tensorizer embeds it into the latent TCT target; the
+deployed model only carries continuous
 cell semantics, typed anchors/links, and runtime-visible needs.
 
 The schema deliberately records *when* evidence becomes available. Flattening events into the
