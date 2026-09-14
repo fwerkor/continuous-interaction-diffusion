@@ -1,7 +1,9 @@
 from __future__ import annotations
 
+import importlib.util
 import json
 from pathlib import Path
+from types import ModuleType
 
 from cid.benchmark_tools import (
     BENCHMARK_ARGUMENT_CANDIDATES_METADATA_KEY,
@@ -16,6 +18,16 @@ from cid.data import TrajectoryExample
 from cid.evaluation import build_replay_registry
 from cid.symbolic_training import symbolic_math_descriptor as training_symbolic_math_descriptor
 from cid.tool_schemas import calculator_descriptor, python_descriptor, symbolic_math_descriptor
+
+
+def _load_script(name: str) -> ModuleType:
+    path = Path(__file__).resolve().parents[1] / "scripts" / f"{name}.py"
+    spec = importlib.util.spec_from_file_location(f"cid_test_{name}", path)
+    if spec is None or spec.loader is None:
+        raise RuntimeError(f"could not load script module from {path}")
+    module = importlib.util.module_from_spec(spec)
+    spec.loader.exec_module(module)
+    return module
 
 
 def _candidate_values(prompt: str, task_kind: str) -> set[tuple[str, str, str]]:
@@ -110,7 +122,9 @@ async def test_live_python_source_rejects_unsafe_code() -> None:
 
 
 def test_sweep_completion_requires_current_dataset_hash(tmp_path: Path) -> None:
-    from scripts.run_public_benchmark_sweep import _merged_result_complete, _result_complete
+    sweep = _load_script("run_public_benchmark_sweep")
+    _merged_result_complete = sweep._merged_result_complete
+    _result_complete = sweep._result_complete
 
     result = tmp_path / "results.jsonl"
     result.write_text("{}\n", encoding="utf-8")
@@ -132,7 +146,7 @@ def test_sweep_completion_requires_current_dataset_hash(tmp_path: Path) -> None:
 
 
 def test_public_benchmark_preparation_enables_tools_without_gold_arguments() -> None:
-    from scripts.prepare_public_benchmarks import _trajectory
+    _trajectory = _load_script("prepare_public_benchmarks")._trajectory
 
     record = {
         "task_id": "bench-gsm-fixture",
