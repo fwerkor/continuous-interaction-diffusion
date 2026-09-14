@@ -6,6 +6,14 @@ import json
 from pathlib import Path
 from typing import Any
 
+from cid.benchmark_tools import (
+    BENCHMARK_ARGUMENT_CANDIDATES_METADATA_KEY,
+    BENCHMARK_LIVE_TOOL_LATENCY_STEPS_METADATA_KEY,
+    BENCHMARK_LIVE_TOOLS_METADATA_KEY,
+    benchmark_argument_candidates,
+    benchmark_live_tool_names,
+    benchmark_tool_descriptors,
+)
 from cid.data import BindingTarget, ExternalEvent, TrajectoryExample, dump_jsonl
 from cid.public_tasks import PublicTaskRowRejected, _adapt_row, _jsonable, _semantic_id
 from cid.public_training import PublicTrainingConfig, _teacher_task_from_public
@@ -173,6 +181,15 @@ def _trajectory(record: dict[str, Any]) -> TrajectoryExample:
         "task_kind": record["task_kind"],
         "semantic_id": record["semantic_id"],
     }
+    benchmark_descriptors = benchmark_tool_descriptors(str(record["task_kind"]))
+    if benchmark_descriptors:
+        metadata[BENCHMARK_LIVE_TOOLS_METADATA_KEY] = list(
+            benchmark_live_tool_names(benchmark_descriptors)
+        )
+        metadata[BENCHMARK_LIVE_TOOL_LATENCY_STEPS_METADATA_KEY] = 2
+        metadata[BENCHMARK_ARGUMENT_CANDIDATES_METADATA_KEY] = benchmark_argument_candidates(
+            record["prompt"], benchmark_descriptors
+        )
     if record["task_kind"] == "python_programming":
         metadata["public_tests"] = list(record["metadata"].get("tests", ()))
         metadata["challenge_tests"] = list(record["metadata"].get("challenge_tests", ()))
@@ -183,6 +200,7 @@ def _trajectory(record: dict[str, Any]) -> TrajectoryExample:
             example_id=record["task_id"],
             prompt=record["prompt"],
             target_display=record["reference_answer"],
+            source_descriptors=benchmark_descriptors,
             metadata=metadata,
         )
 
@@ -261,7 +279,7 @@ def main() -> None:
     output_dir = Path(args.output_dir)
     output_dir.mkdir(parents=True, exist_ok=True)
     training_ids = _training_semantic_ids(Path(args.training_data))
-    overall: dict[str, Any] = {"format_version": 2, "datasets": {}}
+    overall: dict[str, Any] = {"format_version": 3, "datasets": {}}
 
     for source in SOURCES:
         examples: list[TrajectoryExample] = []
@@ -311,6 +329,11 @@ def main() -> None:
             "rejected_rows": rejected,
             "training_semantic_overlap_excluded": overlap,
             "examples": len(examples),
+            "benchmark_tools": (
+                [str(item["name"]) for item in benchmark_tool_descriptors(source["task_kind"])]
+                if source["use"] != "toolizable_retrieval"
+                else ["workspace_search", "workspace_read"]
+            ),
             "jsonl": path.name,
             "jsonl_sha256": _sha256(path),
             "upstream_files": upstream_files,

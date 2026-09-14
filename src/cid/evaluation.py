@@ -436,6 +436,146 @@ class DeterministicCalculatorSource(_StepDelayedSource):
         )
 
 
+def _bounded_python_range(*args: int) -> range:
+    values = range(*args)
+    if len(values) > 100_000:
+        raise ValueError("python range is too large")
+    return values
+
+
+_PYTHON_FUNCTIONS: dict[str, Any] = {
+    "abs": abs,
+    "all": all,
+    "any": any,
+    "len": len,
+    "max": max,
+    "min": min,
+    "range": _bounded_python_range,
+    "round": round,
+    "sorted": sorted,
+    "sum": sum,
+}
+_PYTHON_ALLOWED_NODES = (
+    ast.Expression,
+    ast.Constant,
+    ast.List,
+    ast.Tuple,
+    ast.Name,
+    ast.Load,
+    ast.Store,
+    ast.BinOp,
+    ast.UnaryOp,
+    ast.BoolOp,
+    ast.Compare,
+    ast.IfExp,
+    ast.Call,
+    ast.Subscript,
+    ast.Slice,
+    ast.GeneratorExp,
+    ast.ListComp,
+    ast.comprehension,
+    ast.Add,
+    ast.Sub,
+    ast.Mult,
+    ast.Div,
+    ast.FloorDiv,
+    ast.Mod,
+    ast.Pow,
+    ast.BitXor,
+    ast.UAdd,
+    ast.USub,
+    ast.Not,
+    ast.And,
+    ast.Or,
+    ast.Eq,
+    ast.NotEq,
+    ast.Lt,
+    ast.LtE,
+    ast.Gt,
+    ast.GtE,
+    ast.In,
+    ast.NotIn,
+)
+
+
+def _evaluate_python_computation(code: str) -> str:
+    code = code.strip()
+    if not code or len(code) > 768:
+        raise ValueError("python computation is empty or too long")
+    tree = ast.parse(code, mode="eval")
+    nodes = tuple(ast.walk(tree))
+    if len(nodes) > 256:
+        raise ValueError("python computation is too complex")
+    comprehension_names = {
+        target.id
+        for node in nodes
+        if isinstance(node, ast.comprehension)
+        for target in (node.target,)
+        if isinstance(target, ast.Name)
+    }
+    for node in nodes:
+        if not isinstance(node, _PYTHON_ALLOWED_NODES):
+            raise ValueError(f"unsupported python expression node: {type(node).__name__}")
+        if isinstance(node, ast.Constant):
+            if isinstance(node.value, bool) or not isinstance(node.value, int | float):
+                raise ValueError("python computation supports numeric literals only")
+            if abs(float(node.value)) > 1e12:
+                raise ValueError("python numeric literal is outside the supported range")
+        allowed_names = set(_PYTHON_FUNCTIONS) | comprehension_names
+        if isinstance(node, ast.Name) and node.id not in allowed_names:
+            raise ValueError("python computation contains an undeclared name")
+        if isinstance(node, ast.Call) and (
+            not isinstance(node.func, ast.Name)
+            or node.func.id not in _PYTHON_FUNCTIONS
+            or node.keywords
+        ):
+            raise ValueError("unsupported python function call")
+        if (
+            isinstance(node, ast.BinOp)
+            and isinstance(node.op, ast.Pow)
+            and isinstance(node.right, ast.Constant)
+            and abs(float(node.right.value)) > 12
+        ):
+            raise ValueError("python exponent is outside the supported range")
+    value = eval(  # noqa: S307 - AST and callable whitelists define this expression sandbox.
+        compile(tree, "<cid-benchmark-python>", "eval"),
+        {"__builtins__": {}, **_PYTHON_FUNCTIONS},
+        {},
+    )
+    if isinstance(value, bool) or not isinstance(value, int | float | list | tuple):
+        raise ValueError("python computation returned an unsupported value type")
+    if isinstance(value, (list, tuple)) and len(value) > 256:
+        raise ValueError("python computation returned too many values")
+    if (
+        isinstance(tree.body, ast.Call)
+        and isinstance(tree.body.func, ast.Name)
+        and tree.body.func.id == "round"
+        and len(tree.body.args) == 2
+        and isinstance(tree.body.args[1], ast.Constant)
+        and isinstance(tree.body.args[1].value, int)
+    ):
+        digits = tree.body.args[1].value
+        if -12 <= digits <= 12:
+            return f"{float(value):.{digits}f}"
+    return str(value)
+
+
+class DeterministicPythonSource(_StepDelayedSource):
+    async def read(self, arguments: Mapping[str, Any]) -> Observation:
+        code = str(arguments.get("code", "")).strip()
+        await self._wait_for_latency()
+        try:
+            value: Any = _evaluate_python_computation(code)
+        except (ArithmeticError, SyntaxError, TypeError, ValueError, OverflowError) as exc:
+            value = {"code": code, "error": str(exc)}
+        return Observation(
+            value=value,
+            version=f"python-v1:{code}",
+            provenance="deterministic-python",
+            observed_at=time.monotonic(),
+        )
+
+
 _SYMBOLIC_OPERATIONS = frozenset(
     {
         "solve",
@@ -627,6 +767,8 @@ def build_replay_registry(example: TrajectoryExample) -> SourceRegistry:
             source = DeterministicCalculatorSource(
                 descriptor, latency_steps=live_tool_latency_steps
             )
+        elif descriptor.name in live_tools and descriptor.name == "python":
+            source = DeterministicPythonSource(descriptor, latency_steps=live_tool_latency_steps)
         elif descriptor.name in live_tools and descriptor.name == "symbolic_math":
             source = DeterministicSymbolicMathSource(
                 descriptor, latency_steps=live_tool_latency_steps

@@ -1,6 +1,7 @@
 from __future__ import annotations
 
 import argparse
+import hashlib
 import json
 import os
 import subprocess
@@ -21,12 +22,39 @@ DATASETS = (
 )
 
 
-def _result_complete(summary_path: Path, result_path: Path) -> bool:
+def _sha256(path: Path) -> str:
+    digest = hashlib.sha256()
+    with path.open("rb") as handle:
+        for chunk in iter(lambda: handle.read(8 * 1024 * 1024), b""):
+            digest.update(chunk)
+    return digest.hexdigest()
+
+
+def _result_complete(summary_path: Path, result_path: Path, dataset_sha256: str) -> bool:
     if not summary_path.is_file() or not result_path.is_file():
         return False
     try:
         summary = json.loads(summary_path.read_text(encoding="utf-8"))
         expected = int(summary["dataset"]["examples"])
+        if str(summary["dataset"]["sha256"]) != dataset_sha256:
+            return False
+    except (KeyError, TypeError, ValueError, json.JSONDecodeError):
+        return False
+    with result_path.open("r", encoding="utf-8") as handle:
+        actual = sum(1 for line in handle if line.strip())
+    return actual == expected
+
+
+def _merged_result_complete(dataset_dir: Path, dataset_sha256: str) -> bool:
+    summary_path = dataset_dir / "summary.json"
+    result_path = dataset_dir / "results.jsonl"
+    if not summary_path.is_file() or not result_path.is_file():
+        return False
+    try:
+        summary = json.loads(summary_path.read_text(encoding="utf-8"))
+        expected = int(summary["examples"])
+        if str(summary["dataset_sha256"]) != dataset_sha256:
+            return False
     except (KeyError, TypeError, ValueError, json.JSONDecodeError):
         return False
     with result_path.open("r", encoding="utf-8") as handle:
@@ -145,13 +173,19 @@ def main() -> None:
         raise SystemExit("workers-per-gpu and shard-count must be positive")
 
     queue: deque[tuple[str, int]] = deque()
+    dataset_sha256: dict[str, str] = {}
     for dataset in DATASETS:
         data_path = data_dir / f"{dataset}.jsonl"
         if not data_path.is_file():
             raise SystemExit(f"missing benchmark dataset: {data_path}")
+        dataset_sha256[dataset] = _sha256(data_path)
         for shard in range(args.shard_count):
             shard_dir = output_root / dataset / f"shard-{shard:02d}"
-            if not _result_complete(shard_dir / "summary.json", shard_dir / "results.jsonl"):
+            if not _result_complete(
+                shard_dir / "summary.json",
+                shard_dir / "results.jsonl",
+                dataset_sha256[dataset],
+            ):
                 queue.append((dataset, shard))
 
     running: dict[int, tuple[subprocess.Popen[Any], str, int, int, Any]] = {}
@@ -249,12 +283,13 @@ def main() -> None:
 
         for dataset in DATASETS:
             dataset_dir = output_root / dataset
-            if (dataset_dir / "summary.json").is_file():
+            if _merged_result_complete(dataset_dir, dataset_sha256[dataset]):
                 continue
             complete = all(
                 _result_complete(
                     dataset_dir / f"shard-{shard:02d}" / "summary.json",
                     dataset_dir / f"shard-{shard:02d}" / "results.jsonl",
+                    dataset_sha256[dataset],
                 )
                 for shard in range(args.shard_count)
             )
@@ -267,6 +302,7 @@ def main() -> None:
         "finished_unix_s": time.time(),
         "elapsed_s": time.time() - started,
         "datasets": list(DATASETS),
+        "dataset_sha256": dataset_sha256,
         "gpus": list(gpus),
         "workers_per_gpu": args.workers_per_gpu,
         "shard_count": args.shard_count,

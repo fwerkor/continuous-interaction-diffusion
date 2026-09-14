@@ -179,3 +179,36 @@ identity, as the conservative boundary.
 When adding another public dataset, update its registry and this document in the same commit. Prefer
 upstream training splits with clear licensing, preserve provenance, and keep prospective CID benchmark
 families outside the training registry.
+
+## Public benchmark tool environment
+
+`scripts/prepare_public_benchmarks.py` materializes unseen public benchmark splits separately from
+the training registries. Benchmark tools reuse the exact schemas used by training rather than
+introducing evaluation-only tool names:
+
+| Benchmark task | Available tools |
+|---|---|
+| GSM8K | `calculator(expression)`, `python(code)` |
+| MATH | `symbolic_math(operation, expression, variables)`, `calculator(expression)`, `python(code)` |
+| MMLU / ARC-Challenge | `calculator(expression)` |
+| MBPP | none; the trained `python(code)` tool is a pure-computation tool, not a program-execution sandbox |
+| HotpotQA / 2WikiMultiHopQA / MuSiQue | `workspace_search(query)`, `workspace_read(resource_id)` |
+
+The neural argument head uses a closed-world materialization catalog. For benchmark computation
+tools, candidate argument values are therefore generated only from the user-visible prompt plus
+fixed operation names. Reference answers, reference solutions, answer indices, supporting-fact
+labels, and hidden benchmark annotations are never used to construct argument candidates. Retrieval
+benchmarks similarly expose the task-local corpus rather than gold search/read requests.
+
+Regenerate the benchmark JSONL before a new run:
+
+```bash
+PYTHONPATH=src python scripts/prepare_public_benchmarks.py \
+  --training-data <training-jsonl> \
+  --output-dir <benchmark-data-dir>
+```
+
+`scripts/run_public_benchmark_sweep.py` records and checks each input JSONL SHA-256. If the prepared
+benchmark data changes, old shard summaries no longer count as completed, preventing results from a
+previous tool environment from being silently reused. Preparing the JSONL does not run model
+inference; the sweep remains a separate explicit command.

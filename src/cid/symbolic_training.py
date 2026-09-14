@@ -11,8 +11,12 @@ from typing import Any
 import sympy as sp
 
 from cid.causal_distill import build_causal_teacher_job, dump_causal_teacher_jobs
-from cid.computational_training import calculator_descriptor, record_lookup_descriptor
 from cid.distill import TeacherEvidence, TeacherTask, dump_teacher_requests, dump_teacher_tasks
+from cid.tool_schemas import (
+    calculator_descriptor,
+    record_lookup_descriptor,
+    symbolic_math_descriptor,
+)
 
 SYMBOLIC_FAMILIES = (
     "linear_equation",
@@ -43,39 +47,6 @@ class SymbolicTrainingConfig:
     @property
     def total_tasks(self) -> int:
         return self.count_per_family * len(SYMBOLIC_FAMILIES)
-
-
-def symbolic_math_descriptor() -> dict[str, Any]:
-    return {
-        "name": "symbolic_math",
-        "description": (
-            "Perform exact symbolic algebra or calculus. Supported operations include solve, "
-            "solve_system, expand, factor, simplify, differentiate, integrate, and equivalent."
-        ),
-        "arguments": (
-            {
-                "name": "operation",
-                "kind": "string",
-                "description": "symbolic operation to perform",
-                "required": True,
-            },
-            {
-                "name": "expression",
-                "kind": "string",
-                "description": "expression, equation, or semicolon-separated equation system",
-                "required": True,
-            },
-            {
-                "name": "variables",
-                "kind": "string",
-                "description": "comma-separated symbolic variables",
-                "required": True,
-            },
-        ),
-        "cacheable": True,
-        "dynamic": False,
-        "versioned": False,
-    }
 
 
 def build_symbolic_training(
