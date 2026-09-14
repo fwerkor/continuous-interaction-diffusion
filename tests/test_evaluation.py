@@ -280,6 +280,27 @@ def _workspace_example() -> TrajectoryExample:
     )
 
 
+async def test_task_local_workspace_defaults_to_zero_artificial_latency() -> None:
+    example = _workspace_example()
+    example = TrajectoryExample(
+        example_id=example.example_id,
+        prompt=example.prompt,
+        target_display=example.target_display,
+        source_descriptors=example.source_descriptors,
+        metadata={
+            key: value
+            for key, value in example.metadata.items()
+            if key != "benchmark_workspace_latency_steps"
+        },
+    )
+    registry = build_replay_registry(example)
+    search = registry.get("workspace_search")
+    registry.advance_runtime_step(0)
+    observation = await search.read({"query": "Scott Derrickson"})
+    assert registry.next_runtime_step() is None
+    assert observation.value[0]["resource_id"] == "doc-01"
+
+
 async def test_task_local_workspace_accepts_non_gold_search_queries_and_reads() -> None:
     registry = build_replay_registry(_workspace_example())
     search = registry.get("workspace_search")
@@ -347,6 +368,27 @@ def _live_math_example() -> TrajectoryExample:
             "benchmark_live_tool_latency_steps": 1,
         },
     )
+
+
+async def test_live_calculator_source_defaults_to_zero_artificial_latency() -> None:
+    example = TrajectoryExample(
+        example_id="live-calculator-zero-latency",
+        prompt="Compute 1+1.",
+        target_display="2",
+        source_descriptors=(
+            {
+                "name": "calculator",
+                "description": "evaluate a deterministic numeric expression",
+                "arguments": ({"name": "expression", "kind": "string", "required": True},),
+            },
+        ),
+        metadata={"benchmark_live_tools": ["calculator"]},
+    )
+    registry = build_replay_registry(example)
+    registry.advance_runtime_step(0)
+    observation = await registry.get("calculator").read({"expression": "1+1"})
+    assert registry.next_runtime_step() is None
+    assert observation.value == "2"
 
 
 async def test_live_calculator_source_executes_deterministically() -> None:

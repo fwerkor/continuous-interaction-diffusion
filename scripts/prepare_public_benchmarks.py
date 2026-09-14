@@ -186,7 +186,7 @@ def _trajectory(record: dict[str, Any]) -> TrajectoryExample:
         metadata[BENCHMARK_LIVE_TOOLS_METADATA_KEY] = list(
             benchmark_live_tool_names(benchmark_descriptors)
         )
-        metadata[BENCHMARK_LIVE_TOOL_LATENCY_STEPS_METADATA_KEY] = 2
+        metadata[BENCHMARK_LIVE_TOOL_LATENCY_STEPS_METADATA_KEY] = 0
         metadata[BENCHMARK_ARGUMENT_CANDIDATES_METADATA_KEY] = benchmark_argument_candidates(
             record["prompt"], benchmark_descriptors
         )
@@ -218,7 +218,7 @@ def _trajectory(record: dict[str, Any]) -> TrajectoryExample:
         for index, resource in enumerate(evidence_bank)
     ]
     metadata["benchmark_workspace_search_top_k"] = 5
-    metadata["benchmark_workspace_latency_steps"] = 2
+    metadata["benchmark_workspace_latency_steps"] = 0
     metadata["benchmark_supporting_resource_ids"] = list(
         dict.fromkeys(
             str(evidence.arguments["resource_id"])

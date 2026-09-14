@@ -168,7 +168,7 @@ def test_public_benchmark_preparation_enables_tools_without_gold_arguments() -> 
 
     assert [item["name"] for item in example.source_descriptors] == ["calculator", "python"]
     assert example.metadata[BENCHMARK_LIVE_TOOLS_METADATA_KEY] == ["calculator", "python"]
-    assert example.metadata[BENCHMARK_LIVE_TOOL_LATENCY_STEPS_METADATA_KEY] == 2
+    assert example.metadata[BENCHMARK_LIVE_TOOL_LATENCY_STEPS_METADATA_KEY] == 0
     candidates = example.metadata[BENCHMARK_ARGUMENT_CANDIDATES_METADATA_KEY]
     assert "12*7+5" in candidates["calculator"]["expression"]
     assert "12*7+5" in candidates["python"]["code"]

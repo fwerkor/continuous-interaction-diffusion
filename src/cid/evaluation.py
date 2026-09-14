@@ -237,7 +237,7 @@ def _rank_workspace_documents(
 
 
 class _StepDelayedSource:
-    def __init__(self, descriptor: SourceDescriptor, *, latency_steps: int = 2) -> None:
+    def __init__(self, descriptor: SourceDescriptor, *, latency_steps: int = 0) -> None:
         self.descriptor = descriptor
         self._latency_steps = max(0, int(latency_steps))
         self._step = 0
@@ -277,7 +277,7 @@ class TaskLocalWorkspaceSearchSource(_StepDelayedSource):
         *,
         top_k: int = 5,
         wrap_query: bool = False,
-        latency_steps: int = 2,
+        latency_steps: int = 0,
     ) -> None:
         super().__init__(descriptor, latency_steps=latency_steps)
         self._documents = documents
@@ -309,7 +309,7 @@ class TaskLocalWorkspaceReadSource(_StepDelayedSource):
         descriptor: SourceDescriptor,
         documents: tuple[dict[str, Any], ...],
         *,
-        latency_steps: int = 2,
+        latency_steps: int = 0,
     ) -> None:
         super().__init__(descriptor, latency_steps=latency_steps)
         self._documents = {str(item["resource_id"]): item for item in documents}
@@ -756,7 +756,7 @@ def build_replay_registry(example: TrajectoryExample) -> SourceRegistry:
     workspace_documents = _workspace_documents(example)
     workspace_top_k = int(example.metadata.get("benchmark_workspace_search_top_k", 5))
     workspace_latency_steps = int(
-        example.metadata.get("benchmark_workspace_latency_steps", 2)
+        example.metadata.get("benchmark_workspace_latency_steps", 0)
     )
     wrap_query = str(example.metadata.get("interaction_pattern", "")) == "decomposition_dag"
     live_tools = {str(name) for name in example.metadata.get("benchmark_live_tools", ())}
