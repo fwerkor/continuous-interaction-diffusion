@@ -1169,6 +1169,7 @@ def _benchmark(args: argparse.Namespace) -> None:
         load_cid_adapter_checkpoint,
         load_cid_adapter_from_pretrained,
         load_cid_adapter_parameter_state,
+        load_cid_model_from_pretrained,
         load_stage_b_model_checkpoint,
         load_stage_b_semantic_encoder,
         wrap_stage_b_fsdp,
@@ -1188,8 +1189,11 @@ def _benchmark(args: argparse.Namespace) -> None:
     local_rank = int(os.environ.get("LOCAL_RANK", "0"))
     distributed = stage_b_sharded
     device_type = resolve_torch_device_type(torch, args.device)
+    unified_release = False
     if release:
         release_config = json.loads((checkpoint / "cid_config.json").read_text(encoding="utf-8"))
+        hf_config = json.loads((checkpoint / "config.json").read_text(encoding="utf-8"))
+        unified_release = hf_config.get("model_type") == "cid"
         adapter_config = ILLaDACIDConfig(**release_config["adapter_config"])
         semantic_pooling = str(release_config.get("semantic_pooling", "mean-v1"))
         configure_torch_accelerator(torch, device_type, local_rank)
@@ -1245,7 +1249,14 @@ def _benchmark(args: argparse.Namespace) -> None:
             ).to(device)
 
         adapter = None
-        if stage_b_sharded:
+        cid_model = None
+        if unified_release:
+            cid_model = load_cid_model_from_pretrained(
+                model_reference,
+                low_cpu_mem_usage=True,
+            )
+            adapter = cid_model.cid_adapter.to(device)
+        elif stage_b_sharded:
             for loading_rank in range(world_size):
                 if rank == loading_rank:
                     adapter = load_adapter()
@@ -1259,22 +1270,31 @@ def _benchmark(args: argparse.Namespace) -> None:
             adapter.set_backbone_trainable(True)
             if device_type == "npu":
                 adapter.set_device_value_validation(False)
-            load_cid_adapter_parameter_state(
-                adapter,
-                load_safetensors(str(checkpoint / "cid_adapter.safetensors"), device="cpu"),
-            )
-            semantic_state = torch.load(
-                checkpoint / "semantic-embedding.pt",
-                map_location="cpu",
-                weights_only=False,
-            )
-            text_encoder = ILLaDATextEncoder.from_frozen_snapshot_state(
-                adapter,
-                tokenizer,
-                semantic_state,
-                device=device,
-                embedding_device="cpu",
-            )
+            if unified_release:
+                if cid_model is None:
+                    raise RuntimeError("unified CID release model was not loaded")
+                text_encoder = cid_model.make_text_encoder(
+                    tokenizer,
+                    device=device,
+                    embedding_device="cpu",
+                )
+            else:
+                load_cid_adapter_parameter_state(
+                    adapter,
+                    load_safetensors(str(checkpoint / "cid_adapter.safetensors"), device="cpu"),
+                )
+                semantic_state = torch.load(
+                    checkpoint / "semantic-embedding.pt",
+                    map_location="cpu",
+                    weights_only=False,
+                )
+                text_encoder = ILLaDATextEncoder.from_frozen_snapshot_state(
+                    adapter,
+                    tokenizer,
+                    semantic_state,
+                    device=device,
+                    embedding_device="cpu",
+                )
             if device_type == "npu":
                 forward_model = wrap_npu_autocast(torch, adapter, dtype=dtype)
             elif dtype is not torch.float32:

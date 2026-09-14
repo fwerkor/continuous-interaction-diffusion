@@ -4,6 +4,13 @@ Importing this package requires the optional `train` dependencies.
 """
 
 from cid.model.diffusion import CIDDiffusionScheduler, DisplayCorruption, ThoughtCorruption
+from cid.model.huggingface import (
+    CIDConfig,
+    CIDModel,
+    build_unified_cid_config,
+    load_cid_model_from_pretrained,
+    unified_state_from_legacy,
+)
 from cid.model.illada import (
     DEFAULT_DISPLAY_CANVAS_TOKENS,
     DEFAULT_MAX_DISPLAY_TOKENS,
@@ -79,6 +86,8 @@ from cid.model.training import (
 )
 
 __all__ = [
+    "CIDConfig",
+    "CIDModel",
     "CIDLoss",
     "CIDLossWeights",
     "CIDRolloutBindingRoute",
@@ -126,6 +135,9 @@ __all__ = [
     "load_cid_adapter_checkpoint",
     "load_cid_adapter_parameter_state",
     "load_cid_adapter_from_pretrained",
+    "load_cid_model_from_pretrained",
+    "build_unified_cid_config",
+    "unified_state_from_legacy",
     "materialize_indexed_rollout_windows",
     "load_stage_b_checkpoint",
     "load_stage_b_model_checkpoint",

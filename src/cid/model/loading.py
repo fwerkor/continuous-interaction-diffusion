@@ -43,7 +43,19 @@ def load_cid_adapter_from_pretrained(
     freeze_backbone: bool = False,
     **from_pretrained_kwargs: object,
 ) -> ILLaDACIDAdapter:
-    if backbone_model_type(model_name_or_path) == "lfm2":
+    model_type = backbone_model_type(model_name_or_path)
+    if model_type == "cid":
+        if config is not None:
+            raise ValueError("unified CID checkpoints carry their adapter configuration internally")
+        from cid.model.huggingface import load_cid_model_from_pretrained
+
+        model = load_cid_model_from_pretrained(
+            model_name_or_path,
+            **from_pretrained_kwargs,
+        )
+        model.cid_adapter.set_backbone_trainable(not freeze_backbone)
+        return model.cid_adapter
+    if model_type == "lfm2":
         return LFMCIDAdapter.from_pretrained(
             model_name_or_path,
             config=config,

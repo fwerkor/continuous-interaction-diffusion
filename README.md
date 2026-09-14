@@ -147,8 +147,12 @@ model = ILLaDACIDAdapter.from_pretrained(
 The loader pins the official checkpoint revision used by this repository and enables the model's
 required Hugging Face remote code. Use `load_cid_adapter_from_pretrained()` when the backbone may
 be any supported family; it dispatches LFM2 to `AutoModelForMaskedLM` and LLaDA-family checkpoints
-to their existing causal-LM wrappers. The 8B checkpoint is about 16.5 GB. For an interface smoke
-test using the official iLLaDA implementation without downloading the 8B weights:
+to their existing causal-LM wrappers. Public unified CID checkpoints such as `CID-v1-0.4B` store
+the backbone, CID-specific modules, and frozen semantic embedding in one `model.safetensors` file;
+`load_cid_model_from_pretrained()` restores the complete package, while the adapter loader remains
+compatible with both unified releases and legacy backbone-only checkpoints. The 8B checkpoint is
+about 16.5 GB. For an interface smoke test using the official iLLaDA implementation without
+downloading the 8B weights:
 
 ```bash
 python examples/illada_tiny_smoke.py
