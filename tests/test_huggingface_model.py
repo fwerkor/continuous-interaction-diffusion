@@ -1,12 +1,31 @@
 from __future__ import annotations
 
+from importlib import import_module
 from pathlib import Path
 
-import torch
-from safetensors.torch import load_file
-from transformers.models.lfm2.configuration_lfm2 import Lfm2Config
+import pytest
 
-from cid.model.huggingface import CIDConfig, CIDModel, unified_state_from_legacy
+
+def _optional_model_dependency(name: str):
+    try:
+        return import_module(name)
+    except (ImportError, RuntimeError) as exc:
+        pytest.skip(
+            f"optional model dependency {name!r} is unavailable: {exc}",
+            allow_module_level=True,
+        )
+
+
+torch = _optional_model_dependency("torch")
+transformers = _optional_model_dependency("transformers")
+safetensors_torch = _optional_model_dependency("safetensors.torch")
+
+load_file = safetensors_torch.load_file
+Lfm2Config = import_module("transformers.models.lfm2.configuration_lfm2").Lfm2Config
+cid_huggingface = import_module("cid.model.huggingface")
+CIDConfig = cid_huggingface.CIDConfig
+CIDModel = cid_huggingface.CIDModel
+unified_state_from_legacy = cid_huggingface.unified_state_from_legacy
 
 
 def _tiny_cid_config() -> CIDConfig:

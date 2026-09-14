@@ -25,7 +25,7 @@ jobs:
         with:
           python-version: '3.12'
       - run: python -m pip install --index-url https://download.pytorch.org/whl/cpu torch
-      - run: python -m pip install -e '.[dev]'
+      - run: python -m pip install -e '.[dev,train]'
       - run: >-
           pytest
           tests/test_accelerator.py
@@ -38,3 +38,4 @@ jobs:
           tests/test_materialize.py
           tests/test_neural_policy.py
           tests/test_training.py
+          tests/test_huggingface_model.py
