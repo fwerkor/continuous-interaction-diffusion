@@ -212,11 +212,13 @@ a faster accelerator from losing post-observation reasoning budget merely becaus
 forwards during the same tool latency.
 
 The runtime also guards against short reasoning cycles. When no required external work is pending,
-it tracks a bounded fingerprint of recent TCT, Display, and tool-request proposals. Repeated fixed
-points or short-period oscillations trigger a rollback to the compatible pre-cycle model state,
-local re-diffusion of the affected TCT slots, re-masking of oscillating Display positions, and a
-short-lived taboo on the repeated proposals. If recovery attempts are exhausted, the trajectory
-returns the last accepted state instead of spending the remaining compute budget on the loop.
+it tracks both an exact proposal fingerprint and a coarser behavior fingerprint over Display,
+source actions, and structural state. The latter ignores small latent-value drift so numerical
+motion inside the TCT cannot hide a visibly stalled or oscillating trajectory. Repeated fixed points
+or short-period oscillations trigger a rollback to the compatible pre-cycle model state, local
+re-diffusion of the affected TCT slots, re-masking of oscillating Display positions, and a short-lived
+taboo on exact repeated proposals. If recovery attempts are exhausted, the trajectory returns the
+last accepted state instead of spending the remaining compute budget on the loop.
 
 A model-declared terminal candidate is also subject to a final freshness barrier. `ONCE` bindings
 are accepted once resolved; due `MAX_AGE` bindings and `ALWAYS` bindings must be refreshed or version

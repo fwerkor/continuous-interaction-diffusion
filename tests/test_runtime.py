@@ -889,6 +889,26 @@ class AlternatingDisplayPolicy:
         )
 
 
+class LatentDriftPolicy:
+    def __init__(self, *, converge_at: int | None = None) -> None:
+        self.converge_at = converge_at
+
+    def step(self, context: ModelContext) -> ModelUpdate:
+        cells = list(context.thought.cells)
+        cell = cells[0]
+        cells[0] = replace(
+            cell,
+            semantic=(cell.semantic[0] + 0.01, *cell.semantic[1:]),
+        )
+        return ModelUpdate(
+            thought=context.thought.advance(tuple(cells)),
+            display=context.display.advance(context.display.token_ids),
+            converged=(
+                self.converge_at is not None and context.step >= self.converge_at
+            ),
+        )
+
+
 async def test_runtime_escapes_stationary_model_loop_before_compute_budget() -> None:
     config = RuntimeConfig(
         max_steps=100,
@@ -929,3 +949,39 @@ async def test_runtime_detects_short_period_display_oscillation_and_remasks_it()
     assert result.trace.count("loop_escape_applied") == 1
     assert result.trace.count("loop_escape_exhausted") == 1
     assert result.steps < config.max_steps
+
+
+async def test_runtime_detects_behavioral_loop_despite_continuous_latent_drift() -> None:
+    config = RuntimeConfig(
+        max_steps=100,
+        loop_escape_attempts=1,
+    )
+    result = await CIDRuntime(SourceRegistry(), config).run(
+        LatentDriftPolicy(),
+        thought=seeded_thought(1),
+        display=DisplayCanvas.masked(1, -1),
+    )
+
+    detected = tuple(event for event in result.trace.events if event.kind == "loop_detected")
+    assert detected
+    assert detected[0].payload["mode"] == "behavior"
+    assert detected[0].payload["period"] == 1
+    assert detected[0].payload["repeats"] == 12
+    assert result.trace.count("loop_escape_applied") == 1
+    assert result.trace.count("loop_escape_exhausted") == 1
+    assert result.steps < config.max_steps
+
+
+async def test_behavioral_loop_guard_allows_normal_latent_refinement_to_converge() -> None:
+    result = await CIDRuntime(
+        SourceRegistry(),
+        RuntimeConfig(max_steps=100, loop_escape_attempts=1),
+    ).run(
+        LatentDriftPolicy(converge_at=7),
+        thought=seeded_thought(1),
+        display=DisplayCanvas.masked(1, -1),
+    )
+
+    assert result.converged
+    assert result.steps == 8
+    assert result.trace.count("loop_detected") == 0

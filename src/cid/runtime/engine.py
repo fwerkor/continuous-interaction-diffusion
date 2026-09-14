@@ -38,6 +38,8 @@ from cid.state import CellLifecycle, CognitiveField, DisplayCanvas, FactItem, Fa
 
 _LOOP_MAX_PERIOD = 4
 _LOOP_MIN_REPEATS = 4
+_BEHAVIOR_LOOP_MIN_SPAN = 12
+_BEHAVIOR_LOOP_MIN_REPEATS = 3
 _LOOP_REDIFFUSION_NOISE = 0.5
 _LOOP_TABOO_STEPS = 8
 
@@ -112,6 +114,7 @@ class _StreamJob:
 @dataclass(frozen=True, slots=True)
 class _LoopSnapshot:
     signature: tuple[Any, ...]
+    behavior_signature: tuple[Any, ...]
     input_thought: CognitiveField
     input_display: DisplayCanvas
     proposed_thought: CognitiveField
@@ -192,7 +195,10 @@ class CIDRuntime:
         loop_escape_count = 0
         last_escape_slots: tuple[int, ...] = ()
         last_escape_display_positions: tuple[int, ...] = ()
-        loop_history_limit = _LOOP_MAX_PERIOD * _LOOP_MIN_REPEATS + 1
+        loop_history_limit = max(
+            _LOOP_MAX_PERIOD * _LOOP_MIN_REPEATS,
+            _BEHAVIOR_LOOP_MIN_SPAN + _LOOP_MAX_PERIOD,
+        ) + 1
 
         try:
             while True:
@@ -296,6 +302,7 @@ class CIDRuntime:
                 proposed_display = update.display
 
                 proposal_signature = self._proposal_signature(update)
+                behavior_signature = self._behavior_signature(update)
                 expired_taboo = [
                     signature
                     for signature, expires_at in taboo_signatures.items()
@@ -306,6 +313,7 @@ class CIDRuntime:
 
                 snapshot = _LoopSnapshot(
                     signature=proposal_signature,
+                    behavior_signature=behavior_signature,
                     input_thought=previous_thought,
                     input_display=previous_display,
                     proposed_thought=proposed_thought,
@@ -355,20 +363,27 @@ class CIDRuntime:
                     await asyncio.sleep(0)
                     continue
 
-                loop_period = None if external_pending else self._loop_period(loop_history)
-                if loop_period is not None:
-                    repeated_count = loop_period * _LOOP_MIN_REPEATS
+                loop_match = None if external_pending else self._loop_period(loop_history)
+                loop_mode = "exact"
+                if loop_match is None and not external_pending:
+                    loop_match = self._loop_period(loop_history, behavior=True)
+                    loop_mode = "behavior"
+                if loop_match is not None:
+                    loop_period, loop_repeats = loop_match
+                    repeated_count = loop_period * loop_repeats
                     cycle = tuple(loop_history[-repeated_count:])
-                    cycle_signatures = {item.signature for item in cycle}
-                    expires_at = completed_steps + _LOOP_TABOO_STEPS
-                    for signature in cycle_signatures:
-                        taboo_signatures[signature] = expires_at
+                    if loop_mode == "exact":
+                        cycle_signatures = {item.signature for item in cycle}
+                        expires_at = completed_steps + _LOOP_TABOO_STEPS
+                        for signature in cycle_signatures:
+                            taboo_signatures[signature] = expires_at
                     last_escape_slots, last_escape_display_positions = self._loop_targets(cycle)
                     self.trace.emit(
                         "loop_detected",
                         step,
                         period=loop_period,
-                        repeats=_LOOP_MIN_REPEATS,
+                        repeats=loop_repeats,
+                        mode=loop_mode,
                         cell_slots=list(last_escape_slots),
                         display_positions=list(last_escape_display_positions),
                         runtime_step=self._runtime_step,
@@ -377,7 +392,7 @@ class CIDRuntime:
                         self.trace.emit(
                             "loop_escape_exhausted",
                             step,
-                            reason="cycle_detected",
+                            reason=f"{loop_mode}_cycle_detected",
                             attempts=loop_escape_count,
                             runtime_step=self._runtime_step,
                         )
@@ -395,7 +410,7 @@ class CIDRuntime:
                     self.trace.emit(
                         "loop_escape_applied",
                         step,
-                        reason="cycle_detected",
+                        reason=f"{loop_mode}_cycle_detected",
                         attempt=loop_escape_count,
                         period=loop_period,
                         rolled_back=rollback.input_thought.occupied_cell_ids
@@ -1065,11 +1080,33 @@ class CIDRuntime:
 
     @classmethod
     def _proposal_signature(cls, update: ModelUpdate) -> tuple[Any, ...]:
-        needs = []
+        return (
+            tuple(cls._cell_loop_key(cell) for cell in update.thought.cells),
+            tuple(update.display.token_ids),
+            cls._need_loop_keys(update),
+            tuple(update.reopen_cell_ids),
+            bool(update.equilibrium),
+            bool(update.converged),
+        )
+
+    @classmethod
+    def _behavior_signature(cls, update: ModelUpdate) -> tuple[Any, ...]:
+        return (
+            tuple((cell.cell_id, cell.lifecycle.value) for cell in update.thought.cells),
+            tuple(update.display.token_ids),
+            cls._need_loop_keys(update),
+            tuple(update.reopen_cell_ids),
+            bool(update.equilibrium),
+            bool(update.converged),
+        )
+
+    @staticmethod
+    def _need_loop_keys(update: ModelUpdate) -> tuple[tuple[Any, ...], ...]:
+        keys: list[tuple[Any, ...]] = []
         for need in update.needs:
             source = need.selected_source()
             work_key = "" if source is None else canonical_work_key(source, need.arguments)
-            needs.append(
+            keys.append(
                 (
                     source,
                     work_key,
@@ -1080,14 +1117,7 @@ class CIDRuntime:
                     bool(need.promote_to_fact),
                 )
             )
-        return (
-            tuple(cls._cell_loop_key(cell) for cell in update.thought.cells),
-            tuple(update.display.token_ids),
-            tuple(needs),
-            tuple(update.reopen_cell_ids),
-            bool(update.equilibrium),
-            bool(update.converged),
-        )
+        return tuple(keys)
 
     @classmethod
     def _cell_loop_key(cls, cell: Any) -> tuple[Any, ...]:
@@ -1111,16 +1141,29 @@ class CIDRuntime:
         indexes = tuple(round(index * last / (samples - 1)) for index in range(samples))
         return tuple(round(float(semantic[index]), 3) for index in indexes)
 
-    def _loop_period(self, history: list[_LoopSnapshot]) -> int | None:
-        signatures = tuple(item.signature for item in history)
+    def _loop_period(
+        self,
+        history: list[_LoopSnapshot],
+        *,
+        behavior: bool = False,
+    ) -> tuple[int, int] | None:
+        signatures = tuple(
+            item.behavior_signature if behavior else item.signature for item in history
+        )
         for period in range(1, _LOOP_MAX_PERIOD + 1):
-            required = period * _LOOP_MIN_REPEATS
+            repeats = _LOOP_MIN_REPEATS
+            if behavior:
+                repeats = max(
+                    _BEHAVIOR_LOOP_MIN_REPEATS,
+                    (_BEHAVIOR_LOOP_MIN_SPAN + period - 1) // period,
+                )
+            required = period * repeats
             if len(signatures) < required:
                 continue
             tail = signatures[-required:]
             motif = tail[:period]
             if all(signature == motif[index % period] for index, signature in enumerate(tail)):
-                return period
+                return period, repeats
         return None
 
     @classmethod
