@@ -104,15 +104,13 @@ def convert(source: Path, output: Path) -> None:
     (output / "modeling_cid.py").write_text(REMOTE_MODELING, encoding="utf-8")
 
     semantic_metadata = dict(release_config.get("semantic_embedding_snapshot", {}))
-    legacy_semantic_sha256 = semantic_metadata.pop("sha256", None)
+    semantic_metadata.pop("sha256", None)
     semantic_metadata.update(
         {
             "file": "model.safetensors",
             "tensor_key": "semantic_embedding_weight",
         }
     )
-    if legacy_semantic_sha256 is not None:
-        semantic_metadata["legacy_sidecar_sha256"] = legacy_semantic_sha256
     release_config["semantic_embedding_snapshot"] = semantic_metadata
 
     old_weights = release_config.get("weights", {})
