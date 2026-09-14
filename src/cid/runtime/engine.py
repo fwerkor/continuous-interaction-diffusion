@@ -4,10 +4,17 @@ import asyncio
 import time
 from collections.abc import Iterable
 from copy import deepcopy
-from dataclasses import dataclass
+from dataclasses import dataclass, replace
 from typing import Any
 
-from cid.contracts import CIDPolicy, FreshnessDemand, ModelContext, Observation, Percept
+from cid.contracts import (
+    CIDPolicy,
+    FreshnessDemand,
+    ModelContext,
+    ModelUpdate,
+    Observation,
+    Percept,
+)
 from cid.defaults import DEFAULT_BINDING_THRESHOLD
 from cid.grounding import STRONG_LINK_RELATIONS, ClosedWorldGrounder, ObjectKind, ObjectRef
 from cid.lifecycle import LifecycleTransitionController, LifecycleTransitionSignals
@@ -18,7 +25,7 @@ from cid.reclamation import (
     retired_reclamation_candidates,
 )
 from cid.runtime.archive import CognitiveArchive, CognitiveTombstone
-from cid.runtime.bindings import Binding, BindingStatus, BindingTable
+from cid.runtime.bindings import Binding, BindingStatus, BindingTable, canonical_work_key
 from cid.runtime.sources import (
     ReadOnlySource,
     RuntimeSnapshotSource,
@@ -28,6 +35,11 @@ from cid.runtime.sources import (
 )
 from cid.runtime.trace import RuntimeTrace
 from cid.state import CellLifecycle, CognitiveField, DisplayCanvas, FactItem, FactStore
+
+_LOOP_MAX_PERIOD = 4
+_LOOP_MIN_REPEATS = 4
+_LOOP_REDIFFUSION_NOISE = 0.5
+_LOOP_TABOO_STEPS = 8
 
 
 @dataclass(frozen=True, slots=True)
@@ -41,6 +53,7 @@ class RuntimeConfig:
     reclamation_grace_steps: int = DEFAULT_RECLAMATION_GRACE_STEPS
     reclamation_low_watermark: float = DEFAULT_RECLAMATION_LOW_WATERMARK
     reclamation_target_watermark: float = DEFAULT_RECLAMATION_TARGET_WATERMARK
+    loop_escape_attempts: int = 2
 
     def __post_init__(self) -> None:
         if self.max_steps <= 0:
@@ -61,6 +74,8 @@ class RuntimeConfig:
             raise ValueError("reclamation_target_watermark must be in [0, 1]")
         if self.reclamation_target_watermark < self.reclamation_low_watermark:
             raise ValueError("reclamation_target_watermark cannot be below low watermark")
+        if self.loop_escape_attempts < 0:
+            raise ValueError("loop_escape_attempts must be non-negative")
 
 
 @dataclass(frozen=True, slots=True)
@@ -92,6 +107,15 @@ class _VersionJob:
 class _StreamJob:
     task: asyncio.Task[None]
     queue: asyncio.Queue[Observation]
+
+
+@dataclass(frozen=True, slots=True)
+class _LoopSnapshot:
+    signature: tuple[Any, ...]
+    input_thought: CognitiveField
+    input_display: DisplayCanvas
+    proposed_thought: CognitiveField
+    proposed_display: DisplayCanvas
 
 
 class CIDRuntime:
@@ -163,6 +187,12 @@ class CIDRuntime:
         )
         descriptors = self.sources.descriptors()
         descriptor_by_name = {descriptor.name: descriptor for descriptor in descriptors}
+        loop_history: list[_LoopSnapshot] = []
+        taboo_signatures: dict[tuple[Any, ...], int] = {}
+        loop_escape_count = 0
+        last_escape_slots: tuple[int, ...] = ()
+        last_escape_display_positions: tuple[int, ...] = ()
+        loop_history_limit = _LOOP_MAX_PERIOD * _LOOP_MIN_REPEATS + 1
 
         try:
             while True:
@@ -214,12 +244,18 @@ class CIDRuntime:
                     await asyncio.sleep(0)
                 thought = self._maybe_reclaim(thought, step)
                 previous_thought = thought
+                previous_display = display
                 observations_before = self._observation_count()
                 self._drain_completed_version_jobs(step)
                 self._drain_completed_jobs(step)
                 self._drain_stream_updates(step)
                 if self._observation_count() > observations_before:
                     epoch_steps = 0
+                    loop_history.clear()
+                    taboo_signatures.clear()
+                    loop_escape_count = 0
+                    last_escape_slots = ()
+                    last_escape_display_positions = ()
                 percepts = self._project_available(step, thought)
                 context = ModelContext(
                     facts=self.facts.snapshot(),
@@ -257,7 +293,124 @@ class CIDRuntime:
                 completed_steps += 1
                 epoch_steps += 1
                 proposed_thought = update.thought
-                display = update.display
+                proposed_display = update.display
+
+                proposal_signature = self._proposal_signature(update)
+                expired_taboo = [
+                    signature
+                    for signature, expires_at in taboo_signatures.items()
+                    if completed_steps > expires_at
+                ]
+                for signature in expired_taboo:
+                    taboo_signatures.pop(signature, None)
+
+                snapshot = _LoopSnapshot(
+                    signature=proposal_signature,
+                    input_thought=previous_thought,
+                    input_display=previous_display,
+                    proposed_thought=proposed_thought,
+                    proposed_display=proposed_display,
+                )
+                loop_history.append(snapshot)
+                if len(loop_history) > loop_history_limit:
+                    del loop_history[: len(loop_history) - loop_history_limit]
+
+                external_pending = self._has_pending_required_external_work()
+                if proposal_signature in taboo_signatures and not external_pending:
+                    self.trace.emit(
+                        "loop_taboo_transition_blocked",
+                        step,
+                        runtime_step=self._runtime_step,
+                    )
+                    if loop_escape_count >= self.config.loop_escape_attempts:
+                        self.trace.emit(
+                            "loop_escape_exhausted",
+                            step,
+                            reason="taboo_transition_repeated",
+                            attempts=loop_escape_count,
+                            runtime_step=self._runtime_step,
+                        )
+                        break
+                    loop_escape_count += 1
+                    thought, display = self._rediffuse_loop_state(
+                        previous_thought,
+                        previous_display,
+                        cell_slots=last_escape_slots,
+                        display_positions=last_escape_display_positions,
+                        current_thought=previous_thought,
+                        current_display=previous_display,
+                    )
+                    self.trace.emit(
+                        "loop_escape_applied",
+                        step,
+                        reason="taboo_transition_repeated",
+                        attempt=loop_escape_count,
+                        cell_slots=list(last_escape_slots),
+                        display_positions=list(last_escape_display_positions),
+                        runtime_step=self._runtime_step,
+                    )
+                    loop_history.clear()
+                    epoch_steps = 0
+                    self._runtime_step += 1
+                    await asyncio.sleep(0)
+                    continue
+
+                loop_period = None if external_pending else self._loop_period(loop_history)
+                if loop_period is not None:
+                    repeated_count = loop_period * _LOOP_MIN_REPEATS
+                    cycle = tuple(loop_history[-repeated_count:])
+                    cycle_signatures = {item.signature for item in cycle}
+                    expires_at = completed_steps + _LOOP_TABOO_STEPS
+                    for signature in cycle_signatures:
+                        taboo_signatures[signature] = expires_at
+                    last_escape_slots, last_escape_display_positions = self._loop_targets(cycle)
+                    self.trace.emit(
+                        "loop_detected",
+                        step,
+                        period=loop_period,
+                        repeats=_LOOP_MIN_REPEATS,
+                        cell_slots=list(last_escape_slots),
+                        display_positions=list(last_escape_display_positions),
+                        runtime_step=self._runtime_step,
+                    )
+                    if loop_escape_count >= self.config.loop_escape_attempts:
+                        self.trace.emit(
+                            "loop_escape_exhausted",
+                            step,
+                            reason="cycle_detected",
+                            attempts=loop_escape_count,
+                            runtime_step=self._runtime_step,
+                        )
+                        break
+                    loop_escape_count += 1
+                    rollback = cycle[0]
+                    thought, display = self._rediffuse_loop_state(
+                        rollback.input_thought,
+                        rollback.input_display,
+                        cell_slots=last_escape_slots,
+                        display_positions=last_escape_display_positions,
+                        current_thought=previous_thought,
+                        current_display=previous_display,
+                    )
+                    self.trace.emit(
+                        "loop_escape_applied",
+                        step,
+                        reason="cycle_detected",
+                        attempt=loop_escape_count,
+                        period=loop_period,
+                        rolled_back=rollback.input_thought.occupied_cell_ids
+                        == previous_thought.occupied_cell_ids,
+                        cell_slots=list(last_escape_slots),
+                        display_positions=list(last_escape_display_positions),
+                        runtime_step=self._runtime_step,
+                    )
+                    loop_history.clear()
+                    epoch_steps = 0
+                    self._runtime_step += 1
+                    await asyncio.sleep(0)
+                    continue
+
+                display = proposed_display
                 live_cell_ids = set(proposed_thought.live_cell_ids)
                 unknown_reopens = set(update.reopen_cell_ids) - set(
                     previous_thought.occupied_cell_ids
@@ -465,10 +618,7 @@ class CIDRuntime:
         for binding in self.bindings.active():
             work_key = binding.work_key
             source = self.sources.get(binding.source)
-            if (
-                not binding.arguments_complete
-                and not source.descriptor.accepts_partial_arguments
-            ):
+            if not binding.arguments_complete and not source.descriptor.accepts_partial_arguments:
                 continue
 
             if (
@@ -546,9 +696,7 @@ class CIDRuntime:
 
         task.add_done_callback(mark_ready)
         binding.status = (
-            BindingStatus.REFRESHING
-            if binding.observation is not None
-            else BindingStatus.WAITING
+            BindingStatus.REFRESHING if binding.observation is not None else BindingStatus.WAITING
         )
         self.trace.emit(
             "external_refresh_started",
@@ -589,9 +737,7 @@ class CIDRuntime:
             work_key=work_key,
         )
 
-    def _ensure_stream(
-        self, binding: Binding, source: StreamingSource, step: int
-    ) -> None:
+    def _ensure_stream(self, binding: Binding, source: StreamingSource, step: int) -> None:
         work_key = binding.work_key
         if work_key in self._streams or work_key in self._completed_streams:
             return
@@ -606,9 +752,7 @@ class CIDRuntime:
         task.add_done_callback(lambda _: self._external_progress.set())
         self._streams[work_key] = _StreamJob(task=task, queue=queue)
         binding.status = (
-            BindingStatus.REFRESHING
-            if binding.observation is not None
-            else BindingStatus.WAITING
+            BindingStatus.REFRESHING if binding.observation is not None else BindingStatus.WAITING
         )
         self.trace.emit(
             "stream_started",
@@ -868,8 +1012,7 @@ class CIDRuntime:
             any(job.task.done() for job in self._jobs.values())
             or any(job.task.done() for job in self._version_jobs.values())
             or any(
-                not stream.queue.empty() or stream.task.done()
-                for stream in self._streams.values()
+                not stream.queue.empty() or stream.task.done() for stream in self._streams.values()
             )
         )
 
@@ -919,6 +1062,157 @@ class CIDRuntime:
         ):
             return True
         return any(not stream.queue.empty() for stream in self._streams.values())
+
+    @classmethod
+    def _proposal_signature(cls, update: ModelUpdate) -> tuple[Any, ...]:
+        needs = []
+        for need in update.needs:
+            source = need.selected_source()
+            work_key = "" if source is None else canonical_work_key(source, need.arguments)
+            needs.append(
+                (
+                    source,
+                    work_key,
+                    need.freshness.value,
+                    None if need.max_age_s is None else round(float(need.max_age_s), 3),
+                    tuple(target.identifier for target in need.target_cells),
+                    tuple(target.identifier for target in need.target_display),
+                    bool(need.promote_to_fact),
+                )
+            )
+        return (
+            tuple(cls._cell_loop_key(cell) for cell in update.thought.cells),
+            tuple(update.display.token_ids),
+            tuple(needs),
+            tuple(update.reopen_cell_ids),
+            bool(update.equilibrium),
+            bool(update.converged),
+        )
+
+    @classmethod
+    def _cell_loop_key(cls, cell: Any) -> tuple[Any, ...]:
+        roles = tuple(
+            sorted((role.value, round(float(weight), 3)) for role, weight in cell.roles.items())
+        )
+        return (
+            cell.cell_id,
+            cell.lifecycle.value,
+            round(float(cell.uncertainty), 3),
+            round(float(cell.noise), 3),
+            roles,
+            cls._semantic_sketch(cell.semantic),
+        )
+
+    @staticmethod
+    def _semantic_sketch(semantic: tuple[float, ...], samples: int = 12) -> tuple[float, ...]:
+        if len(semantic) <= samples:
+            return tuple(round(float(value), 3) for value in semantic)
+        last = len(semantic) - 1
+        indexes = tuple(round(index * last / (samples - 1)) for index in range(samples))
+        return tuple(round(float(semantic[index]), 3) for index in indexes)
+
+    def _loop_period(self, history: list[_LoopSnapshot]) -> int | None:
+        signatures = tuple(item.signature for item in history)
+        for period in range(1, _LOOP_MAX_PERIOD + 1):
+            required = period * _LOOP_MIN_REPEATS
+            if len(signatures) < required:
+                continue
+            tail = signatures[-required:]
+            motif = tail[:period]
+            if all(signature == motif[index % period] for index, signature in enumerate(tail)):
+                return period
+        return None
+
+    @classmethod
+    def _loop_targets(
+        cls, cycle: tuple[_LoopSnapshot, ...]
+    ) -> tuple[tuple[int, ...], tuple[int, ...]]:
+        if not cycle:
+            return (), ()
+        capacities = {item.proposed_thought.capacity for item in cycle}
+        cell_slots: list[int] = []
+        if len(capacities) == 1:
+            for slot in range(cycle[0].proposed_thought.capacity):
+                variants = {cls._cell_loop_key(item.proposed_thought.cells[slot]) for item in cycle}
+                if len(variants) > 1:
+                    cell_slots.append(slot)
+
+        display_lengths = {len(item.proposed_display.token_ids) for item in cycle}
+        display_positions: list[int] = []
+        if len(display_lengths) == 1:
+            for position in range(len(cycle[0].proposed_display.token_ids)):
+                variants = {item.proposed_display.token_ids[position] for item in cycle}
+                if len(variants) > 1:
+                    display_positions.append(position)
+
+        if not cell_slots:
+            latest = cycle[-1].proposed_thought
+            cell_slots = [
+                slot
+                for slot, cell in enumerate(latest.cells)
+                if cell.live and cell.lifecycle is not CellLifecycle.WAITING
+            ]
+        return tuple(cell_slots), tuple(display_positions)
+
+    def _rediffuse_loop_state(
+        self,
+        base_thought: CognitiveField,
+        base_display: DisplayCanvas,
+        *,
+        cell_slots: tuple[int, ...],
+        display_positions: tuple[int, ...],
+        current_thought: CognitiveField,
+        current_display: DisplayCanvas,
+    ) -> tuple[CognitiveField, DisplayCanvas]:
+        compatible_thought = (
+            base_thought.capacity == current_thought.capacity
+            and base_thought.width == current_thought.width
+            and tuple((cell.cell_id, cell.lifecycle) for cell in base_thought.cells)
+            == tuple((cell.cell_id, cell.lifecycle) for cell in current_thought.cells)
+        )
+        thought_source = base_thought if compatible_thought else current_thought
+        cells = list(thought_source.cells)
+        effective_slots = cell_slots or tuple(
+            slot
+            for slot, cell in enumerate(cells)
+            if cell.live and cell.lifecycle is not CellLifecycle.WAITING
+        )
+        for slot in effective_slots:
+            if not 0 <= slot < len(cells):
+                continue
+            cell = cells[slot]
+            if not cell.live or cell.lifecycle is CellLifecycle.WAITING:
+                continue
+            cells[slot] = cell.reopened(_LOOP_REDIFFUSION_NOISE)
+        thought = replace(
+            thought_source,
+            cells=tuple(cells),
+            step=current_thought.step,
+            next_cell_serial=max(thought_source.next_cell_serial, current_thought.next_cell_serial),
+        )
+
+        compatible_display = (
+            len(base_display.token_ids) == len(current_display.token_ids)
+            and base_display.mask_token_id == current_display.mask_token_id
+            and base_display.eos_token_id == current_display.eos_token_id
+        )
+        display_source = base_display if compatible_display else current_display
+        token_ids = list(display_source.token_ids)
+        for position in display_positions:
+            if not 0 <= position < len(token_ids):
+                continue
+            if (
+                display_source.eos_token_id is not None
+                and token_ids[position] == display_source.eos_token_id
+            ):
+                continue
+            token_ids[position] = display_source.mask_token_id
+        display = replace(
+            display_source,
+            token_ids=tuple(token_ids),
+            step=current_display.step,
+        )
+        return thought, display
 
     def _maybe_reclaim(
         self,

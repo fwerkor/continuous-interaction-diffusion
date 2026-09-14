@@ -870,3 +870,62 @@ async def test_streaming_source_updates_one_persistent_binding_without_polling_r
     assert result.trace.count("stream_started") == 1
     assert result.trace.count("stream_observation") == 2
     assert result.bindings[-1].external_refreshes == 2
+
+
+class StuckPolicy:
+    def step(self, context: ModelContext) -> ModelUpdate:
+        return ModelUpdate(
+            thought=context.thought.advance(context.thought.cells),
+            display=context.display.advance(context.display.token_ids),
+        )
+
+
+class AlternatingDisplayPolicy:
+    def step(self, context: ModelContext) -> ModelUpdate:
+        token_id = 10 if context.step % 2 == 0 else 11
+        return ModelUpdate(
+            thought=context.thought.advance(context.thought.cells),
+            display=context.display.advance((token_id,)),
+        )
+
+
+async def test_runtime_escapes_stationary_model_loop_before_compute_budget() -> None:
+    config = RuntimeConfig(
+        max_steps=100,
+        loop_escape_attempts=1,
+    )
+    result = await CIDRuntime(SourceRegistry(), config).run(
+        StuckPolicy(),
+        thought=seeded_thought(1),
+        display=DisplayCanvas.masked(1, -1),
+    )
+
+    assert not result.converged
+    assert result.steps < config.max_steps
+    detected = tuple(event for event in result.trace.events if event.kind == "loop_detected")
+    assert detected
+    assert detected[0].payload["period"] == 1
+    assert result.trace.count("loop_escape_applied") == 1
+    assert result.trace.count("loop_taboo_transition_blocked") == 1
+    assert result.trace.count("loop_escape_exhausted") == 1
+    assert result.trace.count("compute_budget_exhausted") == 0
+
+
+async def test_runtime_detects_short_period_display_oscillation_and_remasks_it() -> None:
+    config = RuntimeConfig(
+        max_steps=100,
+        loop_escape_attempts=1,
+    )
+    result = await CIDRuntime(SourceRegistry(), config).run(
+        AlternatingDisplayPolicy(),
+        thought=seeded_thought(1),
+        display=DisplayCanvas.masked(1, -1),
+    )
+
+    detected = tuple(event for event in result.trace.events if event.kind == "loop_detected")
+    assert detected
+    assert detected[0].payload["period"] == 2
+    assert detected[0].payload["display_positions"] == [0]
+    assert result.trace.count("loop_escape_applied") == 1
+    assert result.trace.count("loop_escape_exhausted") == 1
+    assert result.steps < config.max_steps

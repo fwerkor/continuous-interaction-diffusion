@@ -211,6 +211,13 @@ observation reopens a new epoch, while the wall-clock budget remains trajectory-
 a faster accelerator from losing post-observation reasoning budget merely because it exhausted more
 forwards during the same tool latency.
 
+The runtime also guards against short reasoning cycles. When no required external work is pending,
+it tracks a bounded fingerprint of recent TCT, Display, and tool-request proposals. Repeated fixed
+points or short-period oscillations trigger a rollback to the compatible pre-cycle model state,
+local re-diffusion of the affected TCT slots, re-masking of oscillating Display positions, and a
+short-lived taboo on the repeated proposals. If recovery attempts are exhausted, the trajectory
+returns the last accepted state instead of spending the remaining compute budget on the loop.
+
 A model-declared terminal candidate is also subject to a final freshness barrier. `ONCE` bindings
 are accepted once resolved; due `MAX_AGE` bindings and `ALWAYS` bindings must be refreshed or version
 checked at the candidate boundary. If the source changed, the new percept is assimilated before the
