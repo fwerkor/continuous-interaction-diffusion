@@ -374,6 +374,31 @@ async def test_live_calculator_source_rejects_unsafe_expression() -> None:
     assert "error" in observation.value
 
 
+async def test_live_symbolic_source_rejects_non_scalar_expression_without_crashing() -> None:
+    registry = build_replay_registry(_live_math_example())
+    symbolic = registry.get("symbolic_math")
+    registry.advance_runtime_step(0)
+    task = asyncio.create_task(
+        symbolic.read(
+            {
+                "operation": "simplify",
+                "expression": "x,1",
+                "variables": "x",
+            }
+        )
+    )
+    await asyncio.sleep(0)
+    registry.advance_runtime_step(1)
+    observation = await task
+    assert observation.value == {
+        "operation": "simplify",
+        "expression": "x,1",
+        "variables": "x",
+        "error": "symbolic expression must evaluate to a scalar expression",
+    }
+    assert observation.provenance == "deterministic-symbolic-math"
+
+
 async def test_live_symbolic_source_solves_training_style_equation() -> None:
     registry = build_replay_registry(_live_math_example())
     symbolic = registry.get("symbolic_math")

@@ -619,6 +619,8 @@ def _parse_symbolic_expression(expression: str, symbols: Mapping[str, Any]) -> A
         "Symbol": sp.Symbol,
     }
     value = parse_expr(text, local_dict=dict(symbols), global_dict=global_dict, evaluate=True)
+    if not isinstance(value, sp.Expr):
+        raise ValueError("symbolic expression must evaluate to a scalar expression")
     if int(sp.count_ops(value)) > 100:
         raise ValueError("symbolic expression is too complex")
     for power in value.atoms(sp.Pow):
