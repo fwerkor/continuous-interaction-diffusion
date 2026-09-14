@@ -1,5 +1,6 @@
 from __future__ import annotations
 
+import ast
 import asyncio
 import math
 import re
@@ -235,7 +236,7 @@ def _rank_workspace_documents(
     )
 
 
-class _StepDelayedWorkspaceSource:
+class _StepDelayedSource:
     def __init__(self, descriptor: SourceDescriptor, *, latency_steps: int = 2) -> None:
         self.descriptor = descriptor
         self._latency_steps = max(0, int(latency_steps))
@@ -268,7 +269,7 @@ class _StepDelayedWorkspaceSource:
         await event.wait()
 
 
-class TaskLocalWorkspaceSearchSource(_StepDelayedWorkspaceSource):
+class TaskLocalWorkspaceSearchSource(_StepDelayedSource):
     def __init__(
         self,
         descriptor: SourceDescriptor,
@@ -302,7 +303,7 @@ class TaskLocalWorkspaceSearchSource(_StepDelayedWorkspaceSource):
         )
 
 
-class TaskLocalWorkspaceReadSource(_StepDelayedWorkspaceSource):
+class TaskLocalWorkspaceReadSource(_StepDelayedSource):
     def __init__(
         self,
         descriptor: SourceDescriptor,
@@ -333,6 +334,278 @@ class TaskLocalWorkspaceReadSource(_StepDelayedWorkspaceSource):
         )
 
 
+_CALCULATOR_FUNCTIONS = frozenset({"abs", "floor", "sqrt", "log", "round"})
+_MAX_CALCULATOR_ABS = 1e100
+
+
+def _checked_numeric(value: Any) -> int | float:
+    if isinstance(value, bool) or not isinstance(value, (int, float)):
+        raise ValueError("calculator expression must evaluate to a real number")
+    if not math.isfinite(float(value)) or abs(float(value)) > _MAX_CALCULATOR_ABS:
+        raise ValueError("calculator result is outside the supported range")
+    return value
+
+
+def _evaluate_calculator_node(node: ast.AST) -> int | float:
+    if isinstance(node, ast.Constant):
+        return _checked_numeric(node.value)
+    if isinstance(node, ast.UnaryOp) and isinstance(node.op, (ast.UAdd, ast.USub)):
+        value = _evaluate_calculator_node(node.operand)
+        return _checked_numeric(+value if isinstance(node.op, ast.UAdd) else -value)
+    if isinstance(node, ast.BinOp):
+        left = _evaluate_calculator_node(node.left)
+        right = _evaluate_calculator_node(node.right)
+        if isinstance(node.op, ast.Add):
+            value = left + right
+        elif isinstance(node.op, ast.Sub):
+            value = left - right
+        elif isinstance(node.op, ast.Mult):
+            value = left * right
+        elif isinstance(node.op, ast.Div):
+            value = left / right
+        elif isinstance(node.op, ast.FloorDiv):
+            value = left // right
+        elif isinstance(node.op, ast.Mod):
+            value = left % right
+        elif isinstance(node.op, ast.Pow):
+            if abs(float(right)) > 12:
+                raise ValueError("calculator exponent is outside the supported range")
+            value = left**right
+        else:
+            raise ValueError("unsupported calculator operator")
+        return _checked_numeric(value)
+    if isinstance(node, ast.Call) and isinstance(node.func, ast.Name):
+        name = node.func.id
+        if name not in _CALCULATOR_FUNCTIONS or node.keywords:
+            raise ValueError("unsupported calculator function")
+        args = [_evaluate_calculator_node(item) for item in node.args]
+        if name == "abs" and len(args) == 1:
+            value = abs(args[0])
+        elif name == "floor" and len(args) == 1:
+            value = math.floor(args[0])
+        elif name == "sqrt" and len(args) == 1:
+            value = math.sqrt(args[0])
+        elif name == "log" and len(args) in {1, 2}:
+            value = math.log(*args)
+        elif name == "round" and len(args) in {1, 2}:
+            digits = int(args[1]) if len(args) == 2 else None
+            if digits is not None and (args[1] != digits or not -12 <= digits <= 12):
+                raise ValueError("round precision is outside the supported range")
+            value = round(args[0], digits) if digits is not None else round(args[0])
+        else:
+            raise ValueError("invalid calculator function arguments")
+        return _checked_numeric(value)
+    raise ValueError("unsupported calculator expression")
+
+
+def _evaluate_calculator(expression: str) -> str:
+    expression = expression.strip()
+    if not expression or len(expression) > 512:
+        raise ValueError("calculator expression is empty or too long")
+    tree = ast.parse(expression, mode="eval")
+    if sum(1 for _ in ast.walk(tree)) > 128:
+        raise ValueError("calculator expression is too complex")
+    value = _evaluate_calculator_node(tree.body)
+    if (
+        isinstance(tree.body, ast.Call)
+        and isinstance(tree.body.func, ast.Name)
+        and tree.body.func.id == "round"
+        and len(tree.body.args) == 2
+    ):
+        digits_node = tree.body.args[1]
+        if isinstance(digits_node, ast.Constant) and isinstance(digits_node.value, int):
+            return f"{float(value):.{digits_node.value}f}"
+    if isinstance(value, float) and value.is_integer():
+        return str(int(value))
+    return str(value)
+
+
+class DeterministicCalculatorSource(_StepDelayedSource):
+    async def read(self, arguments: Mapping[str, Any]) -> Observation:
+        expression = str(arguments.get("expression", "")).strip()
+        await self._wait_for_latency()
+        try:
+            value: Any = _evaluate_calculator(expression)
+        except (ArithmeticError, SyntaxError, ValueError, OverflowError) as exc:
+            value = {"expression": expression, "error": str(exc)}
+        return Observation(
+            value=value,
+            version=f"calculator-v1:{expression}",
+            provenance="deterministic-calculator",
+            observed_at=time.monotonic(),
+        )
+
+
+_SYMBOLIC_OPERATIONS = frozenset(
+    {
+        "solve",
+        "solve_system",
+        "expand",
+        "factor",
+        "simplify",
+        "differentiate",
+        "integrate",
+        "equivalent",
+    }
+)
+_SYMBOLIC_SAFE_TEXT = re.compile(r"^[0-9A-Za-z+\-*/^().,;= ]+$")
+
+
+def _symbolic_variables(raw: str) -> tuple[str, ...]:
+    variables = tuple(item.strip() for item in raw.split(",") if item.strip())
+    if not variables or len(variables) > 4:
+        raise ValueError("symbolic variables must contain between one and four names")
+    if any(not re.fullmatch(r"[A-Za-z]", item) for item in variables):
+        raise ValueError("symbolic variables must be single ASCII letters")
+    if len(set(variables)) != len(variables):
+        raise ValueError("symbolic variables must be unique")
+    return variables
+
+
+def _parse_symbolic_expression(expression: str, symbols: Mapping[str, Any]) -> Any:
+    import sympy as sp
+    from sympy.parsing.sympy_parser import parse_expr
+
+    text = expression.strip().replace("^", "**")
+    if not text or len(text) > 512 or not _SYMBOLIC_SAFE_TEXT.fullmatch(text):
+        raise ValueError("symbolic expression contains unsupported text")
+    identifiers = set(re.findall(r"[A-Za-z]+", text))
+    if identifiers - set(symbols):
+        raise ValueError("symbolic expression contains undeclared identifiers")
+    global_dict = {
+        "Integer": sp.Integer,
+        "Rational": sp.Rational,
+        "Float": sp.Float,
+        "Symbol": sp.Symbol,
+    }
+    value = parse_expr(text, local_dict=dict(symbols), global_dict=global_dict, evaluate=True)
+    if int(sp.count_ops(value)) > 100:
+        raise ValueError("symbolic expression is too complex")
+    for power in value.atoms(sp.Pow):
+        exponent = power.exp
+        if exponent.is_number and exponent.is_real and abs(float(exponent)) > 12:
+            raise ValueError("symbolic exponent is outside the supported range")
+    return value
+
+
+def _symbolic_equation(text: str, symbols: Mapping[str, Any]) -> Any:
+    import sympy as sp
+
+    if "==" in text:
+        left, right = text.split("==", 1)
+    elif "=" in text:
+        left, right = text.split("=", 1)
+    else:
+        return _parse_symbolic_expression(text, symbols)
+    return sp.Eq(
+        _parse_symbolic_expression(left, symbols),
+        _parse_symbolic_expression(right, symbols),
+    )
+
+
+def _evaluate_symbolic(operation: str, expression: str, variables: str) -> str:
+    import sympy as sp
+
+    operation = operation.strip()
+    if operation not in _SYMBOLIC_OPERATIONS:
+        raise ValueError("unsupported symbolic operation")
+    variable_names = _symbolic_variables(variables)
+    symbols = {name: sp.Symbol(name) for name in variable_names}
+
+    if operation == "solve":
+        equation = _symbolic_equation(expression, symbols)
+        variable = symbols[variable_names[0]]
+        solutions = sp.solve(equation, variable)
+        if len(solutions) > 16:
+            raise ValueError("symbolic solve produced too many solutions")
+        ordered = sorted(solutions, key=sp.default_sort_key)
+        return ", ".join(sp.sstr(item) for item in ordered)
+
+    if operation == "solve_system":
+        equations = [
+            _symbolic_equation(item.strip(), symbols)
+            for item in expression.split(";")
+            if item.strip()
+        ]
+        if not equations or len(equations) > 4:
+            raise ValueError("symbolic system must contain between one and four equations")
+        solutions = sp.solve(equations, tuple(symbols[name] for name in variable_names), dict=True)
+        if len(solutions) != 1:
+            return "; ".join(
+                ", ".join(
+                    f"{name}={sp.sstr(solution.get(symbols[name]))}"
+                    for name in variable_names
+                )
+                for solution in solutions[:16]
+            )
+        solution = solutions[0]
+        return ", ".join(
+            f"{name}={sp.sstr(solution[symbols[name]])}" for name in variable_names
+        )
+
+    if operation == "integrate":
+        match = re.fullmatch(r"integral\((.*),([A-Za-z]),([^,]+),([^,]+)\)", expression.strip())
+        if match is None:
+            raise ValueError("integrate expects integral(expression,variable,lower,upper)")
+        body, variable_name, lower, upper = match.groups()
+        if variable_name not in symbols:
+            raise ValueError("integral variable must be declared")
+        body_value = _parse_symbolic_expression(body, symbols)
+        lower_value = _parse_symbolic_expression(lower, symbols)
+        upper_value = _parse_symbolic_expression(upper, symbols)
+        result = sp.integrate(
+            body_value,
+            (symbols[variable_name], lower_value, upper_value),
+        )
+        return sp.sstr(sp.factor(result))
+
+    if operation == "equivalent":
+        if "==" not in expression:
+            raise ValueError("equivalent expects two expressions separated by ==")
+        left, right = expression.split("==", 1)
+        difference = sp.simplify(
+            _parse_symbolic_expression(left, symbols)
+            - _parse_symbolic_expression(right, symbols)
+        )
+        return "yes" if difference == 0 else "no"
+
+    value = _parse_symbolic_expression(expression, symbols)
+    if operation == "expand":
+        result = sp.expand(value)
+    elif operation == "factor":
+        result = sp.factor(value)
+    elif operation == "simplify":
+        result = sp.cancel(value)
+    elif operation == "differentiate":
+        result = sp.diff(value, symbols[variable_names[0]])
+    else:
+        raise AssertionError(f"unhandled symbolic operation: {operation}")
+    return sp.sstr(result)
+
+
+class DeterministicSymbolicMathSource(_StepDelayedSource):
+    async def read(self, arguments: Mapping[str, Any]) -> Observation:
+        operation = str(arguments.get("operation", "")).strip()
+        expression = str(arguments.get("expression", "")).strip()
+        variables = str(arguments.get("variables", "")).strip()
+        await self._wait_for_latency()
+        try:
+            value: Any = _evaluate_symbolic(operation, expression, variables)
+        except (ArithmeticError, SyntaxError, TypeError, ValueError, OverflowError) as exc:
+            value = {
+                "operation": operation,
+                "expression": expression,
+                "variables": variables,
+                "error": str(exc),
+            }
+        return Observation(
+            value=value,
+            version=f"symbolic-math-v1:{operation}:{expression}:{variables}",
+            provenance="deterministic-symbolic-math",
+            observed_at=time.monotonic(),
+        )
+
+
 def build_replay_registry(example: TrajectoryExample) -> SourceRegistry:
     registry = SourceRegistry()
     events_by_source: dict[str, list[ExternalEvent]] = defaultdict(list)
@@ -344,9 +617,21 @@ def build_replay_registry(example: TrajectoryExample) -> SourceRegistry:
         example.metadata.get("benchmark_workspace_latency_steps", 2)
     )
     wrap_query = str(example.metadata.get("interaction_pattern", "")) == "decomposition_dag"
+    live_tools = {str(name) for name in example.metadata.get("benchmark_live_tools", ())}
+    live_tool_latency_steps = int(
+        example.metadata.get("benchmark_live_tool_latency_steps", workspace_latency_steps)
+    )
     for raw in example.source_descriptors:
         descriptor = _source_descriptor(raw)
-        if workspace_documents and descriptor.name == "workspace_search":
+        if descriptor.name in live_tools and descriptor.name == "calculator":
+            source = DeterministicCalculatorSource(
+                descriptor, latency_steps=live_tool_latency_steps
+            )
+        elif descriptor.name in live_tools and descriptor.name == "symbolic_math":
+            source = DeterministicSymbolicMathSource(
+                descriptor, latency_steps=live_tool_latency_steps
+            )
+        elif workspace_documents and descriptor.name == "workspace_search":
             source = TaskLocalWorkspaceSearchSource(
                 descriptor,
                 workspace_documents,

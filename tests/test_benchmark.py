@@ -432,3 +432,47 @@ async def test_neural_benchmark_accepts_explicit_fixed_display_capacity() -> Non
     ]
     assert model_events
     assert all(len(event["payload"]["display_token_ids"]) == 8 for event in model_events)
+
+
+def test_materialization_catalog_accepts_explicit_live_tool_candidates() -> None:
+    adapter = configured_adapter()
+    tokenizer = TinyTokenizer()
+    encoder = import_module("cid.model.encoding").ILLaDATextEncoder(adapter, tokenizer)
+    example = TrajectoryExample(
+        example_id="bench-live-tool-catalog",
+        prompt="Compute 37*19+8 and solve 3*x+4=19.",
+        target_display="x",
+        source_descriptors=(
+            {
+                "name": "calculator",
+                "arguments": ({"name": "expression", "required": True},),
+            },
+            {
+                "name": "symbolic_math",
+                "arguments": (
+                    {"name": "operation", "required": True},
+                    {"name": "expression", "required": True},
+                    {"name": "variables", "required": True},
+                ),
+            },
+        ),
+        metadata={
+            "benchmark_tool_argument_candidates": {
+                "calculator": {"expression": ["37*19+8"]},
+                "symbolic_math": {
+                    "operation": ["solve", "factor"],
+                    "expression": ["3*x+4=19"],
+                    "variables": ["x"],
+                },
+            }
+        },
+    )
+
+    catalog = build_materialization_catalog(example, encoder)
+    values = {(item.source, item.name, str(item.value)) for item in catalog.arguments}
+
+    assert ("calculator", "expression", "37*19+8") in values
+    assert ("symbolic_math", "operation", "solve") in values
+    assert ("symbolic_math", "operation", "factor") in values
+    assert ("symbolic_math", "expression", "3*x+4=19") in values
+    assert ("symbolic_math", "variables", "x") in values

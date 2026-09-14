@@ -319,3 +319,76 @@ async def test_task_local_workspace_invalid_read_returns_error_instead_of_hangin
         "resource_id": "doc-does-not-exist",
         "error": "resource_not_found",
     }
+
+
+def _live_math_example() -> TrajectoryExample:
+    return TrajectoryExample(
+        example_id="live-math-tools",
+        prompt="Use the available math tools.",
+        target_display="done",
+        source_descriptors=(
+            {
+                "name": "calculator",
+                "description": "evaluate a deterministic numeric expression",
+                "arguments": ({"name": "expression", "kind": "string", "required": True},),
+            },
+            {
+                "name": "symbolic_math",
+                "description": "perform exact symbolic algebra or calculus",
+                "arguments": (
+                    {"name": "operation", "kind": "string", "required": True},
+                    {"name": "expression", "kind": "string", "required": True},
+                    {"name": "variables", "kind": "string", "required": True},
+                ),
+            },
+        ),
+        metadata={
+            "benchmark_live_tools": ["calculator", "symbolic_math"],
+            "benchmark_live_tool_latency_steps": 1,
+        },
+    )
+
+
+async def test_live_calculator_source_executes_deterministically() -> None:
+    registry = build_replay_registry(_live_math_example())
+    calculator = registry.get("calculator")
+    registry.advance_runtime_step(0)
+    task = asyncio.create_task(calculator.read({"expression": "round((17**2+23)/6,2)"}))
+    await asyncio.sleep(0)
+    assert registry.next_runtime_step() == 1
+    registry.advance_runtime_step(1)
+    observation = await task
+    assert observation.value == "52.00"
+    assert observation.provenance == "deterministic-calculator"
+
+
+async def test_live_calculator_source_rejects_unsafe_expression() -> None:
+    registry = build_replay_registry(_live_math_example())
+    calculator = registry.get("calculator")
+    registry.advance_runtime_step(0)
+    task = asyncio.create_task(calculator.read({"expression": "__import__('os').getcwd()"}))
+    await asyncio.sleep(0)
+    registry.advance_runtime_step(1)
+    observation = await task
+    assert isinstance(observation.value, dict)
+    assert "error" in observation.value
+
+
+async def test_live_symbolic_source_solves_training_style_equation() -> None:
+    registry = build_replay_registry(_live_math_example())
+    symbolic = registry.get("symbolic_math")
+    registry.advance_runtime_step(0)
+    task = asyncio.create_task(
+        symbolic.read(
+            {
+                "operation": "solve",
+                "expression": "5*(6*x+(-19))-15*(6*x+(-70))=7375",
+                "variables": "x",
+            }
+        )
+    )
+    await asyncio.sleep(0)
+    registry.advance_runtime_step(1)
+    observation = await task
+    assert observation.value == "-107"
+    assert observation.provenance == "deterministic-symbolic-math"

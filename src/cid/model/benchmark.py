@@ -231,6 +231,21 @@ def build_materialization_catalog(
             if resource_id:
                 add_argument("workspace_read", "resource_id", resource_id)
 
+    live_argument_candidates = example.metadata.get("benchmark_tool_argument_candidates", {})
+    if isinstance(live_argument_candidates, dict):
+        for source, by_argument in live_argument_candidates.items():
+            if not isinstance(by_argument, dict):
+                continue
+            for name, values in by_argument.items():
+                if isinstance(values, (str, bytes)):
+                    candidate_values = (values,)
+                elif isinstance(values, (list, tuple)):
+                    candidate_values = values
+                else:
+                    continue
+                for value in candidate_values:
+                    add_argument(str(source), str(name), value)
+
     anchors = tuple(
         AnchorCandidate(
             anchor=entry.anchor,
