@@ -1159,7 +1159,6 @@ def _benchmark(args: argparse.Namespace) -> None:
     import torch.distributed as dist
     import transformers
     from safetensors.torch import load_file as load_safetensors
-    from transformers import AutoTokenizer
 
     from cid.model import (
         CIDMaterializerConfig,
@@ -1176,7 +1175,7 @@ def _benchmark(args: argparse.Namespace) -> None:
     )
     from cid.model.benchmark import run_neural_benchmark_case
     from cid.model.encoding import ILLaDATextEncoder
-    from cid.model.loading import pretrained_revision
+    from cid.model.loading import load_cid_tokenizer
 
     checkpoint = Path(args.checkpoint)
     release = args.checkpoint_kind == "release"
@@ -1230,12 +1229,8 @@ def _benchmark(args: argparse.Namespace) -> None:
         "fp16": torch.float16,
         "fp32": torch.float32,
     }[args.dtype]
-    tokenizer_kwargs: dict[str, object] = {"trust_remote_code": True}
     model_reference = str(checkpoint) if release else args.model
-    revision = pretrained_revision(model_reference)
-    if revision is not None:
-        tokenizer_kwargs["revision"] = revision
-    tokenizer = AutoTokenizer.from_pretrained(model_reference, **tokenizer_kwargs)
+    tokenizer = load_cid_tokenizer(model_reference)
 
     try:
 
@@ -1877,7 +1872,6 @@ def _select_end_to_end_validation_examples(
 def _train_stage_a(args: argparse.Namespace) -> None:
     import torch
     import torch.distributed as dist
-    from transformers import AutoTokenizer
 
     from cid.model import (
         CIDTrainer,
@@ -1897,7 +1891,7 @@ def _train_stage_a(args: argparse.Namespace) -> None:
     )
     from cid.model.benchmark import run_neural_benchmark_case
     from cid.model.encoding import ILLaDATextEncoder
-    from cid.model.loading import pretrained_revision
+    from cid.model.loading import load_cid_tokenizer
 
     if args.thought_capacity != 128:
         raise ValueError("CID v1 Stage A requires --thought-capacity 128")
@@ -1980,11 +1974,7 @@ def _train_stage_a(args: argparse.Namespace) -> None:
             adapter.set_gradient_checkpointing(True)
         grouped_moe_layers = adapter.pack_frozen_moe_experts()
 
-        tokenizer_kwargs: dict[str, object] = {"trust_remote_code": True}
-        revision = pretrained_revision(args.model)
-        if revision is not None:
-            tokenizer_kwargs["revision"] = revision
-        tokenizer = AutoTokenizer.from_pretrained(args.model, **tokenizer_kwargs)
+        tokenizer = load_cid_tokenizer(args.model)
         text_encoder = ILLaDATextEncoder(
             adapter, tokenizer, pooling_mode=args.semantic_pooling
         )
@@ -2645,7 +2635,6 @@ def _resolve_stage_b_performance_profile(
 def _train_stage_b(args: argparse.Namespace) -> None:
     import torch
     import torch.distributed as dist
-    from transformers import AutoTokenizer
 
     from cid.model import (
         CIDTrainer,
@@ -2668,7 +2657,7 @@ def _train_stage_b(args: argparse.Namespace) -> None:
         wrap_stage_b_fsdp,
     )
     from cid.model.encoding import ILLaDATextEncoder
-    from cid.model.loading import backbone_model_type, pretrained_revision
+    from cid.model.loading import backbone_model_type, load_cid_tokenizer
 
     if args.thought_capacity != 128:
         raise ValueError("CID v1 Stage B requires --thought-capacity 128")
@@ -2881,11 +2870,7 @@ def _train_stage_b(args: argparse.Namespace) -> None:
             lr_schedule = str(saved_trainer_config.get("lr_schedule", "cosine"))
             lr_decay_start_steps = int(saved_trainer_config.get("lr_decay_start_steps", 0))
 
-        tokenizer_kwargs: dict[str, object] = {"trust_remote_code": True}
-        revision = pretrained_revision(args.model)
-        if revision is not None:
-            tokenizer_kwargs["revision"] = revision
-        tokenizer = AutoTokenizer.from_pretrained(args.model, **tokenizer_kwargs)
+        tokenizer = load_cid_tokenizer(args.model)
 
         def load_adapter() -> tuple[ILLaDACIDAdapter, ILLaDATextEncoder]:
             # Keep the initial FP32 model on host memory. On CUDA, FSDP's device_id moves

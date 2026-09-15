@@ -3,6 +3,14 @@
 Importing this package requires the optional `train` dependencies.
 """
 
+from cid.model.ar import (
+    AR_CID_MODEL_TYPES,
+    CID_MASK_TOKEN,
+    MINICPM5_2B_BASE,
+    QWEN3_4B_BASE,
+    prepare_ar_backbone_for_cid,
+    prepare_ar_tokenizer,
+)
 from cid.model.diffusion import CIDDiffusionScheduler, DisplayCorruption, ThoughtCorruption
 from cid.model.huggingface import (
     CIDConfig,
@@ -32,7 +40,7 @@ from cid.model.lfm import (
     LFM2_MASK_TOKEN_ID,
     LFMCIDAdapter,
 )
-from cid.model.loading import load_cid_adapter_from_pretrained
+from cid.model.loading import load_cid_adapter_from_pretrained, load_cid_tokenizer
 from cid.model.losses import CIDLoss, CIDLossWeights, CIDTargets, cid_loss
 from cid.model.materialize import (
     AnchorCandidate,
@@ -86,6 +94,10 @@ from cid.model.training import (
 )
 
 __all__ = [
+    "AR_CID_MODEL_TYPES",
+    "CID_MASK_TOKEN",
+    "MINICPM5_2B_BASE",
+    "QWEN3_4B_BASE",
     "CIDConfig",
     "CIDModel",
     "CIDLoss",
@@ -135,9 +147,12 @@ __all__ = [
     "load_cid_adapter_checkpoint",
     "load_cid_adapter_parameter_state",
     "load_cid_adapter_from_pretrained",
+    "load_cid_tokenizer",
     "load_cid_model_from_pretrained",
     "build_unified_cid_config",
     "unified_state_from_legacy",
+    "prepare_ar_backbone_for_cid",
+    "prepare_ar_tokenizer",
     "materialize_indexed_rollout_windows",
     "load_stage_b_checkpoint",
     "load_stage_b_model_checkpoint",

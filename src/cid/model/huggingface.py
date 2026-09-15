@@ -7,9 +7,10 @@ from typing import Any
 
 import torch
 from torch import Tensor
-from transformers import PretrainedConfig, PreTrainedModel
+from transformers import AutoConfig, AutoModelForCausalLM, PretrainedConfig, PreTrainedModel
 from transformers.models.lfm2.configuration_lfm2 import Lfm2Config
 
+from cid.model.ar import AR_CID_MODEL_TYPES
 from cid.model.encoding import ILLaDATextEncoder
 from cid.model.illada import ILLaDACIDAdapter, ILLaDACIDConfig
 from cid.model.lfm import LFM2_EOS_TOKEN_ID, LFM2_MASK_TOKEN_ID, LFMCIDAdapter
@@ -42,8 +43,14 @@ class CIDConfig(PretrainedConfig):
         self.base_model = base_model
         self.release_name = release_name
 
-        if self.backbone_config and self.backbone_config.get("model_type") != "lfm2":
-            raise ValueError("unified CID checkpoints currently support the LFM2 backbone")
+        supported_backbones = {"lfm2", *AR_CID_MODEL_TYPES}
+        if (
+            self.backbone_config
+            and self.backbone_config.get("model_type") not in supported_backbones
+        ):
+            raise ValueError(
+                "unified CID checkpoints support LFM2, Llama, and Qwen3 backbones"
+            )
         if self.semantic_embedding:
             required = {
                 "format_version",
@@ -66,10 +73,6 @@ class CIDModel(PreTrainedModel):
     config_class = CIDConfig
     base_model_prefix = "adapter"
     main_input_name = "batch"
-    _tied_weights_keys = {
-        "adapter.backbone.lm_head.weight": "adapter.backbone.lfm2.embed_tokens.weight"
-    }
-
     def __init__(self, config: CIDConfig) -> None:
         super().__init__(config)
         if not config.backbone_config:
@@ -80,18 +83,29 @@ class CIDModel(PreTrainedModel):
             raise ValueError("CIDConfig.semantic_embedding is required")
 
         backbone_values = dict(config.backbone_config)
-        if backbone_values.get("model_type") != "lfm2":
-            raise ValueError("unified CID checkpoints currently support the LFM2 backbone")
-        backbone_values.setdefault("mask_token_id", LFM2_MASK_TOKEN_ID)
-        backbone_values.setdefault("eos_token_id", LFM2_EOS_TOKEN_ID)
+        model_type = str(backbone_values.get("model_type", ""))
         backbone_values["use_cache"] = False
         backbone_values.pop("auto_map", None)
         backbone_values.pop("architectures", None)
-        backbone_config = Lfm2Config.from_dict(backbone_values)
-        backbone = Lfm2BidirectionalForMaskedLM(backbone_config)
+        if model_type == "lfm2":
+            backbone_values.setdefault("mask_token_id", LFM2_MASK_TOKEN_ID)
+            backbone_values.setdefault("eos_token_id", LFM2_EOS_TOKEN_ID)
+            backbone_config = Lfm2Config.from_dict(backbone_values)
+            backbone = Lfm2BidirectionalForMaskedLM(backbone_config)
+            adapter_class = LFMCIDAdapter
+        elif model_type in AR_CID_MODEL_TYPES:
+            if backbone_values.get("mask_token_id") is None:
+                raise ValueError("unified autoregressive CID backbone must define mask_token_id")
+            config_values = dict(backbone_values)
+            config_values.pop("model_type", None)
+            backbone_config = AutoConfig.for_model(model_type, **config_values)
+            backbone = AutoModelForCausalLM.from_config(backbone_config)
+            adapter_class = ILLaDACIDAdapter
+        else:
+            raise ValueError(f"unsupported unified CID backbone: {model_type!r}")
 
         adapter_config = ILLaDACIDConfig(**config.adapter_config)
-        self.adapter = LFMCIDAdapter(backbone, config=adapter_config, freeze_backbone=False)
+        self.adapter = adapter_class(backbone, config=adapter_config, freeze_backbone=False)
 
         semantic = config.semantic_embedding
         expected_shape = (self.adapter.vocab_size, self.adapter.d_model)
@@ -179,8 +193,16 @@ def build_unified_cid_config(
         else dict(adapter_config)
     )
     backbone_values = dict(backbone_config)
-    backbone_values.setdefault("mask_token_id", LFM2_MASK_TOKEN_ID)
-    backbone_values.setdefault("eos_token_id", LFM2_EOS_TOKEN_ID)
+    if backbone_values.get("model_type") == "lfm2":
+        backbone_values.setdefault("mask_token_id", LFM2_MASK_TOKEN_ID)
+        backbone_values.setdefault("eos_token_id", LFM2_EOS_TOKEN_ID)
+    elif backbone_values.get("model_type") in AR_CID_MODEL_TYPES:
+        if backbone_values.get("mask_token_id") is None:
+            raise ValueError("autoregressive CID backbone config must define mask_token_id")
+    else:
+        raise ValueError(
+            f"unsupported unified CID backbone: {backbone_values.get('model_type')!r}"
+        )
     backbone_values["use_cache"] = False
     backbone_values.pop("auto_map", None)
     backbone_values.pop("architectures", None)

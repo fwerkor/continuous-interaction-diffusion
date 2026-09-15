@@ -1,5 +1,6 @@
 from __future__ import annotations
 
+from cid.model.ar import AR_CID_MODEL_TYPES, prepare_ar_tokenizer
 from cid.model.illada import (
     ILLADA_8B_BASE,
     ILLADA_8B_BASE_REVISION,
@@ -36,6 +37,30 @@ def backbone_model_type(model_name_or_path: str) -> str:
     return str(config.model_type)
 
 
+def load_cid_tokenizer(model_name_or_path: str, **tokenizer_kwargs: object):
+    from transformers import AutoConfig, AutoTokenizer
+
+    tokenizer_kwargs.setdefault("trust_remote_code", True)
+    revision = pretrained_revision(model_name_or_path)
+    if revision is not None:
+        tokenizer_kwargs.setdefault("revision", revision)
+    tokenizer = AutoTokenizer.from_pretrained(model_name_or_path, **tokenizer_kwargs)
+
+    config_kwargs: dict[str, object] = {
+        "trust_remote_code": tokenizer_kwargs.get("trust_remote_code", True)
+    }
+    if tokenizer_kwargs.get("revision") is not None:
+        config_kwargs["revision"] = tokenizer_kwargs["revision"]
+    config = AutoConfig.from_pretrained(model_name_or_path, **config_kwargs)
+    model_type = str(config.model_type)
+    if model_type == "cid":
+        backbone_config = getattr(config, "backbone_config", {})
+        model_type = str(backbone_config.get("model_type", ""))
+    if model_type in AR_CID_MODEL_TYPES:
+        prepare_ar_tokenizer(tokenizer)
+    return tokenizer
+
+
 def load_cid_adapter_from_pretrained(
     model_name_or_path: str,
     *,
@@ -62,6 +87,8 @@ def load_cid_adapter_from_pretrained(
             freeze_backbone=freeze_backbone,
             **from_pretrained_kwargs,
         )
+    if model_type in AR_CID_MODEL_TYPES:
+        from_pretrained_kwargs.setdefault("attn_implementation", "sdpa")
     return ILLaDACIDAdapter.from_pretrained(
         model_name_or_path,
         config=config,

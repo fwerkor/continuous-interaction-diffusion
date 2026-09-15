@@ -8,6 +8,11 @@ from torch import nn
 
 from cid.grounding import AnchorKind, LinkRelation, ObjectKind
 from cid.lifecycle import MODELED_LIFECYCLES
+from cid.model.ar import (
+    AR_CID_MODEL_TYPES,
+    bidirectional_ar_hidden_states,
+    prepare_ar_backbone_for_cid,
+)
 from cid.model.components import CIDExternalFusion, CIDOutputHeads
 from cid.model.tensors import CIDTensorBatch, CIDTensorOutput, live_slot_occupancy
 
@@ -610,9 +615,9 @@ class ILLaDACIDAdapter(nn.Module):
         self.is_llada_moe = model_type == "llada" and int(
             getattr(backbone_config, "num_experts", 0)
         ) > 0
-        if model_type not in {"illada", "lfm2"} and not self.is_llada_moe:
+        if model_type not in {"illada", "lfm2", *AR_CID_MODEL_TYPES} and not self.is_llada_moe:
             raise ValueError(
-                "expected an iLLaDA, LLaDA-MoE, or bidirectional LFM2 backbone, "
+                "expected an iLLaDA, LLaDA-MoE, bidirectional LFM2, Llama, or Qwen3 backbone, "
                 f"got {backbone_config.model_type!r}"
             )
         self.d_model = int(backbone_config.hidden_size)
@@ -622,8 +627,8 @@ class ILLaDACIDAdapter(nn.Module):
             LLADA_MOE_MASK_TOKEN_ID if self.is_llada_moe else ILLADA_MASK_TOKEN_ID
         )
         configured_mask_token_id = getattr(backbone_config, "mask_token_id", None)
-        if model_type == "lfm2" and configured_mask_token_id is None:
-            raise ValueError("bidirectional LFM2 backbone must define mask_token_id")
+        if model_type in {"lfm2", *AR_CID_MODEL_TYPES} and configured_mask_token_id is None:
+            raise ValueError(f"{model_type} CID backbone must define mask_token_id")
         self.mask_token_id = int(
             default_mask_token_id if configured_mask_token_id is None else configured_mask_token_id
         )
@@ -717,6 +722,17 @@ class ILLaDACIDAdapter(nn.Module):
             model_name_or_path,
             **from_pretrained_kwargs,
         )
+        if str(backbone.config.model_type) in AR_CID_MODEL_TYPES:
+            from transformers import AutoTokenizer
+
+            tokenizer_kwargs: dict[str, object] = {
+                "trust_remote_code": bool(from_pretrained_kwargs.get("trust_remote_code", True))
+            }
+            revision = from_pretrained_kwargs.get("revision")
+            if revision is not None:
+                tokenizer_kwargs["revision"] = revision
+            tokenizer = AutoTokenizer.from_pretrained(model_name_or_path, **tokenizer_kwargs)
+            prepare_ar_backbone_for_cid(backbone, tokenizer)
         return cls(backbone, config=config, freeze_backbone=freeze_backbone)
 
     def set_backbone_trainable(self, trainable: bool) -> None:
@@ -849,7 +865,7 @@ class ILLaDACIDAdapter(nn.Module):
             return
         if chunk_size <= 0:
             raise ValueError("MLP chunk size must be positive")
-        if self.is_llada_moe or self.backbone_family == "lfm2":
+        if self.is_llada_moe or self.backbone_family in {"lfm2", *AR_CID_MODEL_TYPES}:
             return
         decoder = self.hidden_backbone()
         layers = getattr(decoder, "layers", None)
@@ -872,7 +888,7 @@ class ILLaDACIDAdapter(nn.Module):
             return
         if chunk_size <= 0:
             raise ValueError("norm chunk size must be positive")
-        if self.backbone_family == "lfm2":
+        if self.backbone_family in {"lfm2", *AR_CID_MODEL_TYPES}:
             return
         decoder = self.hidden_backbone()
         layers = getattr(decoder, "layers", None)
@@ -983,12 +999,21 @@ class ILLaDACIDAdapter(nn.Module):
             self._captured_router_logits.clear()
             self._capture_router_logits = True
         try:
-            decoder_output = self.hidden_backbone()(
-                **decoder_kwargs,
-            )
+            if self.backbone_family in AR_CID_MODEL_TYPES:
+                hidden = bidirectional_ar_hidden_states(
+                    self.hidden_backbone(),
+                    inputs_embeds=seed_hidden,
+                    attention_mask=attention_mask,
+                    position_ids=position_ids,
+                )
+                decoder_output = None
+            else:
+                decoder_output = self.hidden_backbone()(
+                    **decoder_kwargs,
+                )
+                hidden = decoder_output.last_hidden_state
         finally:
             self._capture_router_logits = False
-        hidden = decoder_output.last_hidden_state
 
         thought_weight = neural_occupancy
         prompt_weight = prompt_keys.to(dtype=thought_weight.dtype).unsqueeze(-1)

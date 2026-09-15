@@ -108,17 +108,18 @@ python -m pip install -e '.[data]'
 
 ## Diffusion backbone adapters
 
-CID supports three production backbone sizes: dense `GSAI-ML/iLLaDA-8B-Base`, sparse
-`inclusionAI/LLaDA-MoE-7B-A1B-Base`, and the compact
-`LiquidAI/LFM2.5-Encoder-350M-Diffusion` used by CID-v1-0.4B. All three keep the pretrained
-masked-token embedding and LM head, run `[TCT | prompt | display]` through their native
-bidirectional sequence model, and attach the same CID external-perception fusion and prediction
-heads. The LFM2 path preserves its original full-attention/short-convolution stack and native
-weight geometry. The MoE path keeps its 64-expert/Top-8 routing
-and adds the upstream load-balancing auxiliary loss only when the backbone is unfrozen in Stage B.
-The immutable prompt remains token-level conditioning; protected Facts are reserved for externally
-controlled values. Empty TCT slots are masked as attention keys so they can query context for
-allocation without contaminating the current display.
+CID supports native diffusion backbones at 0.4B, 7B-A1B, and 8B scale, plus AR-derived
+`openbmb/MiniCPM5-2B-Base` and `Qwen/Qwen3-4B-Base` training paths for CID-v1-2B and CID-v1-4B.
+All paths attach the same CID external-perception fusion and prediction heads. Native diffusion
+backbones keep their pretrained masked-token embedding and bidirectional sequence model. The AR
+path keeps the original Llama/Qwen3 weights, adds a dedicated `<|cid_mask|>` token, disables causal
+attention and KV caching during CID denoising, and reuses the original decoder layers, RoPE, MLPs,
+norms, and LM head. The LFM2 path preserves its original full-attention/short-convolution stack and
+native weight geometry. The MoE path keeps its 64-expert/Top-8 routing and adds the upstream
+load-balancing auxiliary loss only when the backbone is unfrozen in Stage B. The immutable prompt
+remains token-level conditioning; protected Facts are reserved for externally controlled values.
+Empty TCT slots are masked as attention keys so they can query context for allocation without
+contaminating the current display.
 
 The same model loader and CID training/runtime ABI are used across CPU, NVIDIA CUDA, and Ascend NPU
 backends; backend support is not maintained as separate model forks:
@@ -127,6 +128,8 @@ backends; backend support is not maintained as separate model forks:
 | --- | --- | --- | --- | --- |
 | CID-v1-8B | iLLaDA-8B-Base | supported | supported | supported |
 | CID-v1-7B-A1B | LLaDA-MoE-7B-A1B-Base | supported | supported | supported |
+| CID-v1-4B | Qwen3-4B-Base | code path | code path | code path |
+| CID-v1-2B | MiniCPM5-2B-Base | code path | code path | code path |
 | CID-v1-0.4B | LFM2.5-Encoder-350M-Diffusion | supported | supported | supported |
 
 Stage A uses the same DDP path on CUDA and NPU. Stage B uses FSDP `FULL_SHARD` for multi-rank
@@ -144,10 +147,11 @@ model = ILLaDACIDAdapter.from_pretrained(
 )
 ```
 
-The loader pins the official checkpoint revision used by this repository and enables the model's
+The loader pins revisions where this repository has a fixed production checkpoint and enables any
 required Hugging Face remote code. Use `load_cid_adapter_from_pretrained()` when the backbone may
-be any supported family; it dispatches LFM2 to `AutoModelForMaskedLM` and LLaDA-family checkpoints
-to their existing causal-LM wrappers. Public unified CID checkpoints such as `CID-v1-0.4B` store
+be any supported family; it dispatches LFM2 to `AutoModelForMaskedLM`, while iLLaDA, LLaDA-MoE,
+Llama, and Qwen3 use their causal-LM checkpoint classes with CID's bidirectional execution path.
+Public unified CID checkpoints such as `CID-v1-0.4B` store
 the backbone, CID-specific modules, and frozen semantic embedding in one `model.safetensors` file;
 `load_cid_model_from_pretrained()` restores the complete package, while the adapter loader remains
 compatible with both unified releases and legacy backbone-only checkpoints. The 8B checkpoint is
@@ -159,9 +163,10 @@ python examples/illada_tiny_smoke.py
 ```
 
 Special tokens are backbone-specific: iLLaDA uses mask id `5`, LLaDA-MoE uses mask id `156895`
-and EOS id `156892`, and LFM2.5 diffusion uses mask id `16` and EOS id `7`. The adapter carries
-these IDs into training, runtime, checkpoints, and benchmarks so artifacts from different backbones
-cannot be mixed silently. The LFM2.5 checkpoint remains subject to its upstream LFM Open License
+and EOS id `156892`, and LFM2.5 diffusion uses mask id `16` and EOS id `7`. AR-derived CID models
+register `<|cid_mask|>` in the source tokenizer and persist its assigned ID with the checkpoint.
+The adapter carries these IDs into training, runtime, checkpoints, and benchmarks so artifacts from
+different backbones cannot be mixed silently. The LFM2.5 checkpoint remains subject to its upstream LFM Open License
 v1.0; this repository's Apache-2.0 license does not replace the model-weight license.
 `CIDDiffusionScheduler` supplies
 masked-display corruption, continuous TCT corruption, confidence-ranked iterative reveal, and
@@ -453,6 +458,23 @@ LR `5e-6`. Both stages auto-resume their latest clean checkpoint. The companion
 `scripts/watchdog-cid-v1-8b-8xa6000.sh` waits for all eight GPUs to be idle, prevents duplicate
 launches with a file lock, and restarts failed runs from the latest checkpoint until both stages
 complete.
+
+For the small AR-derived targets, the shared launcher selects the canonical base model and keeps the
+hardware count configurable:
+
+```bash
+DATA=/path/to/train.jsonl VALIDATION_DATA=/path/to/validation.jsonl \
+RUN_ROOT=/path/to/cid-v1-2b NPROC_PER_NODE=4 \
+scripts/train-cid-v1-small-ar.sh 2b all
+
+DATA=/path/to/train.jsonl VALIDATION_DATA=/path/to/validation.jsonl \
+RUN_ROOT=/path/to/cid-v1-4b NPROC_PER_NODE=4 \
+scripts/train-cid-v1-small-ar.sh 4b all
+```
+
+The initial AR-to-CID Stage B learning-rate settings are launcher defaults rather than calibrated
+model-specific optima; `STAGE_B_LR` and `BACKBONE_LR_SCALE` can be overridden without changing the
+training contract.
 
 Consecutive trajectory transitions are grouped into full contiguous rollout windows, bucketed by
 window length, padded to equal rank counts, and sharded before training. Rollout state is detached

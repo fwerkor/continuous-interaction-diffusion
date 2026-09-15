@@ -11,8 +11,14 @@ from typing import Any
 import torch
 from huggingface_hub import snapshot_download
 from safetensors.torch import load_file, save_file
+from transformers import AutoTokenizer
 
-from cid.model import build_unified_cid_config, unified_state_from_legacy
+from cid.model import (
+    AR_CID_MODEL_TYPES,
+    build_unified_cid_config,
+    prepare_ar_tokenizer,
+    unified_state_from_legacy,
+)
 
 REMOTE_CONFIGURATION = 'from cid.model.huggingface import CIDConfig\n\n__all__ = ["CIDConfig"]\n'
 REMOTE_MODELING = 'from cid.model.huggingface import CIDModel\n\n__all__ = ["CIDModel"]\n'
@@ -78,6 +84,16 @@ def convert(source: Path, output: Path) -> None:
     release_config: dict[str, Any] = json.loads(
         (source / "cid_config.json").read_text(encoding="utf-8")
     )
+    if backbone_config.get("model_type") in AR_CID_MODEL_TYPES:
+        tokenizer = AutoTokenizer.from_pretrained(source, trust_remote_code=True)
+        mask_token_id = prepare_ar_tokenizer(tokenizer)
+        expected_mask_token_id = int(backbone_config["mask_token_id"])
+        if mask_token_id != expected_mask_token_id:
+            raise ValueError(
+                "autoregressive release tokenizer mask token does not match backbone config: "
+                f"{mask_token_id} != {expected_mask_token_id}"
+            )
+        tokenizer.save_pretrained(output)
     semantic_state = torch.load(
         source / "semantic-embedding.pt",
         map_location="cpu",

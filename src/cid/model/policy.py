@@ -19,7 +19,7 @@ from cid.model.encoding import (
     canonical_percept_text,
 )
 from cid.model.illada import ILLADA_8B_BASE, ILLaDACIDAdapter
-from cid.model.loading import pretrained_revision
+from cid.model.loading import load_cid_tokenizer
 from cid.model.materialize import CIDMaterializer, ClosedWorldMaterializationCatalog
 from cid.model.tensors import CIDTensorBatch, build_percept_routing_masks
 from cid.state import CognitiveRole, FactItem
@@ -47,13 +47,7 @@ class ILLaDAContextTensorizer:
         model_name_or_path: str = ILLADA_8B_BASE,
         **tokenizer_kwargs: object,
     ) -> ILLaDAContextTensorizer:
-        from transformers import AutoTokenizer
-
-        tokenizer_kwargs.setdefault("trust_remote_code", True)
-        revision = pretrained_revision(model_name_or_path)
-        if revision is not None:
-            tokenizer_kwargs.setdefault("revision", revision)
-        tokenizer = AutoTokenizer.from_pretrained(model_name_or_path, **tokenizer_kwargs)
+        tokenizer = load_cid_tokenizer(model_name_or_path, **tokenizer_kwargs)
         return cls(adapter, tokenizer)
 
     def __call__(
