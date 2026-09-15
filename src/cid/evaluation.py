@@ -288,7 +288,12 @@ class TaskLocalWorkspaceSearchSource(_StepDelayedSource):
         query = str(arguments.get("query", "")).strip()
         await self._wait_for_latency()
         candidates = list(
-            _rank_workspace_documents(query, self._documents, top_k=self._top_k)
+            await asyncio.to_thread(
+                _rank_workspace_documents,
+                query,
+                self._documents,
+                top_k=self._top_k,
+            )
         )
         value: Any = (
             {"query": query, "candidates": candidates}
@@ -425,7 +430,7 @@ class DeterministicCalculatorSource(_StepDelayedSource):
         expression = str(arguments.get("expression", "")).strip()
         await self._wait_for_latency()
         try:
-            value: Any = _evaluate_calculator(expression)
+            value: Any = await asyncio.to_thread(_evaluate_calculator, expression)
         except (ArithmeticError, SyntaxError, ValueError, OverflowError) as exc:
             value = {"expression": expression, "error": str(exc)}
         return Observation(
@@ -565,7 +570,7 @@ class DeterministicPythonSource(_StepDelayedSource):
         code = str(arguments.get("code", "")).strip()
         await self._wait_for_latency()
         try:
-            value: Any = _evaluate_python_computation(code)
+            value: Any = await asyncio.to_thread(_evaluate_python_computation, code)
         except (ArithmeticError, SyntaxError, TypeError, ValueError, OverflowError) as exc:
             value = {"code": code, "error": str(exc)}
         return Observation(
@@ -732,7 +737,9 @@ class DeterministicSymbolicMathSource(_StepDelayedSource):
         variables = str(arguments.get("variables", "")).strip()
         await self._wait_for_latency()
         try:
-            value: Any = _evaluate_symbolic(operation, expression, variables)
+            value: Any = await asyncio.to_thread(
+                _evaluate_symbolic, operation, expression, variables
+            )
         except (ArithmeticError, SyntaxError, TypeError, ValueError, OverflowError) as exc:
             value = {
                 "operation": operation,

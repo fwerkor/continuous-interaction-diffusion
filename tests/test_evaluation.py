@@ -1,8 +1,10 @@
 from __future__ import annotations
 
 import asyncio
+import threading
 import time
 
+import cid.evaluation as evaluation_module
 from cid.contracts import FreshnessDemand, InformationNeed, ModelContext, ModelUpdate
 from cid.data import ExternalEvent, TrajectoryExample
 from cid.evaluation import (
@@ -368,6 +370,51 @@ def _live_math_example() -> TrajectoryExample:
             "benchmark_live_tool_latency_steps": 1,
         },
     )
+
+
+async def test_local_tool_cpu_work_runs_off_event_loop(monkeypatch) -> None:
+    event_loop_thread = threading.get_ident()
+    worker_threads: list[int] = []
+
+    def fake_calculator(expression: str) -> str:
+        worker_threads.append(threading.get_ident())
+        return expression
+
+    monkeypatch.setattr(evaluation_module, "_evaluate_calculator", fake_calculator)
+    registry = build_replay_registry(_live_math_example())
+    calculator = registry.get("calculator")
+    registry.advance_runtime_step(0)
+    task = asyncio.create_task(calculator.read({"expression": "1+1"}))
+    await asyncio.sleep(0)
+    registry.advance_runtime_step(1)
+    observation = await task
+
+    assert observation.value == "1+1"
+    assert worker_threads
+    assert all(thread_id != event_loop_thread for thread_id in worker_threads)
+
+
+async def test_workspace_search_cpu_work_runs_off_event_loop(monkeypatch) -> None:
+    event_loop_thread = threading.get_ident()
+    worker_threads: list[int] = []
+
+    def fake_rank(query, documents, *, top_k):
+        worker_threads.append(threading.get_ident())
+        return ({"resource_id": "doc-01", "title": query},)
+
+    monkeypatch.setattr(evaluation_module, "_rank_workspace_documents", fake_rank)
+    example = _workspace_example()
+    registry = build_replay_registry(example)
+    search = registry.get("workspace_search")
+    registry.advance_runtime_step(0)
+    task = asyncio.create_task(search.read({"query": "Scott Derrickson"}))
+    await asyncio.sleep(0)
+    registry.advance_runtime_step(2)
+    observation = await task
+
+    assert observation.value[0]["resource_id"] == "doc-01"
+    assert worker_threads
+    assert all(thread_id != event_loop_thread for thread_id in worker_threads)
 
 
 async def test_live_calculator_source_defaults_to_zero_artificial_latency() -> None:
