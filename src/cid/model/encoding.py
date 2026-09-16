@@ -1,6 +1,7 @@
 from __future__ import annotations
 
 import json
+from collections import OrderedDict
 from collections.abc import Mapping
 from typing import Any
 
@@ -25,6 +26,8 @@ class ILLaDATextEncoder:
     FROZEN_SNAPSHOT_FORMAT_VERSION = 1
     ORDER_MOMENT_SCALE = 0.25
     SOURCE_IDENTITY_SCALE = 0.25
+    TOKEN_CACHE_SIZE = 8192
+    DETACHED_TEXT_CACHE_SIZE = 8192
 
     def __init__(
         self,
@@ -42,6 +45,8 @@ class ILLaDATextEncoder:
         self.d_model = adapter.d_model
         self.pooling_mode = pooling_mode
         self._is_frozen_snapshot = False
+        self._token_cache: OrderedDict[tuple[str, bool], Tensor] = OrderedDict()
+        self._detached_text_cache: OrderedDict[str, Tensor] = OrderedDict()
 
     @classmethod
     def from_frozen_snapshot(
@@ -71,6 +76,8 @@ class ILLaDATextEncoder:
         snapshot.d_model = adapter.d_model
         snapshot.pooling_mode = pooling_mode
         snapshot._is_frozen_snapshot = True
+        snapshot._token_cache = OrderedDict()
+        snapshot._detached_text_cache = OrderedDict()
         return snapshot
 
     @classmethod
@@ -114,6 +121,8 @@ class ILLaDATextEncoder:
         snapshot.d_model = adapter.d_model
         snapshot.pooling_mode = pooling_mode
         snapshot._is_frozen_snapshot = True
+        snapshot._token_cache = OrderedDict()
+        snapshot._detached_text_cache = OrderedDict()
         return snapshot
 
     @property
@@ -146,12 +155,24 @@ class ILLaDATextEncoder:
     def tokenize(self, text: str, *, add_special_tokens: bool) -> Tensor:
         if not text:
             return torch.empty((1, 0), dtype=torch.long, device=self.device)
+        cache_key = (text, add_special_tokens)
+        cached = self._token_cache.get(cache_key)
+        if cached is not None:
+            self._token_cache.move_to_end(cache_key)
+            return cached.to(device=self.device)
         encoded = self.tokenizer(
             text,
             add_special_tokens=add_special_tokens,
             return_tensors="pt",
         )
-        return encoded["input_ids"].to(device=self.device)
+        input_ids = encoded["input_ids"]
+        self._remember(
+            self._token_cache,
+            cache_key,
+            input_ids.detach().cpu(),
+            self.TOKEN_CACHE_SIZE,
+        )
+        return input_ids.to(device=self.device)
 
     def encode_one(self, text: str, *, detach: bool = False) -> Tensor:
         return self.encode_texts((text,), detach=detach)[0, 0]
@@ -163,6 +184,41 @@ class ILLaDATextEncoder:
                 device=self.device,
                 dtype=self.dtype,
             )
+        if detach and self._semantic_cache_safe():
+            vectors: list[Tensor | None] = []
+            missing_texts: list[str] = []
+            missing_indices: list[int] = []
+            for index, text in enumerate(texts):
+                cached = self._detached_text_cache.get(text)
+                if cached is None:
+                    vectors.append(None)
+                    missing_texts.append(text)
+                    missing_indices.append(index)
+                else:
+                    self._detached_text_cache.move_to_end(text)
+                    vectors.append(cached)
+            if missing_texts:
+                missing_vectors = self._encode_texts_uncached(tuple(missing_texts), detach=True)[0]
+                for index, text, vector in zip(
+                    missing_indices,
+                    missing_texts,
+                    missing_vectors.unbind(0),
+                    strict=True,
+                ):
+                    vector = vector.detach()
+                    self._remember(
+                        self._detached_text_cache,
+                        text,
+                        vector,
+                        self.DETACHED_TEXT_CACHE_SIZE,
+                    )
+                    vectors[index] = vector
+            if any(vector is None for vector in vectors):
+                raise RuntimeError("detached semantic cache failed to materialize an encoded text")
+            return torch.stack(tuple(vector for vector in vectors if vector is not None), dim=0).unsqueeze(0)
+        return self._encode_texts_uncached(texts, detach=detach)
+
+    def _encode_texts_uncached(self, texts: tuple[str, ...], *, detach: bool) -> Tensor:
         encoded = self.tokenizer(
             list(texts),
             add_special_tokens=False,
@@ -200,6 +256,16 @@ class ILLaDATextEncoder:
             pooled = mean + self.ORDER_MOMENT_SCALE * directional
         result = pooled.unsqueeze(0)
         return result.detach() if detach else result
+
+    def _semantic_cache_safe(self) -> bool:
+        return self.is_frozen_snapshot or not self._embedding.weight.requires_grad
+
+    @staticmethod
+    def _remember(cache: OrderedDict, key: Any, value: Tensor, limit: int) -> None:
+        cache[key] = value
+        cache.move_to_end(key)
+        while len(cache) > limit:
+            cache.popitem(last=False)
 
     def encode_source_descriptors(
         self,
