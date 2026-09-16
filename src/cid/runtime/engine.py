@@ -384,12 +384,23 @@ class CIDRuntime:
                     loop_period, loop_repeats = loop_match
                     repeated_count = loop_period * loop_repeats
                     cycle = tuple(loop_history[-repeated_count:])
-                    if loop_mode == "exact":
+                    stable_fixed_point = (
+                        loop_period == 1
+                        and self._display_is_resolved_and_stable(
+                            previous_display,
+                            proposed_display,
+                        )
+                    )
+                    if stable_fixed_point:
+                        last_escape_slots = ()
+                        last_escape_display_positions = ()
+                    else:
+                        last_escape_slots, last_escape_display_positions = self._loop_targets(cycle)
+                    if loop_mode == "exact" and not stable_fixed_point:
                         cycle_signatures = {item.signature for item in cycle}
                         expires_at = completed_steps + _LOOP_TABOO_STEPS
                         for signature in cycle_signatures:
                             taboo_signatures[signature] = expires_at
-                    last_escape_slots, last_escape_display_positions = self._loop_targets(cycle)
                     self.trace.emit(
                         "loop_detected",
                         step,
@@ -400,58 +411,52 @@ class CIDRuntime:
                         display_positions=list(last_escape_display_positions),
                         runtime_step=self._runtime_step,
                     )
-                    if (
-                        loop_period == 1
-                        and self._display_is_resolved_and_stable(
-                            previous_display,
-                            proposed_display,
-                        )
-                    ):
-                        display = proposed_display
+                    if stable_fixed_point:
                         self.trace.emit(
-                            "stable_fixed_point_reached",
+                            "stable_fixed_point_protected",
                             step,
                             mode=loop_mode,
                             repeats=loop_repeats,
                             runtime_step=self._runtime_step,
                         )
-                        break
-                    if loop_escape_count >= self.config.loop_escape_attempts:
+                        loop_history.clear()
+                    else:
+                        if loop_escape_count >= self.config.loop_escape_attempts:
+                            self.trace.emit(
+                                "loop_escape_exhausted",
+                                step,
+                                reason=f"{loop_mode}_cycle_detected",
+                                attempts=loop_escape_count,
+                                runtime_step=self._runtime_step,
+                            )
+                            break
+                        loop_escape_count += 1
+                        rollback = cycle[0]
+                        thought, display = self._rediffuse_loop_state(
+                            rollback.input_thought,
+                            rollback.input_display,
+                            cell_slots=last_escape_slots,
+                            display_positions=last_escape_display_positions,
+                            current_thought=previous_thought,
+                            current_display=previous_display,
+                        )
                         self.trace.emit(
-                            "loop_escape_exhausted",
+                            "loop_escape_applied",
                             step,
                             reason=f"{loop_mode}_cycle_detected",
-                            attempts=loop_escape_count,
+                            attempt=loop_escape_count,
+                            period=loop_period,
+                            rolled_back=rollback.input_thought.occupied_cell_ids
+                            == previous_thought.occupied_cell_ids,
+                            cell_slots=list(last_escape_slots),
+                            display_positions=list(last_escape_display_positions),
                             runtime_step=self._runtime_step,
                         )
-                        break
-                    loop_escape_count += 1
-                    rollback = cycle[0]
-                    thought, display = self._rediffuse_loop_state(
-                        rollback.input_thought,
-                        rollback.input_display,
-                        cell_slots=last_escape_slots,
-                        display_positions=last_escape_display_positions,
-                        current_thought=previous_thought,
-                        current_display=previous_display,
-                    )
-                    self.trace.emit(
-                        "loop_escape_applied",
-                        step,
-                        reason=f"{loop_mode}_cycle_detected",
-                        attempt=loop_escape_count,
-                        period=loop_period,
-                        rolled_back=rollback.input_thought.occupied_cell_ids
-                        == previous_thought.occupied_cell_ids,
-                        cell_slots=list(last_escape_slots),
-                        display_positions=list(last_escape_display_positions),
-                        runtime_step=self._runtime_step,
-                    )
-                    loop_history.clear()
-                    epoch_steps = 0
-                    self._runtime_step += 1
-                    await asyncio.sleep(0)
-                    continue
+                        loop_history.clear()
+                        epoch_steps = 0
+                        self._runtime_step += 1
+                        await asyncio.sleep(0)
+                        continue
 
                 display = proposed_display
                 live_cell_ids = set(proposed_thought.live_cell_ids)
@@ -634,7 +639,6 @@ class CIDRuntime:
         stop_events = {
             "wall_clock_budget_exhausted", "total_compute_budget_exhausted",
             "compute_budget_exhausted", "loop_escape_exhausted",
-            "stable_fixed_point_reached",
         }
         stop_reason = "converged" if converged else next(
             (event.kind for event in reversed(self.trace.events) if event.kind in stop_events),

@@ -910,6 +910,9 @@ class LatentDriftPolicy:
 
 
 class StableResolvedDisplayPolicy:
+    def __init__(self, *, converge_at: int | None = None) -> None:
+        self.converge_at = converge_at
+
     def step(self, context: ModelContext) -> ModelUpdate:
         cells = list(context.thought.cells)
         cell = cells[0]
@@ -920,6 +923,9 @@ class StableResolvedDisplayPolicy:
         return ModelUpdate(
             thought=context.thought.advance(tuple(cells)),
             display=context.display.advance((42,)),
+            converged=(
+                self.converge_at is not None and context.step >= self.converge_at
+            ),
         )
 
 
@@ -946,10 +952,8 @@ async def test_runtime_escapes_stationary_model_loop_before_compute_budget() -> 
 
 
 async def test_runtime_preserves_resolved_display_at_exact_fixed_point() -> None:
-    result = await CIDRuntime(
-        SourceRegistry(),
-        RuntimeConfig(max_steps=100, loop_escape_attempts=1),
-    ).run(
+    config = RuntimeConfig(max_steps=12, loop_escape_attempts=1)
+    result = await CIDRuntime(SourceRegistry(), config).run(
         StuckPolicy(),
         thought=seeded_thought(1),
         display=DisplayCanvas(token_ids=(42,), mask_token_id=-1),
@@ -960,8 +964,13 @@ async def test_runtime_preserves_resolved_display_at_exact_fixed_point() -> None
     detected = tuple(event for event in result.trace.events if event.kind == "loop_detected")
     assert detected[0].payload["mode"] == "exact"
     assert detected[0].payload["period"] == 1
-    assert result.trace.count("stable_fixed_point_reached") == 1
+    assert result.trace.count("stable_fixed_point_protected") >= 1
     assert result.trace.count("loop_escape_applied") == 0
+    assert result.trace.count("loop_escape_exhausted") == 0
+    assert result.steps == config.max_steps
+    terminal = result.trace.events[-1]
+    assert terminal.kind == "trajectory_finished"
+    assert terminal.payload["stop_reason"] == "compute_budget_exhausted"
 
 
 async def test_runtime_detects_short_period_display_oscillation_and_remasks_it() -> None:
@@ -1007,7 +1016,7 @@ async def test_runtime_detects_behavioral_loop_despite_continuous_latent_drift()
 
 async def test_runtime_preserves_resolved_display_at_stable_behavior_fixed_point() -> None:
     config = RuntimeConfig(
-        max_steps=100,
+        max_steps=24,
         loop_escape_attempts=1,
     )
     result = await CIDRuntime(SourceRegistry(), config).run(
@@ -1018,17 +1027,37 @@ async def test_runtime_preserves_resolved_display_at_stable_behavior_fixed_point
 
     assert not result.converged
     assert result.display.token_ids == (42,)
-    assert result.steps < config.max_steps
+    assert result.steps == config.max_steps
     detected = tuple(event for event in result.trace.events if event.kind == "loop_detected")
     assert detected
     assert detected[0].payload["mode"] == "behavior"
     assert detected[0].payload["period"] == 1
-    assert result.trace.count("stable_fixed_point_reached") == 1
+    assert result.trace.count("stable_fixed_point_protected") >= 1
     assert result.trace.count("loop_escape_applied") == 0
     assert result.trace.count("loop_escape_exhausted") == 0
     terminal = result.trace.events[-1]
     assert terminal.kind == "trajectory_finished"
-    assert terminal.payload["stop_reason"] == "stable_fixed_point_reached"
+    assert terminal.payload["stop_reason"] == "compute_budget_exhausted"
+
+
+async def test_stable_fixed_point_protection_waits_for_model_convergence() -> None:
+    result = await CIDRuntime(
+        SourceRegistry(),
+        RuntimeConfig(max_steps=40, loop_escape_attempts=1),
+    ).run(
+        StableResolvedDisplayPolicy(converge_at=15),
+        thought=seeded_thought(1),
+        display=DisplayCanvas.masked(1, -1),
+    )
+
+    assert result.converged
+    assert result.steps == 16
+    assert result.display.token_ids == (42,)
+    assert result.trace.count("stable_fixed_point_protected") >= 1
+    assert result.trace.count("loop_escape_applied") == 0
+    terminal = result.trace.events[-1]
+    assert terminal.kind == "trajectory_finished"
+    assert terminal.payload["stop_reason"] == "converged"
 
 
 async def test_behavioral_loop_guard_allows_normal_latent_refinement_to_converge() -> None:
