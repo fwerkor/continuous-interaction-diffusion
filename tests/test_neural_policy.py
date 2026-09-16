@@ -203,7 +203,8 @@ async def test_neural_policy_runs_tiny_illada_inside_async_runtime() -> None:
     assert result.converged
     assert result.steps == 2
     assert result.display.token_ids == (7, 7, 7)
-    assert tokenizer.prompts == ["Which value should I return?"] * 2
+    # Detached text encodings are cached across runtime steps.
+    assert tokenizer.prompts == ["Which value should I return?"]
 
 
 async def test_neural_policy_materializes_executable_need_and_reads_source() -> None:

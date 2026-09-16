@@ -215,7 +215,9 @@ class ILLaDATextEncoder:
                     vectors[index] = vector
             if any(vector is None for vector in vectors):
                 raise RuntimeError("detached semantic cache failed to materialize an encoded text")
-            return torch.stack(tuple(vector for vector in vectors if vector is not None), dim=0).unsqueeze(0)
+            return torch.stack(
+                tuple(vector for vector in vectors if vector is not None), dim=0
+            ).unsqueeze(0)
         return self._encode_texts_uncached(texts, detach=detach)
 
     def _encode_texts_uncached(self, texts: tuple[str, ...], *, detach: bool) -> Tensor:
