@@ -81,6 +81,15 @@ def prepare_ar_backbone_for_cid(backbone: nn.Module, tokenizer: Any) -> int:
                 )
 
     backbone.config.mask_token_id = mask_token_id
+    tokenizer_eos_token_id = getattr(tokenizer, "eos_token_id", None)
+    if tokenizer_eos_token_id is None:
+        raise ValueError("autoregressive CID tokenizer must define eos_token_id")
+    # Some AR checkpoints (for example MiniCPM5) expose several generation stop
+    # IDs in the model config while their tokenizer still has one canonical EOS.
+    # CID's display diffusion uses a single structural EOS token, so keep the
+    # prepared backbone aligned with the tokenizer instead of carrying the
+    # generation-only list into the CID adapter.
+    backbone.config.eos_token_id = int(tokenizer_eos_token_id)
     backbone.config.use_cache = False
     _set_attention_noncausal(backbone.get_decoder())
     return mask_token_id

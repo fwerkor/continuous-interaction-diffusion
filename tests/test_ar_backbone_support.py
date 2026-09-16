@@ -113,6 +113,19 @@ def test_ar_backbone_is_prepared_with_dedicated_mask_token(model_class, config_f
     assert adapter.backbone_family == model.config.model_type
 
 
+def test_ar_backbone_normalizes_multiple_config_eos_ids() -> None:
+    config = _llama_config()
+    config.eos_token_id = [2, 7]
+    model = transformers.LlamaForCausalLM(config)
+    tokenizer = _TinyTokenizer(32, eos_token_id=2)
+
+    prepare_ar_backbone_for_cid(model, tokenizer)
+
+    assert model.config.eos_token_id == 2
+    adapter = ILLaDACIDAdapter(model, freeze_backbone=True)
+    assert adapter.eos_token_id == 2
+
+
 def test_new_mask_token_uses_mean_embedding_inside_reserved_vocab_capacity() -> None:
     model = transformers.LlamaForCausalLM(_llama_config())
     tokenizer = _TinyTokenizer(31)
