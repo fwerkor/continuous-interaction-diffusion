@@ -1,10 +1,13 @@
 from __future__ import annotations
 
 import math
+from bisect import bisect_right
 from dataclasses import dataclass
 
 import torch
 from torch import Tensor
+
+_MAX_STRUCTURAL_EDIT_TOKENS = 32
 
 
 def denoising_reveal_fraction(step: int, total_steps: int) -> float:
@@ -217,6 +220,32 @@ class CIDDiffusionScheduler:
                 if current_eos.numel():
                     eos_position = int(current_eos[0])
 
+            structural_edit = None
+            if eos_position is not None and revision_fraction:
+                structural_edit = self._structural_display_edit(
+                    token_ids[batch_index],
+                    predicted[batch_index],
+                    confidence[batch_index] - current_confidence[batch_index],
+                    eos_position=eos_position,
+                    revision_fraction=revision_fraction,
+                    revision_margin=revision_margin,
+                )
+            if structural_edit is not None:
+                start, delete_count, inserted = structural_edit
+                active = token_ids[batch_index, : eos_position + 1].tolist()
+                revised = [
+                    *active[:start],
+                    *inserted,
+                    *active[start + delete_count :],
+                ]
+                result[batch_index].fill_(self.mask_token_id)
+                result[batch_index, : len(revised)] = torch.tensor(
+                    revised,
+                    dtype=result.dtype,
+                    device=result.device,
+                )
+                continue
+
             active_content_stop = (
                 eos_position if eos_position is not None else token_ids.shape[1]
             )
@@ -295,6 +324,136 @@ class CIDDiffusionScheduler:
                 if eos_positions.numel():
                     result[batch_index, int(eos_positions[0]) + 1 :] = self.mask_token_id
         return result
+
+    def _structural_display_edit(
+        self,
+        token_ids: Tensor,
+        predicted: Tensor,
+        gains: Tensor,
+        *,
+        eos_position: int,
+        revision_fraction: float,
+        revision_margin: float,
+    ) -> tuple[int, int, tuple[int, ...]] | None:
+        """Decode one local insertion/deletion from shifted suffix predictions.
+
+        Display logits are position-wise, so a middle insertion otherwise requires the model to
+        rewrite every later token one slot to the right. When the prediction already contains a
+        short shifted copy of the existing suffix, that copy is enough evidence for the runtime to
+        perform the splice and preserve the suffix itself. A multi-token anchor keeps an ordinary
+        same-position replacement from being reinterpreted as an insertion.
+        """
+
+        if eos_position <= 0:
+            return None
+        active = token_ids[: eos_position + 1].tolist()
+        proposal = predicted.detach().tolist()
+        gain_values = gains[:eos_position].detach().tolist()
+        edit_budget = min(
+            _MAX_STRUCTURAL_EDIT_TOKENS,
+            max(1, math.ceil(eos_position * revision_fraction)),
+        )
+        capacity = int(token_ids.shape[0])
+        candidates: list[
+            tuple[tuple[int, float, int, int], int, int, tuple[int, ...]]
+        ] = []
+
+        def matched_prefix(left: list[int], right: list[int]) -> int:
+            count = 0
+            for left_token, right_token in zip(left, right, strict=False):
+                if left_token != right_token:
+                    break
+                count += 1
+            return count
+
+        def anchor_positions(sequence: list[int]) -> dict[int, dict[tuple[int, ...], list[int]]]:
+            result: dict[int, dict[tuple[int, ...], list[int]]] = {2: {}, 3: {}}
+            for length in (2, 3):
+                for position in range(len(sequence) - length + 1):
+                    key = tuple(sequence[position : position + length])
+                    result[length].setdefault(key, []).append(position)
+            return result
+
+        def nearest_after(positions: list[int], start: int, maximum: int) -> int | None:
+            index = bisect_right(positions, start)
+            if index >= len(positions) or positions[index] > maximum:
+                return None
+            return positions[index]
+
+        def add_candidate(
+            *,
+            start: int,
+            delete_count: int,
+            inserted: tuple[int, ...],
+            anchor: int,
+        ) -> None:
+            if anchor < 2 or gain_values[start] < revision_margin:
+                return
+            net_growth = len(inserted) - delete_count
+            if eos_position + 1 + net_growth > capacity:
+                return
+            score = (anchor, float(gain_values[start]), -abs(net_growth), start)
+            candidates.append((score, start, delete_count, inserted))
+
+        changed_starts = [
+            start
+            for start in range(eos_position)
+            if proposal[start] != active[start] and gain_values[start] >= revision_margin
+        ]
+        if not changed_starts:
+            return None
+
+        active_anchors = anchor_positions(active)
+        proposal_anchors = anchor_positions(proposal)
+        for start in changed_starts:
+            suffix_length = len(active) - start
+            anchor_length = min(3, suffix_length)
+            insertion_key = tuple(active[start : start + anchor_length])
+            insertion_anchor_start = nearest_after(
+                proposal_anchors[anchor_length].get(insertion_key, []),
+                start,
+                start + edit_budget,
+            )
+            if insertion_anchor_start is not None:
+                inserted = tuple(proposal[start:insertion_anchor_start])
+                if inserted and not any(
+                    token == self.mask_token_id or token == self.eos_token_id
+                    for token in inserted
+                ):
+                    add_candidate(
+                        start=start,
+                        delete_count=0,
+                        inserted=inserted,
+                        anchor=matched_prefix(
+                            proposal[insertion_anchor_start:],
+                            active[start:],
+                        ),
+                    )
+
+            anchor_length = min(3, len(proposal) - start)
+            if anchor_length < 2:
+                continue
+            deletion_key = tuple(proposal[start : start + anchor_length])
+            deletion_suffix_start = nearest_after(
+                active_anchors[anchor_length].get(deletion_key, []),
+                start,
+                min(eos_position - 1, start + edit_budget),
+            )
+            if deletion_suffix_start is not None:
+                add_candidate(
+                    start=start,
+                    delete_count=deletion_suffix_start - start,
+                    inserted=(),
+                    anchor=matched_prefix(
+                        proposal[start:],
+                        active[deletion_suffix_start:],
+                    ),
+                )
+
+        if not candidates:
+            return None
+        _, start, delete_count, inserted = max(candidates, key=lambda item: item[0])
+        return start, delete_count, inserted
 
     def _replacement_tokens(
         self,

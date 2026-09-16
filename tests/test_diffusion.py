@@ -273,3 +273,64 @@ def test_visible_replacement_corruption_never_injects_eos() -> None:
     assert not corruption.token_ids.eq(2).any()
     assert not corruption.token_ids.eq(5).any()
     assert torch.all(corruption.token_ids != tokens)
+
+
+def test_display_refinement_splices_middle_insertion_without_overwriting_suffix() -> None:
+    scheduler = CIDDiffusionScheduler(mask_token_id=5, eos_token_id=2)
+    tokens = torch.tensor([[9, 10, 11, 12, 13, 14, 2, 5, 5]])
+    logits = torch.full((1, 9, 16), -20.0)
+    # Only the inserted token and a short shifted suffix anchor are predicted correctly.
+    # The runtime must preserve the rest of the old suffix instead of trusting later logits.
+    proposal = [9, 10, 7, 11, 12, 13, 0, 0, 0]
+    for position, token in enumerate(proposal):
+        logits[0, position, token] = 20.0
+
+    refined = scheduler.refine_display(
+        tokens,
+        logits,
+        reveal_fraction=1.0,
+        revision_fraction=1.0,
+        revision_margin=0.0,
+    )
+
+    assert refined.tolist() == [[9, 10, 7, 11, 12, 13, 14, 2, 5]]
+
+
+def test_display_refinement_splices_middle_deletion_without_rewriting_suffix() -> None:
+    scheduler = CIDDiffusionScheduler(mask_token_id=5, eos_token_id=2)
+    tokens = torch.tensor([[9, 10, 7, 11, 12, 13, 14, 2, 5]])
+    logits = torch.full((1, 9, 16), -20.0)
+    proposal = [9, 10, 11, 12, 13, 0, 0, 0, 0]
+    for position, token in enumerate(proposal):
+        logits[0, position, token] = 20.0
+
+    refined = scheduler.refine_display(
+        tokens,
+        logits,
+        reveal_fraction=1.0,
+        revision_fraction=1.0,
+        revision_margin=0.0,
+    )
+
+    assert refined.tolist() == [[9, 10, 11, 12, 13, 14, 2, 5, 5]]
+
+
+def test_display_refinement_can_expand_one_unknown_slot_before_preserved_suffix() -> None:
+    scheduler = CIDDiffusionScheduler(mask_token_id=5, eos_token_id=2)
+    tokens = torch.tensor([[9, 5, 11, 12, 13, 14, 2, 5, 5]])
+    logits = torch.full((1, 9, 16), -20.0)
+    # The first pass only needs to insert the extra token before the preserved suffix.
+    # The original MASK remains available for the next denoising pass to reveal token 7.
+    proposal = [9, 7, 8, 11, 12, 13, 0, 0, 0]
+    for position, token in enumerate(proposal):
+        logits[0, position, token] = 20.0
+
+    refined = scheduler.refine_display(
+        tokens,
+        logits,
+        reveal_fraction=1.0,
+        revision_fraction=1.0,
+        revision_margin=0.0,
+    )
+
+    assert refined.tolist() == [[9, 5, 8, 11, 12, 13, 14, 2, 5]]

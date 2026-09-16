@@ -4510,6 +4510,39 @@ def test_training_display_keeps_physical_tail_available_after_visible_eos() -> N
     assert torch.equal(collated.batch.display_padding_mask[0], sample.batch.display_padding_mask[0])
 
 
+def test_teacher_forcing_uses_previous_display_for_variable_length_revision() -> None:
+    adapter = make_adapter(seed=148)
+    tokenizer = TinyTokenizer()
+    tensorizer = ILLaDATrajectoryTensorizer(adapter, tokenizer)
+    base = make_trajectory()
+    target = "AXYC"
+    example = replace(
+        base,
+        target_display=target,
+        display_targets=(
+            DisplayTarget(step=0, text=f"A{DISPLAY_UNKNOWN_MARKER}C"),
+            DisplayTarget(step=1, text=target),
+        ),
+    )
+
+    sample = tensorizer.tensorize(example, source_step=0, timestep=0.0)
+
+    source_tokens = [
+        *TinyTokenizer._ids("A", add_special_tokens=False),
+        adapter.mask_token_id,
+        *TinyTokenizer._ids("C", add_special_tokens=False),
+        tensorizer.eos_token_id,
+    ]
+    target_tokens = [
+        *TinyTokenizer._ids(target, add_special_tokens=False),
+        tensorizer.eos_token_id,
+    ]
+    assert sample.batch.display_ids[0, : len(source_tokens)].tolist() == source_tokens
+    assert sample.targets.display_ids[0, 0] == -100
+    assert sample.targets.display_ids[0, 1 : len(target_tokens)].tolist() == target_tokens[1:]
+    assert sample.batch.display_noise[0, 1 : len(target_tokens), 0].eq(1.0).all()
+
+
 def test_training_display_unknown_marker_maps_to_model_mask_token() -> None:
     adapter = make_adapter(seed=148)
     tensorizer = ILLaDATrajectoryTensorizer(adapter, TinyTokenizer())

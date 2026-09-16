@@ -2545,8 +2545,22 @@ class ILLaDATrajectoryTensorizer:
         target_display = self._display_text(example, supervision_step)
         target_text_ids = self._encode_display_text(target_display)
         realized_tokens = target_text_ids.shape[1]
+        source_display = None
+        source_text_ids = None
+        if rollout_state is None and source_step >= 0 and any(
+            item.step == source_step for item in example.display_targets
+        ):
+            source_display = self._display_text(example, source_step)
+            if source_display != target_display:
+                source_text_ids = self._encode_display_text(source_display)
+        required_display_tokens = realized_tokens + 1
+        if source_text_ids is not None:
+            required_display_tokens = max(
+                required_display_tokens,
+                int(source_text_ids.shape[1]) + 1,
+            )
         display_canvas_tokens = self._display_canvas_size(
-            realized_tokens + 1,
+            required_display_tokens,
             rollout_state=rollout_state,
         )
         logical_length = (
@@ -2586,6 +2600,35 @@ class ILLaDATrajectoryTensorizer:
                 (*display_input_ids.shape, 1),
                 device=device,
                 dtype=dtype,
+            )
+        elif rollout_state is None and source_text_ids is not None:
+            source_display_ids = torch.full_like(
+                target_display_ids,
+                self.adapter.mask_token_id,
+            )
+            source_tokens = int(source_text_ids.shape[1])
+            source_display_ids[:, :source_tokens] = source_text_ids
+            source_display_ids[:, source_tokens] = self.eos_token_id
+            transition_mask = display_supervision_mask & (
+                source_display_ids != target_display_ids
+            )
+            stable_mask = display_supervision_mask & ~transition_mask
+            display_corruption = self.scheduler.corrupt_display(
+                source_display_ids,
+                timestep_tensor,
+                eligible_mask=stable_mask,
+                vocab_size=self.adapter.vocab_size,
+                replacement_fraction=self.display_replacement_fraction,
+                generator=generator,
+            )
+            display_input_ids = display_corruption.token_ids
+            display_labels = display_corruption.labels
+            display_labels[transition_mask] = target_display_ids[transition_mask]
+            display_noise = display_corruption.noise * display_supervision_mask.unsqueeze(-1)
+            display_noise = torch.where(
+                transition_mask.unsqueeze(-1),
+                torch.ones_like(display_noise),
+                display_noise,
             )
         elif rollout_state is None:
             display_corruption = self.scheduler.corrupt_display(
