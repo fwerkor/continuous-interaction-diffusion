@@ -400,6 +400,22 @@ class CIDRuntime:
                         display_positions=list(last_escape_display_positions),
                         runtime_step=self._runtime_step,
                     )
+                    if (
+                        loop_period == 1
+                        and self._display_is_resolved_and_stable(
+                            previous_display,
+                            proposed_display,
+                        )
+                    ):
+                        display = proposed_display
+                        self.trace.emit(
+                            "stable_fixed_point_reached",
+                            step,
+                            mode=loop_mode,
+                            repeats=loop_repeats,
+                            runtime_step=self._runtime_step,
+                        )
+                        break
                     if loop_escape_count >= self.config.loop_escape_attempts:
                         self.trace.emit(
                             "loop_escape_exhausted",
@@ -618,6 +634,7 @@ class CIDRuntime:
         stop_events = {
             "wall_clock_budget_exhausted", "total_compute_budget_exhausted",
             "compute_budget_exhausted", "loop_escape_exhausted",
+            "stable_fixed_point_reached",
         }
         stop_reason = "converged" if converged else next(
             (event.kind for event in reversed(self.trace.events) if event.kind in stop_events),
@@ -1081,6 +1098,17 @@ class CIDRuntime:
     @staticmethod
     def _deadline_expired(deadline: float | None) -> bool:
         return deadline is not None and time.monotonic() >= deadline
+
+    @staticmethod
+    def _display_is_resolved_and_stable(
+        previous: DisplayCanvas,
+        proposed: DisplayCanvas,
+    ) -> bool:
+        if proposed.token_ids != previous.token_ids:
+            return False
+        if proposed.unresolved or proposed.realized_length <= 0:
+            return False
+        return proposed.eos_token_id is None or proposed.eos_token_id in proposed.token_ids
 
     def _external_progress_ready(self) -> bool:
         return (

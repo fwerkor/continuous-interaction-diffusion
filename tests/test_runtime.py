@@ -909,6 +909,20 @@ class LatentDriftPolicy:
         )
 
 
+class StableResolvedDisplayPolicy:
+    def step(self, context: ModelContext) -> ModelUpdate:
+        cells = list(context.thought.cells)
+        cell = cells[0]
+        cells[0] = replace(
+            cell,
+            semantic=(cell.semantic[0] + 0.01, *cell.semantic[1:]),
+        )
+        return ModelUpdate(
+            thought=context.thought.advance(tuple(cells)),
+            display=context.display.advance((42,)),
+        )
+
+
 async def test_runtime_escapes_stationary_model_loop_before_compute_budget() -> None:
     config = RuntimeConfig(
         max_steps=100,
@@ -929,6 +943,25 @@ async def test_runtime_escapes_stationary_model_loop_before_compute_budget() -> 
     assert result.trace.count("loop_taboo_transition_blocked") == 1
     assert result.trace.count("loop_escape_exhausted") == 1
     assert result.trace.count("compute_budget_exhausted") == 0
+
+
+async def test_runtime_preserves_resolved_display_at_exact_fixed_point() -> None:
+    result = await CIDRuntime(
+        SourceRegistry(),
+        RuntimeConfig(max_steps=100, loop_escape_attempts=1),
+    ).run(
+        StuckPolicy(),
+        thought=seeded_thought(1),
+        display=DisplayCanvas(token_ids=(42,), mask_token_id=-1),
+    )
+
+    assert not result.converged
+    assert result.display.token_ids == (42,)
+    detected = tuple(event for event in result.trace.events if event.kind == "loop_detected")
+    assert detected[0].payload["mode"] == "exact"
+    assert detected[0].payload["period"] == 1
+    assert result.trace.count("stable_fixed_point_reached") == 1
+    assert result.trace.count("loop_escape_applied") == 0
 
 
 async def test_runtime_detects_short_period_display_oscillation_and_remasks_it() -> None:
@@ -970,6 +1003,32 @@ async def test_runtime_detects_behavioral_loop_despite_continuous_latent_drift()
     assert result.trace.count("loop_escape_applied") == 1
     assert result.trace.count("loop_escape_exhausted") == 1
     assert result.steps < config.max_steps
+
+
+async def test_runtime_preserves_resolved_display_at_stable_behavior_fixed_point() -> None:
+    config = RuntimeConfig(
+        max_steps=100,
+        loop_escape_attempts=1,
+    )
+    result = await CIDRuntime(SourceRegistry(), config).run(
+        StableResolvedDisplayPolicy(),
+        thought=seeded_thought(1),
+        display=DisplayCanvas.masked(1, -1),
+    )
+
+    assert not result.converged
+    assert result.display.token_ids == (42,)
+    assert result.steps < config.max_steps
+    detected = tuple(event for event in result.trace.events if event.kind == "loop_detected")
+    assert detected
+    assert detected[0].payload["mode"] == "behavior"
+    assert detected[0].payload["period"] == 1
+    assert result.trace.count("stable_fixed_point_reached") == 1
+    assert result.trace.count("loop_escape_applied") == 0
+    assert result.trace.count("loop_escape_exhausted") == 0
+    terminal = result.trace.events[-1]
+    assert terminal.kind == "trajectory_finished"
+    assert terminal.payload["stop_reason"] == "stable_fixed_point_reached"
 
 
 async def test_behavioral_loop_guard_allows_normal_latent_refinement_to_converge() -> None:
