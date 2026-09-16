@@ -5,6 +5,7 @@ import time
 from collections.abc import Iterable
 from copy import deepcopy
 from dataclasses import dataclass, replace
+from itertools import zip_longest
 from typing import Any
 
 from cid.contracts import (
@@ -52,6 +53,7 @@ class RuntimeConfig:
     binding_threshold: float = DEFAULT_BINDING_THRESHOLD
     idle_yield_s: float = 0.001
     trace_display: bool = False
+    trace_details: bool = False
     reclamation_grace_steps: int = DEFAULT_RECLAMATION_GRACE_STEPS
     reclamation_low_watermark: float = DEFAULT_RECLAMATION_LOW_WATERMARK
     reclamation_target_watermark: float = DEFAULT_RECLAMATION_TARGET_WATERMARK
@@ -272,6 +274,7 @@ class CIDRuntime:
                     step=step,
                     prompt=prompt,
                     diffusion_step=epoch_steps,
+                    trace_details=self.config.trace_details,
                 )
 
                 self.trace.emit(
@@ -287,7 +290,16 @@ class CIDRuntime:
                     "converged": update.converged,
                     "runtime_step": self._runtime_step,
                 }
-                if self.config.trace_display:
+                if self.config.trace_details:
+                    finished_payload["diagnostics"] = dict(update.diagnostics)
+                    finished_payload["binding_threshold"] = self.config.binding_threshold
+                    finished_payload["display_previous_token_ids"] = list(display.token_ids)
+                    finished_payload["display_changed_positions"] = [
+                        i for i, (old, new) in enumerate(
+                            zip_longest(display.token_ids, update.display.token_ids)
+                        ) if old != new
+                    ]
+                if self.config.trace_display or self.config.trace_details:
                     finished_payload.update(
                         display_token_ids=list(update.display.token_ids),
                         display_visible_token_ids=list(update.display.visible_token_ids),
@@ -453,6 +465,13 @@ class CIDRuntime:
                         confidence=need.confidence,
                         source=source,
                         executable=executable,
+                        **({
+                            "arguments": deepcopy(dict(need.arguments)),
+                            "source_scores": dict(need.source_scores),
+                            "target_cells": [ref.identifier for ref in need.target_cells],
+                            "target_display": [ref.identifier for ref in need.target_display],
+                            "binding_threshold": self.config.binding_threshold,
+                        } if self.config.trace_details else {}),
                     )
 
                 touched = self.bindings.reconcile(
@@ -468,6 +487,12 @@ class CIDRuntime:
                         need_id=binding.need_id,
                         source=binding.source,
                         arguments_complete=binding.arguments_complete,
+                        **({
+                            "arguments": deepcopy(dict(binding.arguments)),
+                            "work_key": binding.work_key,
+                            "target_cells": [ref.identifier for ref in binding.target_cells],
+                            "target_display": [ref.identifier for ref in binding.target_display],
+                        } if self.config.trace_details else {}),
                     )
 
                 self._cancel_orphan_external_work(step)
@@ -496,6 +521,22 @@ class CIDRuntime:
                             f"lifecycle state: {missing}"
                         )
                 self._trace_lifecycle_changes(previous_thought, thought, step)
+                if self.config.trace_details:
+                    self.trace.emit(
+                        "runtime_state", step,
+                        cells=[
+                            {
+                                "slot": slot, "cell_id": cell.cell_id,
+                                "lifecycle": cell.lifecycle.value,
+                                "uncertainty": cell.uncertainty, "noise": cell.noise,
+                                "roles": {role.value: score for role, score in cell.roles.items()},
+                            }
+                            for slot, cell in enumerate(thought.cells) if cell.occupied
+                        ],
+                        pending_jobs=len(self._jobs),
+                        unresolved_bindings=self._has_unresolved_active_binding(),
+                        fact_count=len(self.facts.snapshot().items),
+                    )
                 self._record_lifecycle_steps(previous_thought, thought, step)
                 unresolved = self._has_unresolved_active_binding()
                 settled = update.equilibrium or update.converged
@@ -574,11 +615,20 @@ class CIDRuntime:
             self._streams.clear()
             self._detached_tasks.clear()
 
+        stop_events = {
+            "wall_clock_budget_exhausted", "total_compute_budget_exhausted",
+            "compute_budget_exhausted", "loop_escape_exhausted",
+        }
+        stop_reason = "converged" if converged else next(
+            (event.kind for event in reversed(self.trace.events) if event.kind in stop_events),
+            "stopped",
+        )
         self.trace.emit(
             "trajectory_finished",
             completed_steps,
             converged=converged,
             runtime_step=self._runtime_step,
+            stop_reason=stop_reason,
         )
         thought = self._maybe_reclaim(thought, completed_steps, force=True)
 
@@ -625,6 +675,11 @@ class CIDRuntime:
                 binding_id=binding.binding_id,
                 index=binding.cognitive_projections,
                 grounded_targets=len(target_cells) - len(binding.target_cells),
+                **({
+                    "source": binding.source,
+                    "target_cells": [ref.identifier for ref in target_cells],
+                    "target_display": [ref.identifier for ref in binding.target_display],
+                } if self.config.trace_details else {}),
             )
         return tuple(percepts)
 
@@ -880,6 +935,11 @@ class CIDRuntime:
                 work_key=binding.work_key,
                 version=observation.version,
                 runtime_step=self._runtime_step,
+                **({
+                    "source": binding.source,
+                    "observation": deepcopy(observation.value),
+                    "provenance": observation.provenance,
+                } if self.config.trace_details else {}),
             )
             if binding.promote_to_fact:
                 self._promote_fact(binding, observation)

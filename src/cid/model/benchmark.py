@@ -147,6 +147,7 @@ def _decode_display_trace_events(
     tokenizer: Any,
 ) -> tuple[dict[str, Any], ...]:
     decoded: list[dict[str, Any]] = []
+    token_text: dict[int, str] = {}
     for event in events:
         item = dict(event)
         payload = dict(item.get("payload", {}))
@@ -161,6 +162,16 @@ def _decode_display_trace_events(
                 token_ids,
                 skip_special_tokens=True,
             )
+        if "display_previous_token_ids" in payload:
+            for ids_key, text_key in (
+                ("display_token_ids", "display_token_text"),
+                ("display_previous_token_ids", "display_previous_token_text"),
+            ):
+                ids = payload.get(ids_key, [])
+                for token in ids:
+                    if token not in token_text:
+                        token_text[token] = tokenizer.decode([token], skip_special_tokens=False)
+                payload[text_key] = [token_text[token] for token in ids]
         item["payload"] = payload
         decoded.append(item)
     return tuple(decoded)

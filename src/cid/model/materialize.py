@@ -219,6 +219,37 @@ class CIDMaterializer:
             display=display,
             needs=needs,
             reopen_cells=reopen_cells,
+            diagnostics=(
+                {
+                    "convergence_score": convergence,
+                    "convergence_threshold": self.config.convergence_threshold,
+                    "need_threshold": self.config.need_threshold,
+                    "need_eligible_slots": [
+                        slot for slot, cell in enumerate(thought.cells) if cell.live
+                    ],
+                    "allocation_eligible_slots": [
+                        slot for slot, cell in enumerate(context.thought.cells)
+                        if not cell.occupied
+                    ],
+                    "allocation_threshold": self.config.allocation_threshold,
+                    "max_allocations_per_step": self.config.max_allocations_per_step,
+                    "need_scores": torch.sigmoid(
+                        output.need_logits[batch_index].float()
+                    ).detach().cpu().tolist(),
+                    "allocation_scores": torch.sigmoid(
+                        output.allocation_logits[batch_index].float()
+                    ).detach().cpu().tolist(),
+                    "source_names": [source.name for source in context.sources],
+                    "source_scores": torch.softmax(
+                        output.source_logits[batch_index].float(), dim=-1
+                    ).detach().cpu().tolist(),
+                    "display_stable": display_stable,
+                    "display_has_boundary": display_has_boundary,
+                    "display_nonempty": display_nonempty,
+                    "display_resolved": display.unresolved == 0,
+                    "diffusion_step": context.diffusion_step,
+                } if context.trace_details else {}
+            ),
             equilibrium=convergence >= self.config.convergence_threshold,
             converged=(
                 display.unresolved == 0

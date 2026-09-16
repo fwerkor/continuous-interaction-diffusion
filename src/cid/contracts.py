@@ -113,6 +113,7 @@ class ModelContext:
     step: int
     prompt: str = ""
     diffusion_step: int = 0
+    trace_details: bool = False
 
 
 @dataclass(frozen=True, slots=True)
@@ -123,6 +124,7 @@ class ModelUpdate:
     reopen_cells: tuple[ObjectRef, ...] = ()
     equilibrium: bool = False
     converged: bool = False
+    diagnostics: Mapping[str, Any] = field(default_factory=dict)
 
     def __post_init__(self) -> None:
         if any(target.kind is not ObjectKind.CELL for target in self.reopen_cells):

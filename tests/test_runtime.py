@@ -985,3 +985,56 @@ async def test_behavioral_loop_guard_allows_normal_latent_refinement_to_converge
     assert result.converged
     assert result.steps == 8
     assert result.trace.count("loop_detected") == 0
+
+
+async def test_detailed_trace_preserves_tool_payloads_and_routing() -> None:
+    results = []
+    for detailed in (False, True):
+        source = CountingSource()
+        registry = SourceRegistry()
+        registry.register(source)
+        result = await CIDRuntime(
+            registry, RuntimeConfig(max_steps=20, trace_details=detailed),
+        ).run(
+            DuplicateNeedPolicy(),
+            thought=seeded_thought(2),
+            display=DisplayCanvas.masked(2, -1),
+        )
+        results.append(result)
+        assert source.reads == 1
+        events = result.trace.events
+        observations = [e.payload for e in events if e.kind == "binding_observation_updated"]
+        if detailed:
+            assert {p["observation"] for p in observations} == {"same"}
+            bindings = [e.payload for e in events if e.kind == "binding_active"]
+            assert all(p["arguments"] == {"key": "same"} for p in bindings)
+            projections = [e.payload for e in events if e.kind == "cognitive_projection"]
+            assert all(p["target_cells"] for p in projections)
+            assert result.trace.count("runtime_state")
+        else:
+            assert all("observation" not in p for p in observations)
+            assert not result.trace.count("runtime_state")
+        terminal = next(e for e in events if e.kind == "trajectory_finished")
+        assert terminal.payload["stop_reason"] == "converged"
+    assert results[0].converged == results[1].converged
+    assert results[0].display == results[1].display
+
+
+async def test_detailed_trace_accepts_display_canvas_size_changes() -> None:
+    class ExpandingPolicy:
+        def step(self, context: ModelContext) -> ModelUpdate:
+            return ModelUpdate(
+                thought=context.thought,
+                display=DisplayCanvas(token_ids=(7, 8, 9), mask_token_id=-1),
+                converged=True,
+            )
+
+    result = await CIDRuntime(
+        SourceRegistry(), RuntimeConfig(max_steps=2, trace_details=True),
+    ).run(
+        ExpandingPolicy(), thought=seeded_thought(1),
+        display=DisplayCanvas(token_ids=(7, 8), mask_token_id=-1),
+    )
+    step = next(e for e in result.trace.events if e.kind == "model_step_finished")
+    assert step.payload["display_changed_positions"] == [2]
+    assert result.display.token_ids == (7, 8, 9)

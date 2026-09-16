@@ -401,3 +401,23 @@ def test_prefix_allocation_stops_at_first_low_free_slot() -> None:
     )
 
     assert selected.tolist() == [[False, True, False, False]]
+
+
+def test_diagnostics_are_opt_in_and_do_not_change_materialization() -> None:
+    context = ModelContext(
+        facts=FactStore().snapshot(),
+        thought=CognitiveField.empty(capacity=3, width=4),
+        display=DisplayCanvas.masked(length=3, mask_token_id=5, eos_token_id=2),
+        sources=(SourceDescriptor(name="lookup", description="lookup"),),
+        percepts=(), step=0,
+    )
+    materializer = CIDMaterializer()
+    output = make_output()
+    normal = materializer.materialize(output, context)
+    detailed = materializer.materialize(output, replace(context, trace_details=True))
+    assert not normal.diagnostics
+    assert replace(detailed, diagnostics={}) == normal
+    assert detailed.diagnostics["convergence_score"] > 0.99
+    assert detailed.diagnostics["display_resolved"] is False
+    assert len(detailed.diagnostics["need_scores"]) == 3
+    assert detailed.diagnostics["allocation_eligible_slots"] == [0, 1, 2]
