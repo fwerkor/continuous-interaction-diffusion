@@ -1,0 +1,39 @@
+{
+  "format": "cid-diffusion-stream-v1",
+  "base_model": "openbmb/MiniCPM5-2B-Base",
+  "sequence_length": 2048,
+  "sources": [
+    {
+      "name": "ultrax-web-en",
+      "repo": "openbmb/UltraX-Preview",
+      "revision": "a88527587389fd4ab352e9ad1273f4c0a234d8df",
+      "pattern": "data/UltraX-Ultra-FineWeb/*.parquet",
+      "column": "cleaned_content",
+      "weight": 0.70
+    },
+    {
+      "name": "ultrafineweb-zh",
+      "repo": "openbmb/Ultra-FineWeb",
+      "revision": "02c85641e3d19a854be2e09139c25adaa9518063",
+      "pattern": "data/ultrafineweb_zh/*.parquet",
+      "column": "content",
+      "weight": 0.15
+    },
+    {
+      "name": "ultradata-code",
+      "repo": "openbmb/UltraData-Code",
+      "revision": "85182d829f2ce7ea07cca72ebfc509deea1d9f5f",
+      "pattern": "data/UltraData-Code-L2/*/*.parquet",
+      "column": "content",
+      "weight": 0.10
+    },
+    {
+      "name": "ultradata-math",
+      "repo": "openbmb/UltraData-Math",
+      "revision": "fe10db8efd35597fd7fcff8ff576b5ec4ea5ff87",
+      "pattern": "data/UltraData-Math-L2-preview/*.parquet",
+      "column": "content",
+      "weight": 0.05
+    }
+  ]
+}

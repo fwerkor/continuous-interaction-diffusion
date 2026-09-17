@@ -662,6 +662,7 @@ class CIDTrainer:
         self._pending_examples = 0
         self._pending_global_examples = 0
         self._pending_ddp_unsynced = False
+        self._pending_fsdp_unsynced = False
         self._reduced_gradient_accumulator: dict[str, Tensor] = {}
         self.pad_token_id = getattr(tensorizer.tokenizer, "pad_token_id", None)
         if self.pad_token_id is None:
@@ -682,6 +683,8 @@ class CIDTrainer:
     def train_microbatch(
         self,
         transitions: tuple[tuple[TrajectoryExample, int], ...],
+        *,
+        force_gradient_sync: bool = False,
     ) -> CIDLoss:
         if not transitions:
             raise ValueError("training micro-batch cannot be empty")
@@ -695,7 +698,10 @@ class CIDTrainer:
             )
             for example, source_step in transitions
         )
-        losses, _, _ = self._forward_backward(samples)
+        losses, _, _ = self._forward_backward(
+            samples,
+            force_gradient_sync=force_gradient_sync,
+        )
         return losses
 
     def train_rollout_microbatch(
@@ -780,6 +786,7 @@ class CIDTrainer:
         *,
         rollout_probability: float,
         physical_micro_batch_size: int | None = None,
+        force_gradient_sync: bool = False,
     ) -> tuple[float, float, int, dict[str, Tensor]]:
         if not windows:
             raise ValueError("rollout micro-batch cannot be empty")
@@ -870,6 +877,7 @@ class CIDTrainer:
                     sample_mask=chunk_mask,
                     allow_optimizer_step=True,
                     global_effective_batch_size=global_batch_size,
+                    force_gradient_sync=force_gradient_sync,
                 )
                 raw_loss = float(losses.total.detach().float()) * effective_batch_size
                 raw_loss_sum += raw_loss
@@ -908,6 +916,7 @@ class CIDTrainer:
         sample_mask: tuple[bool, ...] | None = None,
         allow_optimizer_step: bool = True,
         global_effective_batch_size: int | None = None,
+        force_gradient_sync: bool = False,
     ) -> tuple[CIDLoss, CIDTensorOutput, CIDTrainingBatch]:
         if not samples:
             raise ValueError("training samples cannot be empty")
@@ -938,9 +947,20 @@ class CIDTrainer:
         use_stage_a_no_sync = bool(
             getattr(self.forward_model, "_cid_stage_a_ddp", False)
             and not will_step
+            and not force_gradient_sync
         )
-        sync_context = self.forward_model.no_sync() if use_stage_a_no_sync else nullcontext()
-        if self.preserve_reduced_gradients and self._pending_accumulation:
+        use_stage_b_no_sync = bool(
+            getattr(self.forward_model, "_cid_fsdp_no_sync_accumulation", False)
+            and not will_step
+            and not force_gradient_sync
+        )
+        use_no_sync = use_stage_a_no_sync or use_stage_b_no_sync
+        sync_context = self.forward_model.no_sync() if use_no_sync else nullcontext()
+        if (
+            self.preserve_reduced_gradients
+            and self._pending_accumulation
+            and not self._pending_fsdp_unsynced
+        ):
             self._stash_reduced_gradients()
         with sync_context:
             output = self.forward_model(training_batch.batch)
@@ -951,6 +971,8 @@ class CIDTrainer:
             (losses.total * effective_batch_size * loss_scale).backward()
         if getattr(self.forward_model, "_cid_stage_a_ddp", False):
             self._pending_ddp_unsynced = use_stage_a_no_sync
+        if getattr(self.forward_model, "_cid_fsdp_no_sync_accumulation", False):
+            self._pending_fsdp_unsynced = use_stage_b_no_sync
         self._pending_accumulation += 1
         self._pending_examples += effective_batch_size
         self._pending_global_examples += global_effective_batch_size
@@ -1322,7 +1344,7 @@ class CIDTrainer:
             microbatches = self._rollout_microbatches(
                 windows, shuffle=shuffle, preserve_order=preserve_order
             )
-            for microbatch in microbatches:
+            for microbatch_index, microbatch in enumerate(microbatches):
                 (
                     loss_sum,
                     raw_loss_sum,
@@ -1332,6 +1354,7 @@ class CIDTrainer:
                     microbatch,
                     rollout_probability=rollout_probability,
                     physical_micro_batch_size=physical_micro_batch_size,
+                    force_gradient_sync=microbatch_index == len(microbatches) - 1,
                 )
                 total_loss += loss_sum
                 total_raw_loss += raw_loss_sum
@@ -1668,9 +1691,13 @@ class CIDTrainer:
             order = list(transitions)
             if shuffle:
                 self.shuffle_rng.shuffle(order)
-            for start in range(0, len(order), self.config.micro_batch_size):
+            starts = list(range(0, len(order), self.config.micro_batch_size))
+            for batch_index, start in enumerate(starts):
                 microbatch = tuple(order[start : start + self.config.micro_batch_size])
-                loss = self.train_microbatch(microbatch)
+                loss = self.train_microbatch(
+                    microbatch,
+                    force_gradient_sync=batch_index == len(starts) - 1,
+                )
                 losses.extend([float(loss.total.detach().float())] * len(microbatch))
             self.state = CIDTrainerState(
                 transitions_seen=self.state.transitions_seen,
@@ -1755,6 +1782,7 @@ class CIDTrainer:
         self._pending_examples = 0
         self._pending_global_examples = 0
         self._pending_ddp_unsynced = False
+        self._pending_fsdp_unsynced = False
         self._reduced_gradient_accumulator.clear()
         self.optimizer.zero_grad(set_to_none=True)
 
@@ -1791,6 +1819,7 @@ class CIDTrainer:
         self._pending_examples = 0
         self._pending_global_examples = 0
         self._pending_ddp_unsynced = False
+        self._pending_fsdp_unsynced = False
         self._reduced_gradient_accumulator.clear()
         self.data_order_version = int(state.get("data_order_version", 1))
         self.optimizer.zero_grad(set_to_none=True)
@@ -2016,10 +2045,16 @@ class CIDTrainer:
         ):
             raise ValueError("checkpoint pending accumulation has an invalid example count")
         self._pending_ddp_unsynced = False
+        self._pending_fsdp_unsynced = False
 
     def _optimizer_step(self) -> None:
         if self._pending_ddp_unsynced:
             self._sync_pending_stage_a_ddp_gradients()
+        if self._pending_fsdp_unsynced:
+            raise RuntimeError(
+                "cannot step optimizer with unsynchronized FSDP gradients; "
+                "force the final accumulation backward to synchronize first"
+            )
         if self.preserve_reduced_gradients:
             self._restore_reduced_gradients()
         normalizer = self._gradient_example_normalizer()
@@ -2053,6 +2088,8 @@ class CIDTrainer:
             self._pending_accumulation = 0
             self._pending_examples = 0
             self._pending_global_examples = 0
+            self._pending_ddp_unsynced = False
+            self._pending_fsdp_unsynced = False
             raise FloatingPointError(
                 "non-finite CID gradient norm on at least one rank before optimizer step; "
                 f"local_norm={reported_gradient_norm}"
@@ -2063,6 +2100,7 @@ class CIDTrainer:
         self._pending_examples = 0
         self._pending_global_examples = 0
         self._pending_ddp_unsynced = False
+        self._pending_fsdp_unsynced = False
         self.state = CIDTrainerState(
             transitions_seen=self.state.transitions_seen,
             optimizer_steps=self.state.optimizer_steps + 1,
@@ -5145,6 +5183,8 @@ def wrap_stage_b_fsdp(
     compute_dtype: torch.dtype = torch.bfloat16,
     cpu_offload: bool = False,
     throughput_optimized: bool = False,
+    no_sync_accumulation: bool = False,
+    aggressive_prefetch: bool = False,
 ) -> torch.nn.Module:
     from torch.distributed.fsdp import (
         BackwardPrefetch,
@@ -5164,6 +5204,7 @@ def wrap_stage_b_fsdp(
         transformer_auto_wrap_policy,
         transformer_layer_cls={layer_class},
     )
+    throughput_prefetch = throughput_optimized or aggressive_prefetch
     fsdp = FullyShardedDataParallel(
         adapter,
         auto_wrap_policy=auto_wrap_policy,
@@ -5178,17 +5219,19 @@ def wrap_stage_b_fsdp(
         sync_module_states=False,
         backward_prefetch=(
             BackwardPrefetch.BACKWARD_PRE
-            if throughput_optimized
+            if throughput_prefetch
             else BackwardPrefetch.BACKWARD_POST
         ),
-        forward_prefetch=throughput_optimized,
-        limit_all_gathers=True,
+        forward_prefetch=throughput_prefetch,
+        limit_all_gathers=not aggressive_prefetch,
         use_orig_params=True,
     )
     # FSDP CPU offload overwrites an existing reduced CPU gradient on the next
     # backward. CIDTrainer detects this marker and explicitly accumulates those
     # already-reduced shards between micro-batches.
     fsdp._cid_cpu_offload_reduced_gradients = cpu_offload
+    fsdp._cid_fsdp_no_sync_accumulation = no_sync_accumulation
+    fsdp._cid_fsdp_aggressive_prefetch = aggressive_prefetch
     return fsdp
 
 

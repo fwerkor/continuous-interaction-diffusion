@@ -4,6 +4,7 @@ from typing import Any
 
 import torch
 from torch import nn
+from torch.utils.checkpoint import checkpoint
 
 MINICPM5_2B_BASE = "openbmb/MiniCPM5-2B-Base"
 QWEN3_4B_BASE = "Qwen/Qwen3-4B-Base"
@@ -113,16 +114,25 @@ def bidirectional_ar_hidden_states(
     hidden_states = inputs_embeds
     position_embeddings = decoder.rotary_emb(hidden_states, position_ids)
 
+    use_gradient_checkpointing = bool(
+        decoder.training and getattr(decoder, "gradient_checkpointing", False)
+    )
     for decoder_layer in decoder.layers[: decoder.config.num_hidden_layers]:
-        hidden_states = decoder_layer(
-            hidden_states,
-            attention_mask=key_mask,
-            position_ids=position_ids,
-            past_key_values=None,
-            use_cache=False,
-            cache_position=None,
-            position_embeddings=position_embeddings,
-        )
+        def layer_forward(states: torch.Tensor, *, layer: nn.Module = decoder_layer) -> torch.Tensor:
+            return layer(
+                states,
+                attention_mask=key_mask,
+                position_ids=position_ids,
+                past_key_values=None,
+                use_cache=False,
+                cache_position=None,
+                position_embeddings=position_embeddings,
+            )
+
+        if use_gradient_checkpointing:
+            hidden_states = checkpoint(layer_forward, hidden_states, use_reentrant=False)
+        else:
+            hidden_states = layer_forward(hidden_states)
     return decoder.norm(hidden_states)
 
 

@@ -2940,6 +2940,8 @@ def _train_stage_b(args: argparse.Namespace) -> None:
                 compute_dtype=compute_dtype,
                 cpu_offload=args.fsdp_cpu_offload,
                 throughput_optimized=performance_profile.name == "illada-high-memory",
+                no_sync_accumulation=args.fsdp_no_sync_accumulation,
+                aggressive_prefetch=args.fsdp_aggressive_prefetch,
             )
             gradient_clipper = training_model.clip_grad_norm_
         optimizer = torch.optim.AdamW(
@@ -4199,6 +4201,24 @@ def main() -> None:
         help=(
             "offload FSDP parameter/gradient shards and optimizer state to host memory; "
             "intended for 24 GB GPUs and disabled by default"
+        ),
+    )
+    train_full.add_argument(
+        "--fsdp-no-sync-accumulation",
+        action=argparse.BooleanOptionalAction,
+        default=False,
+        help=(
+            "accumulate Stage B FSDP gradients under no_sync and synchronize only on the "
+            "optimizer-step boundary; uses more GPU memory to reduce communication/offload"
+        ),
+    )
+    train_full.add_argument(
+        "--fsdp-aggressive-prefetch",
+        action=argparse.BooleanOptionalAction,
+        default=False,
+        help=(
+            "use BACKWARD_PRE plus forward prefetch and disable the FSDP all-gather rate "
+            "limiter; intended for configurations with spare accelerator memory"
         ),
     )
     train_full.add_argument(
