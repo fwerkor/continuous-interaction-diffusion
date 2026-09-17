@@ -18,10 +18,11 @@ import pyarrow.parquet as pq
 import torch
 import torch.distributed as dist
 import torch.distributed.checkpoint as dcp
+from huggingface_hub import HfFileSystem
+from torch import Tensor
 from torch.distributed.fsdp import (
     BackwardPrefetch,
     CPUOffload,
-    FullyShardedDataParallel as FSDP,
     FullStateDictConfig,
     MixedPrecision,
     ShardedOptimStateDictConfig,
@@ -29,8 +30,10 @@ from torch.distributed.fsdp import (
     ShardingStrategy,
     StateDictType,
 )
+from torch.distributed.fsdp import (
+    FullyShardedDataParallel as FSDP,
+)
 from torch.distributed.fsdp.wrap import transformer_auto_wrap_policy
-from huggingface_hub import HfFileSystem
 from transformers import AutoModelForCausalLM, AutoTokenizer
 
 from cid.model.diffusion_base import (
@@ -40,7 +43,6 @@ from cid.model.diffusion_base import (
     masked_diffusion_loss,
     stage0_learning_rate,
 )
-
 
 
 class RemoteTokenSource:
@@ -116,7 +118,7 @@ class RemoteTokenSource:
             self._buffer.extend(token_ids)
             self._buffer.append(self.eos_token_id)
         end = self._offset + needed
-        result = np.asarray(self._buffer[self._offset:end], dtype=np.int64)
+        result = np.asarray(self._buffer[self._offset : end], dtype=np.int64)
         self._offset = end
         if self._offset >= 16384:
             del self._buffer[: self._offset]
@@ -169,7 +171,7 @@ class StreamingCorpusSampler:
         world_size: int,
         seed: int,
         evaluation: bool = False,
-    ) -> "StreamingCorpusSampler":
+    ) -> StreamingCorpusSampler:
         manifest = json.loads(Path(path).read_text(encoding="utf-8"))
         return cls(
             manifest,
@@ -219,6 +221,7 @@ def build_sampler(
         )
     return PackedCorpusSampler.from_manifest(manifest_path, seed=seed)
 
+
 def parse_args() -> argparse.Namespace:
     parser = argparse.ArgumentParser()
     parser.add_argument("--model", default="openbmb/MiniCPM5-2B-Base")
@@ -241,9 +244,7 @@ def parse_args() -> argparse.Namespace:
     parser.add_argument("--checkpoint-every", type=int, default=250)
     parser.add_argument("--keep-checkpoints", type=int, default=2)
     parser.add_argument("--resume")
-    parser.add_argument(
-        "--cpu-offload", action=argparse.BooleanOptionalAction, default=True
-    )
+    parser.add_argument("--cpu-offload", action=argparse.BooleanOptionalAction, default=True)
     parser.add_argument(
         "--gradient-checkpointing", action=argparse.BooleanOptionalAction, default=True
     )
@@ -286,9 +287,7 @@ def wrap_fsdp(
         cpu_offload=CPUOffload(offload_params=cpu_offload),
         sync_module_states=False,
         backward_prefetch=(
-            BackwardPrefetch.BACKWARD_PRE
-            if aggressive_prefetch
-            else BackwardPrefetch.BACKWARD_POST
+            BackwardPrefetch.BACKWARD_PRE if aggressive_prefetch else BackwardPrefetch.BACKWARD_POST
         ),
         forward_prefetch=aggressive_prefetch,
         limit_all_gathers=not aggressive_prefetch,
@@ -351,7 +350,7 @@ def save_checkpoint(
             output_dir.glob("checkpoint-*"),
             key=lambda path: int(path.name.rsplit("-", 1)[-1]),
         )
-        for stale in checkpoints[:-args.keep_checkpoints]:
+        for stale in checkpoints[: -args.keep_checkpoints]:
             shutil.rmtree(stale)
     dist.barrier()
     return checkpoint
@@ -433,9 +432,7 @@ def export_hf(
     export_dir.mkdir(parents=True, exist_ok=True)
     prefix = "backbone."
     backbone_state = {
-        key[len(prefix) :]: value
-        for key, value in full_state.items()
-        if key.startswith(prefix)
+        key[len(prefix) :]: value for key, value in full_state.items() if key.startswith(prefix)
     }
     if not backbone_state:
         raise RuntimeError("full FSDP state did not contain backbone parameters")
@@ -464,9 +461,7 @@ def export_hf(
         "completed_steps": completed_steps,
         "global_batch_size": args.target_global_batch_size,
         "tokens_seen": (
-            completed_steps
-            * args.target_global_batch_size
-            * int(data_manifest["sequence_length"])
+            completed_steps * args.target_global_batch_size * int(data_manifest["sequence_length"])
         ),
         "training_corpus": data_manifest,
     }

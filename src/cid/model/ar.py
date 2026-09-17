@@ -118,7 +118,10 @@ def bidirectional_ar_hidden_states(
         decoder.training and getattr(decoder, "gradient_checkpointing", False)
     )
     for decoder_layer in decoder.layers[: decoder.config.num_hidden_layers]:
-        def layer_forward(states: torch.Tensor, *, layer: nn.Module = decoder_layer) -> torch.Tensor:
+
+        def layer_forward(
+            states: torch.Tensor, *, layer: nn.Module = decoder_layer
+        ) -> torch.Tensor:
             return layer(
                 states,
                 attention_mask=key_mask,

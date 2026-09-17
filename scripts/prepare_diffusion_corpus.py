@@ -13,7 +13,6 @@ from transformers import AutoTokenizer
 
 from cid.model.ar import prepare_ar_tokenizer
 
-
 SOURCE_SPECS = (
     {
         "name": "ultrax-web-en",
