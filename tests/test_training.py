@@ -4256,6 +4256,36 @@ def test_stage_b_adamw_groups_split_backbone_cid_and_no_decay() -> None:
     assert grouped == trainable
 
 
+def test_stage_b_adamw_groups_can_split_embedding_lr() -> None:
+    adapter = make_adapter()
+    adapter.set_backbone_trainable(True)
+
+    groups = stage_b_adamw_parameter_groups(
+        adapter,
+        backbone_lr_scale=0.1,
+        embedding_lr_scale=0.03,
+        weight_decay=0.01,
+    )
+    by_name = {str(group["group_name"]): group for group in groups}
+
+    assert "embedding-decay" in by_name
+    assert by_name["embedding-decay"]["lr_scale"] == pytest.approx(0.03)
+    assert by_name["backbone-decay"]["lr_scale"] == pytest.approx(0.1)
+    assert by_name["cid-decay"]["lr_scale"] == pytest.approx(1.0)
+
+    embedding_ids = {
+        id(adapter.input_embeddings.weight),
+        id(adapter.output_embeddings.weight),
+    }
+    grouped_embedding_ids = {
+        id(parameter)
+        for name, group in by_name.items()
+        if name.startswith("embedding-")
+        for parameter in group["params"]
+    }
+    assert embedding_ids <= grouped_embedding_ids
+
+
 def test_learning_rate_schedule_preserves_stage_b_group_scales() -> None:
     adapter = make_adapter()
     adapter.set_backbone_trainable(True)

@@ -2513,9 +2513,9 @@ def _stage_b_execution_target(
         raise RuntimeError("Stage B was asked to use an Ascend NPU, but NPU is unavailable")
 
     if device_type == "cuda":
-        if world_size < 4:
+        if world_size < 3:
             raise RuntimeError(
-                "Stage B CUDA full-parameter CID training requires at least four GPU ranks"
+                "Stage B CUDA full-parameter CID training requires at least three GPU ranks"
             )
         return "cuda", local_rank, distributed_backend("cuda")
 
@@ -2663,8 +2663,6 @@ def _train_stage_b(args: argparse.Namespace) -> None:
         raise ValueError("CID v1 Stage B requires --thought-capacity 128")
     if args.resume and args.init_cid_checkpoint:
         raise ValueError("--resume and --init-cid-checkpoint are mutually exclusive")
-    if not args.resume and not args.init_cid_checkpoint:
-        raise ValueError("Stage B requires --init-cid-checkpoint unless --resume is used")
     if args.epochs <= 0:
         raise ValueError("--epochs must be positive")
     if args.micro_batch_size is not None and args.micro_batch_size <= 0:
@@ -2691,6 +2689,8 @@ def _train_stage_b(args: argparse.Namespace) -> None:
         raise ValueError("--min-learning-rate-ratio must be in [0, 1]")
     if args.backbone_lr_scale <= 0.0:
         raise ValueError("--backbone-lr-scale must be positive")
+    if args.embedding_lr_scale is not None and args.embedding_lr_scale <= 0.0:
+        raise ValueError("--embedding-lr-scale must be positive")
 
     world_size = int(os.environ.get("WORLD_SIZE", "1"))
     local_rank = int(os.environ.get("LOCAL_RANK", "0"))
@@ -2927,6 +2927,7 @@ def _train_stage_b(args: argparse.Namespace) -> None:
         optimizer_groups = stage_b_adamw_parameter_groups(
             adapter,
             backbone_lr_scale=args.backbone_lr_scale,
+            embedding_lr_scale=args.embedding_lr_scale,
             weight_decay=args.weight_decay,
         )
         if single_npu_stage_b:
@@ -3044,6 +3045,7 @@ def _train_stage_b(args: argparse.Namespace) -> None:
                 f"grouped_moe_layers={grouped_moe_layers} "
                 f"peak_cid_lr={args.learning_rate:.3e} "
                 f"peak_backbone_lr={args.learning_rate * args.backbone_lr_scale:.3e} "
+                f"peak_embedding_lr={args.learning_rate * (args.embedding_lr_scale if args.embedding_lr_scale is not None else args.backbone_lr_scale):.3e} "
                 f"lr_schedule={lr_schedule} warmup_steps={warmup_steps} "
                 f"decay_start_steps={lr_decay_start_steps} lr_decay_steps={lr_decay_steps} "
                 f"target_epochs={args.epochs}",
@@ -3142,6 +3144,9 @@ def _train_stage_b(args: argparse.Namespace) -> None:
                 backbone_lrs = [
                     lr for name, lr in group_lrs.items() if name.startswith("backbone-")
                 ]
+                embedding_lrs = [
+                    lr for name, lr in group_lrs.items() if name.startswith("embedding-")
+                ]
                 cid_lrs = [lr for name, lr in group_lrs.items() if name.startswith("cid-")]
                 record = {
                     "timestamp": time.time(),
@@ -3156,6 +3161,7 @@ def _train_stage_b(args: argparse.Namespace) -> None:
                     "component_losses": progress.component_mean_losses,
                     "learning_rate": progress.learning_rate,
                     "backbone_learning_rate": min(backbone_lrs) if backbone_lrs else None,
+                    "embedding_learning_rate": min(embedding_lrs) if embedding_lrs else None,
                     "cid_learning_rate": max(cid_lrs) if cid_lrs else None,
                     "rollout_probability": current_rollout_probability,
                     "windows_seen_in_epoch": progress.rollout_windows_seen_in_epoch,
@@ -4094,6 +4100,14 @@ def main() -> None:
         type=float,
         default=0.25,
         help="backbone LR multiplier; default keeps the Stage B backbone peak at 5e-6",
+    )
+    train_full.add_argument(
+        "--embedding-lr-scale",
+        type=float,
+        help=(
+            "optional input/output embedding LR multiplier; when omitted embeddings use "
+            "the backbone LR scale"
+        ),
     )
     train_full.add_argument("--weight-decay", type=float, default=0.01)
     train_full.add_argument(

@@ -5069,6 +5069,7 @@ def stage_b_adamw_parameter_groups(
     adapter: ILLaDACIDAdapter,
     *,
     backbone_lr_scale: float = 0.5,
+    embedding_lr_scale: float | None = None,
     weight_decay: float = 0.01,
 ) -> list[dict[str, object]]:
     """Build stable AdamW groups for Stage B before FSDP wrapping.
@@ -5082,37 +5083,56 @@ def stage_b_adamw_parameter_groups(
 
     if not math.isfinite(backbone_lr_scale) or backbone_lr_scale <= 0.0:
         raise ValueError("backbone_lr_scale must be finite and positive")
+    if embedding_lr_scale is not None and (
+        not math.isfinite(embedding_lr_scale) or embedding_lr_scale <= 0.0
+    ):
+        raise ValueError("embedding_lr_scale must be finite and positive")
     if not math.isfinite(weight_decay) or weight_decay < 0.0:
         raise ValueError("weight_decay must be finite and non-negative")
 
-    buckets: dict[tuple[bool, bool], list[torch.nn.Parameter]] = {
-        (True, True): [],
-        (True, False): [],
-        (False, True): [],
-        (False, False): [],
-    }
+    split_embeddings = embedding_lr_scale is not None
+    embedding_parameter_ids: set[int] = set()
+    if split_embeddings:
+        for module in (adapter.input_embeddings, adapter.output_embeddings):
+            weight = getattr(module, "weight", None)
+            if isinstance(weight, torch.nn.Parameter):
+                embedding_parameter_ids.add(id(weight))
+
+    buckets: dict[tuple[str, bool], list[torch.nn.Parameter]] = {}
     for name, parameter in adapter.named_parameters():
         if not parameter.requires_grad:
             continue
-        is_backbone = name.startswith("backbone.")
+        if split_embeddings and id(parameter) in embedding_parameter_ids:
+            family = "embedding"
+        elif name.startswith("backbone."):
+            family = "backbone"
+        else:
+            family = "cid"
         use_decay = parameter.ndim >= 2
-        buckets[(is_backbone, use_decay)].append(parameter)
+        buckets.setdefault((family, use_decay), []).append(parameter)
 
     groups: list[dict[str, object]] = []
-    for is_backbone, use_decay in ((True, True), (True, False), (False, True), (False, False)):
-        parameters = buckets[(is_backbone, use_decay)]
-        if not parameters:
-            continue
-        groups.append(
-            {
-                "params": parameters,
-                "weight_decay": weight_decay if use_decay else 0.0,
-                "lr_scale": backbone_lr_scale if is_backbone else 1.0,
-                "group_name": (
-                    f"{'backbone' if is_backbone else 'cid'}-{'decay' if use_decay else 'no-decay'}"
-                ),
-            }
-        )
+    families = ("backbone", "embedding", "cid") if split_embeddings else ("backbone", "cid")
+    for family in families:
+        for use_decay in (True, False):
+            parameters = buckets.get((family, use_decay), [])
+            if not parameters:
+                continue
+            lr_scale = (
+                float(embedding_lr_scale)
+                if family == "embedding"
+                else backbone_lr_scale
+                if family == "backbone"
+                else 1.0
+            )
+            groups.append(
+                {
+                    "params": parameters,
+                    "weight_decay": weight_decay if use_decay else 0.0,
+                    "lr_scale": lr_scale,
+                    "group_name": f"{family}-{'decay' if use_decay else 'no-decay'}",
+                }
+            )
     if not groups:
         raise ValueError("Stage B AdamW requires trainable parameters")
     return groups

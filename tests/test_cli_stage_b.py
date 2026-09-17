@@ -135,8 +135,8 @@ def test_stage_b_cpu_target_uses_gloo_without_gpu_rank_minimum() -> None:
     ) == ("cpu", None, "gloo")
 
 
-def test_stage_b_cuda_target_keeps_four_rank_minimum() -> None:
-    with pytest.raises(RuntimeError, match="at least four GPU ranks"):
+def test_stage_b_cuda_target_keeps_three_rank_minimum() -> None:
+    with pytest.raises(RuntimeError, match="at least three GPU ranks"):
         cli._stage_b_execution_target(
             "cuda",
             cuda_available=True,
@@ -150,11 +150,11 @@ def test_stage_b_cuda_target_keeps_four_rank_minimum() -> None:
         "auto",
         cuda_available=True,
         npu_available=False,
-        world_size=4,
-        local_rank=3,
+        world_size=3,
+        local_rank=2,
         dtype="bf16",
         cpu_offload=True,
-    ) == ("cuda", 3, "nccl")
+    ) == ("cuda", 2, "nccl")
 
 
 def test_stage_b_cuda_rejects_fp16_without_loss_scaling() -> None:
