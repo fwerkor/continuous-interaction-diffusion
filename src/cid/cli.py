@@ -3029,6 +3029,11 @@ def _train_stage_b(args: argparse.Namespace) -> None:
             )
 
         output_dir = Path(args.output_dir)
+        embedding_lr_scale = (
+            args.embedding_lr_scale
+            if args.embedding_lr_scale is not None
+            else args.backbone_lr_scale
+        )
         if rank == 0:
             output_dir.mkdir(parents=True, exist_ok=True)
             print(
@@ -3045,7 +3050,7 @@ def _train_stage_b(args: argparse.Namespace) -> None:
                 f"grouped_moe_layers={grouped_moe_layers} "
                 f"peak_cid_lr={args.learning_rate:.3e} "
                 f"peak_backbone_lr={args.learning_rate * args.backbone_lr_scale:.3e} "
-                f"peak_embedding_lr={args.learning_rate * (args.embedding_lr_scale if args.embedding_lr_scale is not None else args.backbone_lr_scale):.3e} "
+                f"peak_embedding_lr={args.learning_rate * embedding_lr_scale:.3e} "
                 f"lr_schedule={lr_schedule} warmup_steps={warmup_steps} "
                 f"decay_start_steps={lr_decay_start_steps} lr_decay_steps={lr_decay_steps} "
                 f"target_epochs={args.epochs}",
