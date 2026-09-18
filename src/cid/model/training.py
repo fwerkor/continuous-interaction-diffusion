@@ -2169,8 +2169,13 @@ class CIDTrainer:
             raise RuntimeError("unsynchronized Stage A DDP gradients require distributed training")
         world_size = torch.distributed.get_world_size()
         for _, parameter in self._trainable:
+            # Every rank must issue the exact same collective sequence.  Conditional
+            # execution can leave a trainable parameter unused on one rank while a
+            # peer has a real gradient; skipping ``None`` here shifts all subsequent
+            # all-reduces and eventually deadlocks NCCL.  A missing local gradient is
+            # exactly a zero contribution to the global DDP gradient.
             if parameter.grad is None:
-                continue
+                parameter.grad = torch.zeros_like(parameter)
             torch.distributed.all_reduce(parameter.grad, op=torch.distributed.ReduceOp.SUM)
             parameter.grad.div_(world_size)
         self._pending_ddp_unsynced = False
