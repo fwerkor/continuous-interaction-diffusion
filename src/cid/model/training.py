@@ -978,11 +978,14 @@ class CIDTrainer:
             self._restore_stage_a_gradients_from_cpu()
             self._stage_a_manual_sync_required = True
 
-        use_stage_a_no_sync = bool(
-            stage_a_ddp
-            and (not will_step or self._stage_a_manual_sync_required)
-            and (not force_gradient_sync or self._stage_a_manual_sync_required)
-        )
+        # Stage A uses one deterministic manual gradient reduction at optimizer-step
+        # boundaries.  Whether a rank enters the CPU gradient-stash path depends on
+        # its local sequence geometry, so allowing non-stashing ranks to fall back to
+        # DDP's automatic reducer would mix two different collective streams across
+        # ranks.  Keeping every Stage A backward under no_sync makes the collective
+        # sequence rank-independent while preserving the same globally averaged
+        # gradient at the optimizer step.
+        use_stage_a_no_sync = bool(stage_a_ddp)
         use_stage_b_no_sync = bool(
             getattr(self.forward_model, "_cid_fsdp_no_sync_accumulation", False)
             and not will_step
