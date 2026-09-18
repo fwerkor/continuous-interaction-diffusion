@@ -689,3 +689,12 @@ Preprint: [arXiv:2608.10438](https://arxiv.org/abs/2608.10438) · DOI: [10.48550
 
 The v0 runtime intentionally accepts only read-only sources. Side-effecting tools need a
 separate commitment/authorization protocol and are outside this repository's first milestone.
+
+## Native engine acceleration
+
+CUDA inference can optionally use the C++20/CUDA cid-engine backend. Install the tested release with:
+
+    pip install "git+https://github.com/fwerkor/cid-engine.git@v0.2.0"
+
+When a CUDA-enabled engine build is available, CID uses its fused display-statistics kernel.
+CPU execution and environments without cid-engine keep the existing PyTorch path.

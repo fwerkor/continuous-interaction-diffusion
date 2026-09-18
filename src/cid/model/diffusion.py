@@ -7,6 +7,13 @@ from dataclasses import dataclass
 import torch
 from torch import Tensor
 
+try:
+    import cid_engine as _cid_engine
+except ModuleNotFoundError as exc:
+    if exc.name != "cid_engine":
+        raise
+    _cid_engine = None
+
 _MAX_STRUCTURAL_EDIT_TOKENS = 32
 
 
@@ -193,22 +200,35 @@ class CIDDiffusionScheduler:
         if revision_margin < 0.0:
             raise ValueError("revision_margin must be non-negative")
 
-        confidence = torch.empty(token_ids.shape, dtype=torch.float32, device=logits.device)
-        predicted = torch.empty(token_ids.shape, dtype=torch.long, device=logits.device)
-        current_confidence = torch.empty(token_ids.shape, dtype=torch.float32, device=logits.device)
-        token_chunk_size = 32
-        for start in range(0, token_ids.shape[1], token_chunk_size):
-            stop = min(token_ids.shape[1], start + token_chunk_size)
-            filtered_logits = logits[:, start:stop].float().clone()
-            probabilities = torch.softmax(filtered_logits, dim=-1)
-            chunk_confidence, chunk_predicted = probabilities.max(dim=-1)
-            confidence[:, start:stop] = chunk_confidence
-            predicted[:, start:stop] = chunk_predicted
-            current_ids = token_ids[:, start:stop].unsqueeze(-1)
-            current_confidence[:, start:stop] = probabilities.gather(
-                dim=-1,
-                index=current_ids,
-            ).squeeze(-1)
+        if (
+            _cid_engine is not None
+            and _cid_engine.CUDA_BACKEND_BUILT
+            and logits.is_cuda
+        ):
+            confidence, predicted, current_confidence = (
+                _cid_engine.display_token_statistics(token_ids, logits)
+            )
+        else:
+            confidence = torch.empty(
+                token_ids.shape, dtype=torch.float32, device=logits.device
+            )
+            predicted = torch.empty(token_ids.shape, dtype=torch.long, device=logits.device)
+            current_confidence = torch.empty(
+                token_ids.shape, dtype=torch.float32, device=logits.device
+            )
+            token_chunk_size = 32
+            for start in range(0, token_ids.shape[1], token_chunk_size):
+                stop = min(token_ids.shape[1], start + token_chunk_size)
+                filtered_logits = logits[:, start:stop].float().clone()
+                probabilities = torch.softmax(filtered_logits, dim=-1)
+                chunk_confidence, chunk_predicted = probabilities.max(dim=-1)
+                confidence[:, start:stop] = chunk_confidence
+                predicted[:, start:stop] = chunk_predicted
+                current_ids = token_ids[:, start:stop].unsqueeze(-1)
+                current_confidence[:, start:stop] = probabilities.gather(
+                    dim=-1,
+                    index=current_ids,
+                ).squeeze(-1)
         result = token_ids.clone()
         for batch_index in range(token_ids.shape[0]):
             eos_position: int | None = None
