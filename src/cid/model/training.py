@@ -619,6 +619,7 @@ class CIDTrainer:
         forward_model: torch.nn.Module | None = None,
         gradient_clipper: Callable[[float], Tensor | float] | None = None,
         preserve_reduced_gradients: bool | None = None,
+        cpu_gradient_stash_threshold_tokens: int | None = None,
     ) -> None:
         if tensorizer.adapter is not adapter:
             raise ValueError("trainer and trajectory tensorizer must share the same adapter")
@@ -630,6 +631,12 @@ class CIDTrainer:
                 getattr(self.forward_model, "_cid_cpu_offload_reduced_gradients", False)
             )
         self.preserve_reduced_gradients = preserve_reduced_gradients
+        if (
+            cpu_gradient_stash_threshold_tokens is not None
+            and cpu_gradient_stash_threshold_tokens <= 0
+        ):
+            raise ValueError("CPU gradient-stash threshold must be positive")
+        self.cpu_gradient_stash_threshold_tokens = cpu_gradient_stash_threshold_tokens
         self.tensorizer = tensorizer
         self.config = config or CIDTrainerConfig()
         if tensorizer.text_encoder.pooling_mode != self.config.semantic_pooling:
@@ -664,6 +671,8 @@ class CIDTrainer:
         self._pending_ddp_unsynced = False
         self._pending_fsdp_unsynced = False
         self._reduced_gradient_accumulator: dict[str, Tensor] = {}
+        self._stage_a_cpu_gradient_accumulator: dict[str, Tensor] = {}
+        self._stage_a_manual_sync_required = False
         self.pad_token_id = getattr(tensorizer.tokenizer, "pad_token_id", None)
         if self.pad_token_id is None:
             raise ValueError("training tokenizer must define pad_token_id")
@@ -944,10 +953,35 @@ class CIDTrainer:
             and self._pending_global_examples + global_effective_batch_size
             >= self._target_global_examples_per_step()
         )
+        sequence_tokens = (
+            int(training_batch.batch.thought_semantic.shape[1])
+            + int(training_batch.batch.prompt_ids.shape[1])
+            + int(training_batch.batch.display_ids.shape[1])
+        )
+        stage_a_ddp = bool(getattr(self.forward_model, "_cid_stage_a_ddp", False))
+        use_stage_a_cpu_stash = bool(
+            stage_a_ddp
+            and self.cpu_gradient_stash_threshold_tokens is not None
+            and training_batch.batch.thought_semantic.device.type == "cuda"
+            and sequence_tokens >= self.cpu_gradient_stash_threshold_tokens
+        )
+        if use_stage_a_cpu_stash:
+            # Long sequences need the GPU headroom currently occupied by gradients from
+            # earlier no_sync micro-batches. Keep those exact FP32 gradients on host
+            # memory until this memory-heavy region has passed.
+            self._stash_stage_a_gradients_to_cpu()
+            self._stage_a_manual_sync_required = True
+        elif self._stage_a_cpu_gradient_accumulator:
+            # Return to the fast GPU accumulation path as soon as a short sequence arrives.
+            # Keep manual synchronization enabled for this optimizer interval so DDP never
+            # has to infer bucket state across the host round-trip.
+            self._restore_stage_a_gradients_from_cpu()
+            self._stage_a_manual_sync_required = True
+
         use_stage_a_no_sync = bool(
-            getattr(self.forward_model, "_cid_stage_a_ddp", False)
-            and not will_step
-            and not force_gradient_sync
+            stage_a_ddp
+            and (not will_step or self._stage_a_manual_sync_required)
+            and (not force_gradient_sync or self._stage_a_manual_sync_required)
         )
         use_stage_b_no_sync = bool(
             getattr(self.forward_model, "_cid_fsdp_no_sync_accumulation", False)
@@ -969,8 +1003,12 @@ class CIDTrainer:
                 names = ", ".join(training_batch.example_ids)
                 raise FloatingPointError(f"non-finite CID loss for training micro-batch: {names}")
             (losses.total * effective_batch_size * loss_scale).backward()
-        if getattr(self.forward_model, "_cid_stage_a_ddp", False):
-            self._pending_ddp_unsynced = use_stage_a_no_sync
+        if use_stage_a_cpu_stash:
+            self._stash_stage_a_gradients_to_cpu()
+        if stage_a_ddp:
+            self._pending_ddp_unsynced = bool(
+                use_stage_a_no_sync or self._stage_a_manual_sync_required
+            )
         if getattr(self.forward_model, "_cid_fsdp_no_sync_accumulation", False):
             self._pending_fsdp_unsynced = use_stage_b_no_sync
         self._pending_accumulation += 1
@@ -1821,6 +1859,8 @@ class CIDTrainer:
         self._pending_ddp_unsynced = False
         self._pending_fsdp_unsynced = False
         self._reduced_gradient_accumulator.clear()
+        self._stage_a_cpu_gradient_accumulator.clear()
+        self._stage_a_manual_sync_required = False
         self.data_order_version = int(state.get("data_order_version", 1))
         self.optimizer.zero_grad(set_to_none=True)
         self.reseed(seed)
@@ -1830,6 +1870,7 @@ class CIDTrainer:
         path: str | Path,
         *,
         dataset_sha256: str | None = None,
+        include_optimizer_state: bool = True,
     ) -> None:
         self.prepare_checkpoint()
         destination = Path(path)
@@ -1852,7 +1893,9 @@ class CIDTrainer:
             },
             "trainable_names": self.trainable_parameter_names,
             "model_state": trainable_state,
-            "optimizer_state": self.optimizer.state_dict(),
+            "optimizer_state": (
+                self.optimizer.state_dict() if include_optimizer_state else None
+            ),
             "generator_state": self.generator.get_state().cpu(),
             "shuffle_state": self.shuffle_rng.getstate(),
             "gradient_state": gradient_state,
@@ -1883,6 +1926,8 @@ class CIDTrainer:
         that its peers never join and the collective sequence diverges.
         """
 
+        if self._stage_a_cpu_gradient_accumulator:
+            self._restore_stage_a_gradients_from_cpu()
         if self._pending_ddp_unsynced:
             self._sync_pending_stage_a_ddp_gradients()
 
@@ -1991,7 +2036,9 @@ class CIDTrainer:
                 parameter.copy_(
                     saved_state[name].to(device=parameter.device, dtype=parameter.dtype)
                 )
-        self.optimizer.load_state_dict(checkpoint["optimizer_state"])
+        optimizer_state = checkpoint.get("optimizer_state")
+        if optimizer_state is not None:
+            self.optimizer.load_state_dict(optimizer_state)
         semantic_snapshot = checkpoint.get("semantic_embedding_snapshot")
         if semantic_snapshot is not None:
             current_encoder = self.tensorizer.text_encoder
@@ -2020,6 +2067,8 @@ class CIDTrainer:
         )
         self.optimizer.zero_grad(set_to_none=True)
         self._reduced_gradient_accumulator.clear()
+        self._stage_a_cpu_gradient_accumulator.clear()
+        self._stage_a_manual_sync_required = False
         self._pending_accumulation = int(checkpoint.get("pending_accumulation", 0))
         self._pending_examples = int(checkpoint.get("pending_examples", 0))
         saved_global_examples = checkpoint.get("pending_global_examples")
@@ -2048,6 +2097,8 @@ class CIDTrainer:
         self._pending_fsdp_unsynced = False
 
     def _optimizer_step(self) -> None:
+        if self._stage_a_cpu_gradient_accumulator:
+            self._restore_stage_a_gradients_from_cpu()
         if self._pending_ddp_unsynced:
             self._sync_pending_stage_a_ddp_gradients()
         if self._pending_fsdp_unsynced:
@@ -2101,6 +2152,7 @@ class CIDTrainer:
         self._pending_global_examples = 0
         self._pending_ddp_unsynced = False
         self._pending_fsdp_unsynced = False
+        self._stage_a_manual_sync_required = False
         self.state = CIDTrainerState(
             transitions_seen=self.state.transitions_seen,
             optimizer_steps=self.state.optimizer_steps + 1,
@@ -2122,6 +2174,7 @@ class CIDTrainer:
             torch.distributed.all_reduce(parameter.grad, op=torch.distributed.ReduceOp.SUM)
             parameter.grad.div_(world_size)
         self._pending_ddp_unsynced = False
+        self._stage_a_manual_sync_required = False
 
     def _gradient_example_normalizer(self) -> float:
         """Return one common per-rank divisor for the global valid-example mean gradient."""
@@ -2135,6 +2188,34 @@ class CIDTrainer:
         if not math.isfinite(normalizer) or normalizer <= 0.0:
             raise RuntimeError("optimizer step requires at least one valid accumulated example")
         return normalizer
+
+    def _stash_stage_a_gradients_to_cpu(self) -> None:
+        """Move accumulated Stage A FP32 gradients to host memory for rare long inputs."""
+
+        for name, parameter in self._trainable:
+            gradient = parameter.grad
+            if gradient is None:
+                continue
+            current = gradient.detach().to(device="cpu", copy=True)
+            saved = self._stage_a_cpu_gradient_accumulator.get(name)
+            if saved is None:
+                self._stage_a_cpu_gradient_accumulator[name] = current
+            else:
+                saved.add_(current.to(dtype=saved.dtype))
+            parameter.grad = None
+
+    def _restore_stage_a_gradients_from_cpu(self) -> None:
+        if not self._stage_a_cpu_gradient_accumulator:
+            return
+        parameters = dict(self._trainable)
+        for name, saved in self._stage_a_cpu_gradient_accumulator.items():
+            parameter = parameters[name]
+            restored = saved.to(device=parameter.device, dtype=parameter.dtype)
+            if parameter.grad is None:
+                parameter.grad = restored
+            else:
+                parameter.grad.add_(restored)
+        self._stage_a_cpu_gradient_accumulator.clear()
 
     def _stash_reduced_gradients(self) -> None:
         """Preserve gradients before a backward path that overwrites reduced grads.
@@ -2177,6 +2258,11 @@ class CIDTrainer:
             name: saved.detach().cpu().clone()
             for name, saved in self._reduced_gradient_accumulator.items()
         }
+        for name, saved in self._stage_a_cpu_gradient_accumulator.items():
+            if name in gradients:
+                gradients[name].add_(saved.detach().cpu().to(dtype=gradients[name].dtype))
+            else:
+                gradients[name] = saved.detach().cpu().clone()
         for name, parameter in self._trainable:
             if parameter.grad is None:
                 continue

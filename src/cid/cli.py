@@ -1972,6 +1972,14 @@ def _train_stage_a(args: argparse.Namespace) -> None:
             adapter.set_device_value_validation(False)
         if args.gradient_checkpointing:
             adapter.set_gradient_checkpointing(True)
+        if args.mlp_chunk_size is not None:
+            if args.mlp_chunk_size <= 0:
+                raise ValueError("--mlp-chunk-size must be positive")
+            adapter.set_mlp_chunk_size(args.mlp_chunk_size)
+        if args.norm_chunk_size is not None:
+            if args.norm_chunk_size <= 0:
+                raise ValueError("--norm-chunk-size must be positive")
+            adapter.set_norm_chunk_size(args.norm_chunk_size)
         grouped_moe_layers = adapter.pack_frozen_moe_experts()
 
         tokenizer = load_cid_tokenizer(args.model)
@@ -2000,12 +2008,26 @@ def _train_stage_a(args: argparse.Namespace) -> None:
                 device_type=device_type,
                 dtype=dtype,
             )
-        stage_a_optimizer = torch.optim.AdamW(
-            (parameter for parameter in adapter.parameters() if parameter.requires_grad),
-            lr=args.learning_rate,
-            weight_decay=args.weight_decay,
-            fused=device_type == "cuda",
+        trainable_parameters = tuple(
+            parameter for parameter in adapter.parameters() if parameter.requires_grad
         )
+        if args.zero_redundancy_optimizer and distributed:
+            from torch.distributed.optim import ZeroRedundancyOptimizer
+
+            stage_a_optimizer = ZeroRedundancyOptimizer(
+                trainable_parameters,
+                optimizer_class=torch.optim.AdamW,
+                lr=args.learning_rate,
+                weight_decay=args.weight_decay,
+                fused=device_type == "cuda",
+            )
+        else:
+            stage_a_optimizer = torch.optim.AdamW(
+                trainable_parameters,
+                lr=args.learning_rate,
+                weight_decay=args.weight_decay,
+                fused=device_type == "cuda",
+            )
         trainer = CIDTrainer(
             adapter,
             tensorizer,
@@ -2030,12 +2052,56 @@ def _train_stage_a(args: argparse.Namespace) -> None:
             ),
             optimizer=stage_a_optimizer,
             forward_model=forward_model,
+            cpu_gradient_stash_threshold_tokens=args.cpu_gradient_stash_threshold_tokens,
         )
+        def zro_optimizer_shard_path(checkpoint: Path, shard_rank: int) -> Path:
+            return checkpoint.with_name(
+                f"{checkpoint.stem}.optimizer-rank-{shard_rank:04d}{checkpoint.suffix}"
+            )
+
+        def save_stage_a_checkpoint(checkpoint: Path) -> None:
+            trainer.prepare_checkpoint()
+            if args.zero_redundancy_optimizer and distributed:
+                optimizer_shard = zro_optimizer_shard_path(checkpoint, rank)
+                optimizer_shard.parent.mkdir(parents=True, exist_ok=True)
+                optimizer_temporary = optimizer_shard.with_name(
+                    f".{optimizer_shard.name}.tmp"
+                )
+                torch.save(stage_a_optimizer.optim.state_dict(), optimizer_temporary)
+                optimizer_temporary.replace(optimizer_shard)
+                dist.barrier()
+            if rank == 0:
+                trainer.save_checkpoint(
+                    checkpoint,
+                    dataset_sha256=dataset_manifest.sha256,
+                    include_optimizer_state=not (
+                        args.zero_redundancy_optimizer and distributed
+                    ),
+                )
+            if distributed:
+                dist.barrier()
+
         if args.resume:
             trainer.load_checkpoint(
                 args.resume,
                 expected_dataset_sha256=dataset_manifest.sha256,
             )
+            if args.zero_redundancy_optimizer and distributed:
+                optimizer_shard = zro_optimizer_shard_path(Path(args.resume), rank)
+                if not optimizer_shard.exists():
+                    raise FileNotFoundError(
+                        f"missing Stage A optimizer shard for rank {rank}: {optimizer_shard}"
+                    )
+                local_state = torch.load(optimizer_shard, map_location="cpu", weights_only=False)
+                stage_a_optimizer.optim.load_state_dict(local_state)
+                for exposed, local in zip(
+                    stage_a_optimizer.param_groups,
+                    stage_a_optimizer.optim.param_groups,
+                    strict=True,
+                ):
+                    for key, value in local.items():
+                        if key != "params":
+                            exposed[key] = value
         if distributed:
             trainer.reseed(args.seed + rank + trainer.state.transitions_seen * 104729)
         if trainer.state.rollout_windows_seen_in_epoch == 0:
@@ -2262,22 +2328,14 @@ def _train_stage_a(args: argparse.Namespace) -> None:
                     # ranks must join their synchronization before rank 0 alone serializes
                     # the checkpoint.  Otherwise rank 0 enters gradient all-reduces while
                     # its peers advance to different collectives and NCCL sequences diverge.
-                    trainer.prepare_checkpoint()
-                    if distributed:
-                        dist.barrier()
+                    checkpoint = output_dir / "stage-a-latest.pt"
+                    save_stage_a_checkpoint(checkpoint)
                     if rank == 0:
-                        checkpoint = output_dir / "stage-a-latest.pt"
-                        trainer.save_checkpoint(
-                            checkpoint,
-                            dataset_sha256=dataset_manifest.sha256,
-                        )
                         print(
                             f"checkpoint optimizer_steps={progress.optimizer_steps} "
                             f"path={checkpoint}",
                             flush=True,
                         )
-                    if distributed:
-                        dist.barrier()
                     while next_checkpoint_step <= progress.optimizer_steps:
                         next_checkpoint_step += args.checkpoint_every_steps
 
@@ -2299,12 +2357,9 @@ def _train_stage_a(args: argparse.Namespace) -> None:
             trainer.data_order_version = _stage_a_completed_epoch_data_order_version(
                 trainer.data_order_version
             )
+            save_stage_a_checkpoint(checkpoint)
+            step_alias = output_dir / f"stage-a-step-{trainer.state.optimizer_steps:08d}.pt"
             if rank == 0:
-                trainer.save_checkpoint(
-                    checkpoint,
-                    dataset_sha256=dataset_manifest.sha256,
-                )
-                step_alias = output_dir / f"stage-a-step-{trainer.state.optimizer_steps:08d}.pt"
                 _replace_checkpoint_alias(
                     step_alias, checkpoint, target_is_directory=False
                 )
@@ -2312,6 +2367,18 @@ def _train_stage_a(args: argparse.Namespace) -> None:
                     output_dir / "stage-a-latest.pt",
                     checkpoint,
                     target_is_directory=False,
+                )
+            if args.zero_redundancy_optimizer and distributed:
+                epoch_shard = zro_optimizer_shard_path(checkpoint, rank)
+                step_shard_alias = zro_optimizer_shard_path(step_alias, rank)
+                latest_shard_alias = zro_optimizer_shard_path(
+                    output_dir / "stage-a-latest.pt", rank
+                )
+                _replace_checkpoint_alias(
+                    step_shard_alias, epoch_shard, target_is_directory=False
+                )
+                _replace_checkpoint_alias(
+                    latest_shard_alias, epoch_shard, target_is_directory=False
                 )
             if distributed:
                 dist.barrier()
@@ -4026,10 +4093,34 @@ def main() -> None:
             "--target-global-batch-size. When neither is set, the legacy default is 8"
         ),
     )
+    train.add_argument(
+        "--zero-redundancy-optimizer",
+        action=argparse.BooleanOptionalAction,
+        default=False,
+        help="shard Stage A AdamW optimizer state across distributed ranks",
+    )
+    train.add_argument(
+        "--cpu-gradient-stash-threshold-tokens",
+        type=int,
+        help=(
+            "temporarily stash accumulated Stage A gradients on CPU when an input reaches "
+            "this total thought+prompt+display token count"
+        ),
+    )
     train.add_argument("--max-grad-norm", type=float, default=1.0)
     train.add_argument("--warmup-steps", type=int, default=0)
     train.add_argument("--lr-decay-steps", type=int, default=0)
     train.add_argument("--min-learning-rate-ratio", type=float, default=0.1)
+    train.add_argument(
+        "--mlp-chunk-size",
+        type=int,
+        help="token chunk size for exact frozen-backbone MLP evaluation",
+    )
+    train.add_argument(
+        "--norm-chunk-size",
+        type=int,
+        help="token chunk size for exact frozen-backbone RMSNorm evaluation",
+    )
     train.add_argument("--timestep-min", type=float, default=0.05)
     train.add_argument("--timestep-max", type=float, default=1.0)
     train.add_argument("--rollout-horizon", type=int, default=3)
