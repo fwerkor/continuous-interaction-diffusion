@@ -77,31 +77,38 @@ class ILLaDAContextTensorizer:
             device=device,
             dtype=dtype,
         )
-        role_features = torch.tensor(
-            [[[float(cell.roles.get(role, 0.0)) for role in role_order] for cell in thought.cells]],
+        role_count = len(role_order)
+        control = torch.tensor(
+            [
+                [
+                    [
+                        *(float(cell.roles.get(role, 0.0)) for role in role_order),
+                        float(
+                            lifecycle_order.index(cell.lifecycle)
+                            if cell.occupied and cell.lifecycle in lifecycle_order
+                            else 0
+                        ),
+                        float(cell.uncertainty),
+                        float(cell.noise),
+                        float(cell.occupied),
+                    ]
+                    for cell in thought.cells
+                ]
+            ],
             device=device,
             dtype=dtype,
         )
-        lifecycle_features = torch.zeros(
-            (1, thought.capacity, len(lifecycle_order)), device=device, dtype=dtype
-        )
-        for slot, cell in enumerate(thought.cells):
-            if cell.occupied and cell.lifecycle in lifecycle_order:
-                lifecycle_features[0, slot, lifecycle_order.index(cell.lifecycle)] = 1.0
-        uncertainty = torch.tensor(
-            [[[cell.uncertainty] for cell in thought.cells]],
-            device=device,
-            dtype=dtype,
-        )
-        local_noise = torch.tensor(
-            [[[cell.noise] for cell in thought.cells]],
-            device=device,
-            dtype=dtype,
-        )
-        slot_occupancy = torch.tensor(
-            [[[float(cell.occupied)] for cell in thought.cells]],
-            device=device,
-            dtype=dtype,
+        role_features = control[..., :role_count]
+        lifecycle_index = control[..., role_count].long()
+        uncertainty = control[..., role_count + 1 : role_count + 2]
+        local_noise = control[..., role_count + 2 : role_count + 3]
+        slot_occupancy = control[..., role_count + 3 : role_count + 4]
+        lifecycle_features = (
+            torch.nn.functional.one_hot(
+                lifecycle_index,
+                num_classes=len(lifecycle_order),
+            ).to(dtype=dtype)
+            * slot_occupancy
         )
         thought_corruption = self.scheduler.corrupt_thought(
             thought_semantic,
