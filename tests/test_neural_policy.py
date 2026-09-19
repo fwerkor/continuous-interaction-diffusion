@@ -356,3 +356,42 @@ def test_tensorizer_reuses_shared_semantic_batch_storage() -> None:
     )
 
     assert batch.data_ptr() == semantic.data_ptr()
+
+
+def test_percept_target_masks_preserve_sparse_cell_slots() -> None:
+    from cid.contracts import Percept
+    from cid.grounding import ObjectRef
+    from cid.state import CellLifecycle
+
+    adapter = ILLaDACIDAdapter(TinyBackbone(), freeze_backbone=True)
+    tensorizer = ILLaDAContextTensorizer(adapter, TinyTokenizer())
+    thought = CognitiveField.empty(capacity=4, width=TinyConfig.hidden_size)
+    thought, first = thought.allocate(slot=0, semantic=(0.0,) * TinyConfig.hidden_size)
+    thought, second = thought.allocate(slot=3, semantic=(0.0,) * TinyConfig.hidden_size)
+    cells = list(thought.cells)
+    cells[0] = replace(cells[0], lifecycle=CellLifecycle.RETIRED)
+    thought = replace(thought, cells=tuple(cells))
+    percept = Percept(
+        binding_id="b",
+        source="source",
+        observation=Observation(value="x"),
+        target_cells=(ObjectRef.cell(first), ObjectRef.cell(second)),
+        target_display=(),
+        projection_index=1,
+    )
+    context = ModelContext(
+        facts=FactStore().snapshot(),
+        thought=thought,
+        display=DisplayCanvas.masked(length=3, mask_token_id=5),
+        sources=(),
+        percepts=(percept,),
+        step=0,
+        prompt="status",
+    )
+
+    thought_mask, _ = tensorizer._percept_target_masks(
+        context,
+        device=torch.device("cpu"),
+    )
+
+    assert thought_mask[0, :, 0].tolist() == [True, False, False, True]

@@ -186,8 +186,9 @@ class ILLaDAContextTensorizer:
         context: ModelContext, *, device: torch.device
     ) -> tuple[torch.Tensor, torch.Tensor]:
         cell_slots = {
-            cell_id: context.thought.slot_of(cell_id)
-            for cell_id in context.thought.occupied_cell_ids
+            cell.cell_id: slot
+            for slot, cell in enumerate(context.thought.cells)
+            if cell.occupied and cell.cell_id is not None
         }
         return build_percept_routing_masks(
             tuple(percept.target_cells for percept in context.percepts),
