@@ -9,7 +9,13 @@ from test_training import TinyTokenizer, make_adapter, make_trajectory
 from cid.model import CIDTrainer, CIDTrainerConfig, ILLaDATrajectoryTensorizer, wrap_stage_a_ddp
 
 
-def make_trainer(*, seed: int, optimized: bool, accumulation_steps: int) -> CIDTrainer:
+def make_trainer(
+    *,
+    seed: int,
+    optimized: bool,
+    accumulation_steps: int,
+    cpu_stash: bool = False,
+) -> CIDTrainer:
     adapter = make_adapter(seed=seed)
     ddp = wrap_stage_a_ddp(adapter, device_ids=None)
     if not optimized:
@@ -26,6 +32,7 @@ def make_trainer(*, seed: int, optimized: bool, accumulation_steps: int) -> CIDT
             seed=19,
         ),
         forward_model=ddp,
+        cpu_gradient_stash_threshold_tokens=1 if cpu_stash else None,
     )
 
 
@@ -50,30 +57,32 @@ def main() -> None:
                 optimized=False,
                 accumulation_steps=accumulation_steps,
             )
-            torch.manual_seed(701)
-            optimized = make_trainer(
-                seed=701,
-                optimized=True,
-                accumulation_steps=accumulation_steps,
-            )
-
             reference_report = reference.train_examples((example,), epochs=1, shuffle=False)
-            optimized_report = optimized.train_examples((example,), epochs=1, shuffle=False)
-
             assert reference_report.optimizer_steps == 1
-            assert optimized_report.optimizer_steps == 1
             reference_parameters = dict(reference.adapter.named_parameters())
-            optimized_parameters = dict(optimized.adapter.named_parameters())
-            assert reference_parameters.keys() == optimized_parameters.keys()
-            for name, reference_parameter in reference_parameters.items():
-                optimized_parameter = optimized_parameters[name]
-                torch.testing.assert_close(
-                    optimized_parameter,
-                    reference_parameter,
-                    rtol=2e-6,
-                    atol=2e-7,
-                    msg=lambda message, name=name: f"{name}: {message}",
+
+            for cpu_stash in (False, True):
+                torch.manual_seed(701)
+                optimized = make_trainer(
+                    seed=701,
+                    optimized=True,
+                    accumulation_steps=accumulation_steps,
+                    cpu_stash=cpu_stash,
                 )
+                optimized_report = optimized.train_examples((example,), epochs=1, shuffle=False)
+
+                assert optimized_report.optimizer_steps == 1
+                optimized_parameters = dict(optimized.adapter.named_parameters())
+                assert reference_parameters.keys() == optimized_parameters.keys()
+                for name, reference_parameter in reference_parameters.items():
+                    optimized_parameter = optimized_parameters[name]
+                    torch.testing.assert_close(
+                        optimized_parameter,
+                        reference_parameter,
+                        rtol=2e-6,
+                        atol=2e-7,
+                        msg=lambda message, name=name: f"{name}: {message}",
+                    )
 
         dist.barrier()
     finally:

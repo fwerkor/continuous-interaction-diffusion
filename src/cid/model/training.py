@@ -685,6 +685,18 @@ class CIDTrainer:
         self._stage_a_cpu_gradient_accumulator: dict[str, Tensor] = {}
         self._stage_a_async_gradient_accumulator: Any | None = None
         self._stage_a_manual_sync_required = False
+        self._stage_a_backward_cpu_stash_active = False
+        self._stage_a_gradient_stash_hook_handles: list[object] = []
+        if (
+            getattr(self.forward_model, "_cid_stage_a_ddp", False)
+            and self.cpu_gradient_stash_threshold_tokens is not None
+        ):
+            for name, parameter in self._trainable:
+                self._stage_a_gradient_stash_hook_handles.append(
+                    parameter.register_post_accumulate_grad_hook(
+                        self._make_stage_a_gradient_stash_hook(name)
+                    )
+                )
         self.pad_token_id = getattr(tensorizer.tokenizer, "pad_token_id", None)
         if self.pad_token_id is None:
             raise ValueError("training tokenizer must define pad_token_id")
@@ -1072,14 +1084,23 @@ class CIDTrainer:
                 pack_saved_tensor,
                 unpack_saved_tensor,
             )
-        with sync_context, saved_tensor_context:
-            output = self.forward_model(training_batch.batch)
-            losses = cid_loss(output, training_batch.targets, batch_mask=valid_rows)
-            if not bool(torch.isfinite(losses.total)):
-                names = ", ".join(training_batch.example_ids)
-                raise FloatingPointError(f"non-finite CID loss for training micro-batch: {names}")
-            (losses.total * effective_batch_size * loss_scale).backward()
+        self._stage_a_backward_cpu_stash_active = use_stage_a_cpu_stash
+        try:
+            with sync_context, saved_tensor_context:
+                output = self.forward_model(training_batch.batch)
+                losses = cid_loss(output, training_batch.targets, batch_mask=valid_rows)
+                if not bool(torch.isfinite(losses.total)):
+                    names = ", ".join(training_batch.example_ids)
+                    raise FloatingPointError(
+                        f"non-finite CID loss for training micro-batch: {names}"
+                    )
+                (losses.total * effective_batch_size * loss_scale).backward()
+        finally:
+            self._stage_a_backward_cpu_stash_active = False
         if use_stage_a_cpu_stash:
+            # The post-accumulate hooks normally leave no live GPU gradients.
+            # Keep this pass as a correctness fallback for any parameter whose
+            # autograd path did not invoke a leaf hook.
             self._stash_stage_a_gradients_to_cpu()
         if stage_a_ddp:
             self._pending_ddp_unsynced = bool(
@@ -2432,6 +2453,28 @@ class CIDTrainer:
         if not math.isfinite(normalizer) or normalizer <= 0.0:
             raise RuntimeError("optimizer step requires at least one valid accumulated example")
         return normalizer
+
+    def _make_stage_a_gradient_stash_hook(
+        self,
+        name: str,
+    ) -> Callable[[Tensor], None]:
+        """Offload one Stage A leaf gradient as soon as autograd has accumulated it."""
+
+        def stash(parameter: Tensor) -> None:
+            if not self._stage_a_backward_cpu_stash_active:
+                return
+            gradient = parameter.grad
+            if gradient is None:
+                return
+            current = gradient.detach().to(device="cpu", copy=True)
+            saved = self._stage_a_cpu_gradient_accumulator.get(name)
+            if saved is None:
+                self._stage_a_cpu_gradient_accumulator[name] = current
+            else:
+                saved.add_(current.to(dtype=saved.dtype))
+            parameter.grad = None
+
+        return stash
 
     def _stash_stage_a_gradients_to_cpu(self) -> None:
         """Move accumulated Stage A gradients to reusable host storage."""
