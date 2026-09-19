@@ -197,6 +197,15 @@ class _TeacherRuntimeTransition:
 
 
 @dataclass(frozen=True, slots=True)
+class _TrainingTargetControl:
+    occupancy: tuple[bool, ...]
+    noise_level: tuple[float, ...]
+    state_noise: tuple[float, ...]
+    lifecycle_indices: tuple[int, ...]
+    lifecycle_present: tuple[bool, ...]
+
+
+@dataclass(frozen=True, slots=True)
 class CIDRolloutWindow:
     example: TrajectoryExample | TrajectoryExampleIndex
     source_steps: tuple[int, ...]
@@ -2738,6 +2747,12 @@ class ILLaDATrajectoryTensorizer:
             occupancy,
             generator=generator,
         )
+        target_control = self._training_target_control_snapshot(
+            occupancy,
+            lifecycle_features,
+            thought_corruption.noise,
+            state_noise,
+        )
 
         (
             percept_projections,
@@ -2778,7 +2793,8 @@ class ILLaDATrajectoryTensorizer:
             # teacher cells missing from the causally reachable supervision state must be
             # allocated into the runtime's deterministic first-free prefix.
             target_output_slots = self._runtime_realisable_target_output_slots(
-                target_output_slots, occupancy
+                target_output_slots,
+                target_control.occupancy,
             )
         if rollout_state is None or rollout_state.diffusion_step is None:
             diffusion_step = self._runtime_diffusion_step(example, source_step)
@@ -3028,9 +3044,7 @@ class ILLaDATrajectoryTensorizer:
             display_labels=display_labels,
             display_supervision_mask=display_supervision_mask,
             input_occupancy=occupancy,
-            input_lifecycle_features=lifecycle_features,
-            input_noise_level=thought_corruption.noise,
-            input_state_noise=state_noise,
+            input_control=target_control,
             observed_binding_ids=(observed_binding_ids if rollout_state is not None else None),
             active_binding_ids=(
                 None if rollout_state is None else frozenset(rollout_state.active_binding_ids)
@@ -3810,9 +3824,7 @@ class ILLaDATrajectoryTensorizer:
         display_labels: Tensor,
         display_supervision_mask: Tensor,
         input_occupancy: Tensor,
-        input_lifecycle_features: Tensor,
-        input_noise_level: Tensor,
-        input_state_noise: Tensor,
+        input_control: _TrainingTargetControl,
         observed_binding_ids: frozenset[str] | None,
         active_binding_ids: frozenset[str] | None,
         binding_routes: Mapping[str, CIDRolloutBindingRoute] | None,
@@ -3947,6 +3959,7 @@ class ILLaDATrajectoryTensorizer:
         )
         link_mask = torch.zeros((1, n, c.max_link_slots), device=device, dtype=torch.bool)
 
+        allocation_target_slots: list[int] = []
         for cell_id, target in target_by_id.items():
             slot = target_output_slots[cell_id]
             thought_target[0, slot] = target_vectors[cell_id]
@@ -3954,7 +3967,7 @@ class ILLaDATrajectoryTensorizer:
             uncertainty[0, slot, 0] = target.uncertainty
             for role_index, role in enumerate(role_order):
                 role_targets[0, slot, role_index] = target.roles.get(role, 0.0)
-            actually_occupied = bool(input_occupancy[0, slot, 0])
+            actually_occupied = input_control.occupancy[slot]
             runtime_cell_id = (
                 input_runtime_cell_ids[slot] if slot < len(input_runtime_cell_ids) else None
             )
@@ -3963,6 +3976,7 @@ class ILLaDATrajectoryTensorizer:
                 # update. Train the lifecycle head on the effective hard-gated state:
                 # WAITING when an unresolved binding already targets it, otherwise ACTIVE.
                 allocation_targets[0, slot] = 1.0
+                allocation_target_slots.append(slot)
                 noise_delta[0, slot, 0] = target.noise - 1.0
                 effective_lifecycle = (
                     CellLifecycle.WAITING
@@ -3977,9 +3991,9 @@ class ILLaDATrajectoryTensorizer:
                 lifecycle[0, slot] = lifecycle_order.index(effective_lifecycle)
                 revision_targets[0, slot] = int(RevisionAction.KEEP)
             else:
-                diffusion_delta = target.noise - float(input_noise_level[0, slot, 0])
+                diffusion_delta = target.noise - input_control.noise_level[slot]
                 noise_delta[0, slot, 0] = diffusion_delta
-                state_delta = target.noise - float(input_state_noise[0, slot, 0])
+                state_delta = target.noise - input_control.state_noise[slot]
                 if state_delta > 1e-6:
                     revision_action = RevisionAction.REOPEN
                 elif state_delta < -1e-6:
@@ -3988,10 +4002,9 @@ class ILLaDATrajectoryTensorizer:
                     revision_action = RevisionAction.KEEP
                 revision_targets[0, slot] = int(revision_action)
 
-                current_features = input_lifecycle_features[0, slot]
                 current_lifecycle = (
-                    lifecycle_order[int(current_features.argmax())]
-                    if bool(current_features.abs().sum())
+                    lifecycle_order[input_control.lifecycle_indices[slot]]
+                    if input_control.lifecycle_present[slot]
                     else CellLifecycle.ACTIVE
                 )
                 signals = LifecycleTransitionSignals(
@@ -4026,12 +4039,15 @@ class ILLaDATrajectoryTensorizer:
                 )
                 lifecycle[0, slot] = lifecycle_order.index(effective_lifecycle)
 
-        self._validate_allocation_targets(input_occupancy, allocation_targets)
+        self._validate_allocation_target_slots(
+            input_control.occupancy,
+            allocation_target_slots,
+        )
 
         target_slots = set(target_output_slots.values())
         retired_index = lifecycle_order.index(CellLifecycle.RETIRED)
-        for slot in range(n):
-            if bool(input_occupancy[0, slot, 0]) and slot not in target_slots:
+        for slot, occupied in enumerate(input_control.occupancy):
+            if occupied and slot not in target_slots:
                 # Over-allocation is a structural rollout error. Teach the lifecycle head to
                 # retire the extra occupied cell rather than silently carrying it forever.
                 lifecycle[0, slot] = retired_index
@@ -4106,8 +4122,6 @@ class ILLaDATrajectoryTensorizer:
             item.cell_id: item for item in example.grounding_targets if item.step == target_step
         }
         for cell_id, slot in target_output_slots.items():
-            if not thought_mask[0, slot]:
-                continue
             anchor_presence_mask[0, slot] = True
             link_presence_mask[0, slot] = True
             grounding = grounding_by_cell.get(cell_id)
@@ -4192,63 +4206,89 @@ class ILLaDATrajectoryTensorizer:
         return max(0, source_step - epoch_start)
 
     @staticmethod
+    def _training_target_control_snapshot(
+        input_occupancy: Tensor,
+        input_lifecycle_features: Tensor,
+        input_noise_level: Tensor,
+        input_state_noise: Tensor,
+    ) -> _TrainingTargetControl:
+        if input_occupancy.ndim != 3 or input_occupancy.shape[0] != 1:
+            raise ValueError("training target occupancy must have shape [1, slots, 1]")
+        slot_count = input_occupancy.shape[1]
+        if input_occupancy.shape[2] != 1:
+            raise ValueError("training target occupancy must have shape [1, slots, 1]")
+        if input_noise_level.shape != input_occupancy.shape:
+            raise ValueError("training target noise level must match occupancy")
+        if input_state_noise.shape != input_occupancy.shape:
+            raise ValueError("training target state noise must match occupancy")
+        if input_lifecycle_features.shape[:2] != (1, slot_count):
+            raise ValueError("training target lifecycle geometry must match occupancy")
+
+        lifecycle_indices = input_lifecycle_features.argmax(dim=-1)
+        lifecycle_present = input_lifecycle_features.abs().sum(dim=-1).ne(0)
+        snapshot = torch.stack(
+            (
+                input_occupancy[0, :, 0].bool().float(),
+                input_noise_level[0, :, 0].float(),
+                input_state_noise[0, :, 0].float(),
+                lifecycle_indices[0].float(),
+                lifecycle_present[0].float(),
+            ),
+            dim=-1,
+        ).detach().cpu().tolist()
+        return _TrainingTargetControl(
+            occupancy=tuple(bool(row[0]) for row in snapshot),
+            noise_level=tuple(float(row[1]) for row in snapshot),
+            state_noise=tuple(float(row[2]) for row in snapshot),
+            lifecycle_indices=tuple(int(row[3]) for row in snapshot),
+            lifecycle_present=tuple(bool(row[4]) for row in snapshot),
+        )
+
+    @staticmethod
     def _runtime_realisable_target_output_slots(
         teacher_slots: Mapping[str, int],
-        input_occupancy: Tensor,
+        occupied: tuple[bool, ...],
     ) -> dict[str, int]:
-        """Align closed-loop teacher cells with the runtime's first-free allocator.
+        """Align closed-loop teacher cells with the runtime's first-free allocator."""
 
-        Occupied physical slots retain positional supervision: the model can correct the
-        semantic contents of an already-materialized runtime cell in place. Teacher cells
-        whose original physical slots are currently free are recovery allocations. Those
-        allocations must occupy the first free physical slots in ascending order, matching
-        ``prefix_allocation_mask`` exactly.
-        """
-
-        occupied = input_occupancy.squeeze(-1).bool()
-        if occupied.ndim != 2 or occupied.shape[0] != 1:
-            raise ValueError(
-                "closed-loop target-slot remapping expects occupancy shape [1, slots, 1]"
-            )
-        slot_count = occupied.shape[1]
+        slot_count = len(occupied)
         retained: dict[str, int] = {}
         recovery: list[tuple[int, str]] = []
         for cell_id, slot in teacher_slots.items():
             if not 0 <= slot < slot_count:
                 raise ValueError("teacher target slot is outside runtime capacity")
-            if bool(occupied[0, slot]):
+            if occupied[slot]:
                 retained[cell_id] = slot
             else:
                 recovery.append((slot, cell_id))
 
-        free_slots = [slot for slot in range(slot_count) if not bool(occupied[0, slot])]
+        free_slots = [slot for slot, is_occupied in enumerate(occupied) if not is_occupied]
         if len(recovery) > len(free_slots):
             raise CIDRolloutRecoveryError(
                 "closed-loop teacher target exceeds available runtime slots"
             )
 
         remapped = dict(retained)
-        for (_, cell_id), slot in zip(sorted(recovery), free_slots[: len(recovery)], strict=True):
+        for (_, cell_id), slot in zip(
+            sorted(recovery),
+            free_slots[: len(recovery)],
+            strict=True,
+        ):
             remapped[cell_id] = slot
         return remapped
 
     @staticmethod
-    def _validate_allocation_targets(input_occupancy: Tensor, allocation_targets: Tensor) -> None:
-        target = allocation_targets.bool()
-        if int(target.sum().item()) > DEFAULT_MAX_ALLOCATIONS_PER_STEP:
+    def _validate_allocation_target_slots(
+        occupied: tuple[bool, ...],
+        target_slots: list[int],
+    ) -> None:
+        if len(target_slots) > DEFAULT_MAX_ALLOCATIONS_PER_STEP:
             raise CIDRolloutRecoveryError("teacher transition exceeds runtime allocation limit")
-        logits = torch.where(
-            target,
-            torch.full_like(allocation_targets, 20.0),
-            torch.full_like(allocation_targets, -20.0),
-        )
-        decoded = prefix_allocation_mask(
-            input_occupancy.squeeze(-1).bool(),
-            logits,
-            threshold=0.5,
-            max_allocations=DEFAULT_MAX_ALLOCATIONS_PER_STEP,
-        )
-        if not torch.equal(decoded, target):
+        if len(target_slots) != len(set(target_slots)):
+            raise ValueError("teacher allocation targets contain duplicate physical slots")
+        free_slots = [slot for slot, is_occupied in enumerate(occupied) if not is_occupied]
+        expected = free_slots[: len(target_slots)]
+        if sorted(target_slots) != expected:
             raise ValueError(
                 "teacher allocation targets are not realizable by the runtime first-free decoder"
             )
