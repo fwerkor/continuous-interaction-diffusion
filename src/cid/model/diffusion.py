@@ -208,6 +208,17 @@ class CIDDiffusionScheduler:
             confidence, predicted, current_confidence = (
                 _cid_engine.display_token_statistics(token_ids, logits)
             )
+            return _cid_engine.refine_display_from_statistics(
+                token_ids,
+                confidence,
+                predicted,
+                current_confidence,
+                mask_token_id=self.mask_token_id,
+                eos_token_id=self.eos_token_id,
+                reveal_fraction=reveal_fraction,
+                revision_fraction=revision_fraction,
+                revision_margin=revision_margin,
+            )
         else:
             confidence = torch.empty(
                 token_ids.shape, dtype=torch.float32, device=logits.device

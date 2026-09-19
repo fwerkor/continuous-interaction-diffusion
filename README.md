@@ -694,7 +694,7 @@ separate commitment/authorization protocol and are outside this repository's fir
 
 CUDA inference can optionally use the C++20/CUDA cid-engine backend. Install the tested release with:
 
-    pip install "git+https://github.com/fwerkor/cid-engine.git@v0.2.0"
+    pip install --no-build-isolation "git+https://github.com/fwerkor/cid-engine.git@v0.3.0"
 
 When a CUDA-enabled engine build is available, CID uses its fused display-statistics kernel.
 CPU execution and environments without cid-engine keep the existing PyTorch path.
