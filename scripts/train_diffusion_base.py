@@ -19,6 +19,7 @@ import torch
 import torch.distributed as dist
 import torch.distributed.checkpoint as dcp
 from huggingface_hub import HfFileSystem
+from safetensors import safe_open
 from torch import Tensor
 from torch.distributed.fsdp import (
     BackwardPrefetch,
@@ -453,6 +454,22 @@ def export_hf(
         safe_serialization=True,
         max_shard_size="4GB",
     )
+    index_path = export_dir / "model.safetensors.index.json"
+    if index_path.is_file():
+        total_parameters = 0
+        for shard_path in sorted(export_dir.glob("model-*.safetensors")):
+            with safe_open(shard_path, framework="pt", device="cpu") as handle:
+                for tensor_name in handle.keys():
+                    parameter_count = 1
+                    for dimension in handle.get_slice(tensor_name).get_shape():
+                        parameter_count *= dimension
+                    total_parameters += parameter_count
+        index = json.loads(index_path.read_text(encoding="utf-8"))
+        index.setdefault("metadata", {})["total_parameters"] = total_parameters
+        index_path.write_text(
+            json.dumps(index, indent=2) + "\n",
+            encoding="utf-8",
+        )
     tokenizer.save_pretrained(export_dir)
     diffusion_config = {
         "format": "cid-diffusion-base-v1",

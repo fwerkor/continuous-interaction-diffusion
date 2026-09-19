@@ -1,5 +1,6 @@
 from __future__ import annotations
 
+import json
 import shutil
 from pathlib import Path
 
@@ -9,6 +10,7 @@ torch = pytest.importorskip("torch")
 transformers = pytest.importorskip("transformers")
 
 from cid.model.modeling_cid_diffusion import CIDDiffusionForMaskedLM
+from scripts.prepare_diffusion_hf_release import repair_safetensors_parameter_count
 
 
 def tiny_config():
@@ -99,3 +101,36 @@ def test_remote_code_round_trip(tmp_path: Path) -> None:
         logits = restored(ids).logits
     assert logits.shape == (1, 3, 33)
     assert torch.isfinite(logits).all()
+
+
+def test_release_helper_repairs_sharded_parameter_metadata(tmp_path: Path) -> None:
+    from safetensors.torch import save_file
+
+    save_file(
+        {"a": torch.zeros(3, 5), "b": torch.zeros(7)},
+        tmp_path / "model-00001-of-00002.safetensors",
+    )
+    save_file(
+        {"c": torch.zeros(2, 4)},
+        tmp_path / "model-00002-of-00002.safetensors",
+    )
+    index = {
+        "metadata": {"total_parameters": 1, "total_size": 0},
+        "weight_map": {
+            "a": "model-00001-of-00002.safetensors",
+            "b": "model-00001-of-00002.safetensors",
+            "c": "model-00002-of-00002.safetensors",
+        },
+    }
+    (tmp_path / "model.safetensors.index.json").write_text(
+        json.dumps(index),
+        encoding="utf-8",
+    )
+
+    total = repair_safetensors_parameter_count(tmp_path)
+    repaired = json.loads(
+        (tmp_path / "model.safetensors.index.json").read_text(encoding="utf-8")
+    )
+
+    assert total == 30
+    assert repaired["metadata"]["total_parameters"] == 30

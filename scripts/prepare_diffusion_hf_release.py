@@ -5,6 +5,8 @@ import json
 import shutil
 from pathlib import Path
 
+from safetensors import safe_open
+
 
 MODEL_FILE = Path(__file__).resolve().parents[1] / "src/cid/model/modeling_cid_diffusion.py"
 
@@ -24,6 +26,27 @@ def update_json(path: Path, update) -> None:
     )
 
 
+def repair_safetensors_parameter_count(release_dir: Path) -> int | None:
+    index_path = release_dir / "model.safetensors.index.json"
+    if not index_path.is_file():
+        return None
+    total_parameters = 0
+    for shard_path in sorted(release_dir.glob("model-*.safetensors")):
+        with safe_open(shard_path, framework="pt", device="cpu") as handle:
+            for tensor_name in handle.keys():
+                parameter_count = 1
+                for dimension in handle.get_slice(tensor_name).get_shape():
+                    parameter_count *= dimension
+                total_parameters += parameter_count
+    index = json.loads(index_path.read_text(encoding="utf-8"))
+    index.setdefault("metadata", {})["total_parameters"] = total_parameters
+    index_path.write_text(
+        json.dumps(index, ensure_ascii=False, indent=2) + "\n",
+        encoding="utf-8",
+    )
+    return total_parameters
+
+
 def main() -> None:
     args = parse_args()
     release_dir = Path(args.release_dir).resolve()
@@ -35,6 +58,7 @@ def main() -> None:
             "release directory must already contain config.json and diffusion_config.json"
         )
 
+    repair_safetensors_parameter_count(release_dir)
     shutil.copy2(MODEL_FILE, release_dir / "modeling_cid_diffusion.py")
 
     def patch_config(config: dict[str, object]) -> None:
