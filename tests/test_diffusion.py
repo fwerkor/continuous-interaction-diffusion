@@ -127,13 +127,17 @@ def test_chunked_display_refinement_matches_full_softmax_reference() -> None:
     logits = torch.randn(2, 73, 64, generator=generator)
 
     probabilities = torch.softmax(logits.float(), dim=-1)
-    confidence, predicted = probabilities.max(dim=-1)
+    predicted = logits.float().argmax(dim=-1)
+    confidence = probabilities.gather(-1, predicted.unsqueeze(-1)).squeeze(-1)
     expected = tokens.clone()
     for batch_index in range(tokens.shape[0]):
         masked_positions = torch.nonzero(tokens[batch_index] == 5, as_tuple=False).flatten()
         reveal_count = (masked_positions.numel() + 1) // 2
         ranked = masked_positions[
-            confidence[batch_index, masked_positions].argsort(descending=True)
+            confidence[batch_index, masked_positions].argsort(
+                descending=True,
+                stable=True,
+            )
         ]
         expected[batch_index, ranked[:reveal_count]] = predicted[batch_index, ranked[:reveal_count]]
 
@@ -152,7 +156,7 @@ def test_chunked_display_refinement_matches_full_softmax_reference() -> None:
             candidate_positions.numel(),
             (visible_positions.numel() + 3) // 4,
         )
-        ranked = candidate_positions[candidate_gains.argsort(descending=True)]
+        ranked = candidate_positions[candidate_gains.argsort(descending=True, stable=True)]
         expected[batch_index, ranked[:revision_count]] = predicted[
             batch_index, ranked[:revision_count]
         ]
@@ -166,6 +170,40 @@ def test_chunked_display_refinement_matches_full_softmax_reference() -> None:
     )
 
     assert torch.equal(actual, expected)
+
+
+def test_display_prediction_is_not_changed_by_softmax_rounding() -> None:
+    scheduler = CIDDiffusionScheduler(mask_token_id=5)
+    tokens = torch.tensor([[5]])
+    logits = torch.tensor([[[0.0, 1.0e-8, -1.0, -2.0, -3.0, -4.0]]])
+
+    assert logits.argmax(dim=-1).item() == 1
+    assert torch.softmax(logits.float(), dim=-1).argmax(dim=-1).item() == 0
+
+    revealed = scheduler.refine_display(
+        tokens,
+        logits,
+        reveal_fraction=1.0,
+        revision_fraction=0.0,
+        revision_margin=1.0,
+    )
+    assert revealed.tolist() == [[1]]
+
+
+def test_display_refinement_uses_position_stable_tie_breaking() -> None:
+    scheduler = CIDDiffusionScheduler(mask_token_id=5)
+    tokens = torch.tensor([[5, 5, 5, 8]])
+    logits = torch.zeros(1, 4, 16)
+
+    revealed = scheduler.refine_display(
+        tokens,
+        logits,
+        reveal_fraction=0.5,
+        revision_fraction=0.0,
+        revision_margin=0.0,
+    )
+
+    assert revealed.tolist() == [[0, 0, 5, 8]]
 
 
 def test_diffusion_scheduler_validates_timestep_range() -> None:

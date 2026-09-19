@@ -232,7 +232,11 @@ class CIDDiffusionScheduler:
                 stop = min(token_ids.shape[1], start + token_chunk_size)
                 filtered_logits = logits[:, start:stop].float().clone()
                 probabilities = torch.softmax(filtered_logits, dim=-1)
-                chunk_confidence, chunk_predicted = probabilities.max(dim=-1)
+                chunk_predicted = filtered_logits.argmax(dim=-1)
+                chunk_confidence = probabilities.gather(
+                    dim=-1,
+                    index=chunk_predicted.unsqueeze(-1),
+                ).squeeze(-1)
                 confidence[:, start:stop] = chunk_confidence
                 predicted[:, start:stop] = chunk_predicted
                 current_ids = token_ids[:, start:stop].unsqueeze(-1)
@@ -287,7 +291,10 @@ class CIDDiffusionScheduler:
             if masked_positions.numel() and reveal_fraction:
                 reveal_count = math.ceil(masked_positions.numel() * reveal_fraction)
                 ranked = masked_positions[
-                    confidence[batch_index, masked_positions].argsort(descending=True)
+                    confidence[batch_index, masked_positions].argsort(
+                        descending=True,
+                        stable=True,
+                    )
                 ]
                 selected = ranked[:reveal_count]
                 result[batch_index, selected] = predicted[batch_index, selected]
@@ -312,7 +319,9 @@ class CIDDiffusionScheduler:
                         candidate_positions.numel(),
                         math.ceil(visible_positions.numel() * revision_fraction),
                     )
-                    ranked = candidate_positions[candidate_gains.argsort(descending=True)]
+                    ranked = candidate_positions[
+                        candidate_gains.argsort(descending=True, stable=True)
+                    ]
                     selected = ranked[:revision_count]
                     result[batch_index, selected] = predicted[batch_index, selected]
 
