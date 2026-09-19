@@ -1033,16 +1033,45 @@ class CIDTrainer:
         ):
             self._stash_reduced_gradients()
         # Long Stage-A examples can leave less than one embedding-gradient's worth
-        # of free VRAM even after accumulated gradients have been stashed.  Offload
-        # only autograd-saved tensors for those already-identified long examples;
-        # values are copied losslessly and restored by autograd during backward.
-        saved_tensor_context = (
-            torch.autograd.graph.save_on_cpu(pin_memory=True)
-            if stage_a_ddp
+        # of free VRAM during backward.  Offload a bounded amount of activation state
+        # only: never duplicate model-parameter storage on the host, and cap host
+        # memory growth so recovery from a long example cannot trigger the OOM killer.
+        saved_tensor_context = nullcontext()
+        if (
+            stage_a_ddp
             and training_batch.batch.thought_semantic.device.type == "cuda"
             and sequence_tokens >= 512
-            else nullcontext()
-        )
+        ):
+            parameter_storages = {
+                parameter.untyped_storage().data_ptr()
+                for parameter in self.forward_model.parameters()
+                if parameter.device.type == "cuda"
+            }
+            offload_budget_bytes = 4 * 1024**3
+            offloaded_bytes = 0
+
+            def pack_saved_tensor(tensor: torch.Tensor) -> object:
+                nonlocal offloaded_bytes
+                if tensor.device.type != "cuda":
+                    return tensor
+                if tensor.untyped_storage().data_ptr() in parameter_storages:
+                    return tensor
+                tensor_bytes = tensor.numel() * tensor.element_size()
+                if tensor_bytes < 1024**2 or offloaded_bytes >= offload_budget_bytes:
+                    return tensor
+                offloaded_bytes += tensor_bytes
+                return (tensor.device, tensor.to(device="cpu", copy=True))
+
+            def unpack_saved_tensor(packed: object) -> torch.Tensor:
+                if isinstance(packed, tuple):
+                    device, tensor = packed
+                    return tensor.to(device=device)
+                return packed
+
+            saved_tensor_context = torch.autograd.graph.saved_tensors_hooks(
+                pack_saved_tensor,
+                unpack_saved_tensor,
+            )
         with sync_context, saved_tensor_context:
             output = self.forward_model(training_batch.batch)
             losses = cid_loss(output, training_batch.targets, batch_mask=valid_rows)
