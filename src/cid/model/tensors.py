@@ -282,13 +282,22 @@ def build_percept_routing_masks(
 ) -> tuple[Tensor, Tensor]:
     if len(target_cells) != len(target_display):
         raise ValueError("percept target cell/display lists must have the same length")
+
     percept_count = len(target_cells)
     thought_mask = torch.zeros(
-        (1, thought_slots, percept_count), dtype=torch.bool, device=device
+        (1, thought_slots, percept_count),
+        dtype=torch.bool,
     )
     display_mask = torch.zeros(
-        (1, display_length, percept_count), dtype=torch.bool, device=device
+        (1, display_length, percept_count),
+        dtype=torch.bool,
     )
+
+    thought_rows: list[int] = []
+    thought_columns: list[int] = []
+    display_rows: list[int] = []
+    display_columns: list[int] = []
+
     for index, (cell_targets, display_targets) in enumerate(
         zip(target_cells, target_display, strict=True)
     ):
@@ -296,9 +305,11 @@ def build_percept_routing_masks(
             for target in cell_targets:
                 slot = cell_slots.get(target.identifier)
                 if slot is not None:
-                    thought_mask[0, slot, index] = True
+                    thought_rows.append(slot)
+                    thought_columns.append(index)
         else:
-            thought_mask[0, :, index] = True
+            thought_rows.extend(range(thought_slots))
+            thought_columns.extend([index] * thought_slots)
 
         if display_targets:
             for target in display_targets:
@@ -307,7 +318,20 @@ def build_percept_routing_masks(
                 start, end = target.span
                 start = max(0, min(start, display_length))
                 end = max(start, min(end, display_length))
-                display_mask[0, start:end, index] = True
+                display_rows.extend(range(start, end))
+                display_columns.extend([index] * (end - start))
         else:
-            display_mask[0, :, index] = True
-    return thought_mask, display_mask
+            display_rows.extend(range(display_length))
+            display_columns.extend([index] * display_length)
+
+    if thought_rows:
+        thought_mask[0, thought_rows, thought_columns] = True
+    if display_rows:
+        display_mask[0, display_rows, display_columns] = True
+
+    if device.type == "cpu":
+        return thought_mask, display_mask
+    return (
+        thought_mask.to(device=device, non_blocking=True),
+        display_mask.to(device=device, non_blocking=True),
+    )
