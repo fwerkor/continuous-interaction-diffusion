@@ -15,6 +15,7 @@ from typing import Any
 
 import torch
 from torch import Tensor
+from torch.nn import functional as F
 
 from cid.contracts import (
     ArgumentDescriptor,
@@ -813,8 +814,8 @@ class CIDTrainer:
 
         rollout_states: list[CIDRolloutState | None] = [None] * len(windows)
         failed_rollout_rows = [False] * len(windows)
-        loss_sum = 0.0
-        raw_loss_sum = 0.0
+        loss_sum_tensor: Tensor | None = None
+        raw_loss_sum_tensor: Tensor | None = None
         transition_count = 0
         component_sums: dict[str, Tensor] = {}
         rollout_length = next(iter(lengths))
@@ -888,9 +889,18 @@ class CIDTrainer:
                     global_effective_batch_size=global_batch_size,
                     force_gradient_sync=force_gradient_sync,
                 )
-                raw_loss = float(losses.total.detach().float()) * effective_batch_size
-                raw_loss_sum += raw_loss
-                loss_sum += raw_loss * loss_weight
+                raw_loss = losses.total.detach().float() * effective_batch_size
+                weighted_loss = raw_loss * loss_weight
+                raw_loss_sum_tensor = (
+                    raw_loss
+                    if raw_loss_sum_tensor is None
+                    else raw_loss_sum_tensor + raw_loss
+                )
+                loss_sum_tensor = (
+                    weighted_loss
+                    if loss_sum_tensor is None
+                    else loss_sum_tensor + weighted_loss
+                )
                 transition_count += effective_batch_size
                 _accumulate_metric_tensors(
                     component_sums,
@@ -915,6 +925,16 @@ class CIDTrainer:
                 del output, training_batch, losses, samples
             if offset + 1 < rollout_length and rollout_probability > 0.0:
                 rollout_states = next_states
+        if loss_sum_tensor is None or raw_loss_sum_tensor is None:
+            loss_sum = 0.0
+            raw_loss_sum = 0.0
+        else:
+            loss_sum, raw_loss_sum = (
+                float(value)
+                for value in torch.stack(
+                    (loss_sum_tensor, raw_loss_sum_tensor)
+                ).detach().cpu().tolist()
+            )
         return loss_sum, raw_loss_sum, transition_count, component_sums
 
     def _forward_backward(
@@ -937,13 +957,15 @@ class CIDTrainer:
             samples,
             pad_token_id=int(self.pad_token_id),
         )
+        effective_batch_size = (
+            sum(sample_mask) if sample_mask is not None else len(samples)
+        )
         valid_rows = torch.tensor(
             sample_mask if sample_mask is not None else (True,) * len(samples),
             dtype=torch.bool,
             device=training_batch.batch.thought_semantic.device,
         )
         training_batch.batch.sample_mask = valid_rows
-        effective_batch_size = int(valid_rows.sum())
         if global_effective_batch_size is None:
             global_effective_batch_size = self._distributed_global_batch_size(effective_batch_size)
         if global_effective_batch_size < effective_batch_size:
@@ -1060,32 +1082,19 @@ class CIDTrainer:
         lifecycle_indices = output.lifecycle_logits[
             batch_index : batch_index + 1, slot_slice
         ].argmax(dim=-1)
-        revision_indices = output.revision_logits[batch_index : batch_index + 1, slot_slice].argmax(
-            dim=-1
-        )
-        input_lifecycle = input_batch.lifecycle_features[batch_index : batch_index + 1, slot_slice]
-        lifecycle_features = torch.zeros(
-            (1, thought_slots, self.adapter.config.num_lifecycles),
-            device=lifecycle_indices.device,
-            dtype=sample.batch.role_features.dtype,
-        )
+        revision_indices = output.revision_logits[
+            batch_index : batch_index + 1, slot_slice
+        ].argmax(dim=-1)
+        input_lifecycle = input_batch.lifecycle_features[
+            batch_index : batch_index + 1, slot_slice
+        ]
+        input_lifecycle_indices = input_lifecycle.argmax(dim=-1)
+        input_lifecycle_present = input_lifecycle.abs().sum(dim=-1).ne(0)
         retired_index = MODELED_LIFECYCLES.index(CellLifecycle.RETIRED)
         previous_retired = previous_occupancy.squeeze(-1) & (
-            input_lifecycle.argmax(dim=-1) == retired_index
+            input_lifecycle_indices == retired_index
         )
         newly_allocated = occupancy.squeeze(-1) & ~previous_occupancy.squeeze(-1)
-        if len(sample.input_runtime_cell_ids) != thought_slots:
-            raise ValueError("training step runtime cell identity does not match thought geometry")
-        runtime_cell_ids = list(sample.input_runtime_cell_ids)
-        next_cell_serial = sample.input_next_cell_serial
-        existing_runtime_ids = {cell_id for cell_id in runtime_cell_ids if cell_id is not None}
-        for slot in newly_allocated[0].nonzero(as_tuple=False).flatten().tolist():
-            while f"c{next_cell_serial}" in existing_runtime_ids:
-                next_cell_serial += 1
-            runtime_cell_id = f"c{next_cell_serial}"
-            runtime_cell_ids[slot] = runtime_cell_id
-            existing_runtime_ids.add(runtime_cell_id)
-            next_cell_serial += 1
         predicted_retired = lifecycle_indices == retired_index
         # CIDMaterializer never revives a previously retired cell, and it coerces a
         # newly allocated cell to ACTIVE unless the model explicitly predicts WAITING.
@@ -1108,12 +1117,84 @@ class CIDTrainer:
             revision_fraction=self.config.rollout_display_revision_fraction,
             revision_margin=self.config.rollout_display_revision_margin,
         )
-        eos_positions = torch.nonzero(
-            display_ids[0] == self.tensorizer.eos_token_id, as_tuple=False
-        ).flatten()
-        display_active_length = (
-            int(eos_positions[0]) + 1 if eos_positions.numel() else display_length
+
+        materializer_config = CIDMaterializerConfig()
+        equilibrium_flag = (
+            torch.sigmoid(output.convergence_logits[batch_index : batch_index + 1].float())
+            >= materializer_config.convergence_threshold
         )
+        control_snapshot = torch.cat(
+            (
+                occupancy.squeeze(-1).long().reshape(-1),
+                previous_occupancy.squeeze(-1).long().reshape(-1),
+                lifecycle_indices.long().reshape(-1),
+                revision_indices.long().reshape(-1),
+                input_lifecycle_indices.long().reshape(-1),
+                input_lifecycle_present.long().reshape(-1),
+                equilibrium_flag.long().reshape(-1),
+                display_ids.long().reshape(-1),
+                previous_display_ids.long().reshape(-1),
+            )
+        ).detach().cpu().tolist()
+
+        cursor = 0
+        occupancy_host = tuple(
+            bool(value)
+            for value in control_snapshot[cursor : cursor + thought_slots]
+        )
+        cursor += thought_slots
+        previous_occupancy_host = tuple(
+            bool(value) for value in control_snapshot[cursor : cursor + thought_slots]
+        )
+        cursor += thought_slots
+        lifecycle_host = tuple(
+            int(value) for value in control_snapshot[cursor : cursor + thought_slots]
+        )
+        cursor += thought_slots
+        revision_host = tuple(
+            int(value) for value in control_snapshot[cursor : cursor + thought_slots]
+        )
+        cursor += thought_slots
+        input_lifecycle_host = tuple(
+            int(value) for value in control_snapshot[cursor : cursor + thought_slots]
+        )
+        cursor += thought_slots
+        input_lifecycle_present_host = tuple(
+            bool(value) for value in control_snapshot[cursor : cursor + thought_slots]
+        )
+        cursor += thought_slots
+        equilibrium = bool(control_snapshot[cursor])
+        cursor += 1
+        display_ids_host = tuple(
+            int(value) for value in control_snapshot[cursor : cursor + display_length]
+        )
+        cursor += display_length
+        previous_display_ids_host = tuple(
+            int(value) for value in control_snapshot[cursor : cursor + display_length]
+        )
+
+        if len(sample.input_runtime_cell_ids) != thought_slots:
+            raise ValueError("training step runtime cell identity does not match thought geometry")
+        runtime_cell_ids = list(sample.input_runtime_cell_ids)
+        next_cell_serial = sample.input_next_cell_serial
+        existing_runtime_ids = {cell_id for cell_id in runtime_cell_ids if cell_id is not None}
+        for slot, (occupied_now, occupied_before) in enumerate(
+            zip(occupancy_host, previous_occupancy_host, strict=True)
+        ):
+            if not occupied_now or occupied_before:
+                continue
+            while f"c{next_cell_serial}" in existing_runtime_ids:
+                next_cell_serial += 1
+            runtime_cell_id = f"c{next_cell_serial}"
+            runtime_cell_ids[slot] = runtime_cell_id
+            existing_runtime_ids.add(runtime_cell_id)
+            next_cell_serial += 1
+
+        try:
+            eos_index = display_ids_host.index(self.tensorizer.eos_token_id)
+        except ValueError:
+            eos_index = -1
+        display_active_length = eos_index + 1 if eos_index >= 0 else display_length
 
         (
             active_binding_ids,
@@ -1156,27 +1237,27 @@ class CIDTrainer:
                 available_cells if route.need_id in observed_binding_ids else waiting_cells
             )
             destination.update(target.identifier for target in route.target_cells)
+        final_lifecycle_host = [0] * thought_slots
         for slot in range(thought_slots):
-            if not bool(occupancy[0, slot, 0]):
+            if not occupancy_host[slot]:
                 continue
             cell_id = runtime_cell_ids[slot]
             if cell_id is None:
                 raise ValueError("occupied rollout slot is missing runtime cell identity")
-            proposed = MODELED_LIFECYCLES[int(lifecycle_indices[0, slot])]
-            if not bool(previous_occupancy[0, slot, 0]):
+            proposed = MODELED_LIFECYCLES[lifecycle_host[slot]]
+            if not previous_occupancy_host[slot]:
                 resolved = (
                     CellLifecycle.WAITING
                     if proposed is CellLifecycle.WAITING and cell_id in waiting_cells
                     else CellLifecycle.ACTIVE
                 )
             else:
-                current_features = input_lifecycle[0, slot]
                 current = (
-                    MODELED_LIFECYCLES[int(current_features.argmax())]
-                    if bool(current_features.abs().sum())
+                    MODELED_LIFECYCLES[input_lifecycle_host[slot]]
+                    if input_lifecycle_present_host[slot]
                     else CellLifecycle.ACTIVE
                 )
-                reopen = int(revision_indices[0, slot]) == int(RevisionAction.REOPEN)
+                reopen = revision_host[slot] == int(RevisionAction.REOPEN)
                 resolved = LifecycleTransitionController.resolve(
                     cell_id=cell_id,
                     current=current,
@@ -1187,9 +1268,21 @@ class CIDTrainer:
                         reopen_cells=frozenset((cell_id,)) if reopen else frozenset(),
                     ),
                 )
-            lifecycle_features[0, slot, MODELED_LIFECYCLES.index(resolved)] = 1.0
+            final_lifecycle_host[slot] = MODELED_LIFECYCLES.index(resolved)
 
-        final_lifecycle_indices = lifecycle_features.argmax(dim=-1)
+        final_lifecycle_indices = torch.tensor(
+            (final_lifecycle_host,),
+            device=lifecycle_indices.device,
+            dtype=torch.long,
+        )
+        lifecycle_features = F.one_hot(
+            final_lifecycle_indices,
+            num_classes=self.adapter.config.num_lifecycles,
+        ).to(dtype=sample.batch.role_features.dtype)
+        lifecycle_features = lifecycle_features * occupancy.to(
+            dtype=lifecycle_features.dtype
+        )
+
         retired_at = dict(sample.input_retired_at)
         occupied_ids = {cell_id for cell_id in runtime_cell_ids if cell_id is not None}
         retired_at = {
@@ -1198,12 +1291,12 @@ class CIDTrainer:
             if cell_id in occupied_ids
         }
         for slot in range(thought_slots):
-            if not bool(occupancy[0, slot, 0]):
+            if not occupancy_host[slot]:
                 continue
             cell_id = runtime_cell_ids[slot]
             if cell_id is None:
                 raise ValueError("occupied rollout slot is missing runtime cell identity")
-            if int(final_lifecycle_indices[0, slot]) == retired_index:
+            if final_lifecycle_host[slot] == retired_index:
                 retired_at.setdefault(cell_id, sample.target_step)
             else:
                 retired_at.pop(cell_id, None)
@@ -1218,17 +1311,13 @@ class CIDTrainer:
         ).clamp(0.0, 1.0)
         local_noise = local_noise * occupancy.to(dtype=local_noise.dtype)
 
-        materializer_config = CIDMaterializerConfig()
-        equilibrium = (
-            float(torch.sigmoid(output.convergence_logits[batch_index].float()).detach())
-            >= materializer_config.convergence_threshold
+        display_unresolved = any(
+            token_id == self.adapter.mask_token_id
+            for token_id in display_ids_host[:display_active_length]
         )
-        display_unresolved = bool(
-            (display_ids[0, :display_active_length] == self.adapter.mask_token_id).any()
-        )
-        display_stable = torch.equal(display_ids, previous_display_ids)
-        display_has_boundary = bool(eos_positions.numel())
-        display_nonempty = display_has_boundary and int(eos_positions[0]) > 0
+        display_stable = display_ids_host == previous_display_ids_host
+        display_has_boundary = eos_index >= 0
+        display_nonempty = display_has_boundary and eos_index > 0
         converged = (
             equilibrium
             and not display_unresolved
