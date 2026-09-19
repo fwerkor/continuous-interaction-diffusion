@@ -5,6 +5,13 @@ from torch import Tensor
 
 from cid.defaults import DEFAULT_MAX_ALLOCATIONS_PER_STEP as DEFAULT_MAX_ALLOCATIONS_PER_STEP
 
+try:
+    import cid_engine as _cid_engine
+except ModuleNotFoundError as exc:
+    if exc.name != "cid_engine":
+        raise
+    _cid_engine = None
+
 
 def prefix_allocation_mask(
     occupancy: Tensor,
@@ -33,6 +40,18 @@ def prefix_allocation_mask(
         raise ValueError("allocation threshold must be in [0, 1]")
     if max_allocations <= 0:
         raise ValueError("max_allocations must be positive")
+
+    if (
+        _cid_engine is not None
+        and _cid_engine.CUDA_BACKEND_BUILT
+        and allocation_logits.is_cuda
+    ):
+        return _cid_engine.prefix_allocation_mask(
+            occupancy,
+            allocation_logits,
+            threshold=threshold,
+            max_allocations=max_allocations,
+        )
 
     occupied = occupancy.bool()
     # Allocation is a discrete runtime decision.  Evaluate its probability in
