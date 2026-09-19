@@ -338,3 +338,21 @@ def test_context_tensorizer_routes_percept_to_target_cell_and_display_span() -> 
     )
     assert query_mask is not None
     assert not query_mask[0, 3 : 3 + batch.prompt_ids.shape[1], 0].any()
+
+
+def test_tensorizer_reuses_shared_semantic_batch_storage() -> None:
+    from cid.model.tensors import DeviceSemanticBatch, semantic_batch_as_tensor
+
+    semantic = torch.randn(3, TinyConfig.hidden_size)
+    owner = DeviceSemanticBatch(semantic)
+    field = CognitiveField.empty(capacity=3, width=TinyConfig.hidden_size)
+    for slot in range(3):
+        field, _ = field.allocate(slot=slot, semantic=owner.row(slot))
+
+    batch = semantic_batch_as_tensor(
+        field.cells,
+        device=semantic.device,
+        dtype=semantic.dtype,
+    )
+
+    assert batch.data_ptr() == semantic.data_ptr()

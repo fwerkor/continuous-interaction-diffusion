@@ -31,7 +31,12 @@ from cid.grounding import Anchor, AnchorKind, CognitiveLink, LinkRelation, Objec
 from cid.lifecycle import MODELED_LIFECYCLES
 from cid.model.allocation import prefix_allocation_mask
 from cid.model.native_engine import cuda_engine
-from cid.model.tensors import CIDTensorOutput, DeviceSemantic, semantic_as_tensor
+from cid.model.tensors import (
+    CIDTensorOutput,
+    DeviceSemantic,
+    DeviceSemanticBatch,
+    semantic_as_tensor,
+)
 from cid.state import CellLifecycle, CognitiveField, CognitiveRole, DisplayCanvas
 
 T = TypeVar("T")
@@ -267,8 +272,9 @@ class CIDMaterializer:
         previous: CognitiveField,
         batch_index: int,
     ) -> CognitiveField:
+        occupied_flags = [cell.occupied for cell in previous.cells]
         occupancy = torch.tensor(
-            [[cell.occupied for cell in previous.cells]],
+            [occupied_flags],
             dtype=torch.bool,
             device=output.allocation_logits.device,
         )
@@ -346,16 +352,70 @@ class CIDMaterializer:
             )
 
         newly_allocated_slots = set(selected_slots)
+        becomes_full = (
+            sum(occupied_flags) + len(selected_slots) >= previous.capacity
+        )
+
+        if becomes_full:
+            field = previous
+            for slot in selected_slots:
+                sketch = tuple(
+                    round(float(value), 3) for value in semantic_sketches[slot]
+                )
+                field, _ = field.allocate(
+                    slot=slot,
+                    semantic=DeviceSemantic(thought_semantic[slot], sketch=sketch),
+                )
+
+            cells = list(field.cells)
+            for slot, cell in enumerate(cells):
+                if not cell.occupied or cell.lifecycle is CellLifecycle.RETIRED:
+                    continue
+                predicted_lifecycle = lifecycle_order[lifecycle_values[slot]]
+                if slot in newly_allocated_slots and predicted_lifecycle not in (
+                    CellLifecycle.ACTIVE,
+                    CellLifecycle.WAITING,
+                ):
+                    predicted_lifecycle = CellLifecycle.ACTIVE
+                sketch = tuple(
+                    round(float(value), 3) for value in semantic_sketches[slot]
+                )
+                cells[slot] = replace(
+                    cell,
+                    semantic=DeviceSemantic(
+                        thought_semantic[slot],
+                        sketch=sketch,
+                    ),
+                    roles={
+                        role: role_values[slot][index]
+                        for index, role in enumerate(role_order)
+                    },
+                    uncertainty=uncertainty_values[slot],
+                    noise=max(
+                        0.0,
+                        min(1.0, cell.noise + noise_delta_values[slot]),
+                    ),
+                    lifecycle=predicted_lifecycle,
+                )
+
+            return CognitiveField(
+                cells=tuple(cells),
+                step=previous.step + 1,
+                next_cell_serial=field.next_cell_serial,
+            )
+
+        semantic_owner = DeviceSemanticBatch(thought_semantic)
         field = previous
         for slot in selected_slots:
-            semantic = DeviceSemantic(
-                thought_semantic[slot],
-                sketch=tuple(round(float(value), 3) for value in semantic_sketches[slot]),
+            sketch = tuple(
+                round(float(value), 3) for value in semantic_sketches[slot]
             )
-            field, _ = field.allocate(slot=slot, semantic=semantic)
+            field, _ = field.allocate(
+                slot=slot,
+                semantic=semantic_owner.row(slot, sketch=sketch),
+            )
 
         cells = list(field.cells)
-
         for slot, cell in enumerate(cells):
             if not cell.occupied or cell.lifecycle is CellLifecycle.RETIRED:
                 continue
@@ -365,19 +425,21 @@ class CIDMaterializer:
                 CellLifecycle.WAITING,
             ):
                 predicted_lifecycle = CellLifecycle.ACTIVE
+            sketch = tuple(
+                round(float(value), 3) for value in semantic_sketches[slot]
+            )
             cells[slot] = replace(
                 cell,
-                semantic=DeviceSemantic(
-                    thought_semantic[slot],
-                    sketch=tuple(
-                        round(float(value), 3) for value in semantic_sketches[slot]
-                    ),
-                ),
+                semantic=semantic_owner.row(slot, sketch=sketch),
                 roles={
-                    role: role_values[slot][index] for index, role in enumerate(role_order)
+                    role: role_values[slot][index]
+                    for index, role in enumerate(role_order)
                 },
                 uncertainty=uncertainty_values[slot],
-                noise=max(0.0, min(1.0, cell.noise + noise_delta_values[slot])),
+                noise=max(
+                    0.0,
+                    min(1.0, cell.noise + noise_delta_values[slot]),
+                ),
                 lifecycle=predicted_lifecycle,
             )
 

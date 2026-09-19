@@ -66,6 +66,57 @@ class DeviceSemantic(Sequence[float]):
         return tuple(round(float(value), 3) for value in values)
 
 
+class DeviceSemanticBatch:
+    """Shared device-resident semantic tensor for a partially occupied TCT."""
+
+    __slots__ = ("_tensor",)
+
+    def __init__(self, tensor: Tensor) -> None:
+        if tensor.ndim != 2:
+            raise ValueError("semantic batch tensor must have shape [slots, hidden]")
+        self._tensor = tensor.detach()
+
+    @property
+    def tensor(self) -> Tensor:
+        return self._tensor
+
+    def row(
+        self,
+        slot: int,
+        *,
+        sketch: tuple[float, ...] | None = None,
+    ) -> SharedDeviceSemantic:
+        if not 0 <= slot < self._tensor.shape[0]:
+            raise IndexError("semantic slot is outside batch capacity")
+        return SharedDeviceSemantic(self, slot, sketch=sketch)
+
+
+class SharedDeviceSemantic(DeviceSemantic):
+    """DeviceSemantic row that also remembers its shared batch owner."""
+
+    __slots__ = ("_owner", "_slot")
+
+    def __init__(
+        self,
+        owner: DeviceSemanticBatch,
+        slot: int,
+        *,
+        sketch: tuple[float, ...] | None = None,
+    ) -> None:
+        self._owner = owner
+        self._slot = slot
+        self._tensor = owner.tensor[slot]
+        self._sketch = sketch
+
+    @property
+    def owner(self) -> DeviceSemanticBatch:
+        return self._owner
+
+    @property
+    def slot(self) -> int:
+        return self._slot
+
+
 def semantic_as_tensor(
     semantic: Sequence[float],
     *,
@@ -78,6 +129,81 @@ def semantic_as_tensor(
             dtype=dtype or semantic.tensor.dtype,
         )
     return torch.tensor(semantic, device=device, dtype=dtype)
+
+
+def semantic_batch_as_tensor(
+    cells: Sequence[object],
+    *,
+    device: torch.device,
+    dtype: torch.dtype,
+) -> Tensor:
+    if cells:
+        first = cells[0]
+        first_semantic = first.semantic
+        if (
+            first.occupied
+            and first.lifecycle is not CellLifecycle.RETIRED
+            and not isinstance(first_semantic, SharedDeviceSemantic)
+        ):
+            rows = [
+                semantic_as_tensor(cell.semantic, device=device, dtype=dtype)
+                for cell in cells
+            ]
+            return torch.stack(rows, dim=0).unsqueeze(0)
+
+    owner: DeviceSemanticBatch | None = None
+    retired: list[tuple[int, Sequence[float]]] = []
+    occupied: list[bool] = []
+
+    for slot, cell in enumerate(cells):
+        occupied.append(bool(cell.occupied))
+        semantic = cell.semantic
+        if cell.occupied and cell.lifecycle is not CellLifecycle.RETIRED:
+            if (
+                not isinstance(semantic, SharedDeviceSemantic)
+                or semantic.slot != slot
+            ):
+                owner = None
+                break
+            if owner is None:
+                owner = semantic.owner
+            elif semantic.owner is not owner:
+                owner = None
+                break
+        elif cell.lifecycle is CellLifecycle.RETIRED:
+            retired.append((slot, semantic))
+
+    if owner is None:
+        rows = [
+            semantic_as_tensor(cell.semantic, device=device, dtype=dtype)
+            for cell in cells
+        ]
+        return torch.stack(rows, dim=0).unsqueeze(0)
+
+    tensor = owner.tensor.to(device=device, dtype=dtype)
+    if not all(occupied):
+        occupancy = torch.tensor(occupied, device=device, dtype=torch.bool)
+        tensor = torch.where(
+            occupancy.unsqueeze(-1),
+            tensor,
+            torch.zeros((), device=device, dtype=dtype),
+        )
+    if retired:
+        tensor = tensor.clone()
+        indices = torch.tensor(
+            [slot for slot, _ in retired],
+            device=device,
+            dtype=torch.long,
+        )
+        rows = torch.stack(
+            [
+                semantic_as_tensor(semantic, device=device, dtype=dtype)
+                for _, semantic in retired
+            ],
+            dim=0,
+        )
+        tensor.index_copy_(0, indices, rows)
+    return tensor.unsqueeze(0)
 
 
 @dataclass(slots=True)

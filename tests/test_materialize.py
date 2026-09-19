@@ -444,3 +444,22 @@ def test_materialized_semantic_reuses_model_tensor_storage() -> None:
 
     expected_sketch = tuple(round(float(value), 3) for value in output.thought_semantic[0, 1])
     assert semantic.sketch(samples=4) == expected_sketch
+
+
+def test_materialized_live_semantics_share_model_batch_owner() -> None:
+    from cid.model.tensors import DeviceSemantic
+
+    field = CognitiveField.empty(capacity=3, width=4)
+    field, _ = field.allocate(slot=0, semantic=(1.0, 0.0, 0.0, 0.0))
+    output = make_output()
+    thought = CIDMaterializer()._materialize_cells(output, field, 0)
+
+    first = thought.cells[0].semantic
+    second = thought.cells[1].semantic
+    assert isinstance(first, DeviceSemantic)
+    assert isinstance(second, DeviceSemantic)
+    assert first.owner is second.owner
+    assert first.slot == 0
+    assert second.slot == 1
+    assert first.tensor.data_ptr() == output.thought_semantic[0, 0].data_ptr()
+    assert second.tensor.data_ptr() == output.thought_semantic[0, 1].data_ptr()
