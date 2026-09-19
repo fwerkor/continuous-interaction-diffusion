@@ -384,25 +384,27 @@ def _masked_element_mean(
     if losses.shape != mask.shape:
         raise ValueError("masked element loss and mask shapes must match")
     selected = mask.bool()
+    selected_losses = torch.where(
+        selected,
+        losses,
+        torch.zeros((), dtype=losses.dtype, device=losses.device),
+    )
     if batch_mask is None:
-        values = losses[selected]
-        if values.numel() == 0:
-            return _differentiable_zero(reference)
-        return values.mean()
+        count = selected.sum()
+        return selected_losses.sum() / count.clamp_min(1).to(dtype=losses.dtype)
     if batch_mask.shape != (losses.shape[0],):
         raise ValueError("component batch_mask must have shape [batch]")
-    active_rows = batch_mask.bool()
-    if not bool(active_rows.any()):
-        return _differentiable_zero(reference)
-    flat_losses = losses.reshape(losses.shape[0], -1)
+
+    flat_losses = selected_losses.reshape(losses.shape[0], -1)
     flat_mask = selected.reshape(selected.shape[0], -1)
     counts = flat_mask.sum(dim=1)
-    row_losses = (flat_losses * flat_mask.to(dtype=flat_losses.dtype)).sum(dim=1)
+    row_losses = flat_losses.sum(dim=1)
     row_losses = row_losses / counts.clamp_min(1).to(dtype=flat_losses.dtype)
     # A valid example with no labels for this component contributes zero. This keeps
     # CIDLoss a true per-example mean, which is required because the trainer multiplies
     # losses.total by the valid-example count before gradient accumulation.
-    return row_losses[active_rows].mean()
+    active_rows = batch_mask.to(dtype=row_losses.dtype)
+    return (row_losses * active_rows).sum() / active_rows.sum().clamp_min(1.0)
 
 
 def _masked_cosine_loss(
@@ -479,14 +481,12 @@ def _capped_positive_weight_binary_cross_entropy(
     denominator = weights.sum(dim=1)
     row_losses = (losses * weights).sum(dim=1) / denominator.clamp_min(1.0)
     if batch_mask is None:
-        valid_rows = (denominator > 0).to(dtype=losses.dtype)
-        return (row_losses * valid_rows).sum() / valid_rows.sum().clamp_min(1.0)
-    if batch_mask.shape != (logits.shape[0],):
-        raise ValueError("component batch_mask must have shape [batch]")
-    active_rows = batch_mask.bool()
-    if not bool(active_rows.any()):
-        return _differentiable_zero(logits)
-    return row_losses[active_rows].mean()
+        active_rows = (denominator > 0).to(dtype=losses.dtype)
+    else:
+        if batch_mask.shape != (logits.shape[0],):
+            raise ValueError("component batch_mask must have shape [batch]")
+        active_rows = batch_mask.to(dtype=losses.dtype)
+    return (row_losses * active_rows).sum() / active_rows.sum().clamp_min(1.0)
 
 
 def _target_positive_mass_binary_cross_entropy(
@@ -535,9 +535,8 @@ def _target_positive_mass_binary_cross_entropy(
     valid_rows = denominator > 0
     if batch_mask is not None:
         valid_rows = valid_rows & batch_mask.bool()
-    if not bool(valid_rows.any()):
-        return _differentiable_zero(logits)
-    return row_losses[valid_rows].mean()
+    active_rows = valid_rows.to(dtype=row_losses.dtype)
+    return (row_losses * active_rows).sum() / active_rows.sum().clamp_min(1.0)
 
 
 def _masked_binary_cross_entropy(
@@ -564,9 +563,9 @@ def _masked_cross_entropy(
     batch_mask: Tensor | None = None,
 ) -> Tensor:
     selected = mask.bool()
-    if not bool(selected.any()):
-        return _differentiable_zero(logits)
     class_count = logits.shape[-1]
+    if class_count == 0:
+        return _differentiable_zero(logits)
     safe_target = target.masked_fill(~selected, 0)
     per_element = F.cross_entropy(
         logits.reshape(-1, class_count),
@@ -593,9 +592,9 @@ def _masked_focal_cross_entropy(
     if gamma < 0.0:
         raise ValueError("focal gamma must be non-negative")
     selected = mask.bool()
-    if not bool(selected.any()):
-        return _differentiable_zero(logits)
     class_count = logits.shape[-1]
+    if class_count == 0:
+        return _differentiable_zero(logits)
     safe_target = target.masked_fill(~selected, 0)
     flat_logits = logits.reshape(-1, class_count)
     flat_target = safe_target.reshape(-1)
