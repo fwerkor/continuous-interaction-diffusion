@@ -694,8 +694,9 @@ separate commitment/authorization protocol and are outside this repository's fir
 
 CUDA inference can optionally use the C++20/CUDA cid-engine backend. Install the tested release with:
 
-    pip install --no-build-isolation "git+https://github.com/fwerkor/cid-engine.git@v0.3.1"
+    pip install --no-build-isolation "git+https://github.com/fwerkor/cid-engine.git@v0.4.0"
 
-When a CUDA-enabled engine build is available, CID uses its native display refinement and
-prefix-allocation paths. CPU execution and environments without cid-engine keep the existing
-PyTorch path.
+When a CUDA-enabled engine build is available, CID uses native display refinement, prefix
+allocation, and compact materialization snapshots. Thought semantic vectors stay device-resident
+between runtime steps instead of being expanded into Python floats and rebuilt as GPU tensors.
+CPU execution and environments without cid-engine keep the existing PyTorch path.

@@ -30,7 +30,8 @@ from cid.defaults import (
 from cid.grounding import Anchor, AnchorKind, CognitiveLink, LinkRelation, ObjectKind, ObjectRef
 from cid.lifecycle import MODELED_LIFECYCLES
 from cid.model.allocation import prefix_allocation_mask
-from cid.model.tensors import CIDTensorOutput
+from cid.model.native_engine import cuda_engine
+from cid.model.tensors import CIDTensorOutput, DeviceSemantic, semantic_as_tensor
 from cid.state import CellLifecycle, CognitiveField, CognitiveRole, DisplayCanvas
 
 T = TypeVar("T")
@@ -278,38 +279,105 @@ class CIDMaterializer:
             max_allocations=self.config.max_allocations_per_step,
         )[0]
 
-        thought_semantic = output.thought_semantic[batch_index].detach().float().cpu()
-        selected_slots = selected.nonzero(as_tuple=False).flatten().cpu().tolist()
+        thought_semantic = output.thought_semantic[batch_index].detach()
+        semantic_width = thought_semantic.shape[-1]
+        sketch_samples = min(12, semantic_width)
+        sketch_positions = _semantic_sketch_positions(semantic_width, sketch_samples)
+        sketch_indexes = torch.tensor(
+            sketch_positions,
+            dtype=torch.long,
+            device=thought_semantic.device,
+        )
+
+        role_order = tuple(CognitiveRole)
+        lifecycle_order = MODELED_LIFECYCLES
+        role_count = len(role_order)
+        engine = cuda_engine(
+            thought_semantic,
+            capability="materialize_cell_snapshot",
+        )
+        native_snapshot = (
+            engine is not None
+            and output.role_logits.dtype == thought_semantic.dtype
+            and output.uncertainty.dtype == thought_semantic.dtype
+            and output.noise_delta.dtype == thought_semantic.dtype
+            and output.lifecycle_logits.dtype == thought_semantic.dtype
+        )
+        if native_snapshot:
+            snapshot_rows = engine.materialize_cell_snapshot(
+                output.thought_semantic[batch_index : batch_index + 1].detach(),
+                output.role_logits[batch_index : batch_index + 1].detach(),
+                output.uncertainty[batch_index : batch_index + 1].detach(),
+                output.noise_delta[batch_index : batch_index + 1].detach(),
+                output.lifecycle_logits[batch_index : batch_index + 1].detach(),
+                selected.unsqueeze(0),
+                sketch_indexes,
+            )[0].cpu().tolist()
+            selected_slots = [
+                slot for slot, row in enumerate(snapshot_rows) if row[0] > 0.5
+            ]
+            lifecycle_values = [int(row[1]) for row in snapshot_rows]
+            uncertainty_values = [float(row[2]) for row in snapshot_rows]
+            noise_delta_values = [float(row[3]) for row in snapshot_rows]
+            role_values = [row[4 : 4 + role_count] for row in snapshot_rows]
+            semantic_sketches = [row[4 + role_count :] for row in snapshot_rows]
+        else:
+            semantic_sketches = (
+                thought_semantic.index_select(-1, sketch_indexes)
+                .float()
+                .cpu()
+                .tolist()
+            )
+            selected_slots = selected.nonzero(as_tuple=False).flatten().cpu().tolist()
+            role_values = (
+                torch.sigmoid(output.role_logits[batch_index].float())
+                .detach()
+                .cpu()
+                .tolist()
+            )
+            uncertainty_values = (
+                output.uncertainty[batch_index].detach().float().cpu().flatten().tolist()
+            )
+            noise_delta_values = (
+                output.noise_delta[batch_index].detach().float().cpu().flatten().tolist()
+            )
+            lifecycle_values = (
+                output.lifecycle_logits[batch_index].argmax(dim=-1).detach().cpu().tolist()
+            )
+
+        newly_allocated_slots = set(selected_slots)
         field = previous
         for slot in selected_slots:
-            semantic = _vector_tuple(thought_semantic[slot])
+            semantic = DeviceSemantic(
+                thought_semantic[slot],
+                sketch=tuple(round(float(value), 3) for value in semantic_sketches[slot]),
+            )
             field, _ = field.allocate(slot=slot, semantic=semantic)
 
         cells = list(field.cells)
-        role_order = tuple(CognitiveRole)
-        lifecycle_order = MODELED_LIFECYCLES
-        role_probs = torch.sigmoid(output.role_logits[batch_index].float()).detach().cpu()
-        uncertainty = output.uncertainty[batch_index].detach().float().cpu()
-        noise_delta = output.noise_delta[batch_index].detach().float().cpu()
-        lifecycle = output.lifecycle_logits[batch_index].argmax(dim=-1).detach().cpu()
 
         for slot, cell in enumerate(cells):
             if not cell.occupied or cell.lifecycle is CellLifecycle.RETIRED:
                 continue
-            predicted_lifecycle = lifecycle_order[int(lifecycle[slot])]
-            if cell.cell_id not in previous.occupied_cell_ids and predicted_lifecycle not in (
+            predicted_lifecycle = lifecycle_order[lifecycle_values[slot]]
+            if slot in newly_allocated_slots and predicted_lifecycle not in (
                 CellLifecycle.ACTIVE,
                 CellLifecycle.WAITING,
             ):
                 predicted_lifecycle = CellLifecycle.ACTIVE
             cells[slot] = replace(
                 cell,
-                semantic=_vector_tuple(thought_semantic[slot]),
+                semantic=DeviceSemantic(
+                    thought_semantic[slot],
+                    sketch=tuple(
+                        round(float(value), 3) for value in semantic_sketches[slot]
+                    ),
+                ),
                 roles={
-                    role: float(role_probs[slot, index]) for index, role in enumerate(role_order)
+                    role: role_values[slot][index] for index, role in enumerate(role_order)
                 },
-                uncertainty=float(uncertainty[slot, 0]),
-                noise=max(0.0, min(1.0, cell.noise + float(noise_delta[slot, 0]))),
+                uncertainty=uncertainty_values[slot],
+                noise=max(0.0, min(1.0, cell.noise + noise_delta_values[slot])),
                 lifecycle=predicted_lifecycle,
             )
 
@@ -402,7 +470,10 @@ class CIDMaterializer:
     ) -> ObjectRef | None:
         if kind is ObjectKind.CELL:
             cell_candidates = tuple(
-                (ObjectRef.cell(cell.cell_id), torch.tensor(cell.semantic, device=query.device))
+                (
+                    ObjectRef.cell(cell.cell_id),
+                    semantic_as_tensor(cell.semantic, device=query.device),
+                )
                 for cell in thought.cells
                 if cell.live and cell.cell_id is not None
             )
@@ -647,5 +718,10 @@ def _nearest_value(
     return candidates[index][0]
 
 
-def _vector_tuple(vector: Tensor) -> tuple[float, ...]:
-    return tuple(vector.detach().float().cpu().tolist())
+def _semantic_sketch_positions(width: int, samples: int) -> tuple[int, ...]:
+    if width <= 0 or samples <= 0:
+        raise ValueError("semantic sketch dimensions must be positive")
+    if samples >= width:
+        return tuple(range(width))
+    last = width - 1
+    return tuple(round(index * last / (samples - 1)) for index in range(samples))

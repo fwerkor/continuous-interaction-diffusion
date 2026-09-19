@@ -21,7 +21,7 @@ from cid.model.encoding import (
 from cid.model.illada import ILLADA_8B_BASE, ILLaDACIDAdapter
 from cid.model.loading import load_cid_tokenizer
 from cid.model.materialize import CIDMaterializer, ClosedWorldMaterializationCatalog
-from cid.model.tensors import CIDTensorBatch, build_percept_routing_masks
+from cid.model.tensors import CIDTensorBatch, build_percept_routing_masks, semantic_as_tensor
 from cid.state import CognitiveRole, FactItem
 
 
@@ -72,11 +72,11 @@ class ILLaDAContextTensorizer:
 
         role_order = tuple(CognitiveRole)
         lifecycle_order = MODELED_LIFECYCLES
-        thought_semantic = torch.tensor(
-            [[cell.semantic for cell in thought.cells]],
-            device=device,
-            dtype=dtype,
-        )
+        semantic_rows = [
+            semantic_as_tensor(cell.semantic, device=device, dtype=dtype)
+            for cell in thought.cells
+        ]
+        thought_semantic = torch.stack(semantic_rows, dim=0).unsqueeze(0)
         role_features = torch.tensor(
             [[[float(cell.roles.get(role, 0.0)) for role in role_order] for cell in thought.cells]],
             device=device,

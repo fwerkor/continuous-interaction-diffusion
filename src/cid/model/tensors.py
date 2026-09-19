@@ -1,6 +1,6 @@
 from __future__ import annotations
 
-from collections.abc import Mapping
+from collections.abc import Iterator, Mapping, Sequence
 from dataclasses import dataclass
 
 import torch
@@ -9,6 +9,75 @@ from torch import Tensor
 from cid.grounding import ObjectRef
 from cid.lifecycle import MODELED_LIFECYCLES
 from cid.state import CellLifecycle
+
+
+class DeviceSemantic(Sequence[float]):
+    """A semantic vector that stays on its source device until scalar access is required."""
+
+    __slots__ = ("_tensor", "_sketch")
+
+    def __init__(
+        self,
+        tensor: Tensor,
+        *,
+        sketch: tuple[float, ...] | None = None,
+    ) -> None:
+        if tensor.ndim != 1:
+            raise ValueError("semantic tensor must be one-dimensional")
+        self._tensor = tensor.detach()
+        self._sketch = sketch
+
+    @property
+    def tensor(self) -> Tensor:
+        return self._tensor
+
+    def __len__(self) -> int:
+        return self._tensor.numel()
+
+    def __getitem__(self, index: int | slice) -> float | tuple[float, ...]:
+        value = self._tensor[index]
+        if isinstance(index, slice):
+            return tuple(float(item) for item in value.detach().float().cpu().tolist())
+        return float(value)
+
+    def __iter__(self) -> Iterator[float]:
+        return iter(self._tensor.detach().float().cpu().tolist())
+
+    def __eq__(self, other: object) -> bool:
+        if isinstance(other, DeviceSemantic):
+            if self._tensor.shape != other._tensor.shape:
+                return False
+            return bool(torch.equal(self._tensor, other._tensor))
+        if isinstance(other, Sequence):
+            return tuple(self) == tuple(other)
+        return NotImplemented
+
+    def sketch(self, samples: int = 12) -> tuple[float, ...]:
+        if self._sketch is not None and samples == len(self._sketch):
+            return self._sketch
+        if len(self) <= samples:
+            return tuple(round(value, 3) for value in self)
+        last = len(self) - 1
+        indexes = torch.tensor(
+            [round(index * last / (samples - 1)) for index in range(samples)],
+            device=self._tensor.device,
+        )
+        values = self._tensor.index_select(0, indexes).detach().float().cpu().tolist()
+        return tuple(round(float(value), 3) for value in values)
+
+
+def semantic_as_tensor(
+    semantic: Sequence[float],
+    *,
+    device: torch.device,
+    dtype: torch.dtype | None = None,
+) -> Tensor:
+    if isinstance(semantic, DeviceSemantic):
+        return semantic.tensor.to(
+            device=device,
+            dtype=dtype or semantic.tensor.dtype,
+        )
+    return torch.tensor(semantic, device=device, dtype=dtype)
 
 
 @dataclass(slots=True)

@@ -2,7 +2,7 @@ from __future__ import annotations
 
 import asyncio
 import time
-from collections.abc import Iterable
+from collections.abc import Iterable, Sequence
 from copy import deepcopy
 from dataclasses import dataclass, replace
 from itertools import zip_longest
@@ -1226,7 +1226,10 @@ class CIDRuntime:
         )
 
     @staticmethod
-    def _semantic_sketch(semantic: tuple[float, ...], samples: int = 12) -> tuple[float, ...]:
+    def _semantic_sketch(semantic: Sequence[float], samples: int = 12) -> tuple[float, ...]:
+        sketch = getattr(semantic, "sketch", None)
+        if sketch is not None:
+            return tuple(sketch(samples))
         if len(semantic) <= samples:
             return tuple(round(float(value), 3) for value in semantic)
         last = len(semantic) - 1

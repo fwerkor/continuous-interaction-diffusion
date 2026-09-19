@@ -1,6 +1,6 @@
 from __future__ import annotations
 
-from collections.abc import Mapping
+from collections.abc import Mapping, Sequence
 from copy import deepcopy
 from dataclasses import dataclass, field, replace
 from types import MappingProxyType
@@ -71,7 +71,7 @@ class FactStore:
 
 @dataclass(frozen=True, slots=True)
 class CognitiveCell:
-    semantic: tuple[float, ...]
+    semantic: Sequence[float]
     cell_id: str | None = None
     roles: Mapping[CognitiveRole, float] = field(default_factory=dict)
     anchors: tuple[Anchor, ...] = ()
@@ -190,7 +190,7 @@ class CognitiveField:
         self,
         *,
         slot: int | None = None,
-        semantic: tuple[float, ...] | None = None,
+        semantic: Sequence[float] | None = None,
         roles: Mapping[CognitiveRole, float] | None = None,
         anchors: tuple[Anchor, ...] = (),
         links: tuple[CognitiveLink, ...] = (),

@@ -421,3 +421,26 @@ def test_diagnostics_are_opt_in_and_do_not_change_materialization() -> None:
     assert detailed.diagnostics["display_resolved"] is False
     assert len(detailed.diagnostics["need_scores"]) == 3
     assert detailed.diagnostics["allocation_eligible_slots"] == [0, 1, 2]
+
+
+def test_materialized_semantic_reuses_model_tensor_storage() -> None:
+    from cid.model.tensors import DeviceSemantic, semantic_as_tensor
+
+    field = CognitiveField.empty(capacity=3, width=4)
+    field, _ = field.allocate(slot=0, semantic=(1.0, 0.0, 0.0, 0.0))
+    output = make_output()
+    thought = CIDMaterializer()._materialize_cells(output, field, 0)
+
+    semantic = thought.cells[1].semantic
+    assert isinstance(semantic, DeviceSemantic)
+    assert semantic.tensor.data_ptr() == output.thought_semantic[0, 1].data_ptr()
+
+    restored = semantic_as_tensor(
+        semantic,
+        device=output.thought_semantic.device,
+        dtype=output.thought_semantic.dtype,
+    )
+    assert restored.data_ptr() == semantic.tensor.data_ptr()
+
+    expected_sketch = tuple(round(float(value), 3) for value in output.thought_semantic[0, 1])
+    assert semantic.sketch(samples=4) == expected_sketch

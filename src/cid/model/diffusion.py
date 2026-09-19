@@ -7,12 +7,7 @@ from dataclasses import dataclass
 import torch
 from torch import Tensor
 
-try:
-    import cid_engine as _cid_engine
-except ModuleNotFoundError as exc:
-    if exc.name != "cid_engine":
-        raise
-    _cid_engine = None
+from cid.model.native_engine import cuda_engine
 
 _MAX_STRUCTURAL_EDIT_TOKENS = 32
 
@@ -200,15 +195,12 @@ class CIDDiffusionScheduler:
         if revision_margin < 0.0:
             raise ValueError("revision_margin must be non-negative")
 
-        if (
-            _cid_engine is not None
-            and _cid_engine.CUDA_BACKEND_BUILT
-            and logits.is_cuda
-        ):
+        engine = cuda_engine(logits, capability="refine_display_from_statistics")
+        if engine is not None:
             confidence, predicted, current_confidence = (
-                _cid_engine.display_token_statistics(token_ids, logits)
+                engine.display_token_statistics(token_ids, logits)
             )
-            return _cid_engine.refine_display_from_statistics(
+            return engine.refine_display_from_statistics(
                 token_ids,
                 confidence,
                 predicted,
