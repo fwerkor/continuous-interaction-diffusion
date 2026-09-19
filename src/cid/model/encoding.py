@@ -28,6 +28,8 @@ class ILLaDATextEncoder:
     SOURCE_IDENTITY_SCALE = 0.25
     TOKEN_CACHE_SIZE = 8192
     DETACHED_TEXT_CACHE_SIZE = 8192
+    DETACHED_BATCH_CACHE_SIZE = 16
+    DETACHED_BATCH_CACHE_MAX_VECTORS = 512
 
     def __init__(
         self,
@@ -47,6 +49,8 @@ class ILLaDATextEncoder:
         self._is_frozen_snapshot = False
         self._token_cache: OrderedDict[tuple[str, bool], Tensor] = OrderedDict()
         self._detached_text_cache: OrderedDict[str, Tensor] = OrderedDict()
+        self._detached_batch_cache: OrderedDict[tuple[str, ...], Tensor] = OrderedDict()
+        self._detached_batch_cache_vectors = 0
 
     @classmethod
     def from_frozen_snapshot(
@@ -78,6 +82,8 @@ class ILLaDATextEncoder:
         snapshot._is_frozen_snapshot = True
         snapshot._token_cache = OrderedDict()
         snapshot._detached_text_cache = OrderedDict()
+        snapshot._detached_batch_cache = OrderedDict()
+        snapshot._detached_batch_cache_vectors = 0
         return snapshot
 
     @classmethod
@@ -123,6 +129,8 @@ class ILLaDATextEncoder:
         snapshot._is_frozen_snapshot = True
         snapshot._token_cache = OrderedDict()
         snapshot._detached_text_cache = OrderedDict()
+        snapshot._detached_batch_cache = OrderedDict()
+        snapshot._detached_batch_cache_vectors = 0
         return snapshot
 
     @property
@@ -185,6 +193,11 @@ class ILLaDATextEncoder:
                 dtype=self.dtype,
             )
         if detach and self._semantic_cache_safe():
+            cached_batch = self._detached_batch_cache.get(texts)
+            if cached_batch is not None:
+                self._detached_batch_cache.move_to_end(texts)
+                return cached_batch.clone()
+
             vectors: list[Tensor | None] = []
             missing_texts: list[str] = []
             missing_indices: list[int] = []
@@ -215,9 +228,12 @@ class ILLaDATextEncoder:
                     vectors[index] = vector
             if any(vector is None for vector in vectors):
                 raise RuntimeError("detached semantic cache failed to materialize an encoded text")
-            return torch.stack(
-                tuple(vector for vector in vectors if vector is not None), dim=0
+            result = torch.stack(
+                tuple(vector for vector in vectors if vector is not None),
+                dim=0,
             ).unsqueeze(0)
+            self._remember_detached_batch(texts, result)
+            return result
         return self._encode_texts_uncached(texts, detach=detach)
 
     def _encode_texts_uncached(self, texts: tuple[str, ...], *, detach: bool) -> Tensor:
@@ -268,6 +284,30 @@ class ILLaDATextEncoder:
         cache.move_to_end(key)
         while len(cache) > limit:
             cache.popitem(last=False)
+
+    def _remember_detached_batch(
+        self,
+        key: tuple[str, ...],
+        value: Tensor,
+    ) -> None:
+        vector_count = int(value.shape[1])
+        if vector_count > self.DETACHED_BATCH_CACHE_MAX_VECTORS:
+            return
+
+        previous = self._detached_batch_cache.pop(key, None)
+        if previous is not None:
+            self._detached_batch_cache_vectors -= int(previous.shape[1])
+
+        self._detached_batch_cache[key] = value.detach().clone()
+        self._detached_batch_cache.move_to_end(key)
+        self._detached_batch_cache_vectors += vector_count
+
+        while (
+            len(self._detached_batch_cache) > self.DETACHED_BATCH_CACHE_SIZE
+            or self._detached_batch_cache_vectors > self.DETACHED_BATCH_CACHE_MAX_VECTORS
+        ):
+            _, evicted = self._detached_batch_cache.popitem(last=False)
+            self._detached_batch_cache_vectors -= int(evicted.shape[1])
 
     def encode_source_descriptors(
         self,

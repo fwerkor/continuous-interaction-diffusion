@@ -4912,3 +4912,35 @@ def test_checkpoint_rejects_batch_geometry_change_mid_epoch(tmp_path) -> None:
     )
     with pytest.raises(ValueError, match="trainer configuration"):
         restored.load_checkpoint(checkpoint)
+
+
+def test_detached_text_batch_cache_returns_independent_storage() -> None:
+    encoder = ILLaDATextEncoder(make_adapter(seed=181), TinyTokenizer())
+    texts = ("alpha", "beta", "gamma")
+
+    first = encoder.encode_texts(texts, detach=True)
+    second = encoder.encode_texts(texts, detach=True)
+
+    assert torch.equal(first, second)
+    assert first.data_ptr() != second.data_ptr()
+
+    before = second.clone()
+    first.zero_()
+    third = encoder.encode_texts(texts, detach=True)
+
+    assert torch.equal(third, before)
+    assert third.data_ptr() != second.data_ptr()
+
+
+def test_detached_text_batch_cache_respects_vector_budget() -> None:
+    encoder = ILLaDATextEncoder(make_adapter(seed=182), TinyTokenizer())
+
+    for batch in range(20):
+        texts = tuple(f"batch-{batch}-text-{index}" for index in range(40))
+        encoder.encode_texts(texts, detach=True)
+
+    assert encoder._detached_batch_cache_vectors <= encoder.DETACHED_BATCH_CACHE_MAX_VECTORS
+    assert len(encoder._detached_batch_cache) <= encoder.DETACHED_BATCH_CACHE_SIZE
+    assert encoder._detached_batch_cache_vectors == sum(
+        int(value.shape[1]) for value in encoder._detached_batch_cache.values()
+    )
