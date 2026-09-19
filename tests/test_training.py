@@ -859,6 +859,43 @@ def test_optimizer_step_rejects_nonfinite_gradient_before_parameter_update() -> 
     assert trainer.state.optimizer_steps == 0
 
 
+def test_stage_a_cpu_stash_resume_keeps_pending_gradients_off_device(
+    tmp_path: Path,
+) -> None:
+    config = CIDTrainerConfig(learning_rate=1e-3)
+    adapter = make_adapter(seed=167)
+    trainer = CIDTrainer(
+        adapter,
+        ILLaDATrajectoryTensorizer(adapter, TinyTokenizer()),
+        config,
+    )
+    name, parameter = trainer._trainable[0]
+    expected = torch.full_like(parameter, 0.25)
+    parameter.grad = expected.clone()
+    trainer._pending_accumulation = 1
+    trainer._pending_examples = 1
+    trainer._pending_global_examples = 1
+    checkpoint = tmp_path / "stage-a.pt"
+    trainer.save_checkpoint(checkpoint, include_optimizer_state=False)
+
+    restored_adapter = make_adapter(seed=168)
+    restored_adapter._cid_stage_a_ddp = True
+    restored = CIDTrainer(
+        restored_adapter,
+        ILLaDATrajectoryTensorizer(restored_adapter, TinyTokenizer()),
+        config,
+        forward_model=restored_adapter,
+        cpu_gradient_stash_threshold_tokens=1,
+    )
+    restored.load_checkpoint(checkpoint)
+
+    restored_parameter = dict(restored._trainable)[name]
+    assert restored_parameter.grad is None
+    assert name in restored._stage_a_cpu_gradient_accumulator
+    torch.testing.assert_close(restored._stage_a_cpu_gradient_accumulator[name], expected)
+    assert restored.pending_accumulation_steps == 1
+
+
 def test_trajectory_tensorizer_rejects_display_that_exceeds_fixed_canvas() -> None:
     adapter = ILLaDACIDAdapter(
         TinyBackbone(),

@@ -2295,14 +2295,29 @@ class CIDTrainer:
             else 1.0
         )
         parameters = dict(self._trainable)
+        stage_a_cpu_stash_resume = bool(
+            getattr(self.forward_model, "_cid_stage_a_ddp", False)
+            and self.cpu_gradient_stash_threshold_tokens is not None
+        )
         for name, saved in gradient_state.items():
             parameter = parameters[name]
-            restored_gradient = saved.to(
-                device=parameter.device, dtype=parameter.dtype
-            )
-            if gradient_world_size_scale != 1.0:
-                restored_gradient.mul_(gradient_world_size_scale)
-            parameter.grad = restored_gradient
+            if stage_a_cpu_stash_resume:
+                restored_gradient = saved.detach().to(
+                    device="cpu",
+                    dtype=parameter.dtype,
+                    copy=True,
+                )
+                if gradient_world_size_scale != 1.0:
+                    restored_gradient.mul_(gradient_world_size_scale)
+                self._stage_a_cpu_gradient_accumulator[name] = restored_gradient
+            else:
+                restored_gradient = saved.to(
+                    device=parameter.device,
+                    dtype=parameter.dtype,
+                )
+                if gradient_world_size_scale != 1.0:
+                    restored_gradient.mul_(gradient_world_size_scale)
+                parameter.grad = restored_gradient
         if self._pending_accumulation == 0 and (
             self._pending_examples or self._pending_global_examples or gradient_state
         ):
