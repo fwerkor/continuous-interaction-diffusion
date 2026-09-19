@@ -999,7 +999,18 @@ class CIDTrainer:
             and not self._pending_fsdp_unsynced
         ):
             self._stash_reduced_gradients()
-        with sync_context:
+        # Long Stage-A examples can leave less than one embedding-gradient's worth
+        # of free VRAM even after accumulated gradients have been stashed.  Offload
+        # only autograd-saved tensors for those already-identified long examples;
+        # values are copied losslessly and restored by autograd during backward.
+        saved_tensor_context = (
+            torch.autograd.graph.save_on_cpu(pin_memory=True)
+            if stage_a_ddp
+            and training_batch.batch.thought_semantic.device.type == "cuda"
+            and sequence_tokens >= 512
+            else nullcontext()
+        )
+        with sync_context, saved_tensor_context:
             output = self.forward_model(training_batch.batch)
             losses = cid_loss(output, training_batch.targets, batch_mask=valid_rows)
             if not bool(torch.isfinite(losses.total)):
