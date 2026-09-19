@@ -1,5 +1,6 @@
 from __future__ import annotations
 
+from collections.abc import Sequence
 from dataclasses import dataclass, replace
 from enum import IntEnum
 from typing import Any, TypeVar
@@ -165,16 +166,28 @@ def decode_need_target_display(
     if active_length < 0:
         raise ValueError("need display-route active length must be non-negative")
     selected = probabilities[:active_length] >= threshold
+    return _decode_selected_display_spans(
+        selected.tolist(),
+        active_length=int(selected.numel()),
+    )
+
+
+def _decode_selected_display_spans(
+    selected: Sequence[bool | float],
+    *,
+    active_length: int,
+) -> tuple[ObjectRef, ...]:
     spans: list[ObjectRef] = []
     start: int | None = None
-    for index, active in enumerate(selected.tolist()):
-        if active and start is None:
+    for index, active in enumerate(selected[:active_length]):
+        enabled = bool(active)
+        if enabled and start is None:
             start = index
-        elif not active and start is not None:
+        elif not enabled and start is not None:
             spans.append(ObjectRef.display_span(start, index))
             start = None
     if start is not None:
-        spans.append(ObjectRef.display_span(start, int(selected.numel())))
+        spans.append(ObjectRef.display_span(start, active_length))
     return tuple(spans)
 
 
@@ -457,70 +470,119 @@ class CIDMaterializer:
         batch_index: int,
     ) -> CognitiveField:
         cells = list(thought.cells)
-        anchor_presence = (
-            torch.sigmoid(output.anchor_presence_logits[batch_index].float())
-            .detach()
-            .cpu()
-        )
+        live_mask = torch.tensor(
+            [cell.live for cell in cells],
+            dtype=torch.bool,
+            device=output.anchor_presence_logits.device,
+        ).unsqueeze(-1)
+
+        anchor_presence = torch.sigmoid(
+            output.anchor_presence_logits[batch_index].float()
+        ).detach()
+        link_presence = torch.sigmoid(
+            output.link_presence_logits[batch_index].float()
+        ).detach()
+        anchor_selected = (
+            anchor_presence >= self.config.anchor_presence_threshold
+        ) & live_mask
+        link_selected = (
+            link_presence >= self.config.link_presence_threshold
+        ) & live_mask
+
         anchor_kinds = (
-            output.anchor_kind_logits[batch_index].argmax(dim=-1).detach().cpu()
-        )
-        link_presence = (
-            torch.sigmoid(output.link_presence_logits[batch_index].float())
-            .detach()
-            .cpu()
+            output.anchor_kind_logits[batch_index].argmax(dim=-1).detach()
         )
         link_relations = (
-            output.link_relation_logits[batch_index].argmax(dim=-1).detach().cpu()
+            output.link_relation_logits[batch_index].argmax(dim=-1).detach()
         )
         link_kinds = (
-            output.link_target_kind_logits[batch_index].argmax(dim=-1).detach().cpu()
+            output.link_target_kind_logits[batch_index].argmax(dim=-1).detach()
         )
+
+        anchor_slots = anchor_selected.shape[-1]
+        combined_selected = torch.cat((anchor_selected, link_selected), dim=-1)
+        combined_primary = torch.cat((anchor_kinds, link_relations), dim=-1)
+        combined_secondary = torch.cat(
+            (
+                torch.full_like(anchor_kinds, -1),
+                link_kinds,
+            ),
+            dim=-1,
+        )
+        positions = combined_selected.nonzero(as_tuple=False)
+        if positions.shape[0] == 0:
+            for slot, cell in enumerate(cells):
+                if cell.live:
+                    cells[slot] = replace(cell, anchors=(), links=())
+            return replace(thought, cells=tuple(cells))
+
+        slot_indices = positions[:, 0]
+        control_indices = positions[:, 1]
+        decisions = torch.cat(
+            (
+                positions.float(),
+                combined_primary[slot_indices, control_indices]
+                .float()
+                .unsqueeze(-1),
+                combined_secondary[slot_indices, control_indices]
+                .float()
+                .unsqueeze(-1),
+            ),
+            dim=-1,
+        ).cpu().tolist()
+
         anchor_order = tuple(AnchorKind)
         relation_order = tuple(LinkRelation)
         object_order = tuple(ObjectKind)
+        anchors_by_slot: list[list[Anchor]] = [[] for _ in cells]
+        links_by_slot: list[list[CognitiveLink]] = [[] for _ in cells]
+        seen_anchor_ids: list[set[str]] = [set() for _ in cells]
+        seen_links: list[set[tuple[LinkRelation, ObjectRef]]] = [
+            set() for _ in cells
+        ]
 
-        for slot, cell in enumerate(cells):
-            if not cell.live:
-                continue
-            anchors: list[Anchor] = []
-            seen_anchor_ids: set[str] = set()
-            for anchor_slot in range(anchor_presence.shape[-1]):
-                if (
-                    float(anchor_presence[slot, anchor_slot])
-                    < self.config.anchor_presence_threshold
-                ):
-                    continue
-                kind = anchor_order[int(anchor_kinds[slot, anchor_slot])]
+        for slot_value, control_value, primary_value, secondary_value in decisions:
+            slot = int(slot_value)
+            control_slot = int(control_value)
+            if control_slot < anchor_slots:
+                anchor_slot = control_slot
+                kind = anchor_order[int(primary_value)]
                 anchor = catalog.resolve_anchor(
                     kind,
                     output.anchor_query[batch_index, slot, anchor_slot],
                     min_similarity=self.config.retrieval_similarity_threshold,
                 )
-                if anchor is not None and anchor.anchor_id not in seen_anchor_ids:
-                    anchors.append(anchor)
-                    seen_anchor_ids.add(anchor.anchor_id)
+                if (
+                    anchor is not None
+                    and anchor.anchor_id not in seen_anchor_ids[slot]
+                ):
+                    anchors_by_slot[slot].append(anchor)
+                    seen_anchor_ids[slot].add(anchor.anchor_id)
+                continue
 
-            links: list[CognitiveLink] = []
-            seen_links: set[tuple[LinkRelation, ObjectRef]] = set()
-            for link_slot in range(link_presence.shape[-1]):
-                if float(link_presence[slot, link_slot]) < self.config.link_presence_threshold:
-                    continue
-                relation = relation_order[int(link_relations[slot, link_slot])]
-                kind = object_order[int(link_kinds[slot, link_slot])]
-                target = self._resolve_object(
-                    kind,
-                    output.link_target_query[batch_index, slot, link_slot],
-                    thought,
-                    catalog,
+            link_slot = control_slot - anchor_slots
+            relation = relation_order[int(primary_value)]
+            kind = object_order[int(secondary_value)]
+            target = self._resolve_object(
+                kind,
+                output.link_target_query[batch_index, slot, link_slot],
+                thought,
+                catalog,
+            )
+            key = (relation, target) if target is not None else None
+            if target is not None and key not in seen_links[slot]:
+                links_by_slot[slot].append(
+                    CognitiveLink(relation=relation, target=target)
                 )
-                key = (relation, target) if target is not None else None
-                if target is not None and key not in seen_links:
-                    links.append(CognitiveLink(relation=relation, target=target))
-                    seen_links.add(key)
+                seen_links[slot].add(key)
 
-            cells[slot] = replace(cell, anchors=tuple(anchors), links=tuple(links))
-
+        for slot, cell in enumerate(cells):
+            if cell.live:
+                cells[slot] = replace(
+                    cell,
+                    anchors=tuple(anchors_by_slot[slot]),
+                    links=tuple(links_by_slot[slot]),
+                )
         return replace(thought, cells=tuple(cells))
 
     def _resolve_object(
@@ -578,79 +640,173 @@ class CIDMaterializer:
             raise ValueError("need-to-display routing must match runtime display capacity")
         if not sources:
             return ()
-        catalog = catalog or ClosedWorldMaterializationCatalog()
-        need_probs = (
-            torch.sigmoid(output.need_logits[batch_index].float()).detach().cpu()
-        )
-        source_probs = (
-            torch.softmax(output.source_logits[batch_index].float(), dim=-1)
-            .detach()
-            .cpu()
-        )
-        argument_presence = (
-            torch.sigmoid(output.argument_presence_logits[batch_index].float())
-            .detach()
-            .cpu()
-        )
-        refresh_actions = (
-            output.refresh_logits[batch_index].argmax(dim=-1).detach().cpu()
-        )
-        freshness_order = tuple(FreshnessDemand)
-        needs: list[InformationNeed] = []
 
-        for slot, cell in enumerate(thought.cells):
+        catalog = catalog or ClosedWorldMaterializationCatalog()
+        device = output.need_logits.device
+        live_mask = torch.tensor(
+            [cell.live and cell.cell_id is not None for cell in thought.cells],
+            dtype=torch.bool,
+            device=device,
+        ).unsqueeze(-1)
+        need_probs = torch.sigmoid(
+            output.need_logits[batch_index].float()
+        ).detach()
+        selected = (need_probs >= self.config.need_threshold) & live_mask
+        positions = selected.nonzero(as_tuple=False)
+        if positions.shape[0] == 0:
+            return ()
+
+        slot_indices = positions[:, 0]
+        need_indices = positions[:, 1]
+        source_probs = torch.softmax(
+            output.source_logits[
+                batch_index,
+                slot_indices,
+                need_indices,
+            ].float(),
+            dim=-1,
+        ).detach()
+        refresh_actions = (
+            output.refresh_logits[
+                batch_index,
+                slot_indices,
+                need_indices,
+            ]
+            .argmax(dim=-1)
+            .detach()
+        )
+        argument_selected = (
+            torch.sigmoid(
+                output.argument_presence_logits[
+                    batch_index,
+                    slot_indices,
+                    need_indices,
+                ].float()
+            )
+            >= self.config.argument_presence_threshold
+        )
+        target_cells_selected = (
+            torch.sigmoid(
+                output.need_target_cell_logits[
+                    batch_index,
+                    slot_indices,
+                    need_indices,
+                ].float()
+            )
+            >= self.config.need_target_cell_threshold
+        )
+        target_display_selected = (
+            torch.sigmoid(
+                output.need_target_display_logits[
+                    batch_index,
+                    slot_indices,
+                    need_indices,
+                ].float()
+            )
+            >= self.config.need_target_display_threshold
+        )
+
+        snapshot = torch.cat(
+            (
+                positions.float(),
+                need_probs[slot_indices, need_indices].unsqueeze(-1),
+                source_probs,
+                refresh_actions.float().unsqueeze(-1),
+                argument_selected.float(),
+                target_cells_selected.float(),
+                target_display_selected.float(),
+            ),
+            dim=-1,
+        ).cpu().tolist()
+
+        freshness_order = tuple(FreshnessDemand)
+        source_count = len(sources)
+        argument_slots = output.argument_presence_logits.shape[-1]
+        cell_slots = thought.capacity
+        display_slots = len(display.token_ids)
+        source_start = 3
+        refresh_index = source_start + source_count
+        argument_start = refresh_index + 1
+        cell_start = argument_start + argument_slots
+        display_start = cell_start + cell_slots
+        display_end = display_start + display_slots
+
+        needs: list[InformationNeed] = []
+        for row in snapshot:
+            slot = int(row[0])
+            need_slot = int(row[1])
+            confidence = float(row[2])
+            cell = thought.cells[slot]
             if not cell.live or cell.cell_id is None:
                 continue
-            for need_slot in range(need_probs.shape[-1]):
-                confidence = float(need_probs[slot, need_slot])
-                if confidence < self.config.need_threshold:
-                    continue
-                scores = {
-                    descriptor.name: float(source_probs[slot, need_slot, source_index])
-                    for source_index, descriptor in enumerate(sources)
-                }
-                selected_index = int(source_probs[slot, need_slot].argmax())
-                source = sources[selected_index]
-                arguments: dict[str, Any] = {}
-                for argument_slot, descriptor in enumerate(source.arguments):
-                    if argument_slot >= output.argument_query.shape[3]:
-                        break
-                    if (
-                        float(argument_presence[slot, need_slot, argument_slot])
-                        < self.config.argument_presence_threshold
-                    ):
-                        continue
-                    value = catalog.resolve_argument(
-                        source.name,
-                        descriptor.name,
-                        output.argument_query[batch_index, slot, need_slot, argument_slot],
-                        min_similarity=self.config.retrieval_similarity_threshold,
-                    )
-                    if value is not None:
-                        arguments[descriptor.name] = value
 
-                freshness = freshness_order[int(refresh_actions[slot, need_slot])]
-                target_cells = self._need_target_cells(
-                    output, thought, slot=slot, need_slot=need_slot, batch_index=batch_index
+            source_values = row[source_start:refresh_index]
+            scores = {
+                descriptor.name: float(source_values[source_index])
+                for source_index, descriptor in enumerate(sources)
+            }
+            selected_index = max(
+                range(source_count),
+                key=source_values.__getitem__,
+            )
+            source = sources[selected_index]
+
+            arguments: dict[str, Any] = {}
+            argument_values = row[argument_start:cell_start]
+            for argument_slot, descriptor in enumerate(source.arguments):
+                if argument_slot >= argument_slots:
+                    break
+                if argument_values[argument_slot] < 0.5:
+                    continue
+                value = catalog.resolve_argument(
+                    source.name,
+                    descriptor.name,
+                    output.argument_query[
+                        batch_index,
+                        slot,
+                        need_slot,
+                        argument_slot,
+                    ],
+                    min_similarity=self.config.retrieval_similarity_threshold,
                 )
-                target_display = self._need_target_display(
-                    output, display, slot=slot, need_slot=need_slot, batch_index=batch_index
+                if value is not None:
+                    arguments[descriptor.name] = value
+
+            targets = [ObjectRef.cell(cell.cell_id)]
+            cell_values = row[cell_start:display_start]
+            for target_slot, active in enumerate(cell_values):
+                target_cell = thought.cells[target_slot]
+                if (
+                    active < 0.5
+                    or not target_cell.live
+                    or target_cell.cell_id is None
+                    or target_cell.cell_id == cell.cell_id
+                ):
+                    continue
+                targets.append(ObjectRef.cell(target_cell.cell_id))
+
+            display_values = row[display_start:display_end]
+            target_display = _decode_selected_display_spans(
+                display_values,
+                active_length=display.active_span_length,
+            )
+
+            freshness = freshness_order[int(row[refresh_index])]
+            needs.append(
+                InformationNeed(
+                    need_id=f"need:{cell.cell_id}:{need_slot}",
+                    source_scores=scores,
+                    arguments=arguments,
+                    confidence=confidence,
+                    freshness=freshness,
+                    max_age_s=self.config.max_age_s
+                    if freshness is FreshnessDemand.MAX_AGE
+                    else None,
+                    target_cells=tuple(targets),
+                    target_display=target_display,
+                    promote_to_fact=source.promote_results_to_fact,
                 )
-                needs.append(
-                    InformationNeed(
-                        need_id=f"need:{cell.cell_id}:{need_slot}",
-                        source_scores=scores,
-                        arguments=arguments,
-                        confidence=confidence,
-                        freshness=freshness,
-                        max_age_s=self.config.max_age_s
-                        if freshness is FreshnessDemand.MAX_AGE
-                        else None,
-                        target_cells=target_cells,
-                        target_display=target_display,
-                        promote_to_fact=source.promote_results_to_fact,
-                    )
-                )
+            )
         return tuple(needs)
 
     def _need_target_cells(
@@ -705,16 +861,26 @@ class CIDMaterializer:
         thought: CognitiveField,
         batch_index: int,
     ) -> tuple[ObjectRef, ...]:
-        actions = output.revision_logits[batch_index].argmax(dim=-1).detach().cpu()
-        previous_live = set(previous.live_cell_ids)
-        return tuple(
-            ObjectRef.cell(cell.cell_id)
-            for slot, cell in enumerate(thought.cells)
-            if cell.live
-            and cell.cell_id is not None
-            and cell.cell_id in previous_live
-            and int(actions[slot]) == int(RevisionAction.REOPEN)
+        reopen_slots = (
+            output.revision_logits[batch_index]
+            .argmax(dim=-1)
+            .eq(int(RevisionAction.REOPEN))
+            .nonzero(as_tuple=False)
+            .flatten()
+            .cpu()
+            .tolist()
         )
+        previous_live = set(previous.live_cell_ids)
+        reopen: list[ObjectRef] = []
+        for slot in reopen_slots:
+            cell = thought.cells[slot]
+            if (
+                cell.live
+                and cell.cell_id is not None
+                and cell.cell_id in previous_live
+            ):
+                reopen.append(ObjectRef.cell(cell.cell_id))
+        return tuple(reopen)
 
     @staticmethod
     def _materialize_display(
