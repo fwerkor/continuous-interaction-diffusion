@@ -1,10 +1,12 @@
 from __future__ import annotations
 
+from importlib import import_module
 from types import SimpleNamespace
 
-import torch
+import pytest
 
-from cid.model import losses
+torch = pytest.importorskip("torch")
+losses = import_module("cid.model.losses")
 
 
 class _ReferenceAssignmentEngine:
