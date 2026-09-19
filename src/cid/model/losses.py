@@ -1,11 +1,13 @@
 from __future__ import annotations
 
+from collections.abc import Callable
 from dataclasses import dataclass
 
 import torch
 from torch import Tensor
 from torch.nn import functional as F
 
+from cid.model.native_engine import cuda_engine
 from cid.model.tensors import CIDTensorOutput
 
 NEED_INTENT_TARGET_POSITIVE_MASS = 0.20
@@ -619,29 +621,39 @@ def _align_anchor_targets(
     kinds = torch.full_like(targets.anchor_kind_targets, -100)
     embeddings = torch.zeros_like(targets.anchor_embeddings)
     mask = torch.zeros_like(targets.anchor_mask)
-    for batch_index, slot in _supervised_cells(targets.anchor_presence_mask):
-        target_slots = torch.nonzero(
-            targets.anchor_mask[batch_index, slot], as_tuple=False
-        ).flatten()
-        if target_slots.numel() == 0:
-            continue
-        query = output.anchor_query[batch_index, slot]
-        target_embedding = targets.anchor_embeddings[batch_index, slot, target_slots]
-        target_kind = targets.anchor_kind_targets[batch_index, slot, target_slots]
-        cost = _retrieval_cost(query, target_embedding)
-        cost = cost + _classification_cost(
-            output.anchor_kind_logits[batch_index, slot], target_kind
+
+    native = _native_anchor_assignment_indices(output, targets)
+    if native is None:
+        indices = _grounding_assignment_indices(
+            targets.anchor_presence_mask,
+            targets.anchor_mask,
+            prediction_slots=output.anchor_query.shape[-2],
+            cost_for_cell=lambda batch_index, slot, target_slots: (
+                _retrieval_cost(
+                    output.anchor_query[batch_index, slot],
+                    targets.anchor_embeddings[batch_index, slot, target_slots],
+                )
+                + _classification_cost(
+                    output.anchor_kind_logits[batch_index, slot],
+                    targets.anchor_kind_targets[batch_index, slot, target_slots],
+                )
+            ),
         )
-        for target_offset, prediction_slot in enumerate(_linear_assignment(cost)):
-            source_slot = int(target_slots[target_offset])
-            presence[batch_index, slot, prediction_slot] = 1.0
-            kinds[batch_index, slot, prediction_slot] = targets.anchor_kind_targets[
-                batch_index, slot, source_slot
-            ]
-            embeddings[batch_index, slot, prediction_slot] = targets.anchor_embeddings[
-                batch_index, slot, source_slot
-            ]
-            mask[batch_index, slot, prediction_slot] = True
+    else:
+        indices = native
+
+    batch_indices, cell_indices, prediction_slots, source_slots = indices
+    if batch_indices.numel() == 0:
+        return presence, kinds, embeddings, mask
+
+    presence[batch_indices, cell_indices, prediction_slots] = 1.0
+    kinds[batch_indices, cell_indices, prediction_slots] = targets.anchor_kind_targets[
+        batch_indices, cell_indices, source_slots
+    ]
+    embeddings[batch_indices, cell_indices, prediction_slots] = targets.anchor_embeddings[
+        batch_indices, cell_indices, source_slots
+    ]
+    mask[batch_indices, cell_indices, prediction_slots] = True
     return presence, kinds, embeddings, mask
 
 
@@ -654,34 +666,337 @@ def _align_link_targets(
     kinds = torch.full_like(targets.link_target_kind_targets, -100)
     embeddings = torch.zeros_like(targets.link_target_embeddings)
     mask = torch.zeros_like(targets.link_mask)
-    for batch_index, slot in _supervised_cells(targets.link_presence_mask):
-        target_slots = torch.nonzero(targets.link_mask[batch_index, slot], as_tuple=False).flatten()
-        if target_slots.numel() == 0:
-            continue
-        target_embedding = targets.link_target_embeddings[batch_index, slot, target_slots]
-        target_relation = targets.link_relation_targets[batch_index, slot, target_slots]
-        target_kind = targets.link_target_kind_targets[batch_index, slot, target_slots]
-        cost = _retrieval_cost(output.link_target_query[batch_index, slot], target_embedding)
-        cost = cost + _classification_cost(
-            output.link_relation_logits[batch_index, slot], target_relation
+
+    native = _native_link_assignment_indices(output, targets)
+    if native is None:
+        indices = _grounding_assignment_indices(
+            targets.link_presence_mask,
+            targets.link_mask,
+            prediction_slots=output.link_target_query.shape[-2],
+            cost_for_cell=lambda batch_index, slot, target_slots: (
+                _retrieval_cost(
+                    output.link_target_query[batch_index, slot],
+                    targets.link_target_embeddings[batch_index, slot, target_slots],
+                )
+                + _classification_cost(
+                    output.link_relation_logits[batch_index, slot],
+                    targets.link_relation_targets[batch_index, slot, target_slots],
+                )
+                + _classification_cost(
+                    output.link_target_kind_logits[batch_index, slot],
+                    targets.link_target_kind_targets[batch_index, slot, target_slots],
+                )
+            ),
         )
-        cost = cost + _classification_cost(
-            output.link_target_kind_logits[batch_index, slot], target_kind
-        )
-        for target_offset, prediction_slot in enumerate(_linear_assignment(cost)):
-            source_slot = int(target_slots[target_offset])
-            presence[batch_index, slot, prediction_slot] = 1.0
-            relations[batch_index, slot, prediction_slot] = targets.link_relation_targets[
-                batch_index, slot, source_slot
-            ]
-            kinds[batch_index, slot, prediction_slot] = targets.link_target_kind_targets[
-                batch_index, slot, source_slot
-            ]
-            embeddings[batch_index, slot, prediction_slot] = targets.link_target_embeddings[
-                batch_index, slot, source_slot
-            ]
-            mask[batch_index, slot, prediction_slot] = True
+    else:
+        indices = native
+
+    batch_indices, cell_indices, prediction_slots, source_slots = indices
+    if batch_indices.numel() == 0:
+        return presence, relations, kinds, embeddings, mask
+
+    presence[batch_indices, cell_indices, prediction_slots] = 1.0
+    relations[batch_indices, cell_indices, prediction_slots] = targets.link_relation_targets[
+        batch_indices, cell_indices, source_slots
+    ]
+    kinds[batch_indices, cell_indices, prediction_slots] = targets.link_target_kind_targets[
+        batch_indices, cell_indices, source_slots
+    ]
+    embeddings[batch_indices, cell_indices, prediction_slots] = targets.link_target_embeddings[
+        batch_indices, cell_indices, source_slots
+    ]
+    mask[batch_indices, cell_indices, prediction_slots] = True
     return presence, relations, kinds, embeddings, mask
+
+
+def _native_anchor_assignment_indices(
+    output: CIDTensorOutput,
+    targets: CIDTargets,
+) -> tuple[Tensor, Tensor, Tensor, Tensor] | None:
+    engine = cuda_engine(output.anchor_query, capability="batched_linear_assignment")
+    if engine is None:
+        return None
+
+    with torch.no_grad():
+        packed_slots, row_counts = _pack_grounding_targets(
+            targets.anchor_presence_mask,
+            targets.anchor_mask,
+        )
+        target_embeddings = _gather_grounding_slots(
+            targets.anchor_embeddings,
+            packed_slots,
+        )
+        target_kinds = _gather_grounding_slots(
+            targets.anchor_kind_targets,
+            packed_slots,
+        )
+        cost = _batched_retrieval_cost(
+            output.anchor_query,
+            target_embeddings,
+        )
+        cost = cost + _batched_classification_cost(
+            output.anchor_kind_logits,
+            target_kinds,
+        )
+        return _native_assignment_indices(
+            engine,
+            packed_slots,
+            row_counts,
+            cost,
+        )
+
+
+def _native_link_assignment_indices(
+    output: CIDTensorOutput,
+    targets: CIDTargets,
+) -> tuple[Tensor, Tensor, Tensor, Tensor] | None:
+    engine = cuda_engine(output.link_target_query, capability="batched_linear_assignment")
+    if engine is None:
+        return None
+
+    with torch.no_grad():
+        packed_slots, row_counts = _pack_grounding_targets(
+            targets.link_presence_mask,
+            targets.link_mask,
+        )
+        target_embeddings = _gather_grounding_slots(
+            targets.link_target_embeddings,
+            packed_slots,
+        )
+        target_relations = _gather_grounding_slots(
+            targets.link_relation_targets,
+            packed_slots,
+        )
+        target_kinds = _gather_grounding_slots(
+            targets.link_target_kind_targets,
+            packed_slots,
+        )
+        cost = _batched_retrieval_cost(
+            output.link_target_query,
+            target_embeddings,
+        )
+        cost = cost + _batched_classification_cost(
+            output.link_relation_logits,
+            target_relations,
+        )
+        cost = cost + _batched_classification_cost(
+            output.link_target_kind_logits,
+            target_kinds,
+        )
+        return _native_assignment_indices(
+            engine,
+            packed_slots,
+            row_counts,
+            cost,
+        )
+
+
+def _pack_grounding_targets(
+    presence_mask: Tensor,
+    target_mask: Tensor,
+) -> tuple[Tensor, Tensor]:
+    if presence_mask.shape != target_mask.shape:
+        raise ValueError("grounding presence and target masks must have matching shapes")
+
+    slot_count = target_mask.shape[-1]
+    slots = torch.arange(
+        slot_count,
+        dtype=torch.long,
+        device=target_mask.device,
+    ).view(*((1,) * (target_mask.ndim - 1)), slot_count)
+    sentinel = torch.full_like(slots, slot_count)
+    packed = torch.where(target_mask.bool(), slots, sentinel).sort(dim=-1).values
+    packed = torch.where(packed < slot_count, packed, torch.zeros_like(packed))
+
+    supervised = presence_mask.bool().any(dim=-1)
+    row_counts = target_mask.bool().sum(dim=-1)
+    row_counts = row_counts * supervised.to(dtype=row_counts.dtype)
+    return packed, row_counts
+
+
+def _gather_grounding_slots(tensor: Tensor, packed_slots: Tensor) -> Tensor:
+    if tensor.shape[: packed_slots.ndim - 1] != packed_slots.shape[:-1]:
+        raise ValueError("grounding tensor batch/slot dimensions do not match packed slots")
+    if tensor.shape[packed_slots.ndim - 1] != packed_slots.shape[-1]:
+        raise ValueError("grounding tensor slot capacity does not match packed slots")
+    if tensor.ndim == packed_slots.ndim:
+        return torch.gather(tensor, dim=-1, index=packed_slots)
+    if tensor.ndim == packed_slots.ndim + 1:
+        index = packed_slots.unsqueeze(-1).expand(
+            *packed_slots.shape,
+            tensor.shape[-1],
+        )
+        return torch.gather(tensor, dim=-2, index=index)
+    raise ValueError("unsupported grounding tensor rank")
+
+
+def _batched_retrieval_cost(query: Tensor, target: Tensor) -> Tensor:
+    normalized_query = F.normalize(query.float(), dim=-1)
+    normalized_target = F.normalize(target.float(), dim=-1)
+    similarity = torch.einsum(
+        "...kd,...md->...mk",
+        normalized_query,
+        normalized_target,
+    )
+    return 1.0 - similarity
+
+
+def _batched_classification_cost(logits: Tensor, target: Tensor) -> Tensor:
+    log_probabilities = F.log_softmax(logits.float(), dim=-1)
+    prediction_slots = logits.shape[-2]
+    target_slots = target.shape[-1]
+
+    # Inactive padded rows are ignored by row_counts in the assignment kernel.
+    # Clamp only those sentinel labels so gather never observes the training
+    # ignore-index value (-100).
+    safe_target = target.clamp_min(0)
+    expanded = log_probabilities.unsqueeze(-3).expand(
+        *log_probabilities.shape[:-2],
+        target_slots,
+        prediction_slots,
+        log_probabilities.shape[-1],
+    )
+    index = safe_target.unsqueeze(-1).unsqueeze(-1).expand(
+        *safe_target.shape,
+        prediction_slots,
+        1,
+    )
+    return -expanded.gather(dim=-1, index=index).squeeze(-1)
+
+
+def _native_assignment_indices(
+    engine: object,
+    packed_slots: Tensor,
+    row_counts: Tensor,
+    cost: Tensor,
+) -> tuple[Tensor, Tensor, Tensor, Tensor]:
+    slot_count = packed_slots.shape[-1]
+    if cost.shape != (*packed_slots.shape, slot_count):
+        raise ValueError("batched grounding cost has unexpected shape")
+
+    flat_cost = cost.detach().float().reshape(-1, slot_count, slot_count).contiguous()
+    flat_counts = row_counts.reshape(-1).long()
+    assignments = engine.batched_linear_assignment(flat_cost, flat_counts)
+
+    offsets = torch.arange(
+        slot_count,
+        dtype=torch.long,
+        device=cost.device,
+    ).unsqueeze(0)
+    valid = offsets < flat_counts.unsqueeze(1)
+    flat_cells = torch.arange(
+        flat_counts.shape[0],
+        dtype=torch.long,
+        device=cost.device,
+    ).unsqueeze(1).expand(-1, slot_count)
+    selected_cells = flat_cells[valid]
+
+    cells_per_batch = packed_slots.shape[-2]
+    batch_indices = selected_cells // cells_per_batch
+    cell_indices = selected_cells % cells_per_batch
+    prediction_indices = assignments[valid]
+    source_indices = packed_slots.reshape(-1, slot_count)[valid]
+    return batch_indices, cell_indices, prediction_indices, source_indices
+
+
+def _grounding_assignment_indices(
+    presence_mask: Tensor,
+    target_mask: Tensor,
+    *,
+    prediction_slots: int,
+    cost_for_cell: Callable[[int, int, list[int]], Tensor],
+) -> tuple[Tensor, Tensor, Tensor, Tensor]:
+    if presence_mask.shape != target_mask.shape:
+        raise ValueError("grounding presence and target masks must have matching shapes")
+    if target_mask.shape[-1] != prediction_slots:
+        raise ValueError("grounding target slots must match prediction slot capacity")
+
+    snapshot = torch.cat(
+        (
+            presence_mask.bool().any(dim=-1, keepdim=True),
+            target_mask.bool(),
+        ),
+        dim=-1,
+    ).detach().cpu().tolist()
+
+    cells: list[tuple[int, int, list[int]]] = []
+    for batch_index, batch_rows in enumerate(snapshot):
+        for slot, row in enumerate(batch_rows):
+            if not row[0]:
+                continue
+            target_slots = [
+                target_slot
+                for target_slot, active in enumerate(row[1:])
+                if active
+            ]
+            if target_slots:
+                cells.append((batch_index, slot, target_slots))
+
+    device = presence_mask.device
+    if not cells:
+        empty = torch.empty(0, dtype=torch.long, device=device)
+        return empty, empty, empty, empty
+
+    padded_costs: list[Tensor] = []
+    row_counts: list[int] = []
+    padded_source_slots: list[list[int]] = []
+    for batch_index, slot, target_slots in cells:
+        with torch.no_grad():
+            cost = cost_for_cell(batch_index, slot, target_slots)
+        if cost.shape != (len(target_slots), prediction_slots):
+            raise ValueError("grounding assignment cost has unexpected shape")
+        if len(target_slots) < prediction_slots:
+            cost = F.pad(
+                cost,
+                (0, 0, 0, prediction_slots - len(target_slots)),
+            )
+        padded_costs.append(cost)
+        row_counts.append(len(target_slots))
+        padded_source_slots.append(
+            target_slots + [0] * (prediction_slots - len(target_slots))
+        )
+
+    cost_batch = torch.stack(padded_costs, dim=0).detach().float()
+    count_tensor = torch.tensor(row_counts, dtype=torch.long, device=device)
+    engine = cuda_engine(cost_batch, capability="batched_linear_assignment")
+    if engine is not None:
+        assignments = engine.batched_linear_assignment(cost_batch, count_tensor)
+    else:
+        host_costs = cost_batch.cpu().tolist()
+        host_assignments = [
+            list(_linear_assignment_matrix(matrix[:row_count]))
+            + [-1] * (prediction_slots - row_count)
+            for matrix, row_count in zip(host_costs, row_counts, strict=True)
+        ]
+        assignments = torch.tensor(
+            host_assignments,
+            dtype=torch.long,
+            device=device,
+        )
+
+    source_slot_tensor = torch.tensor(
+        padded_source_slots,
+        dtype=torch.long,
+        device=device,
+    )
+    cell_batch = torch.tensor(
+        [batch_index for batch_index, _, _ in cells],
+        dtype=torch.long,
+        device=device,
+    )
+    cell_slot = torch.tensor(
+        [slot for _, slot, _ in cells],
+        dtype=torch.long,
+        device=device,
+    )
+    offsets = torch.arange(prediction_slots, device=device).unsqueeze(0)
+    valid = offsets < count_tensor.unsqueeze(1)
+
+    batch_indices = cell_batch.unsqueeze(1).expand(-1, prediction_slots)[valid]
+    cell_indices = cell_slot.unsqueeze(1).expand(-1, prediction_slots)[valid]
+    prediction_indices = assignments[valid]
+    source_indices = source_slot_tensor[valid]
+    return batch_indices, cell_indices, prediction_indices, source_indices
 
 
 def _supervised_cells(presence_mask: Tensor) -> tuple[tuple[int, int], ...]:
@@ -702,9 +1017,12 @@ def _classification_cost(logits: Tensor, target: Tensor) -> Tensor:
 
 
 def _linear_assignment(cost: Tensor) -> tuple[int, ...]:
+    return _linear_assignment_matrix(cost.detach().float().cpu().tolist())
+
+
+def _linear_assignment_matrix(matrix: list[list[float]]) -> tuple[int, ...]:
     """Minimum-cost target-to-prediction assignment for small grounding sets."""
 
-    matrix = cost.detach().float().cpu().tolist()
     rows = len(matrix)
     columns = len(matrix[0]) if rows else 0
     if rows == 0:
