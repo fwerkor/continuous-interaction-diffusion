@@ -2171,16 +2171,52 @@ class CIDTrainer:
         if not torch.distributed.is_available() or not torch.distributed.is_initialized():
             raise RuntimeError("unsynchronized Stage A DDP gradients require distributed training")
         world_size = torch.distributed.get_world_size()
+        bucket_limit_bytes = 25 * 1024 * 1024
+        bucket: list[Tensor] = []
+        bucket_bytes = 0
+        bucket_key: tuple[torch.device, torch.dtype] | None = None
+
+        def reduce_bucket() -> None:
+            nonlocal bucket, bucket_bytes, bucket_key
+            if not bucket:
+                return
+            if len(bucket) == 1:
+                torch.distributed.all_reduce(bucket[0], op=torch.distributed.ReduceOp.SUM)
+            else:
+                torch.distributed.all_reduce_coalesced(
+                    bucket,
+                    op=torch.distributed.ReduceOp.SUM,
+                )
+            for gradient in bucket:
+                gradient.div_(world_size)
+            bucket = []
+            bucket_bytes = 0
+            bucket_key = None
+
         for _, parameter in self._trainable:
-            # Every rank must issue the exact same collective sequence.  Conditional
+            # Every rank must issue the exact same collective sequence. Conditional
             # execution can leave a trainable parameter unused on one rank while a
-            # peer has a real gradient; skipping ``None`` here shifts all subsequent
-            # all-reduces and eventually deadlocks NCCL.  A missing local gradient is
-            # exactly a zero contribution to the global DDP gradient.
+            # peer has a real gradient; a missing local gradient is exactly a zero
+            # contribution to the global DDP gradient.
             if parameter.grad is None:
                 parameter.grad = torch.zeros_like(parameter)
-            torch.distributed.all_reduce(parameter.grad, op=torch.distributed.ReduceOp.SUM)
-            parameter.grad.div_(world_size)
+            gradient = parameter.grad
+            gradient_bytes = gradient.numel() * gradient.element_size()
+            gradient_key = (gradient.device, gradient.dtype)
+            if bucket and (
+                gradient_key != bucket_key
+                or bucket_bytes + gradient_bytes > bucket_limit_bytes
+            ):
+                reduce_bucket()
+            if gradient_bytes > bucket_limit_bytes:
+                torch.distributed.all_reduce(gradient, op=torch.distributed.ReduceOp.SUM)
+                gradient.div_(world_size)
+                continue
+            if not bucket:
+                bucket_key = gradient_key
+            bucket.append(gradient)
+            bucket_bytes += gradient_bytes
+        reduce_bucket()
         self._pending_ddp_unsynced = False
         self._stage_a_manual_sync_required = False
 
