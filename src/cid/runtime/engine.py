@@ -543,7 +543,7 @@ class CIDRuntime:
                         )
 
                 external_tasks_before = self._external_task_count()
-                self._launch_initial_external_work(step)
+                self._launch_due_jobs(step, initial_once_only=True)
                 if self._external_task_count() > external_tasks_before:
                     # Let newly-created first reads enter their first await before
                     # the runtime spends more CPU time tracing and bookkeeping.
@@ -714,14 +714,21 @@ class CIDRuntime:
             )
         return tuple(percepts)
 
-    def _launch_initial_external_work(self, step: int) -> None:
+    def _launch_due_jobs(
+        self,
+        step: int,
+        *,
+        initial_once_only: bool = False,
+    ) -> None:
+        now = time.monotonic()
         for binding in self.bindings.active():
-            if (
+            if initial_once_only and (
                 binding.observation is not None
                 or binding.freshness is not FreshnessDemand.ONCE
             ):
                 continue
 
+            work_key = binding.work_key
             source = self.sources.get(binding.source)
             if (
                 not binding.arguments_complete
@@ -729,34 +736,27 @@ class CIDRuntime:
             ):
                 continue
 
-            work_key = binding.work_key
-            if source.descriptor.cacheable and work_key in self._cache:
-                continue
-            if (
-                work_key in self._jobs
-                or work_key in self._version_jobs
-                or work_key in self._streams
-            ):
-                continue
-            self._ensure_read(binding, source, step)
-
-    def _launch_due_jobs(self, step: int) -> None:
-        now = time.monotonic()
-        for binding in self.bindings.active():
-            work_key = binding.work_key
-            source = self.sources.get(binding.source)
-            if not binding.arguments_complete and not source.descriptor.accepts_partial_arguments:
-                continue
-
             if (
                 binding.observation is None
                 and source.descriptor.cacheable
                 and work_key in self._cache
             ):
+                if initial_once_only:
+                    continue
                 binding.observation = deepcopy(self._cache[work_key])
                 binding.last_refresh_at = now
                 binding.status = BindingStatus.AVAILABLE
                 self.trace.emit("cache_hit", step, binding_id=binding.binding_id)
+
+            if initial_once_only:
+                if (
+                    work_key in self._jobs
+                    or work_key in self._version_jobs
+                    or work_key in self._streams
+                ):
+                    continue
+                self._ensure_read(binding, source, step)
+                continue
 
             if not self._refresh_due(binding, now):
                 continue
