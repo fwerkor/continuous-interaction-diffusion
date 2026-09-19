@@ -75,6 +75,25 @@ class ClosedWorldMaterializationCatalog:
     anchors: tuple[AnchorCandidate, ...] = ()
     objects: tuple[ObjectCandidate, ...] = ()
 
+    def resolve_arguments(
+        self,
+        source: str,
+        name: str,
+        queries: Sequence[Tensor],
+        *,
+        min_similarity: float,
+    ) -> tuple[Any | None, ...]:
+        candidates = tuple(
+            (candidate.value, candidate.embedding)
+            for candidate in self.arguments
+            if candidate.source == source and candidate.name == name
+        )
+        return _nearest_values(
+            queries,
+            candidates,
+            min_similarity=min_similarity,
+        )
+
     def resolve_argument(
         self,
         source: str,
@@ -83,12 +102,30 @@ class ClosedWorldMaterializationCatalog:
         *,
         min_similarity: float,
     ) -> Any | None:
+        return self.resolve_arguments(
+            source,
+            name,
+            (query,),
+            min_similarity=min_similarity,
+        )[0]
+
+    def resolve_anchors(
+        self,
+        kind: AnchorKind,
+        queries: Sequence[Tensor],
+        *,
+        min_similarity: float,
+    ) -> tuple[Anchor | None, ...]:
         candidates = tuple(
-            (candidate.value, candidate.embedding)
-            for candidate in self.arguments
-            if candidate.source == source and candidate.name == name
+            (candidate.anchor, candidate.embedding)
+            for candidate in self.anchors
+            if candidate.anchor.kind is kind
         )
-        return _nearest_value(query, candidates, min_similarity=min_similarity)
+        return _nearest_values(
+            queries,
+            candidates,
+            min_similarity=min_similarity,
+        )
 
     def resolve_anchor(
         self,
@@ -97,12 +134,29 @@ class ClosedWorldMaterializationCatalog:
         *,
         min_similarity: float,
     ) -> Anchor | None:
+        return self.resolve_anchors(
+            kind,
+            (query,),
+            min_similarity=min_similarity,
+        )[0]
+
+    def resolve_objects(
+        self,
+        kind: ObjectKind,
+        queries: Sequence[Tensor],
+        *,
+        min_similarity: float,
+    ) -> tuple[ObjectRef | None, ...]:
         candidates = tuple(
-            (candidate.anchor, candidate.embedding)
-            for candidate in self.anchors
-            if candidate.anchor.kind is kind
+            (candidate.ref, candidate.embedding)
+            for candidate in self.objects
+            if candidate.ref.kind is kind
         )
-        return _nearest_value(query, candidates, min_similarity=min_similarity)
+        return _nearest_values(
+            queries,
+            candidates,
+            min_similarity=min_similarity,
+        )
 
     def resolve_object(
         self,
@@ -111,12 +165,11 @@ class ClosedWorldMaterializationCatalog:
         *,
         min_similarity: float,
     ) -> ObjectRef | None:
-        candidates = tuple(
-            (candidate.ref, candidate.embedding)
-            for candidate in self.objects
-            if candidate.ref.kind is kind
-        )
-        return _nearest_value(query, candidates, min_similarity=min_similarity)
+        return self.resolve_objects(
+            kind,
+            (query,),
+            min_similarity=min_similarity,
+        )[0]
 
 
 @dataclass(frozen=True, slots=True)
@@ -541,36 +594,92 @@ class CIDMaterializer:
             set() for _ in cells
         ]
 
-        for slot_value, control_value, primary_value, secondary_value in decisions:
+        anchor_tasks: dict[AnchorKind, list[tuple[int, int, int]]] = {}
+        link_tasks: dict[
+            ObjectKind,
+            list[tuple[int, int, int, LinkRelation]],
+        ] = {}
+        for decision_index, (
+            slot_value,
+            control_value,
+            primary_value,
+            secondary_value,
+        ) in enumerate(decisions):
             slot = int(slot_value)
             control_slot = int(control_value)
             if control_slot < anchor_slots:
-                anchor_slot = control_slot
                 kind = anchor_order[int(primary_value)]
-                anchor = catalog.resolve_anchor(
-                    kind,
-                    output.anchor_query[batch_index, slot, anchor_slot],
-                    min_similarity=self.config.retrieval_similarity_threshold,
+                anchor_tasks.setdefault(kind, []).append(
+                    (decision_index, slot, control_slot)
                 )
-                if (
-                    anchor is not None
-                    and anchor.anchor_id not in seen_anchor_ids[slot]
-                ):
+                continue
+            link_slot = control_slot - anchor_slots
+            relation = relation_order[int(primary_value)]
+            kind = object_order[int(secondary_value)]
+            link_tasks.setdefault(kind, []).append(
+                (decision_index, slot, link_slot, relation)
+            )
+
+        resolved: dict[int, Anchor | ObjectRef | None] = {}
+        for kind, tasks in anchor_tasks.items():
+            queries = tuple(
+                output.anchor_query[batch_index, slot, anchor_slot]
+                for _, slot, anchor_slot in tasks
+            )
+            values = catalog.resolve_anchors(
+                kind,
+                queries,
+                min_similarity=self.config.retrieval_similarity_threshold,
+            )
+            for (decision_index, _, _), value in zip(
+                tasks,
+                values,
+                strict=True,
+            ):
+                resolved[decision_index] = value
+
+        for kind, tasks in link_tasks.items():
+            queries = tuple(
+                output.link_target_query[batch_index, slot, link_slot]
+                for _, slot, link_slot, _ in tasks
+            )
+            values = self._resolve_objects(
+                kind,
+                queries,
+                thought,
+                catalog,
+            )
+            for (decision_index, _, _, _), value in zip(
+                tasks,
+                values,
+                strict=True,
+            ):
+                resolved[decision_index] = value
+
+        for decision_index, (
+            slot_value,
+            control_value,
+            primary_value,
+            _,
+        ) in enumerate(decisions):
+            slot = int(slot_value)
+            control_slot = int(control_value)
+            value = resolved[decision_index]
+            if control_slot < anchor_slots:
+                anchor = value
+                if not isinstance(anchor, Anchor):
+                    continue
+                if anchor.anchor_id not in seen_anchor_ids[slot]:
                     anchors_by_slot[slot].append(anchor)
                     seen_anchor_ids[slot].add(anchor.anchor_id)
                 continue
 
-            link_slot = control_slot - anchor_slots
             relation = relation_order[int(primary_value)]
-            kind = object_order[int(secondary_value)]
-            target = self._resolve_object(
-                kind,
-                output.link_target_query[batch_index, slot, link_slot],
-                thought,
-                catalog,
-            )
-            key = (relation, target) if target is not None else None
-            if target is not None and key not in seen_links[slot]:
+            target = value
+            if not isinstance(target, ObjectRef):
+                continue
+            key = (relation, target)
+            if key not in seen_links[slot]:
                 links_by_slot[slot].append(
                     CognitiveLink(relation=relation, target=target)
                 )
@@ -585,6 +694,36 @@ class CIDMaterializer:
                 )
         return replace(thought, cells=tuple(cells))
 
+    def _resolve_objects(
+        self,
+        kind: ObjectKind,
+        queries: Sequence[Tensor],
+        thought: CognitiveField,
+        catalog: ClosedWorldMaterializationCatalog,
+    ) -> tuple[ObjectRef | None, ...]:
+        if not queries:
+            return ()
+        if kind is ObjectKind.CELL:
+            device = queries[0].device
+            cell_candidates = tuple(
+                (
+                    ObjectRef.cell(cell.cell_id),
+                    semantic_as_tensor(cell.semantic, device=device),
+                )
+                for cell in thought.cells
+                if cell.live and cell.cell_id is not None
+            )
+            return _nearest_values(
+                queries,
+                cell_candidates,
+                min_similarity=self.config.retrieval_similarity_threshold,
+            )
+        return catalog.resolve_objects(
+            kind,
+            queries,
+            min_similarity=self.config.retrieval_similarity_threshold,
+        )
+
     def _resolve_object(
         self,
         kind: ObjectKind,
@@ -592,25 +731,12 @@ class CIDMaterializer:
         thought: CognitiveField,
         catalog: ClosedWorldMaterializationCatalog,
     ) -> ObjectRef | None:
-        if kind is ObjectKind.CELL:
-            cell_candidates = tuple(
-                (
-                    ObjectRef.cell(cell.cell_id),
-                    semantic_as_tensor(cell.semantic, device=query.device),
-                )
-                for cell in thought.cells
-                if cell.live and cell.cell_id is not None
-            )
-            return _nearest_value(
-                query,
-                cell_candidates,
-                min_similarity=self.config.retrieval_similarity_threshold,
-            )
-        return catalog.resolve_object(
+        return self._resolve_objects(
             kind,
-            query,
-            min_similarity=self.config.retrieval_similarity_threshold,
-        )
+            (query,),
+            thought,
+            catalog,
+        )[0]
 
     def materialize_needs(
         self,
@@ -731,11 +857,16 @@ class CIDMaterializer:
         display_start = cell_start + cell_slots
         display_end = display_start + display_slots
 
-        needs: list[InformationNeed] = []
-        for row in snapshot:
+        selected_sources: list[SourceDescriptor | None] = [None] * len(snapshot)
+        selected_scores: list[dict[str, float] | None] = [None] * len(snapshot)
+        argument_tasks: dict[
+            tuple[str, str],
+            list[tuple[int, int, Tensor]],
+        ] = {}
+
+        for row_index, row in enumerate(snapshot):
             slot = int(row[0])
             need_slot = int(row[1])
-            confidence = float(row[2])
             cell = thought.cells[slot]
             if not cell.live or cell.cell_id is None:
                 continue
@@ -750,27 +881,71 @@ class CIDMaterializer:
                 key=source_values.__getitem__,
             )
             source = sources[selected_index]
+            selected_sources[row_index] = source
+            selected_scores[row_index] = scores
 
-            arguments: dict[str, Any] = {}
             argument_values = row[argument_start:cell_start]
             for argument_slot, descriptor in enumerate(source.arguments):
                 if argument_slot >= argument_slots:
                     break
                 if argument_values[argument_slot] < 0.5:
                     continue
-                value = catalog.resolve_argument(
-                    source.name,
-                    descriptor.name,
-                    output.argument_query[
-                        batch_index,
-                        slot,
-                        need_slot,
+                argument_tasks.setdefault(
+                    (source.name, descriptor.name),
+                    [],
+                ).append(
+                    (
+                        row_index,
                         argument_slot,
-                    ],
-                    min_similarity=self.config.retrieval_similarity_threshold,
+                        output.argument_query[
+                            batch_index,
+                            slot,
+                            need_slot,
+                            argument_slot,
+                        ],
+                    )
                 )
+
+        resolved_arguments: dict[tuple[int, int], Any] = {}
+        for (source_name, argument_name), tasks in argument_tasks.items():
+            queries = tuple(query for _, _, query in tasks)
+            values = catalog.resolve_arguments(
+                source_name,
+                argument_name,
+                queries,
+                min_similarity=self.config.retrieval_similarity_threshold,
+            )
+            for (row_index, argument_slot, _), value in zip(
+                tasks,
+                values,
+                strict=True,
+            ):
                 if value is not None:
-                    arguments[descriptor.name] = value
+                    resolved_arguments[(row_index, argument_slot)] = value
+
+        needs: list[InformationNeed] = []
+        for row_index, row in enumerate(snapshot):
+            slot = int(row[0])
+            need_slot = int(row[1])
+            confidence = float(row[2])
+            cell = thought.cells[slot]
+            source = selected_sources[row_index]
+            scores = selected_scores[row_index]
+            if (
+                not cell.live
+                or cell.cell_id is None
+                or source is None
+                or scores is None
+            ):
+                continue
+
+            arguments: dict[str, Any] = {}
+            for argument_slot, descriptor in enumerate(source.arguments):
+                if argument_slot >= argument_slots:
+                    break
+                key = (row_index, argument_slot)
+                if key in resolved_arguments:
+                    arguments[descriptor.name] = resolved_arguments[key]
 
             targets = [ObjectRef.cell(cell.cell_id)]
             cell_values = row[cell_start:display_start]
@@ -923,27 +1098,71 @@ class CIDMaterializer:
             raise ValueError("need-to-display routing must match information-need slot capacity")
 
 
+def _nearest_values(
+    queries: Sequence[Tensor],
+    candidates: tuple[tuple[T, Tensor], ...],
+    *,
+    min_similarity: float,
+) -> tuple[T | None, ...]:
+    if not queries:
+        return ()
+    if not candidates:
+        return (None,) * len(queries)
+
+    device = queries[0].device
+    query_vectors = [
+        query.detach().float().reshape(-1)
+        for query in queries
+    ]
+    query_width = query_vectors[0].numel()
+    for query, vector in zip(queries, query_vectors, strict=True):
+        if query.device != device or vector.numel() != query_width:
+            raise ValueError(
+                "materialization query batch must share device and embedding width"
+            )
+
+    candidate_vectors = []
+    for _, embedding in candidates:
+        vector = (
+            embedding.detach()
+            .to(device=device, dtype=torch.float32)
+            .reshape(-1)
+        )
+        if vector.numel() != query_width:
+            raise ValueError(
+                "materialization candidate embedding width does not match query width"
+            )
+        candidate_vectors.append(vector)
+
+    query_matrix = torch.stack(query_vectors)
+    candidate_matrix = torch.stack(candidate_vectors)
+    scores = torch.nn.functional.cosine_similarity(
+        query_matrix.unsqueeze(1),
+        candidate_matrix.unsqueeze(0),
+        dim=-1,
+    )
+    best_scores, best_indices = scores.max(dim=-1)
+    decisions = torch.stack(
+        (best_indices.double(), best_scores.double()),
+        dim=-1,
+    ).cpu().tolist()
+    return tuple(
+        candidates[int(index)][0] if score >= min_similarity else None
+        for index, score in decisions
+    )
+
+
 def _nearest_value(
     query: Tensor,
     candidates: tuple[tuple[T, Tensor], ...],
     *,
     min_similarity: float,
 ) -> T | None:
-    if not candidates:
-        return None
-    query_vector = query.detach().float().reshape(-1)
-    candidate_vectors = []
-    for _, embedding in candidates:
-        vector = embedding.detach().to(device=query.device, dtype=torch.float32).reshape(-1)
-        if vector.shape != query_vector.shape:
-            raise ValueError("materialization candidate embedding width does not match query width")
-        candidate_vectors.append(vector)
-    matrix = torch.stack(candidate_vectors)
-    scores = torch.nn.functional.cosine_similarity(matrix, query_vector.unsqueeze(0), dim=-1)
-    index = int(scores.argmax())
-    if float(scores[index]) < min_similarity:
-        return None
-    return candidates[index][0]
+    return _nearest_values(
+        (query,),
+        candidates,
+        min_similarity=min_similarity,
+    )[0]
 
 
 def _semantic_sketch_positions(width: int, samples: int) -> tuple[int, ...]:
