@@ -113,12 +113,13 @@ def masked_diffusion_loss(
     *,
     mask_token_id: int,
     min_mask_ratio: float = 1e-3,
+    max_mask_ratio: float = 1.0,
     generator: torch.Generator | None = None,
 ) -> tuple[Tensor, Tensor, Tensor]:
     """Monte-Carlo LLaDA-style masked diffusion objective."""
 
-    if not 0.0 < min_mask_ratio <= 1.0:
-        raise ValueError("min_mask_ratio must be in (0, 1]")
+    if not 0.0 < min_mask_ratio <= max_mask_ratio <= 1.0:
+        raise ValueError("mask ratio range must satisfy 0 < min <= max <= 1")
     batch_size, sequence_length = clean_ids.shape
     random_ratio = torch.rand(
         (batch_size, 1),
@@ -126,7 +127,7 @@ def masked_diffusion_loss(
         generator=generator,
         dtype=torch.float32,
     )
-    mask_ratio = min_mask_ratio + (1.0 - min_mask_ratio) * random_ratio
+    mask_ratio = min_mask_ratio + (max_mask_ratio - min_mask_ratio) * random_ratio
     masked = torch.rand(
         clean_ids.shape,
         device=clean_ids.device,

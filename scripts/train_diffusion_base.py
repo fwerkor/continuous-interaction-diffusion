@@ -237,6 +237,7 @@ def parse_args() -> argparse.Namespace:
     parser.add_argument("--min-learning-rate-ratio", type=float, default=0.1)
     parser.add_argument("--max-grad-norm", type=float, default=1.0)
     parser.add_argument("--min-mask-ratio", type=float, default=1e-3)
+    parser.add_argument("--max-mask-ratio", type=float, default=1.0)
     parser.add_argument("--seed", type=int, default=17)
     parser.add_argument("--log-every", type=int, default=10)
     parser.add_argument("--eval-every", type=int, default=250)
@@ -338,6 +339,7 @@ def save_checkpoint(
                 "micro_batch_size": args.micro_batch_size,
                 "target_global_batch_size": args.target_global_batch_size,
                 "min_mask_ratio": args.min_mask_ratio,
+                "max_mask_ratio": args.max_mask_ratio,
             },
             "data_manifest": data_manifest,
         }
@@ -390,6 +392,7 @@ def evaluate(
     device: torch.device,
     mask_token_id: int,
     min_mask_ratio: float,
+    max_mask_ratio: float,
     seed: int,
 ) -> float:
     model.eval()
@@ -403,6 +406,7 @@ def evaluate(
                 clean,
                 mask_token_id=mask_token_id,
                 min_mask_ratio=min_mask_ratio,
+                max_mask_ratio=max_mask_ratio,
                 generator=generator,
             )
             total += loss.detach().float()
@@ -460,6 +464,7 @@ def export_hf(
         "sequence_length": int(data_manifest["sequence_length"]),
         "completed_steps": completed_steps,
         "global_batch_size": args.target_global_batch_size,
+        "mask_ratio_range": [args.min_mask_ratio, args.max_mask_ratio],
         "tokens_seen": (
             completed_steps * args.target_global_batch_size * int(data_manifest["sequence_length"])
         ),
@@ -474,6 +479,8 @@ def main() -> None:
     args = parse_args()
     if args.steps <= 0 or args.micro_batch_size <= 0 or args.target_global_batch_size <= 0:
         raise ValueError("steps and batch sizes must be positive")
+    if not 0.0 < args.min_mask_ratio <= args.max_mask_ratio <= 1.0:
+        raise ValueError("mask ratio range must satisfy 0 < min <= max <= 1")
     if not torch.cuda.is_available():
         raise RuntimeError("Stage 0 currently requires CUDA")
 
@@ -495,7 +502,11 @@ def main() -> None:
     data_manifest_path = Path(args.data_manifest)
     data_manifest = json.loads(data_manifest_path.read_text(encoding="utf-8"))
     sequence_length = int(data_manifest["sequence_length"])
-    tokenizer = AutoTokenizer.from_pretrained(args.model, trust_remote_code=True)
+    tokenizer = AutoTokenizer.from_pretrained(
+        args.model,
+        trust_remote_code=True,
+        fix_mistral_regex=True,
+    )
     sampler = build_sampler(
         data_manifest_path,
         tokenizer=tokenizer,
@@ -585,6 +596,7 @@ def main() -> None:
                     clean,
                     mask_token_id=model.mask_token_id,
                     min_mask_ratio=args.min_mask_ratio,
+                    max_mask_ratio=args.max_mask_ratio,
                     generator=generator,
                 )
                 (loss / accumulation_steps).backward()
@@ -646,6 +658,7 @@ def main() -> None:
                 device=device,
                 mask_token_id=model.mask_token_id,
                 min_mask_ratio=args.min_mask_ratio,
+                max_mask_ratio=args.max_mask_ratio,
                 seed=args.seed + 700_000_000 + step + rank,
             )
             if rank == 0:
