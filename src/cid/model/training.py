@@ -1047,7 +1047,7 @@ class CIDTrainer:
                 for parameter in self.forward_model.parameters()
                 if parameter.device.type == "cuda"
             }
-            offload_budget_bytes = 4 * 1024**3
+            offload_budget_bytes = 6 * 1024**3
             offloaded_bytes = 0
 
             def pack_saved_tensor(tensor: torch.Tensor) -> object:
