@@ -83,6 +83,18 @@ tests/                      Runtime invariants and concurrency tests
 Runtime and data tooling have no mandatory third-party dependencies:
 
 ```bash
+python -m pip install cid-core
+```
+
+To enable the optional CID Engine acceleration backend:
+
+```bash
+python -m pip install 'cid-core[engine]'
+```
+
+For an editable source checkout:
+
+```bash
 python -m pip install -e .
 ```
 
