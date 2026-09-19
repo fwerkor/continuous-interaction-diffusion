@@ -541,6 +541,14 @@ class CIDRuntime:
                             f"information need {need.need_id!r} targets cells blocked by "
                             f"lifecycle state: {missing}"
                         )
+
+                external_tasks_before = self._external_task_count()
+                self._launch_initial_external_work(step)
+                if self._external_task_count() > external_tasks_before:
+                    # Let newly-created first reads enter their first await before
+                    # the runtime spends more CPU time tracing and bookkeeping.
+                    await asyncio.sleep(0)
+
                 self._trace_lifecycle_changes(previous_thought, thought, step)
                 if self.config.trace_details:
                     self.trace.emit(
@@ -615,7 +623,9 @@ class CIDRuntime:
                     )
                     continue
 
-                if (self._jobs or self._version_jobs or self._streams) and self.config.idle_yield_s:
+                if (
+                    self._jobs or self._version_jobs or self._streams
+                ) and self.config.idle_yield_s:
                     await asyncio.sleep(self.config.idle_yield_s)
                 else:
                     await asyncio.sleep(0)
@@ -703,6 +713,32 @@ class CIDRuntime:
                 } if self.config.trace_details else {}),
             )
         return tuple(percepts)
+
+    def _launch_initial_external_work(self, step: int) -> None:
+        for binding in self.bindings.active():
+            if (
+                binding.observation is not None
+                or binding.freshness is not FreshnessDemand.ONCE
+            ):
+                continue
+
+            source = self.sources.get(binding.source)
+            if (
+                not binding.arguments_complete
+                and not source.descriptor.accepts_partial_arguments
+            ):
+                continue
+
+            work_key = binding.work_key
+            if source.descriptor.cacheable and work_key in self._cache:
+                continue
+            if (
+                work_key in self._jobs
+                or work_key in self._version_jobs
+                or work_key in self._streams
+            ):
+                continue
+            self._ensure_read(binding, source, step)
 
     def _launch_due_jobs(self, step: int) -> None:
         now = time.monotonic()
@@ -1098,6 +1134,9 @@ class CIDRuntime:
 
     def _observation_count(self) -> int:
         return sum(binding.external_refreshes for binding in self.bindings.all())
+
+    def _external_task_count(self) -> int:
+        return len(self._jobs) + len(self._version_jobs) + len(self._streams)
 
     @staticmethod
     def _deadline_expired(deadline: float | None) -> bool:

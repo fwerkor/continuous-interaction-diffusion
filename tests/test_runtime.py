@@ -1126,3 +1126,31 @@ async def test_detailed_trace_accepts_display_canvas_size_changes() -> None:
     step = next(e for e in result.trace.events if e.kind == "model_step_finished")
     assert step.payload["display_changed_positions"] == [2]
     assert result.display.token_ids == (7, 8, 9)
+
+
+async def test_external_read_launch_precedes_runtime_bookkeeping() -> None:
+    registry = SourceRegistry()
+    registry.register(CountingSource())
+    runtime = CIDRuntime(
+        registry,
+        RuntimeConfig(max_steps=4, trace_details=True),
+    )
+
+    result = await runtime.run(
+        DuplicateNeedPolicy(),
+        thought=seeded_thought(2),
+        display=DisplayCanvas.masked(length=2, mask_token_id=5),
+    )
+
+    events = result.trace.events
+    refresh_index = next(
+        index
+        for index, event in enumerate(events)
+        if event.kind == "external_refresh_started"
+    )
+    runtime_state_index = next(
+        index
+        for index, event in enumerate(events)
+        if event.kind == "runtime_state"
+    )
+    assert refresh_index < runtime_state_index
