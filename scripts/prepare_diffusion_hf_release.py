@@ -7,7 +7,6 @@ from pathlib import Path
 
 from safetensors import safe_open
 
-
 MODEL_FILE = Path(__file__).resolve().parents[1] / "src/cid/model/modeling_cid_diffusion.py"
 
 
@@ -33,7 +32,8 @@ def repair_safetensors_parameter_count(release_dir: Path) -> int | None:
     total_parameters = 0
     for shard_path in sorted(release_dir.glob("model-*.safetensors")):
         with safe_open(shard_path, framework="pt", device="cpu") as handle:
-            for tensor_name in handle.keys():
+            # safetensors.safe_open exposes keys() but is not directly iterable.
+            for tensor_name in handle.keys():  # noqa: SIM118
                 parameter_count = 1
                 for dimension in handle.get_slice(tensor_name).get_shape():
                     parameter_count *= dimension

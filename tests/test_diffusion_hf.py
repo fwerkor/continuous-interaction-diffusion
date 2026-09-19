@@ -2,15 +2,19 @@ from __future__ import annotations
 
 import json
 import shutil
+from importlib import import_module
 from pathlib import Path
 
 import pytest
 
 torch = pytest.importorskip("torch")
 transformers = pytest.importorskip("transformers")
-
-from cid.model.modeling_cid_diffusion import CIDDiffusionForMaskedLM
-from scripts.prepare_diffusion_hf_release import repair_safetensors_parameter_count
+CIDDiffusionForMaskedLM = import_module(
+    "cid.model.modeling_cid_diffusion"
+).CIDDiffusionForMaskedLM
+repair_safetensors_parameter_count = import_module(
+    "scripts.prepare_diffusion_hf_release"
+).repair_safetensors_parameter_count
 
 
 def tiny_config():

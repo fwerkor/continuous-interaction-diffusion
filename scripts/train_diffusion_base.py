@@ -459,7 +459,8 @@ def export_hf(
         total_parameters = 0
         for shard_path in sorted(export_dir.glob("model-*.safetensors")):
             with safe_open(shard_path, framework="pt", device="cpu") as handle:
-                for tensor_name in handle.keys():
+                # safetensors.safe_open exposes keys() but is not directly iterable.
+                for tensor_name in handle.keys():  # noqa: SIM118
                     parameter_count = 1
                     for dimension in handle.get_slice(tensor_name).get_shape():
                         parameter_count *= dimension

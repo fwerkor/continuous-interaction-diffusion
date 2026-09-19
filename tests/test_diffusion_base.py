@@ -1,10 +1,11 @@
 from __future__ import annotations
 
+from importlib import import_module
+
 import pytest
 
 torch = pytest.importorskip("torch")
-
-from cid.model.diffusion_base import masked_diffusion_loss
+masked_diffusion_loss = import_module("cid.model.diffusion_base").masked_diffusion_loss
 
 
 class _UniformModel(torch.nn.Module):
