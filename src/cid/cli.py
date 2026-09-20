@@ -1869,6 +1869,34 @@ def _select_end_to_end_validation_examples(
     return tuple(selected)
 
 
+def _estimate_stage_a_full_activation_bytes(
+    *,
+    batch_size: int,
+    sequence_tokens: int,
+    layer_count: int,
+    hidden_size: int,
+    intermediate_size: int,
+    element_size: int,
+) -> int:
+    if min(
+        batch_size,
+        sequence_tokens,
+        layer_count,
+        hidden_size,
+        intermediate_size,
+        element_size,
+    ) <= 0:
+        raise ValueError("Stage A activation-estimate dimensions must be positive")
+    values_per_token_layer = 6 * hidden_size + 3 * intermediate_size
+    return (
+        batch_size
+        * sequence_tokens
+        * layer_count
+        * values_per_token_layer
+        * element_size
+    )
+
+
 def _train_stage_a(args: argparse.Namespace) -> None:
     import torch
     import torch.distributed as dist
@@ -1972,8 +2000,79 @@ def _train_stage_a(args: argparse.Namespace) -> None:
             raise RuntimeError("failed to load CID adapter on this training rank")
         if device_type == "npu":
             adapter.set_device_value_validation(False)
+        selective_checkpoint_fraction: float | None = None
         if args.gradient_checkpointing:
-            adapter.set_gradient_checkpointing(True)
+            selective_requested = (
+                args.selective_checkpoint_fraction is not None
+                or args.selective_checkpoint_memory_budget_gib is not None
+            )
+            if selective_requested:
+                if (
+                    args.selective_checkpoint_fraction is not None
+                    and args.selective_checkpoint_memory_budget_gib is not None
+                ):
+                    raise ValueError(
+                        "set only one of --selective-checkpoint-fraction and "
+                        "--selective-checkpoint-memory-budget-gib"
+                    )
+                from cid.model.native_engine import native_engine
+
+                engine = native_engine(capability="SelectiveCheckpointController")
+                if engine is None:
+                    raise RuntimeError("selective checkpointing requires cid-engine support")
+                if args.selective_checkpoint_fraction is not None:
+                    selective_checkpoint_fraction = float(args.selective_checkpoint_fraction)
+                    if not 0.0 <= selective_checkpoint_fraction <= 1.0:
+                        raise ValueError("--selective-checkpoint-fraction must be in [0, 1]")
+                else:
+                    if args.selective_checkpoint_memory_budget_gib <= 0:
+                        raise ValueError(
+                            "--selective-checkpoint-memory-budget-gib must be positive"
+                        )
+                    if args.selective_checkpoint_prompt_tokens <= 0:
+                        raise ValueError("--selective-checkpoint-prompt-tokens must be positive")
+                    decoder = adapter.hidden_backbone()
+                    layers = getattr(decoder, "layers", None)
+                    if layers is None or len(layers) == 0:
+                        raise RuntimeError(
+                            "selective checkpointing requires transformer decoder layers"
+                        )
+                    hidden_size = int(adapter.backbone.config.hidden_size)
+                    intermediate_size = int(
+                        getattr(adapter.backbone.config, "intermediate_size", 4 * hidden_size)
+                    )
+                    estimated_sequence_tokens = min(
+                        adapter.max_position_embeddings,
+                        args.thought_capacity
+                        + args.max_display_tokens
+                        + args.selective_checkpoint_prompt_tokens,
+                    )
+                    physical_batch = args.physical_micro_batch_size or args.micro_batch_size
+                    full_activation_bytes = _estimate_stage_a_full_activation_bytes(
+                        batch_size=physical_batch,
+                        sequence_tokens=estimated_sequence_tokens,
+                        layer_count=len(layers),
+                        hidden_size=hidden_size,
+                        intermediate_size=intermediate_size,
+                        element_size=torch.empty((), dtype=dtype).element_size(),
+                    )
+                    selective_checkpoint_fraction = engine.checkpoint_fraction_for_budget(
+                        full_activation_bytes=full_activation_bytes,
+                        available_activation_bytes=int(
+                            args.selective_checkpoint_memory_budget_gib * 1024**3
+                        ),
+                    )
+                adapter.set_gradient_checkpointing(False)
+                layers = getattr(adapter.hidden_backbone(), "layers", None)
+                if layers is None or len(layers) == 0:
+                    raise RuntimeError("selective checkpointing requires transformer layers")
+                adapter._cid_selective_checkpoint_controller = (
+                    engine.SelectiveCheckpointController(
+                        layers, checkpoint_fraction=selective_checkpoint_fraction
+                    )
+                )
+            else:
+                adapter.set_gradient_checkpointing(True)
         if args.mlp_chunk_size is not None:
             if args.mlp_chunk_size <= 0:
                 raise ValueError("--mlp-chunk-size must be positive")
@@ -2234,6 +2333,11 @@ def _train_stage_a(args: argparse.Namespace) -> None:
                 f"target_global_batch={args.target_global_batch_size or 'legacy'} "
                 f"grad_accum={gradient_accumulation_steps} "
                 f"physical_micro_batch={args.physical_micro_batch_size or args.micro_batch_size} "
+                f"checkpoint_fraction={
+                    'legacy-full'
+                    if args.gradient_checkpointing and selective_checkpoint_fraction is None
+                    else selective_checkpoint_fraction or 0.0
+                } "
                 f"grouped_moe_layers={grouped_moe_layers}"
             )
 
