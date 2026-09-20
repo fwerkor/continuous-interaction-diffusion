@@ -68,7 +68,7 @@ from cid.model.materialize import (
     ClosedWorldMaterializationCatalog,
     RevisionAction,
 )
-from cid.model.native_engine import cuda_engine
+from cid.model.native_engine import cuda_engine, native_engine
 from cid.model.tensors import CIDTensorBatch, CIDTensorOutput, build_percept_routing_masks
 from cid.reclamation import retired_reclamation_candidates
 from cid.runtime.bindings import canonical_work_key
@@ -731,6 +731,8 @@ class CIDTrainer:
         self._stage_a_cpu_gradient_accumulator: dict[str, Tensor] = {}
         self._stage_a_async_gradient_accumulator: Any | None = None
         self._stage_a_activation_offloader: Any | None = None
+        self._stage_a_activation_prefetch_controller: Any | None = None
+        self._stage_a_gradient_reducer: Any | None = None
         self._stage_a_manual_sync_required = False
         self._stage_a_backward_cpu_stash_active = False
         self._stage_a_gradient_stash_hook_handles: list[object] = []
@@ -1329,6 +1331,18 @@ class CIDTrainer:
                     )
             if self._stage_a_activation_offloader is not None:
                 self._stage_a_activation_offloader.max_bytes = offload_budget_bytes
+                if self._stage_a_activation_prefetch_controller is None:
+                    engine = native_engine(capability="LayerActivationPrefetchController")
+                    decoder = self.adapter.hidden_backbone()
+                    layers = getattr(decoder, "layers", None)
+                    if engine is not None and layers is not None and len(layers) > 0:
+                        self._stage_a_activation_prefetch_controller = (
+                            engine.LayerActivationPrefetchController(
+                                layers,
+                                self._stage_a_activation_offloader,
+                                prefetch_layers=self.stage_a_activation_offload_prefetch_depth,
+                            )
+                        )
                 saved_tensor_context = self._stage_a_activation_offloader.saved_tensors_context(
                     excluded_storage_ptrs=parameter_storages
                 )
@@ -1359,6 +1373,21 @@ class CIDTrainer:
                     pack_saved_tensor,
                     unpack_saved_tensor,
                 )
+        use_async_stage_a_reduce = bool(
+            stage_a_ddp
+            and will_step
+            and not use_stage_a_cpu_stash
+        )
+        if use_async_stage_a_reduce and self._stage_a_gradient_reducer is None:
+            engine = native_engine(capability="AsyncBucketedGradientReducer")
+            if engine is not None:
+                self._stage_a_gradient_reducer = engine.AsyncBucketedGradientReducer(
+                    self._trainable,
+                    bucket_cap_mb=25.0,
+                )
+        reducer = self._stage_a_gradient_reducer if use_async_stage_a_reduce else None
+        reducer_started = False
+        reducer_finished = False
         self._stage_a_backward_cpu_stash_active = use_stage_a_cpu_stash
         try:
             with sync_context, saved_tensor_context:
@@ -1388,7 +1417,18 @@ class CIDTrainer:
                     raise FloatingPointError(
                         f"non-finite CID loss for training micro-batch: {names}"
                     )
+                if reducer is not None:
+                    reducer.start()
+                    reducer_started = True
                 (losses.total * effective_batch_size * loss_scale).backward()
+                if reducer_started:
+                    reducer.finish()
+                    reducer_finished = True
+                    self._stage_a_manual_sync_required = False
+        except BaseException:
+            if reducer_started and not reducer_finished:
+                reducer.abort()
+            raise
         finally:
             self._stage_a_backward_cpu_stash_active = False
         if use_stage_a_cpu_stash:
@@ -1398,7 +1438,8 @@ class CIDTrainer:
             self._stash_stage_a_gradients_to_cpu()
         if stage_a_ddp:
             self._pending_ddp_unsynced = bool(
-                use_stage_a_no_sync or self._stage_a_manual_sync_required
+                not reducer_finished
+                and (use_stage_a_no_sync or self._stage_a_manual_sync_required)
             )
         if getattr(self.forward_model, "_cid_fsdp_no_sync_accumulation", False):
             self._pending_fsdp_unsynced = use_stage_b_no_sync
