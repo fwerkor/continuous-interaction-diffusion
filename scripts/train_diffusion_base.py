@@ -8,6 +8,7 @@ import random
 import shutil
 import threading
 import time
+from collections import deque
 from functools import partial
 from pathlib import Path
 from typing import Any
@@ -191,14 +192,58 @@ class StreamingCorpusSampler:
         except BaseException as exc:
             self._queue.put(exc)
 
-    def sample(self, batch_size: int) -> Tensor:
-        rows = []
-        for _ in range(batch_size):
+    def sample(self, batch_size: int, *, pin_memory: bool = False) -> Tensor:
+        batch = torch.empty(
+            (batch_size, self.sequence_length),
+            dtype=torch.long,
+            pin_memory=pin_memory,
+        )
+        for row in range(batch_size):
             item = self._queue.get()
             if isinstance(item, BaseException):
                 raise RuntimeError("streaming corpus producer failed") from item
-            rows.append(item)
-        return torch.from_numpy(np.stack(rows, axis=0))
+            batch[row].copy_(torch.from_numpy(item))
+        return batch
+
+
+class DeviceBatchPrefetcher:
+    """Keep pinned host batches and H2D copies ahead of the compute stream."""
+
+    def __init__(
+        self,
+        sampler,
+        *,
+        batch_size: int,
+        device: torch.device,
+        depth: int = 2,
+    ) -> None:
+        if device.type != "cuda":
+            raise ValueError("device prefetch requires CUDA")
+        if depth <= 0:
+            raise ValueError("prefetch depth must be positive")
+        self.sampler = sampler
+        self.batch_size = batch_size
+        self.device = device
+        self.copy_stream = torch.cuda.Stream(device=device)
+        self.pending: deque[tuple[Tensor, torch.cuda.Event]] = deque()
+        for _ in range(depth):
+            self._submit()
+
+    def _submit(self) -> None:
+        host = self.sampler.sample(self.batch_size, pin_memory=True)
+        with torch.cuda.stream(self.copy_stream):
+            batch = host.to(device=self.device, non_blocking=True)
+            ready = torch.cuda.Event()
+            ready.record(self.copy_stream)
+        self.pending.append((batch, ready))
+
+    def next(self) -> Tensor:
+        batch, ready = self.pending.popleft()
+        current = torch.cuda.current_stream(self.device)
+        current.wait_event(ready)
+        batch.record_stream(current)
+        self._submit()
+        return batch
 
 
 def build_sampler(
@@ -493,6 +538,15 @@ def export_hf(
     )
 
 
+def _assert_finite_grad_norm(grad_norm: Tensor, *, step: int) -> None:
+    finite = torch.isfinite(grad_norm)
+    if grad_norm.is_cuda:
+        torch._assert_async(finite, f"non-finite Stage 0 gradient norm at step {step}")
+        return
+    if not bool(finite):
+        raise FloatingPointError(f"non-finite Stage 0 gradient norm at step {step}")
+
+
 def main() -> None:
     args = parse_args()
     if args.steps <= 0 or args.micro_batch_size <= 0 or args.target_global_batch_size <= 0:
@@ -587,6 +641,12 @@ def main() -> None:
     interval_mask = torch.zeros((), device=device, dtype=torch.float32)
     interval_ratio = torch.zeros((), device=device, dtype=torch.float32)
     interval_steps = 0
+    train_batches = DeviceBatchPrefetcher(
+        sampler,
+        batch_size=args.micro_batch_size,
+        device=device,
+        depth=2,
+    )
     fsdp.train()
 
     for step in range(start_step + 1, args.steps + 1):
@@ -605,7 +665,7 @@ def main() -> None:
         step_mask = torch.zeros((), device=device, dtype=torch.float32)
         step_ratio = torch.zeros((), device=device, dtype=torch.float32)
         for micro_step in range(accumulation_steps):
-            clean = sampler.sample(args.micro_batch_size).to(device=device, non_blocking=True)
+            clean = train_batches.next()
             synchronize = micro_step == accumulation_steps - 1 or not args.no_sync_accumulation
             context = fsdp_accumulation_context(fsdp, synchronize=synchronize)
             with context:
@@ -622,8 +682,7 @@ def main() -> None:
             step_mask += masked_fraction.float()
             step_ratio += mean_ratio.float()
         grad_norm = fsdp.clip_grad_norm_(args.max_grad_norm)
-        if not bool(torch.isfinite(grad_norm)):
-            raise FloatingPointError(f"non-finite Stage 0 gradient norm at step {step}")
+        _assert_finite_grad_norm(grad_norm, step=step)
         optimizer.step()
 
         step_loss /= accumulation_steps

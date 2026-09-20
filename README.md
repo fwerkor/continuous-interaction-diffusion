@@ -704,11 +704,13 @@ separate commitment/authorization protocol and are outside this repository's fir
 
 ## Native engine acceleration
 
-CUDA inference can optionally use the C++20/CUDA cid-engine backend. Install the tested release with:
+CUDA inference and Stage-0 diffusion training can optionally use the C++20/CUDA cid-engine
+backend. Install the tested release with:
 
-    pip install --no-build-isolation "git+https://github.com/fwerkor/cid-engine.git@v0.4.0"
+    pip install --no-build-isolation "git+https://github.com/fwerkor/cid-engine.git@v0.5.0"
 
 When a CUDA-enabled engine build is available, CID uses native display refinement, prefix
-allocation, and compact materialization snapshots. Thought semantic vectors stay device-resident
+allocation, compact materialization snapshots, and fused Stage-0 mask corruption. Thought semantic
+vectors stay device-resident
 between runtime steps instead of being expanded into Python floats and rebuilt as GPU tensors.
 CPU execution and environments without cid-engine keep the existing PyTorch path.
