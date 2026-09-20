@@ -490,6 +490,27 @@ def _cid_loss_component_values(losses: CIDLoss) -> dict[str, Tensor]:
     return {name: getattr(losses, name).detach().float() for name in CID_LOSS_COMPONENT_NAMES}
 
 
+def _weighted_cid_loss_mean(
+    losses: tuple[CIDLoss, ...],
+    weights: tuple[int, ...],
+) -> CIDLoss:
+    if not losses or len(losses) != len(weights):
+        raise ValueError("CID loss groups and weights must be non-empty and aligned")
+    if any(weight < 0 for weight in weights):
+        raise ValueError("CID loss group weights must be non-negative")
+    denominator = float(sum(weights))
+    if denominator <= 0.0:
+        raise ValueError("CID loss groups require positive total weight")
+    fields = ("total", *CID_LOSS_COMPONENT_NAMES)
+    values: dict[str, Tensor] = {}
+    for name in fields:
+        value = getattr(losses[0], name) * weights[0]
+        for loss, weight in zip(losses[1:], weights[1:], strict=True):
+            value = value + getattr(loss, name) * weight
+        values[name] = value / denominator
+    return CIDLoss(**values)
+
+
 def _accumulate_metric_tensors(
     destination: dict[str, Tensor],
     values: Mapping[str, Tensor],
@@ -634,6 +655,7 @@ class CIDTrainer:
         stage_a_activation_offload_threshold_tokens: int = 512,
         stage_a_activation_offload_budget_bytes: int | None = None,
         stage_a_activation_offload_prefetch_depth: int = 2,
+        flatten_teacher_forcing_horizon: bool = False,
     ) -> None:
         if tensorizer.adapter is not adapter:
             raise ValueError("trainer and trajectory tensorizer must share the same adapter")
@@ -671,6 +693,7 @@ class CIDTrainer:
         self.stage_a_activation_offload_prefetch_depth = int(
             stage_a_activation_offload_prefetch_depth
         )
+        self.flatten_teacher_forcing_horizon = bool(flatten_teacher_forcing_horizon)
         self.tensorizer = tensorizer
         self.config = config or CIDTrainerConfig()
         if tensorizer.text_encoder.pooling_mode != self.config.semantic_pooling:
@@ -837,6 +860,188 @@ class CIDTrainer:
         )
         return self.config.micro_batch_size * self.config.gradient_accumulation_steps * world_size
 
+    def _distributed_global_batch_sizes(
+        self, local_rows: tuple[int, ...]
+    ) -> tuple[int, ...]:
+        if any(rows < 0 for rows in local_rows):
+            raise ValueError("local valid-row counts must be non-negative")
+        if not local_rows:
+            return ()
+        if not torch.distributed.is_available() or not torch.distributed.is_initialized():
+            return local_rows
+        totals = torch.tensor(
+            local_rows,
+            dtype=torch.int64,
+            device=self.tensorizer.text_encoder.device,
+        )
+        torch.distributed.all_reduce(totals, op=torch.distributed.ReduceOp.SUM)
+        return tuple(int(value) for value in totals.detach().cpu().tolist())
+
+    def _teacher_forcing_flattening_safe(self) -> bool:
+        if not self.flatten_teacher_forcing_horizon:
+            return False
+        if any(parameter.requires_grad for parameter in self.adapter.backbone.parameters()):
+            return False
+        if bool(getattr(self.adapter, "_router_aux_loss_enabled", False)):
+            return False
+        dropout_types = (
+            torch.nn.Dropout,
+            torch.nn.Dropout1d,
+            torch.nn.Dropout2d,
+            torch.nn.Dropout3d,
+            torch.nn.AlphaDropout,
+            torch.nn.FeatureAlphaDropout,
+        )
+        for module in self.forward_model.modules():
+            if isinstance(module, dropout_types) and float(module.p) > 0.0:
+                return False
+        config = getattr(self.adapter.backbone, "config", None)
+        if config is not None:
+            for name in (
+                "attention_dropout",
+                "resid_pdrop",
+                "embd_pdrop",
+                "hidden_dropout",
+                "hidden_dropout_prob",
+            ):
+                value = getattr(config, name, 0.0)
+                if isinstance(value, (int, float)) and float(value) > 0.0:
+                    return False
+        return True
+
+    def _train_teacher_forced_flattened_microbatch(
+        self,
+        windows: tuple[CIDRolloutWindow, ...],
+        *,
+        physical_batch_size: int,
+        loss_weight: float,
+        force_gradient_sync: bool,
+    ) -> tuple[float, float, int, dict[str, Tensor]]:
+        rollout_length = len(windows[0].source_steps)
+        raw_units: list[tuple[int, int, int, tuple[bool, ...]]] = []
+        for offset in range(rollout_length):
+            for start in range(0, len(windows), physical_batch_size):
+                stop = min(start + physical_batch_size, len(windows))
+                sample_mask = tuple(not window.is_padding for window in windows[start:stop])
+                raw_units.append((offset, start, stop, sample_mask))
+
+        local_counts = tuple(sum(unit[3]) for unit in raw_units)
+        global_counts = self._distributed_global_batch_sizes(local_counts)
+        units = tuple(
+            (*unit, global_count)
+            for unit, global_count in zip(raw_units, global_counts, strict=True)
+        )
+
+        max_fused_rows = physical_batch_size * rollout_length
+        target_global = self._target_global_examples_per_step()
+        simulated_pending = self._pending_global_examples
+        execution_groups: list[list[tuple[int, int, int, tuple[bool, ...], int]]] = []
+        current: list[tuple[int, int, int, tuple[bool, ...], int]] = []
+        current_rows = 0
+
+        def flush_group() -> None:
+            nonlocal current, current_rows
+            if current:
+                execution_groups.append(current)
+                current = []
+                current_rows = 0
+
+        for unit in units:
+            offset, start, stop, sample_mask, global_count = unit
+            del offset, sample_mask
+            unit_rows = stop - start
+            if global_count == 0:
+                flush_group()
+                execution_groups.append([unit])
+                continue
+            if current and current_rows + unit_rows > max_fused_rows:
+                flush_group()
+            current.append(unit)
+            current_rows += unit_rows
+            simulated_pending += global_count
+            if simulated_pending >= target_global:
+                flush_group()
+                simulated_pending = 0
+        flush_group()
+
+        loss_sum_tensor: Tensor | None = None
+        raw_loss_sum_tensor: Tensor | None = None
+        transition_count = 0
+        component_sums: dict[str, Tensor] = {}
+        for group in execution_groups:
+            samples: list[CIDTrainingStep] = []
+            combined_mask: list[bool] = []
+            segments: list[tuple[int, int, tuple[bool, ...]]] = []
+            global_batch_size = 0
+            for offset, start, stop, sample_mask, global_count in group:
+                segment_start = len(samples)
+                for window in windows[start:stop]:
+                    samples.append(
+                        self.tensorizer.tensorize(
+                            window.example,
+                            window.source_steps[offset],
+                            timestep=self._sample_timestep(),
+                            generator=self.generator,
+                            rollout_state=None,
+                            rollout_denoising_steps=self.config.rollout_denoising_steps,
+                        )
+                    )
+                segment_stop = len(samples)
+                combined_mask.extend(sample_mask)
+                segments.append((segment_start, segment_stop, sample_mask))
+                global_batch_size += global_count
+
+            effective_batch_size = sum(combined_mask)
+            if global_batch_size == 0:
+                del samples
+                continue
+            loss_groups: list[tuple[bool, ...]] = []
+            if len(segments) > 1:
+                total_rows = len(samples)
+                for start, stop, sample_mask in segments:
+                    mask = [False] * total_rows
+                    mask[start:stop] = sample_mask
+                    loss_groups.append(tuple(mask))
+            losses, output, training_batch = self._forward_backward(
+                tuple(samples),
+                loss_scale=loss_weight,
+                sample_mask=tuple(combined_mask),
+                allow_optimizer_step=True,
+                global_effective_batch_size=global_batch_size,
+                force_gradient_sync=force_gradient_sync,
+                loss_groups=tuple(loss_groups) if loss_groups else None,
+            )
+            raw_loss = losses.total.detach().float() * effective_batch_size
+            weighted_loss = raw_loss * loss_weight
+            raw_loss_sum_tensor = (
+                raw_loss
+                if raw_loss_sum_tensor is None
+                else raw_loss_sum_tensor + raw_loss
+            )
+            loss_sum_tensor = (
+                weighted_loss
+                if loss_sum_tensor is None
+                else loss_sum_tensor + weighted_loss
+            )
+            transition_count += effective_batch_size
+            _accumulate_metric_tensors(
+                component_sums,
+                _cid_loss_component_values(losses),
+                scale=effective_batch_size,
+            )
+            del output, training_batch, losses, samples
+
+        if loss_sum_tensor is None or raw_loss_sum_tensor is None:
+            return 0.0, 0.0, transition_count, component_sums
+        loss_sum, raw_loss_sum = (
+            float(value)
+            for value in torch.stack((loss_sum_tensor, raw_loss_sum_tensor))
+            .detach()
+            .cpu()
+            .tolist()
+        )
+        return loss_sum, raw_loss_sum, transition_count, component_sums
+
     def _train_rollout_microbatch_with_metrics(
         self,
         windows: tuple[CIDRolloutWindow, ...],
@@ -867,6 +1072,17 @@ class CIDTrainer:
         component_sums: dict[str, Tensor] = {}
         rollout_length = next(iter(lengths))
         physical_batch_size = physical_micro_batch_size or len(windows)
+        if (
+            rollout_probability == 0.0
+            and rollout_length > 1
+            and self._teacher_forcing_flattening_safe()
+        ):
+            return self._train_teacher_forced_flattened_microbatch(
+                windows,
+                physical_batch_size=physical_batch_size,
+                loss_weight=loss_weight,
+                force_gradient_sync=force_gradient_sync,
+            )
         for offset in range(rollout_length):
             use_rollout_flags, sample_mask, advance_state = self._rollout_step_plan(
                 windows,
@@ -993,6 +1209,7 @@ class CIDTrainer:
         allow_optimizer_step: bool = True,
         global_effective_batch_size: int | None = None,
         force_gradient_sync: bool = False,
+        loss_groups: tuple[tuple[bool, ...], ...] | None = None,
     ) -> tuple[CIDLoss, CIDTensorOutput, CIDTrainingBatch]:
         if not samples:
             raise ValueError("training samples cannot be empty")
@@ -1000,15 +1217,24 @@ class CIDTrainer:
             raise ValueError("loss_scale must be finite and positive")
         if sample_mask is not None and len(sample_mask) != len(samples):
             raise ValueError("sample_mask length must match training samples")
+        resolved_sample_mask = sample_mask if sample_mask is not None else (True,) * len(samples)
+        if loss_groups is not None:
+            coverage = [0] * len(samples)
+            for group in loss_groups:
+                if len(group) != len(samples):
+                    raise ValueError("loss group length must match training samples")
+                for index, selected in enumerate(group):
+                    if selected:
+                        coverage[index] += 1
+            if tuple(coverage) != tuple(int(selected) for selected in resolved_sample_mask):
+                raise ValueError("loss groups must partition the valid sample mask exactly")
         training_batch = collate_training_steps(
             samples,
             pad_token_id=int(self.pad_token_id),
         )
-        effective_batch_size = (
-            sum(sample_mask) if sample_mask is not None else len(samples)
-        )
+        effective_batch_size = sum(resolved_sample_mask)
         valid_rows = torch.tensor(
-            sample_mask if sample_mask is not None else (True,) * len(samples),
+            resolved_sample_mask,
             dtype=torch.bool,
             device=training_batch.batch.thought_semantic.device,
         )
@@ -1137,7 +1363,26 @@ class CIDTrainer:
         try:
             with sync_context, saved_tensor_context:
                 output = self.forward_model(training_batch.batch)
-                losses = cid_loss(output, training_batch.targets, batch_mask=valid_rows)
+                if loss_groups is None:
+                    losses = cid_loss(output, training_batch.targets, batch_mask=valid_rows)
+                else:
+                    grouped_losses: list[CIDLoss] = []
+                    group_weights: list[int] = []
+                    for group in loss_groups:
+                        group_mask = torch.tensor(
+                            group,
+                            dtype=torch.bool,
+                            device=valid_rows.device,
+                        )
+                        grouped_losses.append(
+                            cid_loss(output, training_batch.targets, batch_mask=group_mask)
+                        )
+                        group_weights.append(sum(group))
+                    losses = (
+                        _weighted_cid_loss_mean(tuple(grouped_losses), tuple(group_weights))
+                        if effective_batch_size > 0
+                        else cid_loss(output, training_batch.targets, batch_mask=valid_rows)
+                    )
                 if not bool(torch.isfinite(losses.total)):
                     names = ", ".join(training_batch.example_ids)
                     raise FloatingPointError(

@@ -2175,6 +2175,7 @@ def _train_stage_a(args: argparse.Namespace) -> None:
             stage_a_activation_offload_prefetch_depth=(
                 args.stage_a_activation_offload_prefetch_depth
             ),
+            flatten_teacher_forcing_horizon=args.flatten_teacher_forcing_horizon,
         )
         def zro_optimizer_shard_path(checkpoint: Path, shard_rank: int) -> Path:
             return checkpoint.with_name(
@@ -4371,6 +4372,15 @@ def main() -> None:
     train.add_argument("--timestep-min", type=float, default=0.05)
     train.add_argument("--timestep-max", type=float, default=1.0)
     train.add_argument("--rollout-horizon", type=int, default=3)
+    train.add_argument(
+        "--flatten-teacher-forcing-horizon",
+        action=argparse.BooleanOptionalAction,
+        default=False,
+        help=(
+            "fuse dependency-free Stage A rollout offsets during pure teacher forcing while "
+            "preserving each physical micro-batch loss normalization"
+        ),
+    )
     train.add_argument(
         "--rollout-allocation-threshold",
         type=float,

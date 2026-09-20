@@ -1474,6 +1474,81 @@ def test_trainer_uses_configured_micro_batches() -> None:
     assert trainer.state.transitions_seen == 8
 
 
+def test_teacher_forcing_horizon_flattening_preserves_update_and_reduces_forwards() -> None:
+    config = CIDTrainerConfig(
+        learning_rate=1e-3,
+        micro_batch_size=2,
+        gradient_accumulation_steps=2,
+        rollout_horizon=3,
+        teacher_forcing_epochs=1,
+        rollout_ramp_epochs=2,
+        timestep_min=0.0,
+        timestep_max=0.0,
+        seed=29,
+    )
+    examples = (
+        make_rollout_trajectory(),
+        replace(make_rollout_trajectory(), example_id="flattened-teacher-forcing-2"),
+    )
+    windows = trajectory_rollout_windows(examples, max_horizon=3)
+
+    baseline_adapter = make_adapter(seed=181)
+    baseline_calls = 0
+
+    def count_baseline(_module, _inputs):
+        nonlocal baseline_calls
+        baseline_calls += 1
+
+    baseline_adapter.register_forward_pre_hook(count_baseline)
+    baseline = CIDTrainer(
+        baseline_adapter,
+        ILLaDATrajectoryTensorizer(baseline_adapter, TinyTokenizer()),
+        config,
+        flatten_teacher_forcing_horizon=False,
+    )
+    baseline_report = baseline.train_rollout_windows(
+        windows,
+        epochs=1,
+        shuffle=False,
+        physical_micro_batch_size=1,
+    )
+
+    flattened_adapter = make_adapter(seed=181)
+    flattened_calls = 0
+
+    def count_flattened(_module, _inputs):
+        nonlocal flattened_calls
+        flattened_calls += 1
+
+    flattened_adapter.register_forward_pre_hook(count_flattened)
+    flattened = CIDTrainer(
+        flattened_adapter,
+        ILLaDATrajectoryTensorizer(flattened_adapter, TinyTokenizer()),
+        config,
+        flatten_teacher_forcing_horizon=True,
+    )
+    flattened_report = flattened.train_rollout_windows(
+        windows,
+        epochs=1,
+        shuffle=False,
+        physical_micro_batch_size=1,
+    )
+
+    assert baseline_report.transitions == flattened_report.transitions
+    assert baseline_report.optimizer_steps == flattened_report.optimizer_steps
+    assert flattened.state == baseline.state
+    assert flattened_calls < baseline_calls
+    baseline_parameters = dict(baseline_adapter.named_parameters())
+    flattened_parameters = dict(flattened_adapter.named_parameters())
+    for name in baseline.trainable_parameter_names:
+        torch.testing.assert_close(
+            flattened_parameters[name],
+            baseline_parameters[name],
+            rtol=2e-5,
+            atol=2e-6,
+        )
+
+
 def test_rollout_physical_micro_batch_preserves_logical_update() -> None:
     config = CIDTrainerConfig(
         learning_rate=1e-3,
