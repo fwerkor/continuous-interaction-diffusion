@@ -2326,6 +2326,11 @@ def _train_stage_a(args: argparse.Namespace) -> None:
         trainable = sum(
             parameter.numel() for parameter in adapter.parameters() if parameter.requires_grad
         )
+        checkpoint_fraction_label: str | float = (
+            "legacy-full"
+            if args.gradient_checkpointing and selective_checkpoint_fraction is None
+            else selective_checkpoint_fraction or 0.0
+        )
         if rank == 0:
             print(
                 f"device={device} world_size={world_size} dtype={args.dtype} "
@@ -2336,11 +2341,7 @@ def _train_stage_a(args: argparse.Namespace) -> None:
                 f"target_global_batch={args.target_global_batch_size or 'legacy'} "
                 f"grad_accum={gradient_accumulation_steps} "
                 f"physical_micro_batch={args.physical_micro_batch_size or args.micro_batch_size} "
-                f"checkpoint_fraction={
-                    'legacy-full'
-                    if args.gradient_checkpointing and selective_checkpoint_fraction is None
-                    else selective_checkpoint_fraction or 0.0
-                } "
+                f"checkpoint_fraction={checkpoint_fraction_label} "
                 f"grouped_moe_layers={grouped_moe_layers}"
             )
 

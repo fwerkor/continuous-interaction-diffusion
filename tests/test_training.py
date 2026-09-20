@@ -1402,6 +1402,9 @@ def test_trajectory_tensorizer_ignores_randomized_physical_slot_placement() -> N
 
 
 def test_stage_a_frozen_shard_preserves_training_update(tmp_path: Path) -> None:
+    native_engine = import_module("cid.model.native_engine").native_engine
+    if native_engine(capability="shard_frozen_transformer") is None:
+        pytest.skip("cid-engine frozen-shard capability is not installed")
     rendezvous = tmp_path / "stage-a-shard-init"
     torch.distributed.init_process_group(
         "gloo",
