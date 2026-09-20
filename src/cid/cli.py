@@ -4358,6 +4358,34 @@ def main() -> None:
         default=2,
         help="number of reverse-order saved activations prefetched during backward",
     )
+    train.add_argument(
+        "--frozen-backbone-sharding",
+        action=argparse.BooleanOptionalAction,
+        default=False,
+        help=(
+            "FULL_SHARD the frozen Stage A transformer decoder with cid-engine; "
+            "use only when inter-rank bandwidth makes parameter materialization worthwhile"
+        ),
+    )
+    train.add_argument(
+        "--selective-checkpoint-fraction",
+        type=float,
+        help="fraction of Stage A transformer layers to activation-checkpoint",
+    )
+    train.add_argument(
+        "--selective-checkpoint-memory-budget-gib",
+        type=float,
+        help=(
+            "derive the Stage A checkpointed-layer fraction from this activation-memory "
+            "budget in GiB"
+        ),
+    )
+    train.add_argument(
+        "--selective-checkpoint-prompt-tokens",
+        type=int,
+        default=512,
+        help="prompt-token estimate used by Stage A checkpoint memory budgeting",
+    )
     train.add_argument("--max-grad-norm", type=float, default=1.0)
     train.add_argument("--warmup-steps", type=int, default=0)
     train.add_argument("--lr-decay-steps", type=int, default=0)
