@@ -2054,6 +2054,9 @@ def _train_stage_a(args: argparse.Namespace) -> None:
             optimizer=stage_a_optimizer,
             forward_model=forward_model,
             cpu_gradient_stash_threshold_tokens=args.cpu_gradient_stash_threshold_tokens,
+            stage_a_activation_offload_threshold_tokens=(
+                args.stage_a_activation_offload_threshold_tokens
+            ),
         )
         def zro_optimizer_shard_path(checkpoint: Path, shard_rank: int) -> Path:
             return checkpoint.with_name(
@@ -4203,6 +4206,15 @@ def main() -> None:
         help=(
             "temporarily stash accumulated Stage A gradients on CPU when an input reaches "
             "this total thought+prompt+display token count"
+        ),
+    )
+    train.add_argument(
+        "--stage-a-activation-offload-threshold-tokens",
+        type=int,
+        default=512,
+        help=(
+            "offload bounded Stage A autograd-saved activation tensors to CPU when an "
+            "input reaches this total thought+prompt+display token count"
         ),
     )
     train.add_argument("--max-grad-norm", type=float, default=1.0)

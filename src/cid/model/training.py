@@ -631,6 +631,7 @@ class CIDTrainer:
         gradient_clipper: Callable[[float], Tensor | float] | None = None,
         preserve_reduced_gradients: bool | None = None,
         cpu_gradient_stash_threshold_tokens: int | None = None,
+        stage_a_activation_offload_threshold_tokens: int = 512,
     ) -> None:
         if tensorizer.adapter is not adapter:
             raise ValueError("trainer and trajectory tensorizer must share the same adapter")
@@ -648,6 +649,11 @@ class CIDTrainer:
         ):
             raise ValueError("CPU gradient-stash threshold must be positive")
         self.cpu_gradient_stash_threshold_tokens = cpu_gradient_stash_threshold_tokens
+        if stage_a_activation_offload_threshold_tokens <= 0:
+            raise ValueError("Stage A activation-offload threshold must be positive")
+        self.stage_a_activation_offload_threshold_tokens = (
+            stage_a_activation_offload_threshold_tokens
+        )
         self.tensorizer = tensorizer
         self.config = config or CIDTrainerConfig()
         if tensorizer.text_encoder.pooling_mode != self.config.semantic_pooling:
@@ -1052,7 +1058,7 @@ class CIDTrainer:
         if (
             stage_a_ddp
             and training_batch.batch.thought_semantic.device.type == "cuda"
-            and sequence_tokens >= 512
+            and sequence_tokens >= self.stage_a_activation_offload_threshold_tokens
         ):
             parameter_storages = {
                 parameter.untyped_storage().data_ptr()
