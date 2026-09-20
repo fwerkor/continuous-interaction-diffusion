@@ -11,6 +11,7 @@ DISK_WAIT_S="${DISK_WAIT_S:-300}"
 MIN_FREE_GB="${MIN_FREE_GB:-350}"
 MAX_RESTARTS="${MAX_RESTARTS:-0}"
 WAIT_FOR_GPUS="${WAIT_FOR_GPUS:-1}"
+EXPECTED_GPU_COUNT="${EXPECTED_GPU_COUNT:-8}"
 WATCHDOG_LOG="${WATCHDOG_LOG:-$RUN_ROOT/watchdog.log}"
 STATUS_FILE="${STATUS_FILE:-$RUN_ROOT/watchdog-status.json}"
 LOCK_FILE="${LOCK_FILE:-$RUN_ROOT/.watchdog.lock}"
@@ -72,13 +73,13 @@ wait_for_disk_space() {
   done
 }
 
-wait_for_eight_idle_gpus() {
+wait_for_idle_gpus() {
   while true; do
     local gpu_count active
     gpu_count="$(available_gpu_count)"
-    if [[ "$gpu_count" -lt 8 ]]; then
-      write_status "blocked" "only $gpu_count GPUs visible; need 8" "$restarts"
-      log "only $gpu_count GPUs visible; waiting for 8"
+    if [[ "$gpu_count" -lt "$EXPECTED_GPU_COUNT" ]]; then
+      write_status "blocked" +        "only $gpu_count GPUs visible; need $EXPECTED_GPU_COUNT" "$restarts"
+      log "only $gpu_count GPUs visible; waiting for $EXPECTED_GPU_COUNT"
       sleep "$GPU_WAIT_S"
       continue
     fi
@@ -116,7 +117,7 @@ log "CID 8B watchdog initialized; launcher=$LAUNCHER run_root=$RUN_ROOT"
 while true; do
   wait_for_disk_space
   if [[ "$WAIT_FOR_GPUS" == "1" ]]; then
-    wait_for_eight_idle_gpus
+    wait_for_idle_gpus
   fi
 
   write_status "running" "Stage A/B launcher active" "$restarts"
