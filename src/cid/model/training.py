@@ -1972,6 +1972,7 @@ class CIDTrainer:
         *,
         dataset_sha256: str | None = None,
         include_optimizer_state: bool = True,
+        epoch_progress: Mapping[str, Any] | None = None,
     ) -> None:
         self.prepare_checkpoint()
         destination = Path(path)
@@ -2011,6 +2012,8 @@ class CIDTrainer:
             "data_order_version": self.data_order_version,
             "dataset_sha256": dataset_sha256,
         }
+        if epoch_progress is not None:
+            payload["epoch_progress"] = dict(epoch_progress)
         semantic_snapshot = _trainer_frozen_semantic_snapshot(self)
         if semantic_snapshot is not None:
             payload["semantic_embedding_snapshot"] = semantic_snapshot
@@ -2037,7 +2040,8 @@ class CIDTrainer:
         path: str | Path,
         *,
         expected_dataset_sha256: str | None = None,
-    ) -> None:
+        allow_partial_world_size_change: bool = False,
+    ) -> dict[str, Any]:
         checkpoint = torch.load(path, map_location="cpu", weights_only=False)
         if checkpoint.get("format_version") not in self.SUPPORTED_CHECKPOINT_VERSIONS:
             raise ValueError("unsupported CID trainer checkpoint version")
@@ -2049,19 +2053,30 @@ class CIDTrainer:
         ):
             raise ValueError("CID trainer checkpoint dataset SHA-256 does not match training data")
         trainer_state = checkpoint.get("trainer_state", {})
-        if int(trainer_state.get("rollout_windows_seen_in_epoch", 0)) > 0:
-            saved_world_size = checkpoint.get("world_size")
-            current_world_size = (
-                torch.distributed.get_world_size()
-                if torch.distributed.is_available() and torch.distributed.is_initialized()
-                else 1
-            )
+        saved_world_size = checkpoint.get("world_size")
+        current_world_size = (
+            torch.distributed.get_world_size()
+            if torch.distributed.is_available() and torch.distributed.is_initialized()
+            else 1
+        )
+        partial_epoch = int(trainer_state.get("rollout_windows_seen_in_epoch", 0)) > 0
+        partial_world_size_change = bool(
+            partial_epoch
+            and saved_world_size is not None
+            and int(saved_world_size) != current_world_size
+        )
+        portable_partial_resume = bool(
+            allow_partial_world_size_change
+            and partial_world_size_change
+            and int(checkpoint.get("data_order_version", 1)) >= 4
+        )
+        if partial_epoch:
             if saved_world_size is None:
                 raise ValueError(
                     "partial-epoch checkpoint does not record its world size; resume from an "
                     "epoch-boundary checkpoint instead"
                 )
-            if int(saved_world_size) != current_world_size:
+            if int(saved_world_size) != current_world_size and not portable_partial_resume:
                 raise ValueError(
                     "partial-epoch checkpoint world size does not match the current training "
                     "world size; resume from an epoch-boundary checkpoint before changing ranks"
@@ -2069,12 +2084,6 @@ class CIDTrainer:
         saved_trainer_config = dict(checkpoint["trainer_config"])
         saved_trainer_config.setdefault("semantic_pooling", "mean-v1")
         current_trainer_config = asdict(self.config)
-        saved_world_size = checkpoint.get("world_size")
-        current_world_size = (
-            torch.distributed.get_world_size()
-            if torch.distributed.is_available() and torch.distributed.is_initialized()
-            else 1
-        )
         world_size_changed = (
             saved_world_size is not None and int(saved_world_size) != current_world_size
         )
@@ -2112,7 +2121,7 @@ class CIDTrainer:
                     == current_geometry[0] * current_geometry[1] * current_world_size
                 )
             if not (
-                clean_epoch_boundary
+                (clean_epoch_boundary or portable_partial_resume)
                 and equivalent_geometry
                 and saved_without_geometry == current_without_geometry
             ):
@@ -2164,7 +2173,11 @@ class CIDTrainer:
             transitions_seen=int(state["transitions_seen"]),
             optimizer_steps=int(state["optimizer_steps"]),
             epochs_completed=int(state.get("epochs_completed", 0)),
-            rollout_windows_seen_in_epoch=int(state.get("rollout_windows_seen_in_epoch", 0)),
+            rollout_windows_seen_in_epoch=(
+                0
+                if portable_partial_resume
+                else int(state.get("rollout_windows_seen_in_epoch", 0))
+            ),
         )
         self.optimizer.zero_grad(set_to_none=True)
         self._reduced_gradient_accumulator.clear()
@@ -2182,10 +2195,20 @@ class CIDTrainer:
             saved_global_examples = self._pending_examples * world_size
         self._pending_global_examples = int(saved_global_examples)
         gradient_state = checkpoint.get("gradient_state", {})
+        gradient_world_size_scale = (
+            float(saved_world_size) / float(current_world_size)
+            if portable_partial_resume and gradient_state
+            else 1.0
+        )
         parameters = dict(self._trainable)
         for name, saved in gradient_state.items():
             parameter = parameters[name]
-            parameter.grad = saved.to(device=parameter.device, dtype=parameter.dtype)
+            restored_gradient = saved.to(
+                device=parameter.device, dtype=parameter.dtype
+            )
+            if gradient_world_size_scale != 1.0:
+                restored_gradient.mul_(gradient_world_size_scale)
+            parameter.grad = restored_gradient
         if self._pending_accumulation == 0 and (
             self._pending_examples or self._pending_global_examples or gradient_state
         ):
@@ -2196,6 +2219,12 @@ class CIDTrainer:
             raise ValueError("checkpoint pending accumulation has an invalid example count")
         self._pending_ddp_unsynced = False
         self._pending_fsdp_unsynced = False
+        return {
+            "world_size": saved_world_size,
+            "trainer_state": dict(trainer_state),
+            "data_order_version": int(checkpoint.get("data_order_version", 1)),
+            "epoch_progress": checkpoint.get("epoch_progress"),
+        }
 
     def _optimizer_step(self) -> None:
         if self._stage_a_cpu_gradient_accumulator:

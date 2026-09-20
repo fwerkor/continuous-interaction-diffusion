@@ -4795,6 +4795,98 @@ def test_checkpoint_rejects_world_size_change_mid_epoch(tmp_path) -> None:
         restored.load_checkpoint(checkpoint)
 
 
+def test_checkpoint_allows_portable_world_size_change_mid_epoch(tmp_path) -> None:
+    adapter = make_adapter(seed=330)
+    trainer = CIDTrainer(
+        adapter,
+        ILLaDATrajectoryTensorizer(adapter, TinyTokenizer()),
+        CIDTrainerConfig(micro_batch_size=1, gradient_accumulation_steps=2),
+    )
+    trainer.data_order_version = 5
+    trainer.state = CIDTrainerState(
+        transitions_seen=96,
+        optimizer_steps=3,
+        rollout_windows_seen_in_epoch=8,
+    )
+    checkpoint = tmp_path / "portable-mid-epoch.pt"
+    trainer.save_checkpoint(checkpoint)
+    payload = torch.load(checkpoint, map_location="cpu", weights_only=False)
+    payload["world_size"] = 4
+    torch.save(payload, checkpoint)
+
+    restored_adapter = make_adapter(seed=330)
+    restored = CIDTrainer(
+        restored_adapter,
+        ILLaDATrajectoryTensorizer(restored_adapter, TinyTokenizer()),
+        CIDTrainerConfig(micro_batch_size=1, gradient_accumulation_steps=8),
+    )
+    metadata = restored.load_checkpoint(
+        checkpoint, allow_partial_world_size_change=True
+    )
+
+    assert restored.state.optimizer_steps == 3
+    assert restored.state.rollout_windows_seen_in_epoch == 0
+    assert metadata["world_size"] == 4
+    assert metadata["trainer_state"]["rollout_windows_seen_in_epoch"] == 8
+
+
+def test_checkpoint_rescales_pending_gradients_for_portable_world_size_change(
+    tmp_path,
+) -> None:
+    source_config = CIDTrainerConfig(
+        gradient_accumulation_steps=2,
+        timestep_min=1.0,
+        timestep_max=1.0,
+        seed=19,
+    )
+    example = make_rollout_trajectory()
+    adapter = make_adapter(seed=331)
+    trainer = CIDTrainer(
+        adapter,
+        ILLaDATrajectoryTensorizer(adapter, TinyTokenizer()),
+        source_config,
+    )
+    trainer.data_order_version = 5
+    trainer.train_transition(example, 0)
+    trainer.state = CIDTrainerState(
+        transitions_seen=trainer.state.transitions_seen,
+        optimizer_steps=trainer.state.optimizer_steps,
+        epochs_completed=0,
+        rollout_windows_seen_in_epoch=8,
+    )
+    checkpoint = tmp_path / "portable-pending-mid-epoch.pt"
+    trainer.save_checkpoint(checkpoint)
+    payload = torch.load(checkpoint, map_location="cpu", weights_only=False)
+    original_gradients = {
+        name: gradient.clone() for name, gradient in payload["gradient_state"].items()
+    }
+    payload["world_size"] = 4
+    payload["pending_global_examples"] = 4
+    payload["gradient_state"] = {
+        name: gradient / 4 for name, gradient in original_gradients.items()
+    }
+    torch.save(payload, checkpoint)
+
+    restored_adapter = make_adapter(seed=331)
+    restored = CIDTrainer(
+        restored_adapter,
+        ILLaDATrajectoryTensorizer(restored_adapter, TinyTokenizer()),
+        CIDTrainerConfig(
+            gradient_accumulation_steps=8,
+            timestep_min=1.0,
+            timestep_max=1.0,
+            seed=19,
+        ),
+    )
+    restored.load_checkpoint(checkpoint, allow_partial_world_size_change=True)
+
+    restored_parameters = dict(restored_adapter.named_parameters())
+    for name, original in original_gradients.items():
+        assert torch.allclose(restored_parameters[name].grad, original)
+    assert restored.pending_accumulation_steps == 1
+    assert restored.state.rollout_windows_seen_in_epoch == 0
+
+
 def test_checkpoint_rejects_legacy_partial_epoch_without_world_size(tmp_path) -> None:
     adapter = make_adapter(seed=324)
     trainer = CIDTrainer(

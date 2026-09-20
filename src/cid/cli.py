@@ -1886,6 +1886,7 @@ def _train_stage_a(args: argparse.Namespace) -> None:
         materialize_indexed_rollout_windows,
         shard_rollout_windows,
         stage_a_gradient_accumulation_steps,
+        stage_b_consumed_windows_by_bucket,
         trajectory_rollout_windows,
         wrap_stage_a_ddp,
     )
@@ -2059,7 +2060,11 @@ def _train_stage_a(args: argparse.Namespace) -> None:
                 f"{checkpoint.stem}.optimizer-rank-{shard_rank:04d}{checkpoint.suffix}"
             )
 
-        def save_stage_a_checkpoint(checkpoint: Path) -> None:
+        def save_stage_a_checkpoint(
+            checkpoint: Path,
+            *,
+            epoch_progress: dict[str, object] | None = None,
+        ) -> None:
             trainer.prepare_checkpoint()
             if args.zero_redundancy_optimizer and distributed:
                 optimizer_shard = zro_optimizer_shard_path(checkpoint, rank)
@@ -2077,14 +2082,17 @@ def _train_stage_a(args: argparse.Namespace) -> None:
                     include_optimizer_state=not (
                         args.zero_redundancy_optimizer and distributed
                     ),
+                    epoch_progress=epoch_progress,
                 )
             if distributed:
                 dist.barrier()
 
+        loaded_checkpoint_metadata = None
         if args.resume:
-            trainer.load_checkpoint(
+            loaded_checkpoint_metadata = trainer.load_checkpoint(
                 args.resume,
                 expected_dataset_sha256=dataset_manifest.sha256,
+                allow_partial_world_size_change=True,
             )
             if args.zero_redundancy_optimizer and distributed:
                 optimizer_shard = zro_optimizer_shard_path(Path(args.resume), rank)
@@ -2102,9 +2110,32 @@ def _train_stage_a(args: argparse.Namespace) -> None:
                     for key, value in local.items():
                         if key != "params":
                             exposed[key] = value
+        saved_world_size = (
+            int(loaded_checkpoint_metadata["world_size"])
+            if loaded_checkpoint_metadata is not None
+            and loaded_checkpoint_metadata.get("world_size") is not None
+            else world_size
+        )
+        world_size_changed = saved_world_size != world_size
+        saved_partial_windows = (
+            int(
+                loaded_checkpoint_metadata["trainer_state"].get(
+                    "rollout_windows_seen_in_epoch", 0
+                )
+            )
+            if loaded_checkpoint_metadata is not None
+            else 0
+        )
+        resume_epoch_progress = (
+            loaded_checkpoint_metadata.get("epoch_progress")
+            if loaded_checkpoint_metadata is not None
+            else None
+        )
         if distributed:
             trainer.reseed(args.seed + rank + trainer.state.transitions_seen * 104729)
-        if trainer.state.rollout_windows_seen_in_epoch == 0:
+        if trainer.state.rollout_windows_seen_in_epoch == 0 and not (
+            world_size_changed and saved_partial_windows
+        ):
             trainer.data_order_version = max(trainer.data_order_version, 5)
 
         examples, validation_examples = _index_train_and_load_validation_examples(
@@ -2190,6 +2221,49 @@ def _train_stage_a(args: argparse.Namespace) -> None:
             trainer.state.optimizer_steps // args.checkpoint_every_steps + 1
         ) * args.checkpoint_every_steps
         for epoch in range(first_epoch, args.epochs + 1):
+            epoch_base_consumed: dict[str, int] = {}
+            if epoch == first_epoch and args.resume:
+                if resume_epoch_progress is not None:
+                    if int(resume_epoch_progress.get("epoch", epoch)) != epoch:
+                        raise ValueError(
+                            "Stage A checkpoint epoch cursor does not match trainer state"
+                        )
+                    cursor_name = (
+                        "consumed_by_bucket"
+                        if world_size_changed
+                        else "base_consumed_by_bucket"
+                    )
+                    epoch_base_consumed = {
+                        str(key): int(value)
+                        for key, value in resume_epoch_progress.get(
+                            cursor_name, {}
+                        ).items()
+                    }
+                elif world_size_changed and saved_partial_windows:
+                    if trainer.data_order_version < 4:
+                        raise ValueError(
+                            "cross-world-size Stage A mid-epoch resume requires "
+                            "data-order v4 or newer"
+                        )
+                    saved_epoch_shard = shard_rollout_windows(
+                        windows,
+                        world_size=saved_world_size,
+                        rank=0,
+                        seed=args.seed,
+                        epoch=epoch,
+                        shuffle=not args.no_shuffle,
+                        micro_batch_size=args.micro_batch_size,
+                        length_aware=trainer.data_order_version >= 2,
+                        zero_gradient_padding=trainer.data_order_version >= 3,
+                        portable_bucket_order=trainer.data_order_version >= 4,
+                        balanced_bucket_order=trainer.data_order_version >= 5,
+                    )
+                    epoch_base_consumed = stage_b_consumed_windows_by_bucket(
+                        windows,
+                        saved_epoch_shard,
+                        local_windows_seen=saved_partial_windows,
+                        world_size=saved_world_size,
+                    )
             legacy_partial_resume = bool(
                 args.resume
                 and epoch == first_epoch
@@ -2198,7 +2272,7 @@ def _train_stage_a(args: argparse.Namespace) -> None:
                     windows_seen_in_epoch=trainer.state.rollout_windows_seen_in_epoch,
                 )
             )
-            local_windows = shard_rollout_windows(
+            epoch_shard = shard_rollout_windows(
                 windows,
                 world_size=world_size,
                 rank=rank,
@@ -2206,14 +2280,22 @@ def _train_stage_a(args: argparse.Namespace) -> None:
                 epoch=epoch,
                 shuffle=not args.no_shuffle,
                 micro_batch_size=args.micro_batch_size,
+                consumed_windows_by_bucket=epoch_base_consumed,
                 legacy_resume_padding=legacy_partial_resume,
                 length_aware=trainer.data_order_version >= 2,
                 zero_gradient_padding=trainer.data_order_version >= 3,
                 portable_bucket_order=trainer.data_order_version >= 4,
                 balanced_bucket_order=trainer.data_order_version >= 5,
             )
+            local_windows = epoch_shard
             total_local_windows = len(local_windows)
             resumed_windows = trainer.state.rollout_windows_seen_in_epoch
+            if world_size_changed and rank == 0 and epoch == first_epoch:
+                print(
+                    f"elastic-resume stage=A old_world_size={saved_world_size} "
+                    f"new_world_size={world_size} optimizer_steps={trainer.state.optimizer_steps}",
+                    flush=True,
+                )
             if legacy_partial_resume and distributed and metrics_path.exists():
                 rank_cursor = None
                 with metrics_path.open("r", encoding="utf-8") as handle:
@@ -2282,6 +2364,8 @@ def _train_stage_a(args: argparse.Namespace) -> None:
                 current_epoch: int = epoch,
                 current_rollout_probability: float = rollout_probability,
                 current_total_windows: int = total_local_windows,
+                current_epoch_shard=epoch_shard,
+                current_base_consumed=epoch_base_consumed,
             ) -> None:
                 nonlocal next_checkpoint_step
                 interval_transitions = progress.transitions
@@ -2329,7 +2413,21 @@ def _train_stage_a(args: argparse.Namespace) -> None:
                     # the checkpoint.  Otherwise rank 0 enters gradient all-reduces while
                     # its peers advance to different collectives and NCCL sequences diverge.
                     checkpoint = output_dir / "stage-a-latest.pt"
-                    save_stage_a_checkpoint(checkpoint)
+                    consumed_by_bucket = stage_b_consumed_windows_by_bucket(
+                        windows,
+                        current_epoch_shard,
+                        local_windows_seen=progress.rollout_windows_seen_in_epoch,
+                        world_size=world_size,
+                        base_consumed_by_bucket=current_base_consumed,
+                    )
+                    save_stage_a_checkpoint(
+                        checkpoint,
+                        epoch_progress={
+                            "epoch": current_epoch,
+                            "base_consumed_by_bucket": current_base_consumed,
+                            "consumed_by_bucket": consumed_by_bucket,
+                        },
+                    )
                     if rank == 0:
                         print(
                             f"checkpoint optimizer_steps={progress.optimizer_steps} "
