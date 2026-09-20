@@ -30,20 +30,18 @@ DEFAULT_MAX_DISPLAY_TOKENS = 1536
 
 def _chunked_illada_mlp_forward(module: nn.Module, x: torch.Tensor) -> torch.Tensor:
     chunk_size = int(module._cid_mlp_chunk_size)
+    dropout = getattr(module, "dropout", None)
+
+    def run_chunk(chunk: torch.Tensor) -> torch.Tensor:
+        output = module.down_proj(module.act_fn(module.gate_proj(chunk)) * module.up_proj(chunk))
+        return dropout(output) if dropout is not None else output
+
     if x.ndim != 3 or x.shape[1] <= chunk_size:
-        return module.dropout(
-            module.down_proj(module.act_fn(module.gate_proj(x)) * module.up_proj(x))
-        )
+        return run_chunk(x)
     outputs = []
     for start in range(0, x.shape[1], chunk_size):
         chunk = x[:, start : start + chunk_size]
-        outputs.append(
-            module.dropout(
-                module.down_proj(
-                    module.act_fn(module.gate_proj(chunk)) * module.up_proj(chunk)
-                )
-            )
-        )
+        outputs.append(run_chunk(chunk))
     return torch.cat(outputs, dim=1)
 
 
@@ -865,18 +863,22 @@ class ILLaDACIDAdapter(nn.Module):
             return
         if chunk_size <= 0:
             raise ValueError("MLP chunk size must be positive")
-        if self.is_llada_moe or self.backbone_family in {"lfm2", *AR_CID_MODEL_TYPES}:
+        if self.is_llada_moe or self.backbone_family == "lfm2":
             return
         decoder = self.hidden_backbone()
         layers = getattr(decoder, "layers", None)
         if layers is None or len(layers) == 0:
             raise RuntimeError("iLLaDA decoder does not expose layers for MLP chunking")
-        resid_pdrop = float(getattr(self.backbone.config, "resid_pdrop", 0.0))
-        if resid_pdrop != 0.0:
-            raise RuntimeError("exact MLP chunking requires zero residual dropout")
+        is_ar_backbone = self.backbone_family in AR_CID_MODEL_TYPES
+        if not is_ar_backbone:
+            resid_pdrop = float(getattr(self.backbone.config, "resid_pdrop", 0.0))
+            if resid_pdrop != 0.0:
+                raise RuntimeError("exact MLP chunking requires zero residual dropout")
         for layer in layers:
             mlp = getattr(layer, "mlp", None)
-            required = ("gate_proj", "up_proj", "down_proj", "act_fn", "dropout")
+            required = ("gate_proj", "up_proj", "down_proj", "act_fn")
+            if not is_ar_backbone:
+                required = (*required, "dropout")
             if mlp is None or any(not hasattr(mlp, name) for name in required):
                 raise RuntimeError("iLLaDA decoder layer does not expose the expected MLP")
             mlp._cid_mlp_chunk_size = int(chunk_size)
