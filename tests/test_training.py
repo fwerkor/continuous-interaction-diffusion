@@ -882,6 +882,22 @@ def test_optimizer_step_rejects_nonfinite_gradient_before_parameter_update() -> 
     assert trainer.state.optimizer_steps == 0
 
 
+def test_distributed_all_true_requires_unanimous_rank_readiness(monkeypatch) -> None:
+    monkeypatch.setattr(torch.distributed, "is_available", lambda: True)
+    monkeypatch.setattr(torch.distributed, "is_initialized", lambda: True)
+
+    def reject_on_peer(flag, *, op) -> None:
+        assert op == torch.distributed.ReduceOp.MIN
+        flag.zero_()
+
+    monkeypatch.setattr(torch.distributed, "all_reduce", reject_on_peer)
+
+    assert not cid_training._distributed_all_true(
+        True,
+        device=torch.device("cpu"),
+    )
+
+
 def test_stage_a_cpu_stash_resume_keeps_pending_gradients_off_device(
     tmp_path: Path,
 ) -> None:

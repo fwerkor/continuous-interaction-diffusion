@@ -89,6 +89,19 @@ class CIDRolloutRecoveryError(ValueError):
     """A closed-loop model state cannot be reconciled with the teacher under runtime limits."""
 
 
+def _distributed_all_true(value: bool, *, device: torch.device) -> bool:
+    """Return true only when every distributed rank reports true."""
+
+    if not (
+        torch.distributed.is_available()
+        and torch.distributed.is_initialized()
+    ):
+        return bool(value)
+    flag = torch.tensor(int(value), device=device, dtype=torch.int32)
+    torch.distributed.all_reduce(flag, op=torch.distributed.ReduceOp.MIN)
+    return bool(flag.item())
+
+
 def _trainer_frozen_semantic_snapshot(trainer: Any) -> dict[str, Any] | None:
     tensorizer = getattr(trainer, "tensorizer", None)
     encoder = getattr(tensorizer, "text_encoder", None)
@@ -1380,19 +1393,32 @@ class CIDTrainer:
                     pack_saved_tensor,
                     unpack_saved_tensor,
                 )
-        use_async_stage_a_reduce = bool(
-            self.stage_a_async_gradient_reduction
-            and stage_a_ddp
-            and will_step
-            and not use_stage_a_cpu_stash
+        async_stage_a_reduce_requested = bool(
+            self.stage_a_async_gradient_reduction and stage_a_ddp and will_step
         )
-        if use_async_stage_a_reduce and self._stage_a_gradient_reducer is None:
+        if async_stage_a_reduce_requested and self._stage_a_gradient_reducer is None:
             engine = native_engine(capability="AsyncBucketedGradientReducer")
             if engine is not None:
                 self._stage_a_gradient_reducer = engine.AsyncBucketedGradientReducer(
                     self._trainable,
                     bucket_cap_mb=25.0,
                 )
+        # Sequence geometry is rank-local, so one rank can enter the CPU gradient
+        # stash path while another rank remains eligible for asynchronous reduction.
+        # Mixing those paths at the same optimizer boundary corrupts the collective
+        # sequence: the async rank launches reducer buckets from backward hooks while
+        # the stashing rank later enters the deterministic manual reducer.  Require a
+        # unanimous decision before any rank starts the async reducer.
+        use_async_stage_a_reduce = bool(
+            async_stage_a_reduce_requested
+            and self._stage_a_gradient_reducer is not None
+            and not use_stage_a_cpu_stash
+        )
+        if async_stage_a_reduce_requested:
+            use_async_stage_a_reduce = _distributed_all_true(
+                use_async_stage_a_reduce,
+                device=training_batch.batch.thought_semantic.device,
+            )
         reducer = self._stage_a_gradient_reducer if use_async_stage_a_reduce else None
         reducer_started = False
         reducer_finished = False
