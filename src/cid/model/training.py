@@ -5407,6 +5407,64 @@ def shard_rollout_windows(
     return tuple(window for microbatch in local_microbatches for window in microbatch)
 
 
+class _StageAManualDataParallel(torch.nn.Module):
+    def __init__(self, adapter: ILLaDACIDAdapter, *, frozen_backbone_sharded: bool) -> None:
+        super().__init__()
+        self.module = adapter
+        self._cid_stage_a_ddp = True
+        self._cid_stage_a_manual_data_parallel = True
+        self._cid_frozen_backbone_sharded = frozen_backbone_sharded
+
+    def no_sync(self):
+        return nullcontext()
+
+    def forward(self, *args, **kwargs):
+        return self.module(*args, **kwargs)
+
+
+def wrap_stage_a_frozen_shard(
+    adapter: ILLaDACIDAdapter,
+    *,
+    device_id: int | torch.device,
+    compute_dtype: torch.dtype = torch.bfloat16,
+    aggressive_prefetch: bool = True,
+) -> torch.nn.Module:
+    if not torch.distributed.is_available() or not torch.distributed.is_initialized():
+        raise RuntimeError("Stage A frozen-backbone sharding requires distributed training")
+    from cid.model.native_engine import native_engine
+
+    engine = native_engine(capability="shard_frozen_transformer")
+    if engine is None:
+        raise RuntimeError("Stage A frozen-backbone sharding requires cid-engine support")
+
+    decoder = adapter.hidden_backbone()
+    layers = getattr(decoder, "layers", None)
+    if layers is None or len(layers) == 0:
+        raise ValueError("Stage A frozen-backbone sharding requires transformer layers")
+    if any(parameter.requires_grad for parameter in decoder.parameters()):
+        raise ValueError("Stage A frozen-backbone sharding requires a frozen decoder")
+
+    ignored_modules = []
+    input_embeddings = adapter.input_embeddings
+    if any(module is input_embeddings for module in decoder.modules()):
+        ignored_modules.append(input_embeddings)
+
+    sharded_decoder = engine.shard_frozen_transformer(
+        decoder,
+        transformer_layer_cls=type(layers[0]),
+        device_id=device_id,
+        ignored_modules=tuple(ignored_modules),
+        compute_dtype=compute_dtype,
+        aggressive_prefetch=aggressive_prefetch,
+    )
+    adapter.replace_hidden_backbone(sharded_decoder)
+
+    for parameter in adapter.parameters():
+        if parameter.requires_grad:
+            torch.distributed.broadcast(parameter.data, src=0)
+    return _StageAManualDataParallel(adapter, frozen_backbone_sharded=True)
+
+
 def wrap_stage_a_ddp(
     adapter: ILLaDACIDAdapter,
     *,

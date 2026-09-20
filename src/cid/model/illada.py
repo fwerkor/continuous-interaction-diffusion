@@ -768,6 +768,19 @@ class ILLaDACIDAdapter(nn.Module):
             raise RuntimeError("diffusion backbone does not expose a hidden-state model")
         return get_decoder()
 
+    def replace_hidden_backbone(self, replacement: nn.Module) -> None:
+        current = self.hidden_backbone()
+        if self.backbone_family == "lfm2":
+            self.backbone.lfm2 = replacement
+            return
+        for name, child in self.backbone.named_children():
+            if child is current:
+                setattr(self.backbone, name, replacement)
+                if self.hidden_backbone() is not replacement:
+                    raise RuntimeError("backbone decoder replacement did not take effect")
+                return
+        raise RuntimeError("diffusion backbone decoder is not a direct child module")
+
     def pack_frozen_moe_experts(self) -> int:
         """Pack frozen MoE experts for compact Stage A execution.
 

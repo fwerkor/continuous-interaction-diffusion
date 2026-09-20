@@ -67,6 +67,7 @@ stage_b_optimizer_steps_per_epoch = cid_model.stage_b_optimizer_steps_per_epoch
 trajectory_rollout_windows = cid_model.trajectory_rollout_windows
 trajectory_transitions = cid_model.trajectory_transitions
 wrap_stage_a_ddp = cid_model.wrap_stage_a_ddp
+wrap_stage_a_frozen_shard = cid_model.wrap_stage_a_frozen_shard
 wrap_stage_b_fsdp = cid_model.wrap_stage_b_fsdp
 cid_loss = cid_model.cid_loss
 target_positive_mass_bce = cid_losses._target_positive_mass_binary_cross_entropy
@@ -1398,6 +1399,54 @@ def test_trajectory_tensorizer_ignores_randomized_physical_slot_placement() -> N
     assert torch.equal(left.targets.allocation_mask, right.targets.allocation_mask)
     assert torch.equal(left.targets.thought_mask, right.targets.thought_mask)
     assert torch.equal(left.targets.source_targets, right.targets.source_targets)
+
+
+def test_stage_a_frozen_shard_preserves_training_update(tmp_path: Path) -> None:
+    rendezvous = tmp_path / "stage-a-shard-init"
+    torch.distributed.init_process_group(
+        "gloo",
+        init_method=f"file://{rendezvous}",
+        rank=0,
+        world_size=1,
+    )
+    try:
+        config = CIDTrainerConfig(
+            learning_rate=1e-3,
+            micro_batch_size=1,
+            gradient_accumulation_steps=1,
+            timestep_min=0.0,
+            timestep_max=0.0,
+        )
+        reference_adapter = make_adapter(seed=165)
+        reference = CIDTrainer(
+            reference_adapter,
+            ILLaDATrajectoryTensorizer(reference_adapter, TinyTokenizer()),
+            config,
+        )
+        sharded_adapter = make_adapter(seed=165)
+        sharded_forward = wrap_stage_a_frozen_shard(
+            sharded_adapter,
+            device_id=torch.device("cpu"),
+            compute_dtype=torch.float32,
+        )
+        sharded = CIDTrainer(
+            sharded_adapter,
+            ILLaDATrajectoryTensorizer(sharded_adapter, TinyTokenizer()),
+            config,
+            forward_model=sharded_forward,
+        )
+
+        example = make_trajectory()
+        reference.train_transition(example, 0)
+        sharded.train_transition(example, 0)
+
+        reference_parameters = dict(reference_adapter.named_parameters())
+        sharded_parameters = dict(sharded_adapter.named_parameters())
+        for name in reference.trainable_parameter_names:
+            torch.testing.assert_close(sharded_parameters[name], reference_parameters[name])
+        assert getattr(sharded_forward, "_cid_frozen_backbone_sharded", False)
+    finally:
+        torch.distributed.destroy_process_group()
 
 
 def test_trainer_uses_configured_micro_batches() -> None:

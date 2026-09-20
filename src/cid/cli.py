@@ -1889,6 +1889,7 @@ def _train_stage_a(args: argparse.Namespace) -> None:
         stage_b_consumed_windows_by_bucket,
         trajectory_rollout_windows,
         wrap_stage_a_ddp,
+        wrap_stage_a_frozen_shard,
     )
     from cid.model.benchmark import run_neural_benchmark_case
     from cid.model.encoding import ILLaDATextEncoder
@@ -1990,18 +1991,28 @@ def _train_stage_a(args: argparse.Namespace) -> None:
         tensorizer = ILLaDATrajectoryTensorizer(
             adapter, tokenizer, text_encoder=text_encoder
         )
-        forward_model = (
-            wrap_stage_a_ddp(
+        if args.frozen_backbone_sharding:
+            if not distributed:
+                raise ValueError("--frozen-backbone-sharding requires distributed Stage A")
+            forward_model = wrap_stage_a_frozen_shard(
                 adapter,
-                device_ids=(
-                    [local_rank]
-                    if str(device).split(":", 1)[0] in {"cuda", "npu"}
-                    else None
-                ),
+                device_id=torch.device(device),
+                compute_dtype=dtype,
+                aggressive_prefetch=True,
             )
-            if distributed
-            else adapter
-        )
+        else:
+            forward_model = (
+                wrap_stage_a_ddp(
+                    adapter,
+                    device_ids=(
+                        [local_rank]
+                        if str(device).split(":", 1)[0] in {"cuda", "npu"}
+                        else None
+                    ),
+                )
+                if distributed
+                else adapter
+            )
         if dtype is not torch.float32:
             forward_model = wrap_torch_autocast(
                 torch,

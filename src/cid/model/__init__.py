@@ -90,6 +90,7 @@ from cid.model.training import (
     trajectory_rollout_windows,
     trajectory_transitions,
     wrap_stage_a_ddp,
+    wrap_stage_a_frozen_shard,
     wrap_stage_b_fsdp,
 )
 
@@ -168,6 +169,7 @@ __all__ = [
     "trajectory_rollout_windows",
     "trajectory_transitions",
     "wrap_stage_a_ddp",
+    "wrap_stage_a_frozen_shard",
     "wrap_stage_b_fsdp",
     "AnchorCandidate",
     "ArgumentCandidate",

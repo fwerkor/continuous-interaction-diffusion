@@ -22,3 +22,11 @@ def cuda_engine(
     if capability is not None and getattr(_ENGINE, capability, None) is None:
         return None
     return _ENGINE
+
+
+def native_engine(*, capability: str | None = None) -> ModuleType | None:
+    if _ENGINE is None:
+        return None
+    if capability is not None and getattr(_ENGINE, capability, None) is None:
+        return None
+    return _ENGINE
