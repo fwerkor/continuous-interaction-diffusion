@@ -49,6 +49,19 @@ def _chunked_illada_rms_norm_forward(
     module: nn.Module,
     hidden_states: torch.Tensor,
 ) -> torch.Tensor:
+    # Modern PyTorch dispatches rms_norm to a fused backend that avoids the large
+    # FP32 intermediate which originally forced token chunking.  Keep the legacy
+    # chunked implementation only for older supported Torch builds.
+    rms_norm = getattr(torch.nn.functional, "rms_norm", None)
+    if rms_norm is not None:
+        normalized = rms_norm(
+            hidden_states.to(torch.float32),
+            (hidden_states.shape[-1],),
+            None,
+            module.variance_epsilon,
+        ).to(hidden_states.dtype)
+        return module.weight * normalized
+
     chunk_size = int(module._cid_norm_chunk_size)
     if hidden_states.ndim != 3 or hidden_states.shape[1] <= chunk_size:
         input_dtype = hidden_states.dtype
