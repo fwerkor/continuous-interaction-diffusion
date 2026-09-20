@@ -37,8 +37,8 @@ from importlib.metadata import version
 import cid_engine
 
 parts = tuple(int(part) for part in version("cid-engine").split(".")[:3])
-if parts < (0, 6, 0):
-    raise SystemExit(f"cid-engine>=0.6.0 required, found {cid_engine.__version__}")
+if parts < (0, 7, 1):
+    raise SystemExit(f"cid-engine>=0.7.1 required, found {cid_engine.__version__}")
 if not cid_engine.CUDA_BACKEND_BUILT:
     raise SystemExit("cid-engine CUDA backend is required")
 PY

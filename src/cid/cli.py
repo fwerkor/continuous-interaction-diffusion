@@ -2093,6 +2093,8 @@ def _train_stage_a(args: argparse.Namespace) -> None:
         if args.frozen_backbone_sharding:
             if not distributed:
                 raise ValueError("--frozen-backbone-sharding requires distributed Stage A")
+            if device_type != "cuda":
+                raise ValueError("--frozen-backbone-sharding is currently supported only on CUDA")
             forward_model = wrap_stage_a_frozen_shard(
                 adapter,
                 device_id=torch.device(device),

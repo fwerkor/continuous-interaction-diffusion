@@ -144,9 +144,12 @@ backends; backend support is not maintained as separate model forks:
 | CID-v1-2B | MiniCPM5-2B-Base | code path | code path | code path |
 | CID-v1-0.4B | LFM2.5-Encoder-350M-Diffusion | supported | supported | supported |
 
-Stage A uses the same DDP path on CUDA and NPU. Stage B uses FSDP `FULL_SHARD` for multi-rank
-accelerator training; the compact 0.4B path additionally supports one-NPU BF16 full-parameter
-training without FSDP. See `docs/training.md` for device-specific launch and checkpoint details.
+Stage A defaults to the same DDP path on CUDA and NPU. CUDA Stage A can optionally use
+`--frozen-backbone-sharding` to `FULL_SHARD` only the immutable transformer while CID trainable
+state remains replicated and is reduced at optimizer boundaries. Stage B uses FSDP `FULL_SHARD` for
+multi-rank accelerator training; the compact 0.4B path additionally supports one-NPU BF16
+full-parameter training without FSDP. See `docs/training.md` for device-specific launch and
+checkpoint details.
 
 ```python
 import torch
@@ -460,8 +463,11 @@ torchrun --standalone --nproc-per-node=6 -m cid.cli train \
 ```
 
 Each rank loads the pinned 8B backbone serially before moving it to its GPU, avoiding six concurrent
-CPU copies during startup. DDP synchronizes only trainable CID state; frozen backbone parameters and
-buffers are excluded from initialization sync.
+CPU copies during startup. The default DDP path synchronizes only trainable CID state; frozen
+backbone parameters and buffers are excluded from initialization sync. On CUDA systems with enough
+inter-GPU bandwidth, `--frozen-backbone-sharding` instead shards the frozen decoder block-by-block
+and overlaps parameter all-gather with compute while retaining exact optimizer-boundary reduction
+of the replicated CID parameters.
 
 For 8×A6000 48 GiB iLLaDA-8B production runs, use
 `scripts/train-cid-v1-8b-8xa6000.sh`. It runs the three-epoch Stage A curriculum and a one-epoch
@@ -516,7 +522,14 @@ then the configured maximum, 1536 by default). The realized text is terminated b
 after EOS receive no token loss. This avoids paying for a 1536-token canvas on short examples while
 keeping every released target representable without truncation. Within self-rollout a display bucket
 may grow but never shrink. Gradient checkpointing is enabled by default for the native iLLaDA stack
-and can be disabled with `--no-gradient-checkpointing`. `--target-global-batch-size` recomputes
+and can be disabled with `--no-gradient-checkpointing`. With cid-engine 0.7.1,
+`--selective-checkpoint-memory-budget-gib` or `--selective-checkpoint-fraction` checkpoints only a
+deterministic subset of decoder layers instead of rematerializing the whole backbone. Long CUDA
+examples use bounded asynchronous pinned activation offload with configurable
+`--stage-a-activation-offload-*` controls. `--flatten-teacher-forcing-horizon` can fuse independent
+rollout offsets during the pure teacher-forcing phase; it preserves the original physical-microbatch
+loss normalization and automatically falls back when dropout, backbone training, or self-rollout
+would make flattening non-equivalent. `--target-global-batch-size` recomputes
 accumulation from the actual world size: at micro-batch 1 and target 96, four ranks use accumulation
 24 and eight ranks use 12. This lets an 8B Stage A run move between 4 and 8 GPUs at a completed-epoch
 checkpoint without doubling or halving its optimization batch. World-size changes remain forbidden
@@ -530,7 +543,7 @@ progress, RNG state, and the training-dataset SHA-256; they
 do not duplicate the frozen backbone. At every completed epoch, the trainer writes a permanent
 `stage-a-epoch-XXXX.pt` snapshot; `stage-a-latest.pt` and the corresponding step name are compatibility
 symlinks to that epoch snapshot. Resume with `--resume <checkpoint>`. A clean epoch-boundary resume
-may change DDP world size when the resolved global effective batch is unchanged; partial-epoch
+may change the Stage A data-parallel world size when the resolved global effective batch is unchanged; partial-epoch
 checkpoints must resume with their original world size. When held-out trajectories are
 provided with `--validation-data` (or are present in `--data` with `metadata.split=validation`), the
 trainer computes a deterministic teacher-forced validation loss after every epoch and appends it to

@@ -137,9 +137,13 @@ accumulation from the actual world size while keeping the global effective trans
 For example, micro-batch 1 with target batch 96 resolves to accumulation 24 on four ranks and 12 on
 eight ranks. `--gradient-accumulation-steps` remains an explicit override, and omitting both options
 keeps the legacy default of eight accumulation steps. Accumulated gradients are normalized by
-example count, which prevents a smaller final micro-batch from being overweighted. Native backbone gradient checkpointing is enabled by the launcher
-by default to reduce activation
-memory while retaining gradients to CID inputs through the frozen backbone. The adapter also
+example count, which prevents a smaller final micro-batch from being overweighted. Native backbone
+gradient checkpointing is enabled by the launcher by default to reduce activation memory while
+retaining gradients to CID inputs through the frozen backbone. On CUDA, cid-engine 0.7.1 adds
+optional frozen-decoder `FULL_SHARD`, bounded asynchronous pinned activation offload, and selective
+layer checkpointing. `--flatten-teacher-forcing-horizon` additionally combines independent offsets
+only while rollout probability is zero; grouped loss masks retain the original per-physical-batch
+objective exactly. The adapter also
 constructs per-sample position IDs from valid prompt and
 display lengths. Padding introduced by another sample therefore does not alter the logical
 positions of a trajectory's display tokens.
@@ -171,7 +175,10 @@ modules retained in FP32, and thresholded runtime probabilities are evaluated in
 bootstrap transition also uses the same canonical Display as runtime (`MASK`, `EOS`, then latent
 capacity). Stage A checkpoints bind resume cursors to the exact training JSONL SHA-256.
 
-This DDP path is for the frozen-backbone Stage A phase.
+The default DDP path is for frozen-backbone Stage A. CUDA runs may instead pass
+`--frozen-backbone-sharding` when parameter all-gather bandwidth is sufficient; this shards only the
+frozen transformer and keeps CID trainable state data-parallel. It is intentionally opt-in because
+PCIe-only topologies can trade memory headroom for enough communication to reduce throughput.
 
 ### Stage B FSDP full-parameter launcher
 
