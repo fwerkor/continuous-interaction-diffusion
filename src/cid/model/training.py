@@ -632,6 +632,8 @@ class CIDTrainer:
         preserve_reduced_gradients: bool | None = None,
         cpu_gradient_stash_threshold_tokens: int | None = None,
         stage_a_activation_offload_threshold_tokens: int = 512,
+        stage_a_activation_offload_budget_bytes: int | None = None,
+        stage_a_activation_offload_prefetch_depth: int = 2,
     ) -> None:
         if tensorizer.adapter is not adapter:
             raise ValueError("trainer and trajectory tensorizer must share the same adapter")
@@ -653,6 +655,21 @@ class CIDTrainer:
             raise ValueError("Stage A activation-offload threshold must be positive")
         self.stage_a_activation_offload_threshold_tokens = (
             stage_a_activation_offload_threshold_tokens
+        )
+        if (
+            stage_a_activation_offload_budget_bytes is not None
+            and stage_a_activation_offload_budget_bytes <= 0
+        ):
+            raise ValueError("Stage A activation-offload budget must be positive")
+        if stage_a_activation_offload_prefetch_depth <= 0:
+            raise ValueError("Stage A activation-offload prefetch depth must be positive")
+        self.stage_a_activation_offload_budget_bytes = (
+            int(stage_a_activation_offload_budget_bytes)
+            if stage_a_activation_offload_budget_bytes is not None
+            else None
+        )
+        self.stage_a_activation_offload_prefetch_depth = int(
+            stage_a_activation_offload_prefetch_depth
         )
         self.tensorizer = tensorizer
         self.config = config or CIDTrainerConfig()
@@ -690,6 +707,7 @@ class CIDTrainer:
         self._reduced_gradient_accumulator: dict[str, Tensor] = {}
         self._stage_a_cpu_gradient_accumulator: dict[str, Tensor] = {}
         self._stage_a_async_gradient_accumulator: Any | None = None
+        self._stage_a_activation_offloader: Any | None = None
         self._stage_a_manual_sync_required = False
         self._stage_a_backward_cpu_stash_active = False
         self._stage_a_gradient_stash_hook_handles: list[object] = []
@@ -1051,9 +1069,9 @@ class CIDTrainer:
         ):
             self._stash_reduced_gradients()
         # Long Stage-A examples can leave less than one embedding-gradient's worth
-        # of free VRAM during backward.  Offload a bounded amount of activation state
-        # only: never duplicate model-parameter storage on the host, and cap host
-        # memory growth so recovery from a long example cannot trigger the OOM killer.
+        # of free VRAM during backward. Prefer cid-engine's pinned asynchronous
+        # saved-tensor path and retain the blocking implementation as a compatibility
+        # fallback for older engine builds.
         saved_tensor_context = nullcontext()
         if (
             stage_a_ddp
@@ -1065,31 +1083,56 @@ class CIDTrainer:
                 for parameter in self.forward_model.parameters()
                 if parameter.device.type == "cuda"
             }
-            offload_budget_bytes = (12 if sequence_tokens >= 1024 else 8) * 1024**3
-            offloaded_bytes = 0
-
-            def pack_saved_tensor(tensor: torch.Tensor) -> object:
-                nonlocal offloaded_bytes
-                if tensor.device.type != "cuda":
-                    return tensor
-                if tensor.untyped_storage().data_ptr() in parameter_storages:
-                    return tensor
-                tensor_bytes = tensor.numel() * tensor.element_size()
-                if tensor_bytes < 1024**2 or offloaded_bytes >= offload_budget_bytes:
-                    return tensor
-                offloaded_bytes += tensor_bytes
-                return (tensor.device, tensor.to(device="cpu", copy=True))
-
-            def unpack_saved_tensor(packed: object) -> torch.Tensor:
-                if isinstance(packed, tuple):
-                    device, tensor = packed
-                    return tensor.to(device=device)
-                return packed
-
-            saved_tensor_context = torch.autograd.graph.saved_tensors_hooks(
-                pack_saved_tensor,
-                unpack_saved_tensor,
+            offload_budget_bytes = (
+                self.stage_a_activation_offload_budget_bytes
+                if self.stage_a_activation_offload_budget_bytes is not None
+                else (12 if sequence_tokens >= 1024 else 8) * 1024**3
             )
+            if self._stage_a_activation_offloader is None:
+                engine = cuda_engine(
+                    training_batch.batch.thought_semantic,
+                    capability="AsyncPinnedActivationOffloader",
+                )
+                if engine is not None:
+                    self._stage_a_activation_offloader = engine.AsyncPinnedActivationOffloader(
+                        training_batch.batch.thought_semantic.device,
+                        max_bytes=offload_budget_bytes,
+                        min_tensor_bytes=1024**2,
+                        prefetch_depth=self.stage_a_activation_offload_prefetch_depth,
+                        requires_grad_only=True,
+                    )
+            if self._stage_a_activation_offloader is not None:
+                self._stage_a_activation_offloader.max_bytes = offload_budget_bytes
+                saved_tensor_context = self._stage_a_activation_offloader.saved_tensors_context(
+                    excluded_storage_ptrs=parameter_storages
+                )
+            else:
+                offloaded_bytes = 0
+
+                def pack_saved_tensor(tensor: torch.Tensor) -> object:
+                    nonlocal offloaded_bytes
+                    if tensor.device.type != "cuda" or not tensor.requires_grad:
+                        return tensor
+                    if tensor.untyped_storage().data_ptr() in parameter_storages:
+                        return tensor
+                    tensor_bytes = tensor.numel() * tensor.element_size()
+                    if tensor_bytes < 1024**2:
+                        return tensor
+                    if offloaded_bytes + tensor_bytes > offload_budget_bytes:
+                        return tensor
+                    offloaded_bytes += tensor_bytes
+                    return (tensor.device, tensor.to(device="cpu", copy=True))
+
+                def unpack_saved_tensor(packed: object) -> torch.Tensor:
+                    if isinstance(packed, tuple):
+                        device, tensor = packed
+                        return tensor.to(device=device)
+                    return packed
+
+                saved_tensor_context = torch.autograd.graph.saved_tensors_hooks(
+                    pack_saved_tensor,
+                    unpack_saved_tensor,
+                )
         self._stage_a_backward_cpu_stash_active = use_stage_a_cpu_stash
         try:
             with sync_context, saved_tensor_context:

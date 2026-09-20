@@ -2068,6 +2068,14 @@ def _train_stage_a(args: argparse.Namespace) -> None:
             stage_a_activation_offload_threshold_tokens=(
                 args.stage_a_activation_offload_threshold_tokens
             ),
+            stage_a_activation_offload_budget_bytes=(
+                None
+                if args.stage_a_activation_offload_budget_gib is None
+                else int(args.stage_a_activation_offload_budget_gib * 1024**3)
+            ),
+            stage_a_activation_offload_prefetch_depth=(
+                args.stage_a_activation_offload_prefetch_depth
+            ),
         )
         def zro_optimizer_shard_path(checkpoint: Path, shard_rank: int) -> Path:
             return checkpoint.with_name(
@@ -4227,6 +4235,20 @@ def main() -> None:
             "offload bounded Stage A autograd-saved activation tensors to CPU when an "
             "input reaches this total thought+prompt+display token count"
         ),
+    )
+    train.add_argument(
+        "--stage-a-activation-offload-budget-gib",
+        type=float,
+        help=(
+            "override the Stage A activation-offload host budget in GiB; the default is "
+            "8 GiB below 1024 total tokens and 12 GiB at or above 1024"
+        ),
+    )
+    train.add_argument(
+        "--stage-a-activation-offload-prefetch-depth",
+        type=int,
+        default=2,
+        help="number of reverse-order saved activations prefetched during backward",
     )
     train.add_argument("--max-grad-norm", type=float, default=1.0)
     train.add_argument("--warmup-steps", type=int, default=0)
