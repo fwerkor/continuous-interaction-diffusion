@@ -139,9 +139,10 @@ eight ranks. `--gradient-accumulation-steps` remains an explicit override, and o
 keeps the legacy default of eight accumulation steps. Accumulated gradients are normalized by
 example count, which prevents a smaller final micro-batch from being overweighted. Native backbone
 gradient checkpointing is enabled by the launcher by default to reduce activation memory while
-retaining gradients to CID inputs through the frozen backbone. On CUDA, cid-engine 0.7.1 adds
-optional frozen-decoder `FULL_SHARD`, bounded asynchronous pinned activation offload, and selective
-layer checkpointing. `--flatten-teacher-forcing-horizon` additionally combines independent offsets
+retaining gradients to CID inputs through the frozen backbone. On CUDA, cid-engine 0.8.0 adds
+optional frozen-decoder `FULL_SHARD`, bounded asynchronous pinned activation offload with
+layer-aware backward prefetch, selective layer checkpointing, and deterministic gradient-reduction
+overlap on the final accumulation backward. `--flatten-teacher-forcing-horizon` additionally combines independent offsets
 only while rollout probability is zero; grouped loss masks retain the original per-physical-batch
 objective exactly. The adapter also
 constructs per-sample position IDs from valid prompt and

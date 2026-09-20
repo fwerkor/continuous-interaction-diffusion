@@ -522,11 +522,14 @@ then the configured maximum, 1536 by default). The realized text is terminated b
 after EOS receive no token loss. This avoids paying for a 1536-token canvas on short examples while
 keeping every released target representable without truncation. Within self-rollout a display bucket
 may grow but never shrink. Gradient checkpointing is enabled by default for the native iLLaDA stack
-and can be disabled with `--no-gradient-checkpointing`. With cid-engine 0.7.1,
+and can be disabled with `--no-gradient-checkpointing`. With cid-engine 0.8.0,
 `--selective-checkpoint-memory-budget-gib` or `--selective-checkpoint-fraction` checkpoints only a
 deterministic subset of decoder layers instead of rematerializing the whole backbone. Long CUDA
 examples use bounded asynchronous pinned activation offload with configurable
-`--stage-a-activation-offload-*` controls. `--flatten-teacher-forcing-horizon` can fuse independent
+`--stage-a-activation-offload-*` controls; cid-engine 0.8.0 tags saved activations by decoder layer
+and prefetches them before layer backward. The final Stage A accumulation backward also overlaps
+deterministic gradient all-reduces with remaining backward compute whenever the CPU gradient-stash
+safety path is not active. `--flatten-teacher-forcing-horizon` can fuse independent
 rollout offsets during the pure teacher-forcing phase; it preserves the original physical-microbatch
 loss normalization and automatically falls back when dropout, backbone training, or self-rollout
 would make flattening non-equivalent. `--target-global-batch-size` recomputes
