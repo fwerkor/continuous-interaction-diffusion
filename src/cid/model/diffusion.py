@@ -71,7 +71,8 @@ class CIDDiffusionScheduler:
     ) -> DisplayCorruption:
         if token_ids.ndim != 2:
             raise ValueError("token_ids must have shape [batch, tokens]")
-        probabilities = self._token_probabilities(token_ids, timesteps)
+        timestep = self._batch_timesteps(token_ids.shape[0], timesteps, token_ids.device)
+        probabilities = timestep[:, None].expand_as(token_ids)
         if eligible_mask is None:
             eligible_mask = torch.ones_like(token_ids, dtype=torch.bool)
         elif eligible_mask.shape != token_ids.shape:
@@ -86,6 +87,44 @@ class CIDDiffusionScheduler:
             device=token_ids.device,
             generator=generator,
         )
+        engine = cuda_engine(token_ids, capability="display_corrupt_from_random")
+        if engine is not None:
+            replacement_draw = None
+            replacement_offsets = None
+            if replacement_fraction:
+                replacement_draw = torch.rand(
+                    token_ids.shape,
+                    device=token_ids.device,
+                    generator=generator,
+                    dtype=torch.float32,
+                )
+                replacement_offsets = torch.randint(
+                    1,
+                    int(vocab_size),
+                    token_ids.shape,
+                    device=token_ids.device,
+                    generator=generator,
+                )
+            corrupted, labels, masked, replaced = engine.display_corrupt_from_random(
+                token_ids,
+                timestep,
+                eligible_mask.bool(),
+                random.float(),
+                replacement_draw,
+                replacement_offsets,
+                mask_token_id=self.mask_token_id,
+                eos_token_id=self.eos_token_id,
+                vocab_size=int(vocab_size or 0),
+                replacement_fraction=replacement_fraction,
+            )
+            return DisplayCorruption(
+                token_ids=corrupted,
+                labels=labels,
+                noise=probabilities.unsqueeze(-1),
+                masked=masked,
+                replaced=replaced,
+            )
+
         corrupted_positions = (random < probabilities) & eligible_mask.bool()
         corrupted_positions = self._ensure_training_mask(
             corrupted_positions,
@@ -136,13 +175,27 @@ class CIDDiffusionScheduler:
         timestep = self._thought_timesteps(
             semantic.shape[0], semantic.shape[1], timesteps, semantic.device
         )
-        alpha = torch.cos(timestep * (math.pi / 2)).square().to(dtype=semantic.dtype).unsqueeze(-1)
         epsilon = torch.randn(
             semantic.shape,
             dtype=semantic.dtype,
             device=semantic.device,
             generator=generator,
         )
+        engine = cuda_engine(semantic, capability="thought_corrupt_from_epsilon")
+        if engine is not None:
+            corrupted, local_noise, masked_epsilon = engine.thought_corrupt_from_epsilon(
+                semantic,
+                timestep,
+                occupancy,
+                epsilon,
+            )
+            return ThoughtCorruption(
+                semantic=corrupted,
+                noise=local_noise,
+                epsilon=masked_epsilon,
+            )
+
+        alpha = torch.cos(timestep * (math.pi / 2)).square().to(dtype=semantic.dtype).unsqueeze(-1)
         corrupted = alpha.sqrt() * semantic + (1.0 - alpha).sqrt() * epsilon
         occupied = occupancy.bool()
         corrupted = torch.where(occupied, corrupted, torch.zeros_like(corrupted))

@@ -68,6 +68,7 @@ from cid.model.materialize import (
     ClosedWorldMaterializationCatalog,
     RevisionAction,
 )
+from cid.model.native_engine import cuda_engine
 from cid.model.tensors import CIDTensorBatch, CIDTensorOutput, build_percept_routing_masks
 from cid.reclamation import retired_reclamation_candidates
 from cid.runtime.bindings import canonical_work_key
@@ -682,6 +683,7 @@ class CIDTrainer:
         self._pending_fsdp_unsynced = False
         self._reduced_gradient_accumulator: dict[str, Tensor] = {}
         self._stage_a_cpu_gradient_accumulator: dict[str, Tensor] = {}
+        self._stage_a_async_gradient_accumulator: Any | None = None
         self._stage_a_manual_sync_required = False
         self.pad_token_id = getattr(tensorizer.tokenizer, "pad_token_id", None)
         if self.pad_token_id is None:
@@ -1002,7 +1004,7 @@ class CIDTrainer:
             # memory until this memory-heavy region has passed.
             self._stash_stage_a_gradients_to_cpu()
             self._stage_a_manual_sync_required = True
-        elif self._stage_a_cpu_gradient_accumulator:
+        elif self._stage_a_stash_has_data():
             # Return to the fast GPU accumulation path as soon as a short sequence arrives.
             # Keep manual synchronization enabled for this optimizer interval so DDP never
             # has to infer bucket state across the host round-trip.
@@ -1080,38 +1082,69 @@ class CIDTrainer:
         occupancy = (
             input_batch.slot_occupancy[batch_index : batch_index + 1, slot_slice].detach().bool()
         )
-        allocation = prefix_allocation_mask(
-            occupancy,
-            output.allocation_logits[batch_index : batch_index + 1, slot_slice].detach(),
-            threshold=self.config.rollout_allocation_threshold,
-            max_allocations=self.config.rollout_max_allocations_per_step,
-        ).unsqueeze(-1)
         previous_occupancy = occupancy
-        occupancy = occupancy | (~occupancy & allocation)
-        lifecycle_indices = output.lifecycle_logits[
-            batch_index : batch_index + 1, slot_slice
-        ].argmax(dim=-1)
-        revision_indices = output.revision_logits[
-            batch_index : batch_index + 1, slot_slice
-        ].argmax(dim=-1)
         input_lifecycle = input_batch.lifecycle_features[
             batch_index : batch_index + 1, slot_slice
         ]
-        input_lifecycle_indices = input_lifecycle.argmax(dim=-1)
-        input_lifecycle_present = input_lifecycle.abs().sum(dim=-1).ne(0)
         retired_index = MODELED_LIFECYCLES.index(CellLifecycle.RETIRED)
-        previous_retired = previous_occupancy.squeeze(-1) & (
-            input_lifecycle_indices == retired_index
+        engine = cuda_engine(
+            output.allocation_logits,
+            capability="rollout_slot_transition",
         )
-        newly_allocated = occupancy.squeeze(-1) & ~previous_occupancy.squeeze(-1)
-        predicted_retired = lifecycle_indices == retired_index
-        # CIDMaterializer never revives a previously retired cell, and it coerces a
-        # newly allocated cell to ACTIVE unless the model explicitly predicts WAITING.
-        # Existing live cells, however, stop owning needs immediately when materialized
-        # as RETIRED. Decode bindings from that same provisional live set.
-        live_slots = (
-            occupancy.squeeze(-1) & ~previous_retired & (~predicted_retired | newly_allocated)
-        )[0]
+        if engine is not None:
+            (
+                next_occupancy,
+                lifecycle_indices,
+                revision_indices,
+                input_lifecycle_indices,
+                input_lifecycle_present,
+                provisional_live_slots,
+            ) = engine.rollout_slot_transition(
+                occupancy.squeeze(-1),
+                output.allocation_logits[
+                    batch_index : batch_index + 1, slot_slice
+                ].detach(),
+                output.lifecycle_logits[
+                    batch_index : batch_index + 1, slot_slice
+                ].detach(),
+                output.revision_logits[
+                    batch_index : batch_index + 1, slot_slice
+                ].detach(),
+                input_lifecycle.detach(),
+                threshold=self.config.rollout_allocation_threshold,
+                max_allocations=self.config.rollout_max_allocations_per_step,
+                retired_index=retired_index,
+            )
+            occupancy = next_occupancy.unsqueeze(-1)
+            live_slots = provisional_live_slots[0]
+        else:
+            allocation = prefix_allocation_mask(
+                occupancy,
+                output.allocation_logits[
+                    batch_index : batch_index + 1, slot_slice
+                ].detach(),
+                threshold=self.config.rollout_allocation_threshold,
+                max_allocations=self.config.rollout_max_allocations_per_step,
+            ).unsqueeze(-1)
+            occupancy = occupancy | (~occupancy & allocation)
+            lifecycle_indices = output.lifecycle_logits[
+                batch_index : batch_index + 1, slot_slice
+            ].argmax(dim=-1)
+            revision_indices = output.revision_logits[
+                batch_index : batch_index + 1, slot_slice
+            ].argmax(dim=-1)
+            input_lifecycle_indices = input_lifecycle.argmax(dim=-1)
+            input_lifecycle_present = input_lifecycle.abs().sum(dim=-1).ne(0)
+            previous_retired = previous_occupancy.squeeze(-1) & (
+                input_lifecycle_indices == retired_index
+            )
+            newly_allocated = occupancy.squeeze(-1) & ~previous_occupancy.squeeze(-1)
+            predicted_retired = lifecycle_indices == retired_index
+            live_slots = (
+                occupancy.squeeze(-1)
+                & ~previous_retired
+                & (~predicted_retired | newly_allocated)
+            )[0]
 
         display_length = sample.batch.display_ids.shape[1]
         previous_display_ids = input_batch.display_ids[
@@ -1960,7 +1993,7 @@ class CIDTrainer:
         self._pending_ddp_unsynced = False
         self._pending_fsdp_unsynced = False
         self._reduced_gradient_accumulator.clear()
-        self._stage_a_cpu_gradient_accumulator.clear()
+        self._clear_stage_a_gradient_stash()
         self._stage_a_manual_sync_required = False
         self.data_order_version = int(state.get("data_order_version", 1))
         self.optimizer.zero_grad(set_to_none=True)
@@ -2030,7 +2063,7 @@ class CIDTrainer:
         that its peers never join and the collective sequence diverges.
         """
 
-        if self._stage_a_cpu_gradient_accumulator:
+        if self._stage_a_stash_has_data():
             self._restore_stage_a_gradients_from_cpu()
         if self._pending_ddp_unsynced:
             self._sync_pending_stage_a_ddp_gradients()
@@ -2181,7 +2214,7 @@ class CIDTrainer:
         )
         self.optimizer.zero_grad(set_to_none=True)
         self._reduced_gradient_accumulator.clear()
-        self._stage_a_cpu_gradient_accumulator.clear()
+        self._clear_stage_a_gradient_stash()
         self._stage_a_manual_sync_required = False
         self._pending_accumulation = int(checkpoint.get("pending_accumulation", 0))
         self._pending_examples = int(checkpoint.get("pending_examples", 0))
@@ -2227,7 +2260,7 @@ class CIDTrainer:
         }
 
     def _optimizer_step(self) -> None:
-        if self._stage_a_cpu_gradient_accumulator:
+        if self._stage_a_stash_has_data():
             self._restore_stage_a_gradients_from_cpu()
         if self._pending_ddp_unsynced:
             self._sync_pending_stage_a_ddp_gradients()
@@ -2361,7 +2394,25 @@ class CIDTrainer:
         return normalizer
 
     def _stash_stage_a_gradients_to_cpu(self) -> None:
-        """Move accumulated Stage A FP32 gradients to host memory for rare long inputs."""
+        """Move accumulated Stage A gradients to reusable host storage."""
+
+        if self._stage_a_async_gradient_accumulator is None:
+            for _, parameter in self._trainable:
+                gradient = parameter.grad
+                if gradient is None or not gradient.is_cuda:
+                    continue
+                engine = cuda_engine(
+                    gradient,
+                    capability="AsyncPinnedGradientAccumulator",
+                )
+                if engine is not None:
+                    self._stage_a_async_gradient_accumulator = (
+                        engine.AsyncPinnedGradientAccumulator(gradient.device)
+                    )
+                break
+        if self._stage_a_async_gradient_accumulator is not None:
+            self._stage_a_async_gradient_accumulator.stash(self._trainable)
+            return
 
         for name, parameter in self._trainable:
             gradient = parameter.grad
@@ -2376,6 +2427,9 @@ class CIDTrainer:
             parameter.grad = None
 
     def _restore_stage_a_gradients_from_cpu(self) -> None:
+        async_accumulator = self._stage_a_async_gradient_accumulator
+        if async_accumulator is not None and async_accumulator.has_data:
+            async_accumulator.restore(self._trainable)
         if not self._stage_a_cpu_gradient_accumulator:
             return
         parameters = dict(self._trainable)
@@ -2387,6 +2441,18 @@ class CIDTrainer:
             else:
                 parameter.grad.add_(restored)
         self._stage_a_cpu_gradient_accumulator.clear()
+
+    def _stage_a_stash_has_data(self) -> bool:
+        async_accumulator = self._stage_a_async_gradient_accumulator
+        return bool(self._stage_a_cpu_gradient_accumulator) or bool(
+            async_accumulator is not None and async_accumulator.has_data
+        )
+
+    def _clear_stage_a_gradient_stash(self) -> None:
+        self._stage_a_cpu_gradient_accumulator.clear()
+        async_accumulator = self._stage_a_async_gradient_accumulator
+        if async_accumulator is not None:
+            async_accumulator.clear()
 
     def _stash_reduced_gradients(self) -> None:
         """Preserve gradients before a backward path that overwrites reduced grads.
@@ -2429,6 +2495,13 @@ class CIDTrainer:
             name: saved.detach().cpu().clone()
             for name, saved in self._reduced_gradient_accumulator.items()
         }
+        async_accumulator = self._stage_a_async_gradient_accumulator
+        if async_accumulator is not None and async_accumulator.has_data:
+            for name, saved in async_accumulator.snapshot().items():
+                if name in gradients:
+                    gradients[name].add_(saved.to(dtype=gradients[name].dtype))
+                else:
+                    gradients[name] = saved
         for name, saved in self._stage_a_cpu_gradient_accumulator.items():
             if name in gradients:
                 gradients[name].add_(saved.detach().cpu().to(dtype=gradients[name].dtype))
