@@ -58,6 +58,8 @@ def test_stage_a_parser_registers_training_memory_flags(monkeypatch) -> None:
             "0.5",
             "--selective-checkpoint-prompt-tokens",
             "768",
+            "--stage-a-async-activation-offload",
+            "--stage-a-async-gradient-reduction",
             "--flatten-teacher-forcing-horizon",
         ],
     )
@@ -69,6 +71,8 @@ def test_stage_a_parser_registers_training_memory_flags(monkeypatch) -> None:
     assert captured["selective_checkpoint_fraction"] == 0.5
     assert captured["selective_checkpoint_memory_budget_gib"] is None
     assert captured["selective_checkpoint_prompt_tokens"] == 768
+    assert captured["stage_a_async_activation_offload"] is True
+    assert captured["stage_a_async_gradient_reduction"] is True
     assert captured["flatten_teacher_forcing_horizon"] is True
 
 
@@ -87,3 +91,5 @@ def test_stage_a_parser_supplies_selective_checkpoint_defaults(monkeypatch) -> N
     assert captured["selective_checkpoint_fraction"] is None
     assert captured["selective_checkpoint_memory_budget_gib"] is None
     assert captured["selective_checkpoint_prompt_tokens"] == 512
+    assert captured["stage_a_async_activation_offload"] is False
+    assert captured["stage_a_async_gradient_reduction"] is False

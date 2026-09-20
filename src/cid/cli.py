@@ -2177,6 +2177,8 @@ def _train_stage_a(args: argparse.Namespace) -> None:
             stage_a_activation_offload_prefetch_depth=(
                 args.stage_a_activation_offload_prefetch_depth
             ),
+            stage_a_async_activation_offload=args.stage_a_async_activation_offload,
+            stage_a_async_gradient_reduction=args.stage_a_async_gradient_reduction,
             flatten_teacher_forcing_horizon=args.flatten_teacher_forcing_horizon,
         )
         def zro_optimizer_shard_path(checkpoint: Path, shard_rank: int) -> Path:
@@ -4357,6 +4359,18 @@ def main() -> None:
         type=int,
         default=2,
         help="number of reverse-order saved activations prefetched during backward",
+    )
+    train.add_argument(
+        "--stage-a-async-activation-offload",
+        action=argparse.BooleanOptionalAction,
+        default=False,
+        help="use cid-engine asynchronous pinned activation offload; disabled by default",
+    )
+    train.add_argument(
+        "--stage-a-async-gradient-reduction",
+        action=argparse.BooleanOptionalAction,
+        default=False,
+        help="overlap Stage A final-backward gradient reduction; disabled by default",
     )
     train.add_argument(
         "--frozen-backbone-sharding",

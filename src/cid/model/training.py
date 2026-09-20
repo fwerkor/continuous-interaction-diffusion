@@ -655,6 +655,8 @@ class CIDTrainer:
         stage_a_activation_offload_threshold_tokens: int = 512,
         stage_a_activation_offload_budget_bytes: int | None = None,
         stage_a_activation_offload_prefetch_depth: int = 2,
+        stage_a_async_activation_offload: bool = False,
+        stage_a_async_gradient_reduction: bool = False,
         flatten_teacher_forcing_horizon: bool = False,
     ) -> None:
         if tensorizer.adapter is not adapter:
@@ -693,6 +695,8 @@ class CIDTrainer:
         self.stage_a_activation_offload_prefetch_depth = int(
             stage_a_activation_offload_prefetch_depth
         )
+        self.stage_a_async_activation_offload = bool(stage_a_async_activation_offload)
+        self.stage_a_async_gradient_reduction = bool(stage_a_async_gradient_reduction)
         self.flatten_teacher_forcing_horizon = bool(flatten_teacher_forcing_horizon)
         self.tensorizer = tensorizer
         self.config = config or CIDTrainerConfig()
@@ -1316,7 +1320,7 @@ class CIDTrainer:
                 if self.stage_a_activation_offload_budget_bytes is not None
                 else (12 if sequence_tokens >= 1024 else 8) * 1024**3
             )
-            if self._stage_a_activation_offloader is None:
+            if self.stage_a_async_activation_offload and self._stage_a_activation_offloader is None:
                 engine = cuda_engine(
                     training_batch.batch.thought_semantic,
                     capability="AsyncPinnedActivationOffloader",
@@ -1329,7 +1333,10 @@ class CIDTrainer:
                         prefetch_depth=self.stage_a_activation_offload_prefetch_depth,
                         requires_grad_only=True,
                     )
-            if self._stage_a_activation_offloader is not None:
+            if (
+                self.stage_a_async_activation_offload
+                and self._stage_a_activation_offloader is not None
+            ):
                 self._stage_a_activation_offloader.max_bytes = offload_budget_bytes
                 if self._stage_a_activation_prefetch_controller is None:
                     engine = native_engine(capability="LayerActivationPrefetchController")
@@ -1374,7 +1381,8 @@ class CIDTrainer:
                     unpack_saved_tensor,
                 )
         use_async_stage_a_reduce = bool(
-            stage_a_ddp
+            self.stage_a_async_gradient_reduction
+            and stage_a_ddp
             and will_step
             and not use_stage_a_cpu_stash
         )
