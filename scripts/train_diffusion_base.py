@@ -302,7 +302,13 @@ def parse_args() -> argparse.Namespace:
         default=True,
     )
     parser.add_argument(
-        "--aggressive-prefetch", action=argparse.BooleanOptionalAction, default=True
+        "--aggressive-prefetch",
+        action=argparse.BooleanOptionalAction,
+        default=False,
+        help=(
+            "overlap FSDP prefetch/all-gathers for throughput at the cost of higher peak "
+            "GPU memory; disabled by default for memory safety"
+        ),
     )
     parser.add_argument("--export-hf", action=argparse.BooleanOptionalAction, default=True)
     return parser.parse_args()
