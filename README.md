@@ -704,8 +704,8 @@ Preprint: [arXiv:2608.10438](https://arxiv.org/abs/2608.10438) · DOI: [10.48550
 
 ```bibtex
 @article{cao2026continuous,
-  title   = {Continuous Interaction Diffusion: A Diffusion-Native Runtime for Asynchronous Tool-Augmented Reasoning},
-  author  = {Cao, Yuhang},
+  title   = {Continuous Interaction Diffusion: A Diffusion-Native Architecture for Asynchronous Tool-Augmented Reasoning},
+  author  = {Cao, Yuhang and Mu, Yanzhou and Fang, Chunrong and Chen, Zhenyu},
   journal = {arXiv preprint arXiv:2608.10438},
   year    = {2026},
   doi     = {10.48550/arXiv.2608.10438},

@@ -12,7 +12,13 @@ preferred-citation:
   authors:
     - family-names: Cao
       given-names: Yuhang
-  title: "Continuous Interaction Diffusion: A Diffusion-Native Runtime for Asynchronous Tool-Augmented Reasoning"
+    - family-names: Mu
+      given-names: Yanzhou
+    - family-names: Fang
+      given-names: Chunrong
+    - family-names: Chen
+      given-names: Zhenyu
+  title: "Continuous Interaction Diffusion: A Diffusion-Native Architecture for Asynchronous Tool-Augmented Reasoning"
   year: 2026
   doi: 10.48550/arXiv.2608.10438
   url: "https://arxiv.org/abs/2608.10438"
