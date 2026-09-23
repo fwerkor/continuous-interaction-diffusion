@@ -1,8 +1,12 @@
 from __future__ import annotations
 
+from importlib import import_module
 from types import SimpleNamespace
 
-from cid.model import native_engine as native_engine_module
+import pytest
+
+pytest.importorskip("torch")
+native_engine_module = import_module("cid.model.native_engine")
 
 
 class _FakeTensor:
