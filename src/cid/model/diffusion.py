@@ -7,7 +7,7 @@ from dataclasses import dataclass
 import torch
 from torch import Tensor
 
-from cid.model.native_engine import cuda_engine
+from cid.model.native_engine import accelerator_engine, cuda_engine
 
 _MAX_STRUCTURAL_EDIT_TOKENS = 32
 
@@ -68,10 +68,16 @@ class CIDDiffusionScheduler:
         vocab_size: int | None = None,
         replacement_fraction: float = 0.0,
         generator: torch.Generator | None = None,
+        _timesteps_validated: bool = False,
     ) -> DisplayCorruption:
         if token_ids.ndim != 2:
             raise ValueError("token_ids must have shape [batch, tokens]")
-        timestep = self._batch_timesteps(token_ids.shape[0], timesteps, token_ids.device)
+        timestep = self._batch_timesteps(
+            token_ids.shape[0],
+            timesteps,
+            token_ids.device,
+            validate_range=not _timesteps_validated,
+        )
         probabilities = timestep[:, None].expand_as(token_ids)
         if eligible_mask is None:
             eligible_mask = torch.ones_like(token_ids, dtype=torch.bool)
@@ -87,7 +93,7 @@ class CIDDiffusionScheduler:
             device=token_ids.device,
             generator=generator,
         )
-        engine = cuda_engine(token_ids, capability="display_corrupt_from_random")
+        engine = accelerator_engine(token_ids, capability="display_corrupt_from_random")
         if engine is not None:
             replacement_draw = None
             replacement_offsets = None
@@ -167,13 +173,18 @@ class CIDDiffusionScheduler:
         occupancy: Tensor,
         *,
         generator: torch.Generator | None = None,
+        _timesteps_validated: bool = False,
     ) -> ThoughtCorruption:
         if semantic.ndim != 3:
             raise ValueError("semantic must have shape [batch, slots, hidden]")
         if occupancy.shape != (*semantic.shape[:2], 1):
             raise ValueError("occupancy must have shape [batch, slots, 1]")
         timestep = self._thought_timesteps(
-            semantic.shape[0], semantic.shape[1], timesteps, semantic.device
+            semantic.shape[0],
+            semantic.shape[1],
+            timesteps,
+            semantic.device,
+            validate_range=not _timesteps_validated,
         )
         epsilon = torch.randn(
             semantic.shape,
@@ -181,7 +192,7 @@ class CIDDiffusionScheduler:
             device=semantic.device,
             generator=generator,
         )
-        engine = cuda_engine(semantic, capability="thought_corrupt_from_epsilon")
+        engine = accelerator_engine(semantic, capability="thought_corrupt_from_epsilon")
         if engine is not None:
             corrupted, local_noise, masked_epsilon = engine.thought_corrupt_from_epsilon(
                 semantic,
@@ -566,24 +577,40 @@ class CIDDiffusionScheduler:
 
     @staticmethod
     def _thought_timesteps(
-        batch_size: int, thought_slots: int, timesteps: Tensor, device: torch.device
+        batch_size: int,
+        thought_slots: int,
+        timesteps: Tensor,
+        device: torch.device,
+        *,
+        validate_range: bool = True,
     ) -> Tensor:
         if timesteps.ndim == 1:
-            timestep = CIDDiffusionScheduler._batch_timesteps(batch_size, timesteps, device)
+            timestep = CIDDiffusionScheduler._batch_timesteps(
+                batch_size,
+                timesteps,
+                device,
+                validate_range=validate_range,
+            )
             return timestep[:, None].expand(-1, thought_slots)
         if timesteps.ndim != 2 or timesteps.shape != (batch_size, thought_slots):
             raise ValueError("thought timesteps must have shape [batch] or [batch, slots]")
         timestep = timesteps.to(device=device, dtype=torch.float32)
-        if bool(((timestep < 0.0) | (timestep > 1.0)).any()):
+        if validate_range and bool(((timestep < 0.0) | (timestep > 1.0)).any()):
             raise ValueError("timesteps must be in [0, 1]")
         return timestep
 
     @staticmethod
-    def _batch_timesteps(batch_size: int, timesteps: Tensor, device: torch.device) -> Tensor:
+    def _batch_timesteps(
+        batch_size: int,
+        timesteps: Tensor,
+        device: torch.device,
+        *,
+        validate_range: bool = True,
+    ) -> Tensor:
         if timesteps.ndim != 1 or timesteps.shape[0] != batch_size:
             raise ValueError("timesteps must have shape [batch]")
         timestep = timesteps.to(device=device, dtype=torch.float32)
-        if bool(((timestep < 0.0) | (timestep > 1.0)).any()):
+        if validate_range and bool(((timestep < 0.0) | (timestep > 1.0)).any()):
             raise ValueError("timesteps must be in [0, 1]")
         return timestep
 

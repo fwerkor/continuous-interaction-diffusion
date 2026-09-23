@@ -3315,6 +3315,7 @@ class ILLaDATrajectoryTensorizer:
             thought_timesteps,
             occupancy,
             generator=generator,
+            _timesteps_validated=rollout_state is None,
         )
         target_control = self._training_target_control_snapshot(
             occupancy,
@@ -3462,6 +3463,7 @@ class ILLaDATrajectoryTensorizer:
                 vocab_size=self.adapter.vocab_size,
                 replacement_fraction=self.display_replacement_fraction,
                 generator=generator,
+                _timesteps_validated=True,
             )
             display_input_ids = display_corruption.token_ids
             display_labels = display_corruption.labels
@@ -3480,6 +3482,7 @@ class ILLaDATrajectoryTensorizer:
                 vocab_size=self.adapter.vocab_size,
                 replacement_fraction=self.display_replacement_fraction,
                 generator=generator,
+                _timesteps_validated=True,
             )
             display_input_ids = display_corruption.token_ids
             display_labels = display_corruption.labels

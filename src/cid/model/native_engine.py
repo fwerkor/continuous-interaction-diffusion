@@ -12,6 +12,27 @@ except ModuleNotFoundError as exc:
     _ENGINE = None
 
 
+def accelerator_engine(
+    tensor: Tensor,
+    *,
+    capability: str | None = None,
+) -> ModuleType | None:
+    if _ENGINE is None:
+        return None
+    device_type = tensor.device.type
+    if device_type == "cuda":
+        if not _ENGINE.CUDA_BACKEND_BUILT:
+            return None
+    elif device_type == "npu":
+        if not getattr(_ENGINE, "CANN_BACKEND_BUILT", False):
+            return None
+    else:
+        return None
+    if capability is not None and getattr(_ENGINE, capability, None) is None:
+        return None
+    return _ENGINE
+
+
 def cuda_engine(
     tensor: Tensor,
     *,
