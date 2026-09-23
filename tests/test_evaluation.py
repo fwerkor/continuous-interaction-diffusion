@@ -488,6 +488,24 @@ async def test_live_symbolic_source_rejects_non_scalar_expression_without_crashi
     assert observation.provenance == "deterministic-symbolic-math"
 
 
+async def test_live_symbolic_source_rejects_incomplete_expression_without_crashing() -> None:
+    registry = build_replay_registry(_live_math_example())
+    symbolic = registry.get("symbolic_math")
+    registry.advance_runtime_step(0)
+    task = asyncio.create_task(
+        symbolic.read(
+            {"operation": "simplify", "expression": "(x+1", "variables": "x"}
+        )
+    )
+    await asyncio.sleep(0)
+    registry.advance_runtime_step(1)
+    observation = await task
+    assert isinstance(observation.value, dict)
+    assert observation.value["expression"] == "(x+1"
+    assert "error" in observation.value
+    assert observation.provenance == "deterministic-symbolic-math"
+
+
 async def test_live_symbolic_source_solves_training_style_equation() -> None:
     registry = build_replay_registry(_live_math_example())
     symbolic = registry.get("symbolic_math")
