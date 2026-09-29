@@ -43,6 +43,7 @@ from cid.defaults import (
     DEFAULT_ARGUMENT_PRESENCE_THRESHOLD,
     DEFAULT_BINDING_THRESHOLD,
     DEFAULT_CONVERGENCE_THRESHOLD,
+    DEFAULT_DISPLAY_REPETITION_SCORE_MULTIPLIER,
     DEFAULT_DISPLAY_REVISION_FRACTION,
     DEFAULT_DISPLAY_REVISION_MARGIN,
     DEFAULT_LINK_PRESENCE_THRESHOLD,
@@ -1470,6 +1471,7 @@ def _benchmark(args: argparse.Namespace) -> None:
                     display_canvas_tokens=args.display_canvas_tokens,
                     display_revision_fraction=args.display_revision_fraction,
                     display_revision_margin=args.display_revision_margin,
+                    display_repetition_score_multiplier=args.display_repetition_score_multiplier,
                     materializer_config=materializer_config,
                     runtime_config=runtime_config,
                     seed=args.seed,
@@ -1548,6 +1550,9 @@ def _benchmark(args: argparse.Namespace) -> None:
                     "max_wall_time_s": args.max_wall_time_s,
                     "display_revision_fraction": args.display_revision_fraction,
                     "display_revision_margin": args.display_revision_margin,
+                    "display_repetition_score_multiplier": (
+                        args.display_repetition_score_multiplier
+                    ),
                     "allocation_threshold": args.allocation_threshold,
                     "convergence_threshold": args.convergence_threshold,
                     "need_threshold": args.need_threshold,
@@ -2158,6 +2163,9 @@ def _train_stage_a(args: argparse.Namespace) -> None:
                 rollout_horizon=args.rollout_horizon,
                 rollout_allocation_threshold=args.rollout_allocation_threshold,
                 rollout_max_allocations_per_step=args.rollout_max_allocations_per_step,
+                rollout_display_repetition_score_multiplier=(
+                    args.rollout_display_repetition_score_multiplier
+                ),
                 teacher_forcing_epochs=args.teacher_forcing_epochs,
                 rollout_ramp_epochs=args.rollout_ramp_epochs,
                 semantic_pooling=args.semantic_pooling,
@@ -3272,6 +3280,9 @@ def _train_stage_b(args: argparse.Namespace) -> None:
                 rollout_horizon=args.rollout_horizon,
                 rollout_allocation_threshold=args.rollout_allocation_threshold,
                 rollout_max_allocations_per_step=args.rollout_max_allocations_per_step,
+                rollout_display_repetition_score_multiplier=(
+                    args.rollout_display_repetition_score_multiplier
+                ),
                 teacher_forcing_epochs=args.teacher_forcing_epochs,
                 rollout_ramp_epochs=args.rollout_ramp_epochs,
                 semantic_pooling=args.semantic_pooling,
@@ -4171,6 +4182,15 @@ def main() -> None:
         type=float,
         default=DEFAULT_DISPLAY_REVISION_MARGIN,
     )
+    policy_tuning.add_argument(
+        "--display-repetition-score-multiplier",
+        type=float,
+        default=DEFAULT_DISPLAY_REPETITION_SCORE_MULTIPLIER,
+        help=(
+            "score multiplier for consecutive equal Display tokens adjacent to a candidate; "
+            "left and right run lengths contribute to the exponent"
+        ),
+    )
     materializer_tuning = benchmark.add_argument_group("materialization tuning")
     materializer_tuning.add_argument(
         "--allocation-threshold", type=float, default=DEFAULT_ALLOCATION_THRESHOLD
@@ -4439,6 +4459,15 @@ def main() -> None:
         help="maximum new cognitive cells materialized by one training rollout step",
     )
     train.add_argument(
+        "--rollout-display-repetition-score-multiplier",
+        type=float,
+        default=DEFAULT_DISPLAY_REPETITION_SCORE_MULTIPLIER,
+        help=(
+            "score multiplier for consecutive equal Display tokens adjacent to a candidate during "
+            "closed-loop rollout; left and right run lengths contribute to the exponent"
+        ),
+    )
+    train.add_argument(
         "--semantic-pooling",
         choices=("mean-v1", "order-aware-v2"),
         default="order-aware-v2",
@@ -4569,6 +4598,15 @@ def main() -> None:
         type=int,
         default=DEFAULT_MAX_ALLOCATIONS_PER_STEP,
         help="maximum new cognitive cells materialized by one training rollout step",
+    )
+    train_full.add_argument(
+        "--rollout-display-repetition-score-multiplier",
+        type=float,
+        default=DEFAULT_DISPLAY_REPETITION_SCORE_MULTIPLIER,
+        help=(
+            "score multiplier for consecutive equal Display tokens adjacent to a candidate during "
+            "closed-loop rollout; left and right run lengths contribute to the exponent"
+        ),
     )
     train_full.add_argument(
         "--semantic-pooling",

@@ -6,7 +6,11 @@ from typing import Any
 import torch
 
 from cid.contracts import ModelContext, ModelUpdate, Percept
-from cid.defaults import DEFAULT_DISPLAY_REVISION_FRACTION, DEFAULT_DISPLAY_REVISION_MARGIN
+from cid.defaults import (
+    DEFAULT_DISPLAY_REPETITION_SCORE_MULTIPLIER,
+    DEFAULT_DISPLAY_REVISION_FRACTION,
+    DEFAULT_DISPLAY_REVISION_MARGIN,
+)
 from cid.lifecycle import MODELED_LIFECYCLES
 from cid.model.diffusion import (
     CIDDiffusionScheduler,
@@ -204,6 +208,7 @@ class ILLaDANeuralPolicyConfig:
     denoising_steps: int = 8
     display_revision_fraction: float = DEFAULT_DISPLAY_REVISION_FRACTION
     display_revision_margin: float = DEFAULT_DISPLAY_REVISION_MARGIN
+    display_repetition_score_multiplier: float = DEFAULT_DISPLAY_REPETITION_SCORE_MULTIPLIER
     seed: int = 0
 
     def __post_init__(self) -> None:
@@ -213,6 +218,8 @@ class ILLaDANeuralPolicyConfig:
             raise ValueError("display_revision_fraction must be in [0, 1]")
         if self.display_revision_margin < 0.0:
             raise ValueError("display_revision_margin must be non-negative")
+        if not 0.0 < self.display_repetition_score_multiplier <= 1.0:
+            raise ValueError("display_repetition_score_multiplier must be in (0, 1]")
 
 
 class ILLaDANeuralPolicy:
@@ -256,6 +263,7 @@ class ILLaDANeuralPolicy:
                 ),
                 revision_fraction=self.config.display_revision_fraction,
                 revision_margin=self.config.display_revision_margin,
+                repetition_score_multiplier=self.config.display_repetition_score_multiplier,
             )
         return self.materializer.materialize(
             output,

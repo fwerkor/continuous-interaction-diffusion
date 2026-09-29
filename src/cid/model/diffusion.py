@@ -247,6 +247,7 @@ class CIDDiffusionScheduler:
         reveal_fraction: float,
         revision_fraction: float,
         revision_margin: float,
+        repetition_score_multiplier: float = 0.7,
     ) -> Tensor:
         if token_ids.ndim != 2:
             raise ValueError("token_ids must have shape [batch, tokens]")
@@ -258,12 +259,31 @@ class CIDDiffusionScheduler:
             raise ValueError("revision_fraction must be in [0, 1]")
         if revision_margin < 0.0:
             raise ValueError("revision_margin must be non-negative")
+        if not 0.0 < repetition_score_multiplier <= 1.0:
+            raise ValueError("repetition_score_multiplier must be in (0, 1]")
 
         engine = cuda_engine(logits, capability="refine_display_from_statistics")
+        if (
+            engine is not None
+            and repetition_score_multiplier < 1.0
+            and getattr(engine, "display_token_statistics_with_repetition", None) is None
+        ):
+            engine = None
         if engine is not None:
-            confidence, predicted, current_confidence = (
-                engine.display_token_statistics(token_ids, logits)
-            )
+            if repetition_score_multiplier < 1.0:
+                confidence, predicted, current_confidence = (
+                    engine.display_token_statistics_with_repetition(
+                        token_ids,
+                        logits,
+                        mask_token_id=self.mask_token_id,
+                        eos_token_id=self.eos_token_id,
+                        repetition_score_multiplier=repetition_score_multiplier,
+                    )
+                )
+            else:
+                confidence, predicted, current_confidence = (
+                    engine.display_token_statistics(token_ids, logits)
+                )
             return engine.refine_display_from_statistics(
                 token_ids,
                 confidence,
@@ -287,6 +307,39 @@ class CIDDiffusionScheduler:
             for start in range(0, token_ids.shape[1], token_chunk_size):
                 stop = min(token_ids.shape[1], start + token_chunk_size)
                 filtered_logits = logits[:, start:stop].float().clone()
+                if repetition_score_multiplier < 1.0:
+                    log_multiplier = math.log(repetition_score_multiplier)
+                    for batch_index in range(token_ids.shape[0]):
+                        row = token_ids[batch_index]
+                        for local_position, position in enumerate(range(start, stop)):
+                            adjacent_runs: dict[int, int] = {}
+                            if position > 0:
+                                repeated_id = int(row[position - 1])
+                                if repeated_id not in (self.mask_token_id, self.eos_token_id):
+                                    exponent = 1
+                                    cursor = position - 2
+                                    while cursor >= 0 and int(row[cursor]) == repeated_id:
+                                        exponent += 1
+                                        cursor -= 1
+                                    adjacent_runs[repeated_id] = exponent
+                            if position + 1 < row.numel():
+                                repeated_id = int(row[position + 1])
+                                if repeated_id not in (self.mask_token_id, self.eos_token_id):
+                                    exponent = 1
+                                    cursor = position + 2
+                                    while (
+                                        cursor < row.numel()
+                                        and int(row[cursor]) == repeated_id
+                                    ):
+                                        exponent += 1
+                                        cursor += 1
+                                    adjacent_runs[repeated_id] = (
+                                        adjacent_runs.get(repeated_id, 0) + exponent
+                                    )
+                            for repeated_id, exponent in adjacent_runs.items():
+                                filtered_logits[
+                                    batch_index, local_position, repeated_id
+                                ] += float(exponent) * log_multiplier
                 probabilities = torch.softmax(filtered_logits, dim=-1)
                 chunk_predicted = filtered_logits.argmax(dim=-1)
                 chunk_confidence = probabilities.gather(

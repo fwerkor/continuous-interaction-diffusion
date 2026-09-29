@@ -31,7 +31,11 @@ from cid.data import (
     load_indexed_jsonl,
     training_transition_source_steps,
 )
-from cid.defaults import DEFAULT_DISPLAY_REVISION_FRACTION, DEFAULT_DISPLAY_REVISION_MARGIN
+from cid.defaults import (
+    DEFAULT_DISPLAY_REPETITION_SCORE_MULTIPLIER,
+    DEFAULT_DISPLAY_REVISION_FRACTION,
+    DEFAULT_DISPLAY_REVISION_MARGIN,
+)
 from cid.grounding import (
     STRONG_LINK_RELATIONS,
     AnchorKind,
@@ -369,6 +373,9 @@ class CIDTrainerConfig:
     rollout_denoising_steps: int = 8
     rollout_display_revision_fraction: float = DEFAULT_DISPLAY_REVISION_FRACTION
     rollout_display_revision_margin: float = DEFAULT_DISPLAY_REVISION_MARGIN
+    rollout_display_repetition_score_multiplier: float = (
+        DEFAULT_DISPLAY_REPETITION_SCORE_MULTIPLIER
+    )
     semantic_pooling: str = "order-aware-v2"
     seed: int = 0
 
@@ -417,6 +424,8 @@ class CIDTrainerConfig:
             raise ValueError("rollout_denoising_steps must be positive")
         if self.rollout_display_revision_margin < 0.0:
             raise ValueError("rollout_display_revision_margin must be non-negative")
+        if not 0.0 < self.rollout_display_repetition_score_multiplier <= 1.0:
+            raise ValueError("rollout_display_repetition_score_multiplier must be in (0, 1]")
         if self.semantic_pooling not in {"mean-v1", "order-aware-v2"}:
             raise ValueError("unsupported semantic_pooling mode")
 
@@ -1588,6 +1597,7 @@ class CIDTrainer:
             ),
             revision_fraction=self.config.rollout_display_revision_fraction,
             revision_margin=self.config.rollout_display_revision_margin,
+            repetition_score_multiplier=self.config.rollout_display_repetition_score_multiplier,
         )
 
         materializer_config = CIDMaterializerConfig()
@@ -2162,6 +2172,9 @@ class CIDTrainer:
                                 ),
                                 revision_fraction=self.config.rollout_display_revision_fraction,
                                 revision_margin=self.config.rollout_display_revision_margin,
+                                repetition_score_multiplier=(
+                                    self.config.rollout_display_repetition_score_multiplier
+                                ),
                             )
                             example = microbatch[row_index].example
                             if not isinstance(example, TrajectoryExample):
@@ -2406,8 +2419,12 @@ class CIDTrainer:
         saved_config.setdefault("semantic_pooling", "mean-v1")
         saved_config.setdefault("lr_schedule", "cosine")
         saved_config.setdefault("lr_decay_start_steps", 0)
+        saved_config.setdefault("rollout_display_repetition_score_multiplier", 1.0)
         current_config = asdict(self.config)
         saved_config["gradient_accumulation_steps"] = current_config["gradient_accumulation_steps"]
+        saved_config["rollout_display_repetition_score_multiplier"] = current_config[
+            "rollout_display_repetition_score_multiplier"
+        ]
         if saved_config != current_config:
             raise ValueError("checkpoint trainer configuration does not match this trainer")
         trainer_state = state["trainer_state"]
@@ -2546,6 +2563,7 @@ class CIDTrainer:
                 )
         saved_trainer_config = dict(checkpoint["trainer_config"])
         saved_trainer_config.setdefault("semantic_pooling", "mean-v1")
+        saved_trainer_config.setdefault("rollout_display_repetition_score_multiplier", 1.0)
         current_trainer_config = asdict(self.config)
         world_size_changed = (
             saved_world_size is not None and int(saved_world_size) != current_world_size
@@ -2570,6 +2588,13 @@ class CIDTrainer:
                 and int(checkpoint.get("pending_examples", 0)) == 0
                 and int(checkpoint.get("pending_global_examples", 0)) == 0
             )
+            if clean_epoch_boundary:
+                saved_without_geometry.pop(
+                    "rollout_display_repetition_score_multiplier", None
+                )
+                current_without_geometry.pop(
+                    "rollout_display_repetition_score_multiplier", None
+                )
             if saved_world_size is None:
                 # Legacy epoch-boundary checkpoints predate world-size metadata. Preserve their
                 # historical local-geometry compatibility rule; partial-epoch legacy checkpoints
