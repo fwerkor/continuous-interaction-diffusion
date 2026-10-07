@@ -1,5 +1,9 @@
 from __future__ import annotations
 
+import pytest
+
+pytest.importorskip("torch")
+
 from cid.model.loading import backbone_source_identity
 
 
