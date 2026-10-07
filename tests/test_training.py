@@ -1764,7 +1764,7 @@ def test_trainer_checkpoint_restores_trainable_state_optimizer_and_progress(tmp_
 
     inference_adapter = make_adapter(seed=77)
     inference_adapter.set_backbone_trainable(True)
-    loaded_state = load_cid_adapter_checkpoint(inference_adapter, path)
+    loaded_state = load_cid_adapter_checkpoint(inference_adapter, path, tokenizer=TinyTokenizer())
     assert loaded_state == CIDTrainerState(
         transitions_seen=4,
         optimizer_steps=2,
@@ -1895,6 +1895,7 @@ def test_stage_b_init_rejects_semantic_pooling_mismatch(tmp_path) -> None:
         load_cid_adapter_checkpoint(
             make_adapter(seed=152),
             checkpoint,
+            tokenizer=TinyTokenizer(),
             expected_semantic_pooling="order-aware-v2",
         )
 
@@ -1937,6 +1938,27 @@ def test_stage_a_checkpoint_rejects_different_backbone_identity(tmp_path) -> Non
         restored.load_checkpoint(path)
 
 
+def test_stage_a_checkpoint_rejects_different_tokenizer_identity(tmp_path) -> None:
+    adapter = make_adapter(seed=176)
+    tokenizer = TinyTokenizer()
+    trainer = CIDTrainer(
+        adapter,
+        ILLaDATrajectoryTensorizer(adapter, tokenizer),
+    )
+    path = tmp_path / "tokenizer-identity.pt"
+    trainer.save_checkpoint(path)
+
+    restored_adapter = make_adapter(seed=176)
+    restored_tokenizer = TinyTokenizer()
+    restored_tokenizer.special_tokens_map = {"mask_token": "<different-mask>"}
+    restored = CIDTrainer(
+        restored_adapter,
+        ILLaDATrajectoryTensorizer(restored_adapter, restored_tokenizer),
+    )
+    with pytest.raises(ValueError, match="tokenizer identity"):
+        restored.load_checkpoint(path)
+
+
 def test_semantic_state_guard_rejects_nonfinite_and_runaway_state() -> None:
     adapter = make_adapter(seed=175)
     encoder = ILLaDATextEncoder(adapter, TinyTokenizer())
@@ -1974,7 +1996,7 @@ def test_stage_a_checkpoint_rejects_previous_neural_contract(tmp_path) -> None:
     with pytest.raises(ValueError, match="neural contract"):
         restored.load_checkpoint(incompatible)
     with pytest.raises(ValueError, match="neural contract"):
-        load_cid_adapter_checkpoint(restored_adapter, incompatible)
+        load_cid_adapter_checkpoint(restored_adapter, incompatible, tokenizer=TinyTokenizer())
 
 
 def test_trainer_checkpoint_restores_pending_gradient_accumulation(tmp_path) -> None:

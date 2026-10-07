@@ -690,6 +690,7 @@ class ILLaDACIDAdapter(nn.Module):
             dropout=self.config.external_dropout,
             normalize_output=False,
             gate_init_bias=-6.0,
+            zero_output_init=True,
         )
         self.output_heads = CIDOutputHeads(
             d_model=self.d_model,

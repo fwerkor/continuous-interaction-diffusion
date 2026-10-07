@@ -1176,7 +1176,7 @@ def _benchmark(args: argparse.Namespace) -> None:
     )
     from cid.model.benchmark import run_neural_benchmark_case
     from cid.model.encoding import ILLaDATextEncoder
-    from cid.model.loading import load_cid_tokenizer
+    from cid.model.loading import apply_neural_contract_compatibility, load_cid_tokenizer
 
     checkpoint = Path(args.checkpoint)
     release = args.checkpoint_kind == "release"
@@ -1275,14 +1275,21 @@ def _benchmark(args: argparse.Namespace) -> None:
                     embedding_device="cpu",
                 )
             else:
+                legacy_contract_version = int(release_config.get("neural_contract_version", 4))
                 load_cid_adapter_parameter_state(
                     adapter,
                     load_safetensors(str(checkpoint / "cid_adapter.safetensors"), device="cpu"),
                 )
-                semantic_state = torch.load(
-                    checkpoint / "semantic-embedding.pt",
-                    map_location="cpu",
-                    weights_only=False,
+                semantic_state = apply_neural_contract_compatibility(
+                    adapter,
+                    dict(
+                        torch.load(
+                            checkpoint / "semantic-embedding.pt",
+                            map_location="cpu",
+                            weights_only=False,
+                        )
+                    ),
+                    neural_contract_version=legacy_contract_version,
                 )
                 text_encoder = ILLaDATextEncoder.from_frozen_snapshot_state(
                     adapter,
@@ -1388,7 +1395,7 @@ def _benchmark(args: argparse.Namespace) -> None:
                 else:
                     forward_model = adapter
             else:
-                load_cid_adapter_checkpoint(adapter, checkpoint)
+                load_cid_adapter_checkpoint(adapter, checkpoint, tokenizer=tokenizer)
                 forward_model = (
                     wrap_npu_autocast(torch, adapter, dtype=dtype)
                     if device_type == "npu"
@@ -1399,7 +1406,7 @@ def _benchmark(args: argparse.Namespace) -> None:
                 # Stage A keeps trainable CID modules in FP32 even though the frozen
                 # backbone is stored and computed in low precision.
                 adapter.set_cid_modules_dtype(torch.float32)
-            load_cid_adapter_checkpoint(adapter, checkpoint)
+            load_cid_adapter_checkpoint(adapter, checkpoint, tokenizer=tokenizer)
             text_encoder = ILLaDATextEncoder(
                 adapter, tokenizer, pooling_mode=semantic_pooling
             )
@@ -3214,6 +3221,7 @@ def _train_stage_b(args: argparse.Namespace) -> None:
                 load_cid_adapter_checkpoint(
                     model,
                     args.init_cid_checkpoint,
+                    tokenizer=tokenizer,
                     expected_semantic_pooling=args.semantic_pooling,
                 )
             snapshot = ILLaDATextEncoder.from_frozen_snapshot(

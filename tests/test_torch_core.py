@@ -382,6 +382,32 @@ def test_torch_core_accepts_empty_external_memory_and_no_sources() -> None:
     assert output.source_logits.shape == (1, 2, config.max_need_slots, 0)
 
 
+def test_external_fusion_starts_as_exact_residual_noop() -> None:
+    fusion_cls = import_module("cid.model.components").CIDExternalFusion
+    fusion = fusion_cls(
+        d_model=8,
+        num_heads=2,
+        normalize_output=False,
+        gate_init_bias=-6.0,
+        zero_output_init=True,
+    )
+    hidden = torch.randn(2, 3, 8)
+    seed_hidden = torch.randn(2, 3, 8)
+    context_weight = torch.ones(2, 3, 1)
+    facts = torch.randn(2, 2, 8)
+    percepts = torch.randn(2, 2, 8)
+
+    output = fusion(
+        hidden,
+        seed_hidden=seed_hidden,
+        context_weight=context_weight,
+        facts=facts,
+        percepts=percepts,
+    )
+
+    assert torch.equal(output, hidden)
+
+
 def test_external_fusion_keeps_mixed_empty_memory_rows_finite() -> None:
     fusion_cls = import_module("cid.model.components").CIDExternalFusion
     fusion = fusion_cls(d_model=8, num_heads=2)

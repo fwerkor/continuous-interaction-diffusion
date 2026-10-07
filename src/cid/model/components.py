@@ -16,6 +16,7 @@ class CIDExternalFusion(nn.Module):
         dropout: float = 0.0,
         normalize_output: bool = True,
         gate_init_bias: float | None = None,
+        zero_output_init: bool = False,
     ) -> None:
         super().__init__()
         self.external_type_embedding = nn.Embedding(2, d_model)
@@ -44,6 +45,10 @@ class CIDExternalFusion(nn.Module):
             nn.init.zeros_(final_percept.weight)
             if final_percept.bias is not None:
                 nn.init.zeros_(final_percept.bias)
+        if zero_output_init:
+            nn.init.zeros_(self.external_attention.out_proj.weight)
+            if self.external_attention.out_proj.bias is not None:
+                nn.init.zeros_(self.external_attention.out_proj.bias)
         if gate_init_bias is not None:
             nn.init.zeros_(self.external_gate.weight)
             nn.init.constant_(self.external_gate.bias, gate_init_bias)

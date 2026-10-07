@@ -110,6 +110,8 @@ def test_cid_additive_inputs_start_as_no_ops() -> None:
         adapter.display_noise_projection.weight,
         adapter.external_fusion.external_type_embedding.weight,
         adapter.external_fusion.percept_projection[2].weight,
+        adapter.external_fusion.external_attention.out_proj.weight,
+        adapter.external_fusion.external_attention.out_proj.bias,
         adapter.output_heads.thought_delta.weight,
         adapter.output_heads.thought_delta.bias,
     ):
