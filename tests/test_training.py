@@ -898,6 +898,30 @@ def test_optimizer_step_rejects_nonfinite_gradient_before_parameter_update() -> 
     assert trainer.state.optimizer_steps == 0
 
 
+def test_optimizer_step_recovers_finite_l2_norm_overflow() -> None:
+    adapter = make_adapter(seed=167)
+    trainer = CIDTrainer(
+        adapter,
+        ILLaDATrajectoryTensorizer(adapter, TinyTokenizer()),
+        CIDTrainerConfig(learning_rate=1e-3),
+    )
+    parameter = next(parameter for _, parameter in trainer._trainable)
+    parameter.grad = torch.full_like(parameter, 1e20)
+    trainer._pending_accumulation = 1
+    trainer._pending_examples = 1
+    trainer._pending_global_examples = 1
+
+    raw_norm = torch.nn.utils.get_total_norm([parameter.grad])
+    assert torch.isinf(raw_norm)
+
+    trainer._optimizer_step()
+
+    assert trainer.state.optimizer_steps == 1
+    assert trainer.pending_accumulation_steps == 0
+    assert parameter.grad is None
+    assert torch.isfinite(parameter).all()
+
+
 def test_distributed_all_true_requires_unanimous_rank_readiness(monkeypatch) -> None:
     monkeypatch.setattr(torch.distributed, "is_available", lambda: True)
     monkeypatch.setattr(torch.distributed, "is_initialized", lambda: True)

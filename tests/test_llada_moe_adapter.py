@@ -301,6 +301,26 @@ def test_llada_moe_grouped_experts_match_reference_outputs_and_input_gradients()
     assert torch.allclose(reference_input.grad, grouped_input.grad, atol=1e-5, rtol=1e-5)
 
 
+def test_llada_moe_chunked_frozen_experts_match_reference_outputs_and_input_gradients() -> None:
+    backbone = TinyLLaDAMoEBackbone()
+    adapter = ILLaDACIDAdapter(backbone, freeze_backbone=True)
+    moe = backbone.decoder.layers[0].mlp
+    reference_input = torch.randn(2, 7, TinyLLaDAMoEConfig.hidden_size, requires_grad=True)
+    chunked_input = reference_input.detach().clone().requires_grad_(True)
+
+    reference_output = moe(reference_input)
+    reference_output.square().sum().backward()
+    adapter.set_mlp_chunk_size(2)
+    packed_layers = adapter.pack_frozen_moe_experts()
+    chunked_output = moe(chunked_input)
+    chunked_output.square().sum().backward()
+
+    assert packed_layers == 1
+    assert moe._cid_moe_chunk_size == 2
+    assert torch.allclose(reference_output, chunked_output, atol=1e-5, rtol=1e-5)
+    assert torch.allclose(reference_input.grad, chunked_input.grad, atol=1e-5, rtol=1e-5)
+
+
 def test_llada_moe_private_grouped_kernel_matches_reference(monkeypatch) -> None:
     illada = import_module("cid.model.illada")
     backbone = TinyLLaDAMoEBackbone()
@@ -390,6 +410,33 @@ def test_llada_moe_trainable_grouped_experts_match_reference_parameter_gradients
     assert sum(p.numel() for p in reference_adapter.parameters()) == sum(
         p.numel() for p in grouped_adapter.parameters()
     )
+
+
+def test_llada_moe_attention_query_chunking_matches_output_and_input_gradient() -> None:
+    backbone = TinyLLaDAMoEBackbone()
+    adapter = ILLaDACIDAdapter(backbone, freeze_backbone=True)
+    attention = backbone.decoder.layers[0].self_attn
+    base_input = torch.randn(2, 7, TinyLLaDAMoEConfig.hidden_size)
+    full_input = base_input.detach().clone().requires_grad_(True)
+    chunked_input = base_input.detach().clone().requires_grad_(True)
+    mask = torch.tensor(
+        [[True, True, True, True, False, True, True], [True] * 7]
+    )
+    cos = torch.ones(2, 7, attention.head_dim)
+    sin = torch.zeros_like(cos)
+
+    attention._cid_key_padding_mask = mask
+    full_output, _, _ = attention(full_input, position_embeddings=(cos, sin))
+    full_output.square().sum().backward()
+    full_gradient = full_input.grad.detach().clone()
+
+    adapter.set_attention_query_chunk_size(2)
+    attention._cid_key_padding_mask = mask
+    chunked_output, _, _ = attention(chunked_input, position_embeddings=(cos, sin))
+    chunked_output.square().sum().backward()
+
+    torch.testing.assert_close(full_output, chunked_output, rtol=1e-5, atol=1e-5)
+    torch.testing.assert_close(full_gradient, chunked_input.grad, rtol=1e-5, atol=1e-5)
 
 
 def test_llada_moe_attention_keeps_masked_slots_out_of_key_context() -> None:

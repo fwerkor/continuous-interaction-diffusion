@@ -776,6 +776,13 @@ class CIDTrainer:
         self._stage_a_manual_sync_required = False
         self._stage_a_backward_cpu_stash_active = False
         self._stage_a_gradient_stash_hook_handles: list[object] = []
+        self._gradient_diagnostics_enabled = os.environ.get(
+            "CID_GRADIENT_DIAGNOSTICS", ""
+        ).strip().lower() in {"1", "true", "yes", "on"}
+        self._pending_gradient_example_ids: list[str] = []
+        self._npu_cache_release_min_free_bytes = int(
+            float(os.environ.get("CID_NPU_CACHE_RELEASE_MIN_FREE_GIB", "0")) * 1024**3
+        )
         if (
             getattr(self.forward_model, "_cid_stage_a_ddp", False)
             and self.cpu_gradient_stash_threshold_tokens is not None
@@ -880,6 +887,48 @@ class CIDTrainer:
             # rollout state. Coverage-only correction for a blocked runtime row does not.
             advance_state.append(real_row and (not scheduled_rollout or runtime_ready))
         return tuple(use_rollout_flags), tuple(execute_rows), tuple(advance_state)
+
+    def _maybe_release_npu_cache(self) -> None:
+        """Return reclaimable allocator cache before HCCL when NPU free HBM is low."""
+        threshold = self._npu_cache_release_min_free_bytes
+        device = self.tensorizer.text_encoder.device
+        if threshold <= 0 or device.type != "npu":
+            return
+        npu = getattr(torch, "npu", None)
+        if npu is None or not hasattr(npu, "mem_get_info") or not hasattr(npu, "empty_cache"):
+            return
+        free_before, total = npu.mem_get_info(device)
+        if int(free_before) >= threshold:
+            return
+        reserved = int(npu.memory_reserved(device))
+        allocated = int(npu.memory_allocated(device))
+        reclaimable = max(0, reserved - allocated)
+        if reclaimable < 256 * 1024**2:
+            return
+        npu.empty_cache()
+        if self._gradient_diagnostics_enabled:
+            free_after, _ = npu.mem_get_info(device)
+            rank = (
+                torch.distributed.get_rank()
+                if torch.distributed.is_available() and torch.distributed.is_initialized()
+                else 0
+            )
+            print(
+                "CID_NPU_CACHE_RELEASE "
+                + json.dumps(
+                    {
+                        "rank": rank,
+                        "free_before_gib": int(free_before) / 1024**3,
+                        "free_after_gib": int(free_after) / 1024**3,
+                        "allocated_gib": allocated / 1024**3,
+                        "reserved_gib": reserved / 1024**3,
+                        "reclaimable_gib": reclaimable / 1024**3,
+                        "total_gib": int(total) / 1024**3,
+                    },
+                    sort_keys=True,
+                ),
+                flush=True,
+            )
 
     def _distributed_global_batch_size(self, local_rows: int) -> int:
         if local_rows < 0:
@@ -1282,6 +1331,7 @@ class CIDTrainer:
         )
         training_batch.batch.sample_mask = valid_rows
         if global_effective_batch_size is None:
+            self._maybe_release_npu_cache()
             global_effective_batch_size = self._distributed_global_batch_size(effective_batch_size)
         if global_effective_batch_size < effective_batch_size:
             raise ValueError("global valid-example count cannot be below the local count")
@@ -1341,22 +1391,27 @@ class CIDTrainer:
         # saved-tensor path and retain the blocking implementation as a compatibility
         # fallback for older engine builds.
         saved_tensor_context = nullcontext()
+        accelerator_type = training_batch.batch.thought_semantic.device.type
         if (
             stage_a_ddp
-            and training_batch.batch.thought_semantic.device.type == "cuda"
+            and accelerator_type in {"cuda", "npu"}
             and sequence_tokens >= self.stage_a_activation_offload_threshold_tokens
         ):
             parameter_storages = {
                 parameter.untyped_storage().data_ptr()
                 for parameter in self.forward_model.parameters()
-                if parameter.device.type == "cuda"
+                if parameter.device.type == accelerator_type
             }
             offload_budget_bytes = (
                 self.stage_a_activation_offload_budget_bytes
                 if self.stage_a_activation_offload_budget_bytes is not None
                 else (12 if sequence_tokens >= 1024 else 8) * 1024**3
             )
-            if self.stage_a_async_activation_offload and self._stage_a_activation_offloader is None:
+            if (
+                accelerator_type == "cuda"
+                and self.stage_a_async_activation_offload
+                and self._stage_a_activation_offloader is None
+            ):
                 engine = cuda_engine(
                     training_batch.batch.thought_semantic,
                     capability="AsyncPinnedActivationOffloader",
@@ -1394,7 +1449,7 @@ class CIDTrainer:
 
                 def pack_saved_tensor(tensor: torch.Tensor) -> object:
                     nonlocal offloaded_bytes
-                    if tensor.device.type != "cuda" or not tensor.requires_grad:
+                    if tensor.device.type != accelerator_type or not tensor.requires_grad:
                         return tensor
                     if tensor.untyped_storage().data_ptr() in parameter_storages:
                         return tensor
@@ -1474,6 +1529,18 @@ class CIDTrainer:
                     raise FloatingPointError(
                         f"non-finite CID loss for training micro-batch: {names}"
                     )
+                if self._gradient_diagnostics_enabled:
+                    self._pending_gradient_example_ids.extend(
+                        example_id
+                        for example_id, selected in zip(
+                            training_batch.example_ids,
+                            resolved_sample_mask,
+                            strict=True,
+                        )
+                        if selected
+                    )
+                    if len(self._pending_gradient_example_ids) > 256:
+                        del self._pending_gradient_example_ids[:-256]
                 if reducer is not None:
                     reducer.start()
                     reducer_started = True
@@ -2765,9 +2832,134 @@ class CIDTrainer:
             "epoch_progress": checkpoint.get("epoch_progress"),
         }
 
+    def _stable_gradient_l2_norm(
+        self,
+        named_parameters: tuple[tuple[str, torch.nn.Parameter], ...],
+    ) -> tuple[float, list[tuple[float, str]]]:
+        """Compute an overflow-resistant L2 norm for finite gradients."""
+
+        total_norm = 0.0
+        maxima: list[tuple[float, str]] = []
+        for name, parameter in named_parameters:
+            gradient = parameter.grad
+            if gradient is None:
+                continue
+            max_abs = float(gradient.detach().abs().max().float().cpu())
+            maxima.append((max_abs, name))
+            if max_abs == 0.0:
+                continue
+            normalized = gradient.detach().to(dtype=torch.float32, copy=True)
+            normalized.div_(max_abs)
+            normalized_norm = float(torch.linalg.vector_norm(normalized).cpu())
+            del normalized
+            total_norm = math.hypot(total_norm, max_abs * normalized_norm)
+        maxima.sort(reverse=True)
+        return total_norm, maxima
+
+    def _gradient_failure_diagnostics(
+        self,
+        named_parameters: tuple[tuple[str, torch.nn.Parameter], ...],
+    ) -> tuple[bool, tuple[str, ...]]:
+        finite_checks: list[Tensor] = []
+        finite_names: list[str] = []
+        for name, parameter in named_parameters:
+            if parameter.grad is None:
+                continue
+            finite_checks.append(torch.isfinite(parameter.grad.detach()).all())
+            finite_names.append(name)
+        if not finite_checks:
+            return True, ()
+        finite_values = torch.stack(finite_checks).detach().cpu().tolist()
+        offending = tuple(
+            name
+            for name, finite in zip(finite_names, finite_values, strict=True)
+            if not finite
+        )
+        return not offending, offending
+
+    def _emit_gradient_diagnostic(
+        self,
+        *,
+        reported_gradient_norm: float,
+        elementwise_finite: bool,
+        offending_parameters: tuple[str, ...],
+        stable_gradient_norm: float | None = None,
+        largest_gradient_maxima: list[tuple[float, str]] | None = None,
+        recovered: bool = False,
+        stage: str = "post_sync",
+    ) -> None:
+        if not self._gradient_diagnostics_enabled and not recovered:
+            return
+        rank = (
+            torch.distributed.get_rank()
+            if torch.distributed.is_available() and torch.distributed.is_initialized()
+            else 0
+        )
+        payload = {
+            "rank": rank,
+            "stage": stage,
+            "next_optimizer_step": self.state.optimizer_steps + 1,
+            "reported_gradient_norm": reported_gradient_norm,
+            "elementwise_finite": elementwise_finite,
+            "offending_parameters": list(offending_parameters[:16]),
+            "stable_gradient_norm": stable_gradient_norm,
+            "largest_gradient_maxima": [
+                {"parameter": name, "max_abs": value}
+                for value, name in (largest_gradient_maxima or [])[:12]
+            ],
+            "example_ids": list(self._pending_gradient_example_ids),
+            "recovered": recovered,
+        }
+        print(
+            "CID_GRADIENT_DIAGNOSTIC " + json.dumps(payload, sort_keys=True),
+            flush=True,
+        )
+
     def _optimizer_step(self) -> None:
         if self._stage_a_stash_has_data():
             self._restore_stage_a_gradients_from_cpu()
+        if self._pending_ddp_unsynced and self._gradient_diagnostics_enabled:
+            pre_sync_named_parameters = tuple(
+                (name, parameter)
+                for name, parameter in self._trainable
+                if parameter.grad is not None
+            )
+            (
+                local_pre_sync_finite,
+                pre_sync_offending_parameters,
+            ) = self._gradient_failure_diagnostics(pre_sync_named_parameters)
+            pre_sync_flag = torch.tensor(
+                int(local_pre_sync_finite),
+                device=self.tensorizer.text_encoder.device,
+                dtype=torch.int32,
+            )
+            if torch.distributed.is_available() and torch.distributed.is_initialized():
+                torch.distributed.all_reduce(
+                    pre_sync_flag,
+                    op=torch.distributed.ReduceOp.SUM,
+                )
+                global_pre_sync_finite = (
+                    int(pre_sync_flag.item()) == torch.distributed.get_world_size()
+                )
+            else:
+                global_pre_sync_finite = local_pre_sync_finite
+            if not global_pre_sync_finite:
+                self._emit_gradient_diagnostic(
+                    reported_gradient_norm=float("nan"),
+                    elementwise_finite=local_pre_sync_finite,
+                    offending_parameters=pre_sync_offending_parameters,
+                    stage="pre_sync",
+                )
+                self.optimizer.zero_grad(set_to_none=True)
+                self._pending_accumulation = 0
+                self._pending_examples = 0
+                self._pending_global_examples = 0
+                self._pending_ddp_unsynced = False
+                self._pending_fsdp_unsynced = False
+                self._pending_gradient_example_ids.clear()
+                raise FloatingPointError(
+                    "non-finite CID gradient detected before Stage A gradient synchronization"
+                )
         if self._pending_ddp_unsynced:
             self._sync_pending_stage_a_ddp_gradients()
         if self._pending_fsdp_unsynced:
@@ -2782,19 +2974,84 @@ class CIDTrainer:
         for _, parameter in self._trainable:
             if parameter.grad is not None:
                 parameter.grad.div_(normalizer)
+
+        named_parameters = tuple(
+            (name, parameter)
+            for name, parameter in self._trainable
+            if parameter.grad is not None
+        )
+        parameters = tuple(parameter for _, parameter in named_parameters)
+        recovered_norm_overflow = False
+        local_elementwise_finite = True
+        offending_parameters: tuple[str, ...] = ()
+        stable_gradient_norm: float | None = None
+        largest_gradient_maxima: list[tuple[float, str]] | None = None
+
         if self.gradient_clipper is None:
-            gradient_norm = torch.nn.utils.clip_grad_norm_(
-                (parameter for _, parameter in self._trainable),
-                self.config.max_grad_norm,
-            )
+            gradients = tuple(parameter.grad for parameter in parameters)
+            gradient_norm = torch.nn.utils.get_total_norm(gradients)
+            local_norm_finite = bool(torch.isfinite(gradient_norm.detach()).all())
+            if local_norm_finite:
+                torch.nn.utils.clip_grads_with_norm_(
+                    parameters,
+                    self.config.max_grad_norm,
+                    gradient_norm,
+                )
+            else:
+                (
+                    local_elementwise_finite,
+                    offending_parameters,
+                ) = self._gradient_failure_diagnostics(named_parameters)
+                if local_elementwise_finite:
+                    (
+                        stable_gradient_norm,
+                        largest_gradient_maxima,
+                    ) = self._stable_gradient_l2_norm(named_parameters)
+                    if (
+                        math.isfinite(stable_gradient_norm)
+                        and stable_gradient_norm <= torch.finfo(torch.float32).max
+                    ):
+                        gradient_norm = torch.tensor(
+                            stable_gradient_norm,
+                            device=self.tensorizer.text_encoder.device,
+                            dtype=torch.float32,
+                        )
+                        torch.nn.utils.clip_grads_with_norm_(
+                            parameters,
+                            self.config.max_grad_norm,
+                            gradient_norm,
+                        )
+                        local_norm_finite = True
+                        recovered_norm_overflow = True
         else:
             gradient_norm = self.gradient_clipper(self.config.max_grad_norm)
+            local_norm_finite = (
+                bool(torch.isfinite(gradient_norm.detach()).all())
+                if isinstance(gradient_norm, Tensor)
+                else math.isfinite(float(gradient_norm))
+            )
+            if not local_norm_finite:
+                (
+                    local_elementwise_finite,
+                    offending_parameters,
+                ) = self._gradient_failure_diagnostics(named_parameters)
+
         if isinstance(gradient_norm, Tensor):
-            finite_gradient_norm = bool(torch.isfinite(gradient_norm.detach()).all())
             reported_gradient_norm = float(gradient_norm.detach().float().cpu())
         else:
             reported_gradient_norm = float(gradient_norm)
-            finite_gradient_norm = math.isfinite(reported_gradient_norm)
+
+        if recovered_norm_overflow:
+            self._emit_gradient_diagnostic(
+                reported_gradient_norm=reported_gradient_norm,
+                elementwise_finite=True,
+                offending_parameters=(),
+                stable_gradient_norm=stable_gradient_norm,
+                largest_gradient_maxima=largest_gradient_maxima,
+                recovered=True,
+            )
+
+        finite_gradient_norm = local_norm_finite
         if torch.distributed.is_available() and torch.distributed.is_initialized():
             finite_flag = torch.tensor(
                 int(finite_gradient_norm),
@@ -2804,12 +3061,20 @@ class CIDTrainer:
             torch.distributed.all_reduce(finite_flag, op=torch.distributed.ReduceOp.SUM)
             finite_gradient_norm = int(finite_flag.item()) == torch.distributed.get_world_size()
         if not finite_gradient_norm:
+            self._emit_gradient_diagnostic(
+                reported_gradient_norm=reported_gradient_norm,
+                elementwise_finite=local_elementwise_finite,
+                offending_parameters=offending_parameters,
+                stable_gradient_norm=stable_gradient_norm,
+                largest_gradient_maxima=largest_gradient_maxima,
+            )
             self.optimizer.zero_grad(set_to_none=True)
             self._pending_accumulation = 0
             self._pending_examples = 0
             self._pending_global_examples = 0
             self._pending_ddp_unsynced = False
             self._pending_fsdp_unsynced = False
+            self._pending_gradient_example_ids.clear()
             raise FloatingPointError(
                 "non-finite CID gradient norm on at least one rank before optimizer step; "
                 f"local_norm={reported_gradient_norm}"
@@ -2822,6 +3087,7 @@ class CIDTrainer:
         self._pending_ddp_unsynced = False
         self._pending_fsdp_unsynced = False
         self._stage_a_manual_sync_required = False
+        self._pending_gradient_example_ids.clear()
         self.state = CIDTrainerState(
             transitions_seen=self.state.transitions_seen,
             optimizer_steps=self.state.optimizer_steps + 1,

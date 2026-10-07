@@ -2086,6 +2086,10 @@ def _train_stage_a(args: argparse.Namespace) -> None:
                 )
             else:
                 adapter.set_gradient_checkpointing(True)
+        if args.attention_query_chunk_size is not None:
+            if args.attention_query_chunk_size <= 0:
+                raise ValueError("--attention-query-chunk-size must be positive")
+            adapter.set_attention_query_chunk_size(args.attention_query_chunk_size)
         if args.mlp_chunk_size is not None:
             if args.mlp_chunk_size <= 0:
                 raise ValueError("--mlp-chunk-size must be positive")
@@ -4455,6 +4459,11 @@ def main() -> None:
     train.add_argument("--warmup-steps", type=int, default=0)
     train.add_argument("--lr-decay-steps", type=int, default=0)
     train.add_argument("--min-learning-rate-ratio", type=float, default=0.1)
+    train.add_argument(
+        "--attention-query-chunk-size",
+        type=int,
+        help="query-token chunk size for exact LLaDA-MoE SDPA evaluation",
+    )
     train.add_argument(
         "--mlp-chunk-size",
         type=int,
