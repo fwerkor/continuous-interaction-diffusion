@@ -1189,21 +1189,25 @@ def test_one_shot_need_is_supervised_before_but_not_after_its_observation() -> N
 
     adapter = make_adapter(seed=125)
     tensorizer = ILLaDATrajectoryTensorizer(adapter, TinyTokenizer())
+    binding = example.binding_targets[0]
+    owner = binding.owner_cell
+    assert owner is not None
+    need_slot = tensorizer._binding_slot_schedule(example)[(owner.identifier, binding.need_id)]
     bootstrap = tensorizer.tensorize(example, source_step=-1, timestep=1.0)
     assimilate = tensorizer.tensorize(example, source_step=0, timestep=1.0)
 
-    assert bootstrap.targets.need_targets[0, 0, 0] == 1
-    assert bootstrap.targets.source_targets[0, 0, 0] == 0
-    assert assimilate.targets.need_targets[0, 0, 0] == 0
-    assert assimilate.targets.source_targets[0, 0, 0] == -100
+    assert bootstrap.targets.need_targets[0, 0, need_slot] == 1
+    assert bootstrap.targets.source_targets[0, 0, need_slot] == 0
+    assert assimilate.targets.need_targets[0, 0, need_slot] == 0
+    assert assimilate.targets.source_targets[0, 0, need_slot] == -100
 
     persistent = replace(
         example,
         binding_targets=(replace(example.binding_targets[0], freshness=FreshnessDemand.ALWAYS),),
     )
     refresh = tensorizer.tensorize(persistent, source_step=0, timestep=1.0)
-    assert refresh.targets.need_targets[0, 0, 0] == 1
-    assert refresh.targets.source_targets[0, 0, 0] == 0
+    assert refresh.targets.need_targets[0, 0, need_slot] == 1
+    assert refresh.targets.source_targets[0, 0, need_slot] == 0
 
 
 def test_trajectory_tensorizer_supervises_one_need_owner_with_multi_region_routes() -> None:
@@ -1230,6 +1234,23 @@ def test_trajectory_tensorizer_supervises_one_need_owner_with_multi_region_route
     assert sample.targets.need_target_display_mask[0, 1, 0, :3].all()
 
 
+def test_trajectory_tensorizer_spreads_need_supervision_across_available_slots() -> None:
+    base = make_trajectory()
+    tensorizer = ILLaDATrajectoryTensorizer(make_adapter(seed=126), TinyTokenizer())
+    observed: set[int] = set()
+
+    for index in range(64):
+        example = replace(base, example_id=f"need-slot-spread-{index}")
+        binding = example.binding_targets[0]
+        owner = binding.owner_cell
+        assert owner is not None
+        schedule = tensorizer._binding_slot_schedule(example)
+        observed.add(schedule[(owner.identifier, binding.need_id)])
+        assert tensorizer._binding_slot_schedule(example) == schedule
+
+    assert observed == set(range(tensorizer.adapter.config.max_need_slots))
+
+
 def test_trajectory_tensorizer_keeps_multiple_bindings_on_one_cell_distinct() -> None:
     base = make_trajectory()
     first = replace(
@@ -1247,15 +1268,21 @@ def test_trajectory_tensorizer_keeps_multiple_bindings_on_one_cell_distinct() ->
     )
     example = replace(base, binding_targets=(first, second))
     tensorizer = ILLaDATrajectoryTensorizer(make_adapter(seed=126), TinyTokenizer())
+    owner = first.owner_cell
+    assert owner is not None
+    schedule = tensorizer._binding_slot_schedule(example)
+    first_slot = schedule[(owner.identifier, first.need_id)]
+    second_slot = schedule[(owner.identifier, second.need_id)]
 
     sample = tensorizer.tensorize(example, source_step=0, timestep=1.0)
 
-    assert sample.targets.need_targets[0, 1, :2].tolist() == [1.0, 1.0]
-    assert sample.targets.source_targets[0, 1, :2].tolist() == [0, 0]
-    assert sample.targets.argument_presence_targets[0, 1, 0, :2].tolist() == [1.0, 1.0]
-    assert sample.targets.argument_presence_targets[0, 1, 1, :2].tolist() == [1.0, 1.0]
-    assert sample.targets.argument_mask[0, 1, 0, :2].all()
-    assert sample.targets.argument_mask[0, 1, 1, :2].all()
+    assert first_slot != second_slot
+    assert sample.targets.need_targets[0, 1, [first_slot, second_slot]].tolist() == [1.0, 1.0]
+    assert sample.targets.source_targets[0, 1, [first_slot, second_slot]].tolist() == [0, 0]
+    assert sample.targets.argument_presence_targets[0, 1, first_slot, :2].tolist() == [1.0, 1.0]
+    assert sample.targets.argument_presence_targets[0, 1, second_slot, :2].tolist() == [1.0, 1.0]
+    assert sample.targets.argument_mask[0, 1, first_slot, :2].all()
+    assert sample.targets.argument_mask[0, 1, second_slot, :2].all()
 
 
 def test_order_aware_text_encoder_distinguishes_reversed_token_order() -> None:
