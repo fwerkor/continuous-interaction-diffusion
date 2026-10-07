@@ -4621,7 +4621,68 @@ def test_stage_a_adamw_groups_do_not_decay_gate_biases() -> None:
     no_decay_ids = {id(parameter) for parameter in by_name["cid-no-decay"]["params"]}
     decay_ids = {id(parameter) for parameter in by_name["cid-decay"]["params"]}
     assert id(adapter.external_fusion.external_gate.bias) in no_decay_ids
+    assert id(adapter.output_heads.need_display_query_scale) in no_decay_ids
+    assert id(adapter.output_heads.need_display_query_bias) in no_decay_ids
     assert id(adapter.role_projection.weight) in decay_ids
+
+
+def test_stage_a_checkpoint_migrates_legacy_ndim_optimizer_groups(tmp_path) -> None:
+    adapter = make_adapter(seed=173)
+    legacy_buckets: dict[bool, list[torch.nn.Parameter]] = {True: [], False: []}
+    for parameter in adapter.parameters():
+        if parameter.requires_grad:
+            legacy_buckets[parameter.ndim >= 2].append(parameter)
+    legacy_groups = [
+        {
+            "params": legacy_buckets[use_decay],
+            "weight_decay": 0.01 if use_decay else 0.0,
+            "group_name": "cid-decay" if use_decay else "cid-no-decay",
+        }
+        for use_decay in (True, False)
+        if legacy_buckets[use_decay]
+    ]
+    legacy_optimizer = torch.optim.AdamW(legacy_groups, lr=1e-3, weight_decay=0.0)
+    trainer = CIDTrainer(
+        adapter,
+        ILLaDATrajectoryTensorizer(adapter, TinyTokenizer()),
+        CIDTrainerConfig(learning_rate=1e-3, weight_decay=0.01),
+        optimizer=legacy_optimizer,
+    )
+    for parameter in adapter.parameters():
+        if parameter.requires_grad:
+            parameter.grad = torch.ones_like(parameter)
+    legacy_optimizer.step()
+    legacy_optimizer.zero_grad(set_to_none=True)
+    expected_step = legacy_optimizer.state[
+        adapter.output_heads.need_display_query_scale
+    ]["step"].detach().clone()
+
+    checkpoint = tmp_path / "legacy-stage-a.pt"
+    trainer.save_checkpoint(checkpoint)
+    payload = torch.load(checkpoint, map_location="cpu", weights_only=False)
+    payload.pop("optimizer_parameter_names")
+    torch.save(payload, checkpoint)
+
+    restored_adapter = make_adapter(seed=173)
+    restored = CIDTrainer(
+        restored_adapter,
+        ILLaDATrajectoryTensorizer(restored_adapter, TinyTokenizer()),
+        CIDTrainerConfig(learning_rate=1e-3, weight_decay=0.01),
+    )
+    restored.load_checkpoint(checkpoint)
+
+    no_decay_group = next(
+        group
+        for group in restored.optimizer.param_groups
+        if group.get("group_name") == "cid-no-decay"
+    )
+    no_decay_ids = {id(parameter) for parameter in no_decay_group["params"]}
+    assert id(restored_adapter.output_heads.need_display_query_scale) in no_decay_ids
+    assert id(restored_adapter.output_heads.need_display_query_bias) in no_decay_ids
+    assert torch.equal(
+        restored.optimizer.state[restored_adapter.output_heads.need_display_query_scale]["step"],
+        expected_step,
+    )
 
 
 def test_stage_b_adamw_groups_split_backbone_cid_and_no_decay() -> None:
@@ -4640,6 +4701,11 @@ def test_stage_b_adamw_groups_split_backbone_cid_and_no_decay() -> None:
     assert by_name["cid-decay"]["lr_scale"] == pytest.approx(1.0)
     assert by_name["backbone-decay"]["weight_decay"] == pytest.approx(0.01)
     assert by_name["cid-no-decay"]["weight_decay"] == pytest.approx(0.0)
+    cid_no_decay_ids = {
+        id(parameter) for parameter in by_name["cid-no-decay"]["params"]
+    }
+    assert id(adapter.output_heads.need_display_query_scale) in cid_no_decay_ids
+    assert id(adapter.output_heads.need_display_query_bias) in cid_no_decay_ids
 
     grouped = {id(parameter) for group in groups for parameter in group["params"]}
     trainable = {id(parameter) for parameter in adapter.parameters() if parameter.requires_grad}

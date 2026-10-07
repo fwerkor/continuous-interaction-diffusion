@@ -2577,6 +2577,11 @@ class CIDTrainer:
             "optimizer_state": (
                 self.optimizer.state_dict() if include_optimizer_state else None
             ),
+            "optimizer_parameter_names": (
+                _optimizer_parameter_names(self.optimizer, self._trainable)
+                if include_optimizer_state
+                else None
+            ),
             "generator_state": self.generator.get_state().cpu(),
             "shuffle_state": self.shuffle_rng.getstate(),
             "gradient_state": gradient_state,
@@ -2744,7 +2749,17 @@ class CIDTrainer:
                 )
         optimizer_state = checkpoint.get("optimizer_state")
         if optimizer_state is not None:
-            self.optimizer.load_state_dict(optimizer_state)
+            saved_optimizer_names = checkpoint.get("optimizer_parameter_names")
+            load_optimizer_state_by_parameter_name(
+                self.optimizer,
+                optimizer_state,
+                self._trainable,
+                saved_parameter_names=(
+                    tuple(tuple(str(name) for name in group) for group in saved_optimizer_names)
+                    if saved_optimizer_names is not None
+                    else None
+                ),
+            )
         semantic_snapshot = checkpoint.get("semantic_embedding_snapshot")
         if semantic_snapshot is not None:
             current_encoder = self.tensorizer.text_encoder
@@ -6334,6 +6349,131 @@ def stage_b_optimizer_steps_per_epoch(
     return optimizer_steps
 
 
+_CID_ADAMW_NO_DECAY_PARAMETER_NAMES = frozenset(
+    {
+        "need_display_query_scale",
+        "need_display_query_bias",
+    }
+)
+
+
+def _adamw_uses_weight_decay(name: str, parameter: torch.nn.Parameter) -> bool:
+    """Return whether an AdamW parameter should receive decoupled weight decay."""
+    if parameter.ndim < 2:
+        return False
+    return name.rsplit(".", 1)[-1] not in _CID_ADAMW_NO_DECAY_PARAMETER_NAMES
+
+
+def _optimizer_parameter_names(
+    optimizer: torch.optim.Optimizer,
+    named_parameters: tuple[tuple[str, torch.nn.Parameter], ...],
+) -> tuple[tuple[str, ...], ...]:
+    name_by_id = {id(parameter): name for name, parameter in named_parameters}
+    groups: list[tuple[str, ...]] = []
+    for group in optimizer.param_groups:
+        try:
+            groups.append(tuple(name_by_id[id(parameter)] for parameter in group["params"]))
+        except KeyError as exc:
+            raise ValueError("optimizer contains a parameter outside the supplied model") from exc
+    return tuple(groups)
+
+
+def _legacy_stage_a_optimizer_parameter_names(
+    optimizer_state: Mapping[str, Any],
+    named_parameters: tuple[tuple[str, torch.nn.Parameter], ...],
+) -> tuple[tuple[str, ...], ...] | None:
+    """Infer pre-no-decay-fix Stage A group membership from the historical ndim rule."""
+    buckets: dict[str, list[str]] = {"cid-decay": [], "cid-no-decay": []}
+    for name, parameter in named_parameters:
+        if not parameter.requires_grad:
+            continue
+        key = "cid-decay" if parameter.ndim >= 2 else "cid-no-decay"
+        buckets[key].append(name)
+
+    inferred: list[tuple[str, ...]] = []
+    for group in optimizer_state.get("param_groups", ()):
+        group_name = str(group.get("group_name", ""))
+        if group_name not in buckets:
+            return None
+        names = tuple(buckets[group_name])
+        if len(names) != len(group.get("params", ())):
+            return None
+        inferred.append(names)
+    return tuple(inferred)
+
+
+def load_optimizer_state_by_parameter_name(
+    optimizer: torch.optim.Optimizer,
+    optimizer_state: Mapping[str, Any],
+    named_parameters: tuple[tuple[str, torch.nn.Parameter], ...],
+    *,
+    saved_parameter_names: tuple[tuple[str, ...], ...] | None = None,
+) -> None:
+    """Load optimizer state across parameter-group membership changes without losing moments."""
+    saved_groups = tuple(optimizer_state.get("param_groups", ()))
+    if saved_parameter_names is None:
+        saved_parameter_names = _legacy_stage_a_optimizer_parameter_names(
+            optimizer_state, named_parameters
+        )
+    if saved_parameter_names is None or len(saved_parameter_names) != len(saved_groups):
+        optimizer.load_state_dict(dict(optimizer_state))
+        return
+
+    saved_state_by_name: dict[str, Any] = {}
+    for group, names in zip(saved_groups, saved_parameter_names, strict=True):
+        saved_ids = tuple(group.get("params", ()))
+        if len(saved_ids) != len(names):
+            optimizer.load_state_dict(dict(optimizer_state))
+            return
+        for saved_id, name in zip(saved_ids, names, strict=True):
+            state = optimizer_state.get("state", {}).get(saved_id)
+            if state is not None:
+                saved_state_by_name[name] = state
+
+    current_names = _optimizer_parameter_names(optimizer, named_parameters)
+    template = optimizer.state_dict()
+    template_groups = tuple(template["param_groups"])
+    if len(current_names) != len(template_groups):
+        raise ValueError("optimizer parameter-name layout does not match its state dict")
+
+    saved_group_by_name = {
+        str(group.get("group_name", index)): group
+        for index, group in enumerate(saved_groups)
+    }
+    migrated_state: dict[Any, Any] = {}
+    migrated_groups: list[dict[str, Any]] = []
+    for index, (actual_group, template_group, names) in enumerate(
+        zip(optimizer.param_groups, template_groups, current_names, strict=True)
+    ):
+        group_name = str(actual_group.get("group_name", index))
+        saved_group = saved_group_by_name.get(group_name)
+        if saved_group is None:
+            optimizer.load_state_dict(dict(optimizer_state))
+            return
+        current_ids = tuple(template_group["params"])
+        if len(current_ids) != len(names):
+            raise ValueError("optimizer parameter-name layout changed during migration")
+        for current_id, name in zip(current_ids, names, strict=True):
+            state = saved_state_by_name.get(name)
+            if state is not None:
+                migrated_state[current_id] = state
+
+        migrated_group = dict(saved_group)
+        migrated_group["params"] = list(current_ids)
+        migrated_group["weight_decay"] = float(actual_group.get("weight_decay", 0.0))
+        migrated_group["group_name"] = group_name
+        if "lr_scale" in actual_group:
+            migrated_group["lr_scale"] = actual_group["lr_scale"]
+        migrated_groups.append(migrated_group)
+
+    optimizer.load_state_dict(
+        {
+            "state": migrated_state,
+            "param_groups": migrated_groups,
+        }
+    )
+
+
 def stage_a_adamw_parameter_groups(
     adapter: ILLaDACIDAdapter,
     *,
@@ -6343,9 +6483,9 @@ def stage_a_adamw_parameter_groups(
     if not math.isfinite(weight_decay) or weight_decay < 0.0:
         raise ValueError("weight_decay must be finite and non-negative")
     buckets: dict[bool, list[torch.nn.Parameter]] = {True: [], False: []}
-    for parameter in adapter.parameters():
+    for name, parameter in adapter.named_parameters():
         if parameter.requires_grad:
-            buckets[parameter.ndim >= 2].append(parameter)
+            buckets[_adamw_uses_weight_decay(name, parameter)].append(parameter)
     groups: list[dict[str, object]] = []
     for use_decay in (True, False):
         parameters = buckets[use_decay]
@@ -6406,7 +6546,7 @@ def stage_b_adamw_parameter_groups(
             family = "backbone"
         else:
             family = "cid"
-        use_decay = parameter.ndim >= 2
+        use_decay = _adamw_uses_weight_decay(name, parameter)
         buckets.setdefault((family, use_decay), []).append(parameter)
 
     groups: list[dict[str, object]] = []
