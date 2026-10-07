@@ -37,6 +37,23 @@ def test_local_backbone_identity_is_stable_and_tracks_middle_weight_changes(
     assert backbone_source_identity(str(source)) != first
 
 
+def test_local_backbone_identity_recovers_from_non_object_cache(
+    tmp_path, monkeypatch
+) -> None:
+    source = tmp_path / "model"
+    source.mkdir()
+    cache = tmp_path / "cache"
+    monkeypatch.setenv("CID_SOURCE_IDENTITY_CACHE_DIR", str(cache))
+    (source / "config.json").write_text('{"model_type":"llama"}\n', encoding="utf-8")
+    (source / "model.safetensors").write_bytes(b"weights")
+
+    expected = backbone_source_identity(str(source))
+    cache_file = next(cache.glob("*.json"))
+    cache_file.write_text("[]\n", encoding="utf-8")
+
+    assert backbone_source_identity(str(source)) == expected
+
+
 def test_hf_backbone_identity_resolves_requested_revision_to_commit(monkeypatch) -> None:
     import huggingface_hub
 

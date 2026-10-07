@@ -112,8 +112,10 @@ def _cached_local_backbone_identity(root: Path, files: tuple[Path, ...]) -> str:
             if cache_path.is_file():
                 try:
                     cached = json.loads(cache_path.read_text(encoding="utf-8"))
-                    if cached.get("manifest") == manifest and isinstance(
-                        cached.get("identity"), str
+                    if (
+                        isinstance(cached, dict)
+                        and cached.get("manifest") == manifest
+                        and isinstance(cached.get("identity"), str)
                     ):
                         return str(cached["identity"])
                 except (OSError, ValueError, TypeError, json.JSONDecodeError):
