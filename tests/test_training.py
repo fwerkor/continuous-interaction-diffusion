@@ -73,6 +73,7 @@ wrap_stage_b_fsdp = cid_model.wrap_stage_b_fsdp
 cid_loss = cid_model.cid_loss
 target_positive_mass_bce = cid_losses._target_positive_mass_binary_cross_entropy
 chunked_illada_mlp_forward = import_module("cid.model.illada")._chunked_illada_mlp_forward
+chunked_lfm2_mlp_forward = import_module("cid.model.illada")._chunked_lfm2_mlp_forward
 chunked_illada_rms_norm_forward = import_module("cid.model.illada")._chunked_illada_rms_norm_forward
 
 
@@ -286,6 +287,28 @@ def test_chunked_ar_mlp_matches_unchunked_forward_and_input_gradient() -> None:
         module.act_fn(module.gate_proj(reference_input)) * module.up_proj(reference_input)
     )
     chunked = chunked_illada_mlp_forward(module, chunked_input)
+    reference_grad = torch.autograd.grad(reference.sum(), reference_input)[0]
+    chunked_grad = torch.autograd.grad(chunked.sum(), chunked_input)[0]
+
+    assert torch.allclose(chunked, reference, rtol=1e-6, atol=1e-6)
+    assert torch.allclose(chunked_grad, reference_grad, rtol=1e-6, atol=1e-6)
+
+
+def test_chunked_lfm2_mlp_matches_unchunked_forward_and_input_gradient() -> None:
+    torch.manual_seed(13)
+    module = SimpleNamespace(
+        w1=nn.Linear(16, 48, bias=False),
+        w3=nn.Linear(16, 48, bias=False),
+        w2=nn.Linear(48, 16, bias=False),
+        _cid_mlp_chunk_size=7,
+    )
+    reference_input = torch.randn(2, 23, 16, requires_grad=True)
+    chunked_input = reference_input.detach().clone().requires_grad_(True)
+
+    reference = module.w2(
+        torch.nn.functional.silu(module.w1(reference_input)) * module.w3(reference_input)
+    )
+    chunked = chunked_lfm2_mlp_forward(module, chunked_input)
     reference_grad = torch.autograd.grad(reference.sum(), reference_input)[0]
     chunked_grad = torch.autograd.grad(chunked.sum(), chunked_input)[0]
 

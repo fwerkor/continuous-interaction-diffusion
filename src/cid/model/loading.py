@@ -237,37 +237,58 @@ def _canonical_tokenizer_json(value: Any, *, key: str | None = None) -> Any:
     return value
 
 
+def _serialized_tokenizer_digest(
+    tokenizer: Any,
+    *,
+    strip_runtime_state: bool,
+    tokenizer_json_runtime: dict[str, Any] | None = None,
+) -> str:
+    save_pretrained = getattr(tokenizer, "save_pretrained", None)
+    if not callable(save_pretrained):
+        raise TypeError("tokenizer does not support save_pretrained")
+    with tempfile.TemporaryDirectory(prefix="cid-tokenizer-identity-") as directory:
+        root = Path(directory)
+        save_pretrained(root)
+        files = tuple(sorted(path for path in root.rglob("*") if path.is_file()))
+        digest = hashlib.sha256()
+        for file in files:
+            relative = str(file.relative_to(root)).encode("utf-8")
+            if file.suffix == ".json":
+                try:
+                    value = json.loads(file.read_text(encoding="utf-8"))
+                    if file.name == "tokenizer.json" and isinstance(value, dict):
+                        value = dict(value)
+                        if strip_runtime_state:
+                            value.pop("truncation", None)
+                            value.pop("padding", None)
+                        elif tokenizer_json_runtime is not None:
+                            value.update(tokenizer_json_runtime)
+                    payload = json.dumps(
+                        _canonical_tokenizer_json(value),
+                        ensure_ascii=False,
+                        sort_keys=True,
+                        separators=(",", ":"),
+                    ).encode("utf-8")
+                except (UnicodeDecodeError, ValueError, TypeError, json.JSONDecodeError):
+                    payload = file.read_bytes()
+            else:
+                payload = file.read_bytes()
+            digest.update(len(relative).to_bytes(4, "big"))
+            digest.update(relative)
+            digest.update(len(payload).to_bytes(8, "big"))
+            digest.update(payload)
+        return digest.hexdigest()
+
+
 def tokenizer_source_identity(tokenizer: Any) -> str:
-    """Hash the tokenizer contract independently from the backbone weights."""
+    """Hash the stable tokenizer contract independently from runtime padding/truncation state."""
 
     save_pretrained = getattr(tokenizer, "save_pretrained", None)
     if callable(save_pretrained):
-        with tempfile.TemporaryDirectory(prefix="cid-tokenizer-identity-") as directory:
-            root = Path(directory)
-            save_pretrained(root)
-            files = tuple(sorted(path for path in root.rglob("*") if path.is_file()))
-            digest = hashlib.sha256()
-            for file in files:
-                relative = str(file.relative_to(root)).encode("utf-8")
-                if file.suffix == ".json":
-                    try:
-                        payload = json.dumps(
-                            _canonical_tokenizer_json(
-                                json.loads(file.read_text(encoding="utf-8"))
-                            ),
-                            ensure_ascii=False,
-                            sort_keys=True,
-                            separators=(",", ":"),
-                        ).encode("utf-8")
-                    except (UnicodeDecodeError, ValueError, TypeError, json.JSONDecodeError):
-                        payload = file.read_bytes()
-                else:
-                    payload = file.read_bytes()
-                digest.update(len(relative).to_bytes(4, "big"))
-                digest.update(relative)
-                digest.update(len(payload).to_bytes(8, "big"))
-                digest.update(payload)
-            return f"tokenizer-sha256:{digest.hexdigest()}"
+        return (
+            "tokenizer-v2-sha256:"
+            + _serialized_tokenizer_digest(tokenizer, strip_runtime_state=True)
+        )
 
     payload: dict[str, Any] = {
         "class": f"{tokenizer.__class__.__module__}.{tokenizer.__class__.__qualname__}",
@@ -295,7 +316,53 @@ def tokenizer_source_identity(tokenizer: Any) -> str:
         default=str,
         separators=(",", ":"),
     ).encode("utf-8")
-    return f"tokenizer-sha256:{hashlib.sha256(encoded).hexdigest()}"
+    return f"tokenizer-v2-sha256:{hashlib.sha256(encoded).hexdigest()}"
+
+
+def tokenizer_identity_matches(tokenizer: Any, saved_identity: object) -> bool:
+    """Match current stable identities and legacy v1 fast-tokenizer runtime states."""
+
+    if not isinstance(saved_identity, str):
+        return False
+    if saved_identity == tokenizer_source_identity(tokenizer):
+        return True
+    if not saved_identity.startswith("tokenizer-sha256:"):
+        return False
+
+    save_pretrained = getattr(tokenizer, "save_pretrained", None)
+    if not callable(save_pretrained):
+        legacy = tokenizer_source_identity(tokenizer).replace(
+            "tokenizer-v2-sha256:", "tokenizer-sha256:", 1
+        )
+        return saved_identity == legacy
+
+    candidates = {
+        "tokenizer-sha256:"
+        + _serialized_tokenizer_digest(tokenizer, strip_runtime_state=False)
+    }
+    pad_token_id = getattr(tokenizer, "pad_token_id", None)
+    pad_token = getattr(tokenizer, "pad_token", None)
+    if pad_token_id is not None and pad_token is not None:
+        padding_side = str(getattr(tokenizer, "padding_side", "right")).lower()
+        candidates.add(
+            "tokenizer-sha256:"
+            + _serialized_tokenizer_digest(
+                tokenizer,
+                strip_runtime_state=False,
+                tokenizer_json_runtime={
+                    "truncation": None,
+                    "padding": {
+                        "strategy": "BatchLongest",
+                        "direction": "Left" if padding_side == "left" else "Right",
+                        "pad_to_multiple_of": None,
+                        "pad_id": int(pad_token_id),
+                        "pad_type_id": int(getattr(tokenizer, "pad_token_type_id", 0)),
+                        "pad_token": str(pad_token),
+                    },
+                },
+            )
+        )
+    return saved_identity in candidates
 
 
 def backbone_model_type(model_name_or_path: str, *, revision: str | None = None) -> str:

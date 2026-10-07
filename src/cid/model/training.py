@@ -64,7 +64,11 @@ from cid.model.encoding import (
     stable_text,
 )
 from cid.model.illada import ILLaDACIDAdapter
-from cid.model.loading import backbone_identity_matches, tokenizer_source_identity
+from cid.model.loading import (
+    backbone_identity_matches,
+    tokenizer_identity_matches,
+    tokenizer_source_identity,
+)
 from cid.model.losses import CIDLoss, CIDTargets, cid_loss
 from cid.model.materialize import (
     ArgumentCandidate,
@@ -99,7 +103,7 @@ def _validate_tokenizer_identity(saved_identity: object, tokenizer: Any | None) 
         return
     if tokenizer is None:
         raise ValueError("checkpoint tokenizer identity requires the tokenizer used for loading")
-    if saved_identity != tokenizer_source_identity(tokenizer):
+    if not tokenizer_identity_matches(tokenizer, saved_identity):
         raise ValueError("checkpoint tokenizer identity does not match the current tokenizer")
 
 

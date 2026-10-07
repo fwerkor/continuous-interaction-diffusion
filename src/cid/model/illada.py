@@ -45,6 +45,20 @@ def _chunked_illada_mlp_forward(module: nn.Module, x: torch.Tensor) -> torch.Ten
     return torch.cat(outputs, dim=1)
 
 
+def _chunked_lfm2_mlp_forward(module: nn.Module, x: torch.Tensor) -> torch.Tensor:
+    chunk_size = int(module._cid_mlp_chunk_size)
+
+    def run_chunk(chunk: torch.Tensor) -> torch.Tensor:
+        return module.w2(torch.nn.functional.silu(module.w1(chunk)) * module.w3(chunk))
+
+    if x.ndim != 3 or x.shape[1] <= chunk_size:
+        return run_chunk(x)
+    outputs = []
+    for start in range(0, x.shape[1], chunk_size):
+        outputs.append(run_chunk(x[:, start : start + chunk_size]))
+    return torch.cat(outputs, dim=1)
+
+
 def _chunked_illada_rms_norm_forward(
     module: nn.Module,
     hidden_states: torch.Tensor,
@@ -965,6 +979,16 @@ class ILLaDACIDAdapter(nn.Module):
                     moe._cid_moe_chunk_size = int(chunk_size)
             return
         if self.backbone_family == "lfm2":
+            decoder = self.hidden_backbone()
+            layers = getattr(decoder, "layers", None)
+            if layers is None or len(layers) == 0:
+                raise RuntimeError("LFM2 decoder does not expose layers for MLP chunking")
+            for layer in layers:
+                mlp = getattr(layer, "feed_forward", None)
+                if mlp is None or any(not hasattr(mlp, name) for name in ("w1", "w2", "w3")):
+                    raise RuntimeError("LFM2 decoder layer does not expose the expected MLP")
+                mlp._cid_mlp_chunk_size = int(chunk_size)
+                mlp.forward = MethodType(_chunked_lfm2_mlp_forward, mlp)
             return
         decoder = self.hidden_backbone()
         layers = getattr(decoder, "layers", None)

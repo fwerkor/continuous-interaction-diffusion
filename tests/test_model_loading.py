@@ -128,6 +128,49 @@ def test_tokenizer_identity_tracks_content_not_source_path() -> None:
     assert first != different
 
 
+class _RuntimeStateTokenizer(_SavedTokenizer):
+    def __init__(self, token: str, source: str, *, padding: object, truncation: object) -> None:
+        super().__init__(token, source)
+        self.padding = padding
+        self.truncation = truncation
+
+    def save_pretrained(self, root) -> None:
+        super().save_pretrained(root)
+        path = root / "tokenizer.json"
+        payload = json.loads(path.read_text(encoding="utf-8"))
+        payload["padding"] = self.padding
+        payload["truncation"] = self.truncation
+        path.write_text(json.dumps(payload), encoding="utf-8")
+
+
+def test_tokenizer_identity_ignores_fast_runtime_padding_and_truncation_state() -> None:
+    neutral = tokenizer_source_identity(
+        _RuntimeStateTokenizer("alpha", "/model", padding=None, truncation=None)
+    )
+    active = tokenizer_source_identity(
+        _RuntimeStateTokenizer(
+            "alpha",
+            "/model",
+            padding={
+                "strategy": "BatchLongest",
+                "direction": "Right",
+                "pad_to_multiple_of": None,
+                "pad_id": 0,
+                "pad_type_id": 0,
+                "pad_token": "<pad>",
+            },
+            truncation={
+                "direction": "Right",
+                "max_length": 128,
+                "strategy": "LongestFirst",
+                "stride": 0,
+            },
+        )
+    )
+
+    assert neutral == active
+
+
 def test_legacy_v4_release_compatibility_restores_original_semantics() -> None:
     adapter = SimpleNamespace(
         external_fusion=SimpleNamespace(percept_residual=True),
