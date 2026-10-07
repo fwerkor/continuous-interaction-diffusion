@@ -1,6 +1,7 @@
 from __future__ import annotations
 
 import json
+import math
 from collections import OrderedDict
 from collections.abc import Mapping
 from typing import Any
@@ -12,6 +13,29 @@ from cid.contracts import SourceDescriptor
 from cid.grounding import Anchor, ObjectRef
 from cid.model.illada import ILLaDACIDAdapter
 from cid.state import FactItem
+
+
+def _semantic_noise_scale(weight: Tensor, *, sample_rows: int = 4096) -> float:
+    """Estimate native embedding RMS without materializing the full table in fp32."""
+    if weight.ndim != 2 or weight.numel() == 0:
+        raise ValueError("semantic embedding weight must be a non-empty matrix")
+    rows = int(weight.shape[0])
+    count = min(rows, sample_rows)
+    if count == rows:
+        sample = weight.detach()
+    else:
+        indices = torch.linspace(
+            0,
+            rows - 1,
+            steps=count,
+            device=weight.device,
+            dtype=torch.float32,
+        ).round().to(dtype=torch.long)
+        sample = weight.detach().index_select(0, indices)
+    value = float(sample.float().square().mean().sqrt().cpu())
+    if not math.isfinite(value) or value <= 0.0:
+        raise ValueError("semantic embedding RMS must be finite and positive")
+    return value
 
 
 class ILLaDATextEncoder:
@@ -46,6 +70,7 @@ class ILLaDATextEncoder:
         self.tokenizer = tokenizer
         self.d_model = adapter.d_model
         self.pooling_mode = pooling_mode
+        self.semantic_noise_scale = _semantic_noise_scale(self._embedding.weight)
         self._is_frozen_snapshot = False
         self._token_cache: OrderedDict[tuple[str, bool], Tensor] = OrderedDict()
         self._detached_text_cache: OrderedDict[str, Tensor] = OrderedDict()
@@ -79,6 +104,7 @@ class ILLaDATextEncoder:
         snapshot.tokenizer = tokenizer
         snapshot.d_model = adapter.d_model
         snapshot.pooling_mode = pooling_mode
+        snapshot.semantic_noise_scale = _semantic_noise_scale(weight)
         snapshot._is_frozen_snapshot = True
         snapshot._token_cache = OrderedDict()
         snapshot._detached_text_cache = OrderedDict()
@@ -126,6 +152,17 @@ class ILLaDATextEncoder:
         snapshot.tokenizer = tokenizer
         snapshot.d_model = adapter.d_model
         snapshot.pooling_mode = pooling_mode
+        declared_noise_scale = state.get("semantic_noise_scale")
+        snapshot.semantic_noise_scale = (
+            _semantic_noise_scale(stored_weight)
+            if declared_noise_scale is None
+            else float(declared_noise_scale)
+        )
+        if (
+            not math.isfinite(snapshot.semantic_noise_scale)
+            or snapshot.semantic_noise_scale <= 0.0
+        ):
+            raise ValueError("frozen semantic embedding noise scale is invalid")
         snapshot._is_frozen_snapshot = True
         snapshot._token_cache = OrderedDict()
         snapshot._detached_text_cache = OrderedDict()
@@ -145,6 +182,7 @@ class ILLaDATextEncoder:
             "encoding_version": self.ENCODING_VERSION,
             "pooling_mode": self.pooling_mode,
             "d_model": self.d_model,
+            "semantic_noise_scale": float(self.semantic_noise_scale),
             "weight": self._embedding.weight.detach().cpu(),
         }
 
@@ -159,6 +197,36 @@ class ILLaDATextEncoder:
     @property
     def embedding_device(self) -> torch.device:
         return self._embedding.weight.device
+
+    def validate_semantic_state(
+        self,
+        semantic: Tensor,
+        *,
+        max_rms_multiple: float = 32.0,
+    ) -> None:
+        if max_rms_multiple <= 0.0:
+            raise ValueError("max_rms_multiple must be positive")
+        values = semantic.detach().float()
+        if values.numel() == 0:
+            return
+        finite = torch.isfinite(values).all()
+        limit = float(self.semantic_noise_scale) * max_rms_multiple
+        bounded = values.square().mean(dim=-1).le(limit * limit).all()
+        if values.device.type in {"cuda", "npu"} and hasattr(torch, "_assert_async"):
+            torch._assert_async(finite, "CID semantic state contains non-finite values")
+            torch._assert_async(
+                bounded,
+                "CID semantic state RMS exceeded the neural-contract limit",
+            )
+            return
+        if not bool(finite):
+            raise FloatingPointError("CID semantic state contains non-finite values")
+        if not bool(bounded):
+            maximum_rms = float(values.square().mean(dim=-1).sqrt().max())
+            raise FloatingPointError(
+                "CID semantic state RMS exceeded the neural-contract limit: "
+                f"{maximum_rms:.6g} > {limit:.6g}"
+            )
 
     def tokenize(self, text: str, *, add_special_tokens: bool) -> Tensor:
         if not text:

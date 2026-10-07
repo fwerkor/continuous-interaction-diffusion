@@ -97,18 +97,20 @@ argument is executable, while keeping argument names/types under the runtime-own
 
 ### Stage A launcher and checkpoints
 
-`CIDTrainer` is the first executable Stage A trainer. It supports random diffusion timesteps,
+`CIDTrainer` is the executable Stage A trainer. Under neural contract v5, the sampled
+`timestep_min`/`timestep_max` range augments Display diffusion only; TCT thought corruption follows
+each cell's actual runtime noise state and scales Gaussian noise to the frozen backbone embedding
+space. Stage A also uses no-decay AdamW groups for biases and one-dimensional controls. It supports
 gradient accumulation, gradient clipping, deterministic transition shuffling, optimizer resume, and
 CID-only checkpoints. When the pretrained backbone is frozen, checkpoints contain only trainable
-CID parameters plus optimizer/progress/RNG state; the pinned pretrained backbone is reloaded
-separately. Every completed epoch is retained as `stage-a-epoch-XXXX.pt`; `stage-a-latest.pt` and
-the epoch-end step name are compatibility symlinks to that permanent snapshot.
-`load_cid_adapter_checkpoint()` restores those CID parameters directly for runtime evaluation.
-Checkpoint metadata also carries a neural-contract version. Contract v3 adds learned
-need-to-cell/display routing and source-declared protected-result promotion on top of the unified
-diffusion-state contract. Changes to tensor geometry or train/runtime semantics intentionally bump
-this contract; incompatible older checkpoints are rejected before weights from a different ABI can
-be loaded.
+CID parameters plus optimizer/progress state; distributed checkpoints additionally persist one RNG
+sidecar per rank so same-world-size resume reproduces the exact stochastic stream. The pinned
+pretrained backbone is reloaded separately and its source identity is checked. Every completed epoch
+is retained as `stage-a-epoch-XXXX.pt`; `stage-a-latest.pt` and the epoch-end step name are
+compatibility symlinks to that permanent snapshot. `load_cid_adapter_checkpoint()` restores those CID
+parameters directly for runtime evaluation. Changes to tensor geometry or train/runtime semantics
+intentionally bump the neural contract; v4 training checkpoints are rejected by v5 rather than being
+silently resumed under different diffusion or initialization semantics.
 
 Both training stages accept `--validation-data <trajectory.jsonl>`. If it is omitted and the main
 trajectory JSONL contains `metadata.split` labels, `train` examples are used for optimization,

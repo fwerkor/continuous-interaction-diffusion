@@ -706,6 +706,10 @@ class ILLaDACIDAdapter(nn.Module):
         )
 
         nn.init.zeros_(self.channel_embedding.weight)
+        nn.init.zeros_(self.role_projection.weight)
+        nn.init.zeros_(self.lifecycle_projection.weight)
+        nn.init.zeros_(self.scalar_projection.weight)
+        nn.init.zeros_(self.occupancy_projection.weight)
         nn.init.zeros_(self.display_noise_projection.weight)
         nn.init.zeros_(self.output_heads.thought_delta.weight)
         nn.init.zeros_(self.output_heads.thought_delta.bias)

@@ -172,6 +172,7 @@ class CIDDiffusionScheduler:
         timesteps: Tensor,
         occupancy: Tensor,
         *,
+        noise_scale: float = 1.0,
         generator: torch.Generator | None = None,
         _timesteps_validated: bool = False,
     ) -> ThoughtCorruption:
@@ -186,12 +187,15 @@ class CIDDiffusionScheduler:
             semantic.device,
             validate_range=not _timesteps_validated,
         )
+        if not math.isfinite(noise_scale) or noise_scale <= 0.0:
+            raise ValueError("thought noise_scale must be finite and positive")
         epsilon = torch.randn(
             semantic.shape,
             dtype=semantic.dtype,
             device=semantic.device,
             generator=generator,
         )
+        epsilon = epsilon * float(noise_scale)
         engine = accelerator_engine(semantic, capability="thought_corrupt_from_epsilon")
         if engine is not None:
             corrupted, local_noise, masked_epsilon = engine.thought_corrupt_from_epsilon(

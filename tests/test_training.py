@@ -59,6 +59,7 @@ load_stage_b_semantic_encoder = cid_model.load_stage_b_semantic_encoder
 save_stage_b_checkpoint = cid_model.save_stage_b_checkpoint
 shard_rollout_windows = cid_model.shard_rollout_windows
 shard_transitions = cid_model.shard_transitions
+stage_a_adamw_parameter_groups = cid_model.stage_a_adamw_parameter_groups
 stage_a_gradient_accumulation_steps = cid_model.stage_a_gradient_accumulation_steps
 stage_b_adamw_parameter_groups = cid_model.stage_b_adamw_parameter_groups
 stage_b_consumed_windows_by_bucket = cid_model.stage_b_consumed_windows_by_bucket
@@ -317,6 +318,21 @@ def test_chunked_illada_rms_norm_matches_unchunked_forward_and_gradient() -> Non
     assert torch.allclose(chunked, reference, rtol=1e-6, atol=1e-6)
     assert torch.allclose(chunked_grads[0], reference_grads[0], rtol=1e-6, atol=1e-6)
     assert torch.allclose(chunked_grads[1], reference_grads[1], rtol=1e-6, atol=1e-6)
+
+
+def test_teacher_thought_corruption_uses_runtime_cell_noise_not_display_timestep() -> None:
+    adapter = make_adapter(seed=171)
+    tensorizer = ILLaDATrajectoryTensorizer(adapter, TinyTokenizer())
+
+    sample = tensorizer.tensorize(
+        make_trajectory(),
+        source_step=0,
+        timestep=0.95,
+        generator=torch.Generator().manual_seed(7),
+    )
+
+    assert sample.batch.local_noise[0, 0, 0].item() == pytest.approx(0.5)
+    assert sample.batch.local_noise[0, 0, 0].item() != pytest.approx(0.95)
 
 
 def test_trajectory_tensorizer_retired_tombstone_blocks_slot_without_pressure() -> None:
@@ -1883,6 +1899,57 @@ def test_stage_b_init_rejects_semantic_pooling_mismatch(tmp_path) -> None:
         )
 
 
+def test_trainer_local_rng_state_round_trips_exactly() -> None:
+    adapter = make_adapter(seed=173)
+    trainer = CIDTrainer(
+        adapter,
+        ILLaDATrajectoryTensorizer(adapter, TinyTokenizer()),
+        CIDTrainerConfig(seed=19),
+    )
+    state = trainer.local_rng_state()
+    expected_torch = torch.rand(5, generator=trainer.generator)
+    expected_python = tuple(trainer.shuffle_rng.random() for _ in range(3))
+
+    trainer.reseed(999)
+    trainer.restore_local_rng_state(state)
+
+    assert torch.equal(expected_torch, torch.rand(5, generator=trainer.generator))
+    assert expected_python == tuple(trainer.shuffle_rng.random() for _ in range(3))
+
+
+def test_stage_a_checkpoint_rejects_different_backbone_identity(tmp_path) -> None:
+    adapter = make_adapter(seed=174)
+    adapter._cid_backbone_identity = "local-edge-sha256:a"
+    trainer = CIDTrainer(
+        adapter,
+        ILLaDATrajectoryTensorizer(adapter, TinyTokenizer()),
+    )
+    path = tmp_path / "identity.pt"
+    trainer.save_checkpoint(path)
+
+    restored_adapter = make_adapter(seed=174)
+    restored_adapter._cid_backbone_identity = "local-edge-sha256:b"
+    restored = CIDTrainer(
+        restored_adapter,
+        ILLaDATrajectoryTensorizer(restored_adapter, TinyTokenizer()),
+    )
+    with pytest.raises(ValueError, match="backbone geometry"):
+        restored.load_checkpoint(path)
+
+
+def test_semantic_state_guard_rejects_nonfinite_and_runaway_state() -> None:
+    adapter = make_adapter(seed=175)
+    encoder = ILLaDATextEncoder(adapter, TinyTokenizer())
+    safe = torch.zeros(1, 2, adapter.d_model)
+    encoder.validate_semantic_state(safe)
+    with pytest.raises(FloatingPointError, match="non-finite"):
+        encoder.validate_semantic_state(torch.full_like(safe, float("inf")))
+    with pytest.raises(FloatingPointError, match="RMS exceeded"):
+        encoder.validate_semantic_state(
+            torch.full_like(safe, encoder.semantic_noise_scale * 64.0)
+        )
+
+
 def test_stage_a_checkpoint_rejects_previous_neural_contract(tmp_path) -> None:
     adapter = make_adapter(seed=145)
     trainer = CIDTrainer(
@@ -2428,7 +2495,7 @@ def test_stage_b_fsdp_runs_full_parameter_optimizer_step_on_cpu(tmp_path) -> Non
         )
         metadata = json.loads((checkpoint / "metadata.json").read_text(encoding="utf-8"))
         assert metadata["format_version"] == 6
-        assert metadata["neural_contract_version"] == 4
+        assert metadata["neural_contract_version"] == 5
         assert metadata["semantic_embedding_snapshot"]["file"] == "semantic-embedding.pt"
 
         restored_adapter = make_adapter(seed=91)
@@ -2787,10 +2854,10 @@ def test_existing_cell_noise_delta_uses_model_visible_corruption_level() -> None
 
     sample = tensorizer.tensorize(make_trajectory(), source_step=0, timestep=0.8)
 
-    # c0's target noise is 0.3. The model sees local_noise=0.8 after corruption,
-    # so runtime-compatible delta supervision is 0.3 - 0.8, not 0.3 - 0.5.
-    assert sample.batch.local_noise[0, 0, 0] == pytest.approx(0.8)
-    assert sample.targets.noise_delta[0, 0, 0] == pytest.approx(-0.5)
+    # c0's runtime state carries noise=0.5. Display timestep augmentation must not
+    # overwrite that TCT noise level, so delta supervision is 0.3 - 0.5.
+    assert sample.batch.local_noise[0, 0, 0] == pytest.approx(0.5)
+    assert sample.targets.noise_delta[0, 0, 0] == pytest.approx(-0.2)
     assert sample.targets.revision_targets[0, 0] == int(cid_model.RevisionAction.STABILIZE)
 
 
@@ -3523,6 +3590,17 @@ def test_free_rollout_records_unrecoverable_recovery_without_crashing(monkeypatc
 
 
 def test_training_rollout_masks_unrecoverable_recovery_without_crashing(monkeypatch) -> None:
+    class NonConvergingModel(nn.Module):
+        def __init__(self, adapter) -> None:
+            super().__init__()
+            self.adapter = adapter
+
+        def forward(self, batch):
+            output = self.adapter(batch)
+            output.convergence_logits = torch.full_like(output.convergence_logits, -20.0)
+            output.need_logits = torch.full_like(output.need_logits, -20.0)
+            return output
+
     adapter = make_adapter(seed=160)
     tensorizer = ILLaDATrajectoryTensorizer(adapter, TinyTokenizer())
     trainer = CIDTrainer(
@@ -3535,6 +3613,7 @@ def test_training_rollout_masks_unrecoverable_recovery_without_crashing(monkeypa
             teacher_forcing_epochs=0,
             rollout_ramp_epochs=0,
         ),
+        forward_model=NonConvergingModel(adapter),
     )
     original_tensorize = tensorizer.tensorize
 
@@ -4436,6 +4515,19 @@ def test_stage_b_optimizer_step_count_matches_bucket_padding() -> None:
     )
 
 
+def test_stage_a_adamw_groups_do_not_decay_gate_biases() -> None:
+    adapter = make_adapter(seed=172)
+    groups = stage_a_adamw_parameter_groups(adapter, weight_decay=0.01)
+    by_name = {str(group["group_name"]): group for group in groups}
+
+    assert by_name["cid-decay"]["weight_decay"] == pytest.approx(0.01)
+    assert by_name["cid-no-decay"]["weight_decay"] == pytest.approx(0.0)
+    no_decay_ids = {id(parameter) for parameter in by_name["cid-no-decay"]["params"]}
+    decay_ids = {id(parameter) for parameter in by_name["cid-decay"]["params"]}
+    assert id(adapter.external_fusion.external_gate.bias) in no_decay_ids
+    assert id(adapter.role_projection.weight) in decay_ids
+
+
 def test_stage_b_adamw_groups_split_backbone_cid_and_no_decay() -> None:
     adapter = make_adapter()
     adapter.set_backbone_trainable(True)
@@ -4621,7 +4713,7 @@ def test_revision_target_tracks_logical_state_change_not_sampled_diffusion_noise
 
     sample = tensorizer.tensorize(make_trajectory(), source_step=0, timestep=0.1)
 
-    assert sample.targets.noise_delta[0, 0, 0] == pytest.approx(0.2)
+    assert sample.targets.noise_delta[0, 0, 0] == pytest.approx(-0.2)
     assert sample.targets.revision_targets[0, 0] == int(cid_model.RevisionAction.STABILIZE)
 
 

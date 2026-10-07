@@ -34,6 +34,16 @@ class CIDExternalFusion(nn.Module):
         )
         self.external_gate = nn.Linear(d_model * 2, d_model)
         self.final_norm = nn.LayerNorm(d_model) if normalize_output else nn.Identity()
+        self.percept_residual = True
+        nn.init.zeros_(self.external_type_embedding.weight)
+        first_percept = self.percept_projection[0]
+        final_percept = self.percept_projection[2]
+        if isinstance(first_percept, nn.Linear) and first_percept.bias is not None:
+            nn.init.zeros_(first_percept.bias)
+        if isinstance(final_percept, nn.Linear):
+            nn.init.zeros_(final_percept.weight)
+            if final_percept.bias is not None:
+                nn.init.zeros_(final_percept.bias)
         if gate_init_bias is not None:
             nn.init.zeros_(self.external_gate.weight)
             nn.init.constant_(self.external_gate.bias, gate_init_bias)
@@ -53,8 +63,11 @@ class CIDExternalFusion(nn.Module):
         context_summary = (seed_hidden * context_weight).sum(dim=1, keepdim=True)
         context_summary = context_summary / context_weight.sum(dim=1, keepdim=True).clamp_min(1.0)
         percept_context = context_summary.expand(-1, percepts.shape[1], -1)
-        projected_percepts = self.percept_projection(
+        percept_update = self.percept_projection(
             torch.cat((percepts, percept_context), dim=-1)
+        )
+        projected_percepts = (
+            percepts + percept_update if self.percept_residual else percept_update
         )
         external_available = self._external_available(
             batch_size=hidden.shape[0],

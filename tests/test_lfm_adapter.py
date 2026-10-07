@@ -114,7 +114,7 @@ def test_lfm_adapter_uses_native_bidirectional_hidden_backbone() -> None:
     assert backbone.lfm2.last_position_ids[0].tolist() == [0, 1, 8, 9, 10, 11, 12, 13, 14]
 
 
-def test_lfm_retired_slots_expose_only_physical_occupancy_marker() -> None:
+def test_lfm_retired_slots_ignore_semantic_controls_but_remain_physically_visible() -> None:
     backbone = TinyLFMBackbone()
     adapter = LFMCIDAdapter(
         backbone,
@@ -146,7 +146,7 @@ def test_lfm_retired_slots_expose_only_physical_occupancy_marker() -> None:
     adapter(mutated)
     mutated_seed = backbone.lfm2.last_inputs_embeds[:, 1]
 
-    assert not torch.equal(empty_seed, retired_seed)
+    assert torch.equal(empty_seed, retired_seed)
     assert torch.equal(retired_seed, mutated_seed)
     assert retired_attention[0, 1]
     assert not torch.equal(empty_output.allocation_logits, retired_output.allocation_logits)

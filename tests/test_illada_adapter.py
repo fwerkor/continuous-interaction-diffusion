@@ -94,6 +94,28 @@ def make_batch(*, batch_size: int = 2, thought_slots: int = 4, display_length: i
     )
 
 
+def test_cid_additive_inputs_start_as_no_ops() -> None:
+    adapter = ILLaDACIDAdapter(
+        TinyILLaDABackbone(),
+        ILLaDACIDConfig(max_thought_slots=8, max_display_tokens=16),
+        freeze_backbone=True,
+    )
+
+    for parameter in (
+        adapter.channel_embedding.weight,
+        adapter.role_projection.weight,
+        adapter.lifecycle_projection.weight,
+        adapter.scalar_projection.weight,
+        adapter.occupancy_projection.weight,
+        adapter.display_noise_projection.weight,
+        adapter.external_fusion.external_type_embedding.weight,
+        adapter.external_fusion.percept_projection[2].weight,
+        adapter.output_heads.thought_delta.weight,
+        adapter.output_heads.thought_delta.bias,
+    ):
+        assert torch.count_nonzero(parameter).item() == 0
+
+
 def test_illada_adapter_uses_shared_bidirectional_sequence_and_native_lm_head() -> None:
     backbone = TinyILLaDABackbone()
     adapter = ILLaDACIDAdapter(

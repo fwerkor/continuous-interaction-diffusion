@@ -71,9 +71,10 @@ def _tiny_cid_config() -> CIDConfig:
             "d_model": 32,
             "vocab_size": 64,
             "dtype": "torch.bfloat16",
+            "semantic_noise_scale": 0.02,
             "tensor_key": "semantic_embedding_weight",
         },
-        neural_contract_version=4,
+        neural_contract_version=5,
     )
 
 

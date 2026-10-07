@@ -118,6 +118,7 @@ class ILLaDAContextTensorizer:
             thought_semantic,
             local_noise.squeeze(-1),
             slot_occupancy,
+            noise_scale=self.text_encoder.semantic_noise_scale,
             generator=generator,
         )
         display_ids = torch.tensor(
@@ -255,6 +256,7 @@ class ILLaDANeuralPolicy:
         )
         with torch.no_grad():
             output = self.forward_model(batch)
+            self.tensorizer.text_encoder.validate_semantic_state(output.thought_semantic)
             display_ids = self.scheduler.refine_display(
                 batch.display_ids,
                 output.display_logits,

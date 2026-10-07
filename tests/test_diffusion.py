@@ -61,6 +61,30 @@ def test_thought_corruption_preserves_empty_slots() -> None:
     assert corruption.noise[0, 1, 0] == 0.0
 
 
+def test_thought_corruption_scales_gaussian_to_semantic_space() -> None:
+    scheduler = CIDDiffusionScheduler(mask_token_id=5)
+    semantic = torch.zeros(1, 2, 128)
+    occupancy = torch.ones(1, 2, 1)
+
+    unscaled = scheduler.corrupt_thought(
+        semantic,
+        torch.tensor([1.0]),
+        occupancy,
+        noise_scale=1.0,
+        generator=torch.Generator().manual_seed(23),
+    )
+    scaled = scheduler.corrupt_thought(
+        semantic,
+        torch.tensor([1.0]),
+        occupancy,
+        noise_scale=0.02,
+        generator=torch.Generator().manual_seed(23),
+    )
+
+    assert torch.allclose(scaled.epsilon, unscaled.epsilon * 0.02)
+    assert torch.allclose(scaled.semantic, unscaled.semantic * 0.02)
+
+
 def test_thought_corruption_supports_per_slot_diffusion_levels() -> None:
     scheduler = CIDDiffusionScheduler(mask_token_id=5)
     semantic = torch.ones(1, 3, 4)

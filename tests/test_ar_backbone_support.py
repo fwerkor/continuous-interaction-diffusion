@@ -213,6 +213,7 @@ def _unified_config(backbone_config) -> CIDConfig:
 def test_unified_ar_cid_model_round_trip(config_factory, tmp_path: Path) -> None:
     model = CIDModel(_unified_config(config_factory()))
     assert model.cid_adapter.backbone_family in {"llama", "qwen3"}
+    assert not model.cid_adapter.external_fusion.percept_residual
 
     model.save_pretrained(tmp_path, safe_serialization=True, max_shard_size="5GB")
     restored = CIDModel.from_pretrained(tmp_path, low_cpu_mem_usage=True)

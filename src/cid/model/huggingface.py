@@ -30,7 +30,7 @@ class CIDConfig(PretrainedConfig):
         backbone_config: Mapping[str, Any] | None = None,
         adapter_config: Mapping[str, Any] | None = None,
         semantic_embedding: Mapping[str, Any] | None = None,
-        neural_contract_version: int = 4,
+        neural_contract_version: int = 5,
         base_model: str | None = None,
         release_name: str | None = None,
         **kwargs: Any,
@@ -60,6 +60,8 @@ class CIDConfig(PretrainedConfig):
                 "vocab_size",
                 "dtype",
             }
+            if self.neural_contract_version >= 5:
+                required.add("semantic_noise_scale")
             missing = required.difference(self.semantic_embedding)
             if missing:
                 raise ValueError(
@@ -106,6 +108,8 @@ class CIDModel(PreTrainedModel):
 
         adapter_config = ILLaDACIDConfig(**config.adapter_config)
         self.adapter = adapter_class(backbone, config=adapter_config, freeze_backbone=False)
+        if config.neural_contract_version < 5:
+            self.adapter.external_fusion.percept_residual = False
 
         semantic = config.semantic_embedding
         expected_shape = (self.adapter.vocab_size, self.adapter.d_model)
@@ -144,6 +148,12 @@ class CIDModel(PreTrainedModel):
             "encoding_version": int(semantic["encoding_version"]),
             "pooling_mode": str(semantic["pooling_mode"]),
             "d_model": int(semantic["d_model"]),
+            "semantic_noise_scale": float(
+                semantic.get(
+                    "semantic_noise_scale",
+                    1.0 if self.config.neural_contract_version < 5 else 0.0,
+                )
+            ),
             "weight": self.semantic_embedding_weight,
         }
 
@@ -206,6 +216,11 @@ def build_unified_cid_config(
     backbone_values["use_cache"] = False
     backbone_values.pop("auto_map", None)
     backbone_values.pop("architectures", None)
+    semantic_noise_scale = semantic_state.get("semantic_noise_scale")
+    if semantic_noise_scale is None:
+        if neural_contract_version >= 5:
+            raise ValueError("neural contract v5 requires semantic_noise_scale")
+        semantic_noise_scale = 1.0
     return CIDConfig(
         backbone_config=backbone_values,
         adapter_config=adapter_values,
@@ -216,6 +231,7 @@ def build_unified_cid_config(
             "d_model": int(semantic_state["d_model"]),
             "vocab_size": int(weight.shape[0]),
             "dtype": str(weight.dtype),
+            "semantic_noise_scale": float(semantic_noise_scale),
             "tensor_key": "semantic_embedding_weight",
         },
         neural_contract_version=neural_contract_version,

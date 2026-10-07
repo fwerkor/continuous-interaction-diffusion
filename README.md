@@ -254,17 +254,20 @@ training artifacts do not skip a version.
   only from already-supported multi-hop QA facts. Canonical SHA-256:
   `07662203cc23f5ee628623090ad029740e51b3d6efb13466a6dcad23a2a3b143`.
 
-The current source tree defines **neural contract v4** for new training runs. Display state is now a
-continuously revisable answer draft: unresolved answer content is represented by the model MASK
-state, EOS may move across the fixed physical canvas, and semantic equilibrium does not terminate a
-trajectory until the materialized display is resolved and stable for a subsequent step. Generic
-process-status supervision such as `Reasoning.` or `Retrieving evidence.` is rejected. Consequently,
-v3 checkpoints are intentionally incompatible with v4. Dataset release **v16** introduced that
-rematerialization and the high-weight v4 curriculum. **v17** tightens the same semantic corpus without
-adding or dropping tasks: residual process narration missed by the original detector is replaced by
-`<|cid_unknown|>`, and multi-hop QA states expose a conservative `Known: ... Answer:
-<|cid_unknown|>` draft only when the corresponding `support-*` facts are already present in that
-step's TCT. Internal dependency curricula do not receive this derived user-visible partial.
+The current source tree defines **neural contract v5** for new model training while retaining the
+dataset-v4/v17 trajectory materialization. v5 fixes the neural scale contract: CID metadata and
+external-memory adapters start as semantic-preserving no-ops, thought diffusion noise is scaled to
+the backbone embedding space and follows each TCT cell's actual runtime noise level, Stage A excludes
+biases and one-dimensional controls from AdamW decay, and distributed Stage A checkpoints preserve
+rank-local RNG state. v4 model checkpoints are intentionally not resumable as v5 training state.
+
+The dataset-side Display contract remains unchanged: Display is a continuously revisable answer
+draft, unresolved answer content is represented by the model MASK state, EOS may move across the
+fixed physical canvas, and semantic equilibrium does not terminate a trajectory until the
+materialized display is resolved and stable for a subsequent step. Dataset release **v16** introduced
+the v4 materialization and high-weight curriculum; **v17** tightens the same semantic corpus without
+adding or dropping tasks. Historical v4 unified inference releases remain loadable with their legacy
+unit-noise semantics.
 
 v14 introduced **51,500 independent train-only natural public tasks**: 30,000 Natural Questions Open
 queries, 15,000 MultiDoc2Dial document-grounded dialogue turns, 4,500 high-quality human OASST1

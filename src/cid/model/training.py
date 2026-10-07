@@ -84,7 +84,7 @@ from cid.state import (
     DisplayCanvas,
 )
 
-CID_NEURAL_CONTRACT_VERSION = 4
+CID_NEURAL_CONTRACT_VERSION = 5
 STAGE_B_SEMANTIC_SNAPSHOT_FILENAME = "semantic-embedding.pt"
 _PORTABLE_LENGTH_BAND_SIZE = 64
 
@@ -125,6 +125,7 @@ def _semantic_snapshot_metadata(state: Mapping[str, Any]) -> dict[str, Any]:
         "pooling_mode": str(state["pooling_mode"]),
         "d_model": int(state["d_model"]),
         "vocab_size": int(weight.shape[0]),
+        "semantic_noise_scale": float(state["semantic_noise_scale"]),
         "dtype": str(weight.dtype),
     }
 
@@ -732,9 +733,12 @@ class CIDTrainer:
         if not self._trainable:
             raise ValueError("trainer requires at least one trainable parameter")
         self.optimizer = optimizer or torch.optim.AdamW(
-            (parameter for _, parameter in self._trainable),
+            stage_a_adamw_parameter_groups(
+                adapter,
+                weight_decay=self.config.weight_decay,
+            ),
             lr=self.config.learning_rate,
-            weight_decay=self.config.weight_decay,
+            weight_decay=0.0,
         )
         # FSDP CPU offload keeps the live parameter shards on host memory between
         # forwards, while tensorization and diffusion corruption still happen on the
@@ -1834,10 +1838,12 @@ class CIDTrainer:
         terminal = converged and not unresolved_binding and not pending_terminal_refresh
         quiescent = (equilibrium and unresolved_binding) or (converged and pending_terminal_refresh)
 
+        rollout_semantic = output.thought_semantic[
+            batch_index : batch_index + 1, slot_slice
+        ].detach()
+        self.tensorizer.text_encoder.validate_semantic_state(rollout_semantic)
         return CIDRolloutState(
-            thought_semantic=output.thought_semantic[
-                batch_index : batch_index + 1, slot_slice
-            ].detach(),
+            thought_semantic=rollout_semantic,
             role_features=torch.sigmoid(
                 output.role_logits[batch_index : batch_index + 1, slot_slice].float()
             ).detach(),
@@ -2333,6 +2339,16 @@ class CIDTrainer:
         self.generator.manual_seed(seed)
         self.shuffle_rng.seed(seed)
 
+    def local_rng_state(self) -> dict[str, Any]:
+        return {
+            "generator_state": self.generator.get_state().cpu(),
+            "shuffle_state": self.shuffle_rng.getstate(),
+        }
+
+    def restore_local_rng_state(self, state: Mapping[str, Any]) -> None:
+        self.generator.set_state(state["generator_state"])
+        self.shuffle_rng.setstate(state["shuffle_state"])
+
     def flush(self) -> None:
         if self._pending_accumulation:
             self._optimizer_step()
@@ -2472,6 +2488,7 @@ class CIDTrainer:
                 "hidden_size": self.adapter.d_model,
                 "vocab_size": self.adapter.vocab_size,
                 "mask_token_id": self.adapter.mask_token_id,
+                "identity": getattr(self.adapter, "_cid_backbone_identity", None),
             },
             "trainable_names": self.trainable_parameter_names,
             "model_state": trainable_state,
@@ -2625,6 +2642,11 @@ class CIDTrainer:
             or str(backbone["model_type"]) != str(self.adapter.backbone.config.model_type)
             or int(backbone.get("mask_token_id", self.adapter.mask_token_id))
             != self.adapter.mask_token_id
+            or (
+                backbone.get("identity") is not None
+                and backbone.get("identity")
+                != getattr(self.adapter, "_cid_backbone_identity", None)
+            )
         ):
             raise ValueError("checkpoint backbone geometry does not match this adapter")
 
@@ -3086,6 +3108,10 @@ def load_cid_adapter_checkpoint(
         or int(backbone["vocab_size"]) != adapter.vocab_size
         or str(backbone["model_type"]) != str(adapter.backbone.config.model_type)
         or int(backbone.get("mask_token_id", adapter.mask_token_id)) != adapter.mask_token_id
+        or (
+            backbone.get("identity") is not None
+            and backbone.get("identity") != getattr(adapter, "_cid_backbone_identity", None)
+        )
     ):
         raise ValueError("checkpoint backbone geometry does not match this adapter")
     if checkpoint["adapter_config"] != asdict(adapter.config):
@@ -3330,17 +3356,16 @@ class ILLaDATrajectoryTensorizer:
             input_retired_at = rollout_state.retired_at
 
         timestep_tensor = torch.tensor([timestep], device=device)
-        thought_timesteps = (
-            timestep_tensor
-            if rollout_state is None
-            else rollout_state.local_noise.to(device=device, dtype=torch.float32).squeeze(-1)
-        )
+        # Thought corruption must match the state carried by the runtime. The sampled
+        # training timestep remains a Display augmentation only; replacing low-noise
+        # TCT state with an unrelated uniform high-noise timestep destroys semantic SNR.
+        thought_timesteps = state_noise.to(device=device, dtype=torch.float32).squeeze(-1)
         thought_corruption = self.scheduler.corrupt_thought(
             thought_semantic,
             thought_timesteps,
             occupancy,
+            noise_scale=self.text_encoder.semantic_noise_scale,
             generator=generator,
-            _timesteps_validated=rollout_state is None,
         )
         target_control = self._training_target_control_snapshot(
             occupancy,
@@ -6017,6 +6042,35 @@ def stage_b_optimizer_steps_per_epoch(
     return optimizer_steps
 
 
+def stage_a_adamw_parameter_groups(
+    adapter: ILLaDACIDAdapter,
+    *,
+    weight_decay: float = 0.01,
+) -> list[dict[str, object]]:
+    """Build Stage A AdamW groups without decaying biases or one-dimensional controls."""
+    if not math.isfinite(weight_decay) or weight_decay < 0.0:
+        raise ValueError("weight_decay must be finite and non-negative")
+    buckets: dict[bool, list[torch.nn.Parameter]] = {True: [], False: []}
+    for parameter in adapter.parameters():
+        if parameter.requires_grad:
+            buckets[parameter.ndim >= 2].append(parameter)
+    groups: list[dict[str, object]] = []
+    for use_decay in (True, False):
+        parameters = buckets[use_decay]
+        if not parameters:
+            continue
+        groups.append(
+            {
+                "params": parameters,
+                "weight_decay": weight_decay if use_decay else 0.0,
+                "group_name": "cid-decay" if use_decay else "cid-no-decay",
+            }
+        )
+    if not groups:
+        raise ValueError("Stage A AdamW requires trainable parameters")
+    return groups
+
+
 def stage_b_adamw_parameter_groups(
     adapter: ILLaDACIDAdapter,
     *,
@@ -6375,6 +6429,7 @@ def save_stage_b_checkpoint(
                 "hidden_size": trainer.adapter.d_model,
                 "vocab_size": trainer.adapter.vocab_size,
                 "mask_token_id": trainer.adapter.mask_token_id,
+                "identity": getattr(trainer.adapter, "_cid_backbone_identity", None),
             },
         }
         if epoch_progress is not None:
@@ -6435,6 +6490,11 @@ def load_stage_b_checkpoint(
         or str(backbone["model_type"]) != str(trainer.adapter.backbone.config.model_type)
         or int(backbone.get("mask_token_id", trainer.adapter.mask_token_id))
         != trainer.adapter.mask_token_id
+        or (
+            backbone.get("identity") is not None
+            and backbone.get("identity")
+            != getattr(trainer.adapter, "_cid_backbone_identity", None)
+        )
     ):
         raise ValueError("Stage B checkpoint backbone geometry does not match")
 
@@ -6532,7 +6592,13 @@ def load_stage_b_model_checkpoint(
         int(backbone["hidden_size"]) != adapter.d_model
         or int(backbone["vocab_size"]) != adapter.vocab_size
         or str(backbone["model_type"]) != str(adapter.backbone.config.model_type)
-        or int(backbone.get("mask_token_id", adapter.mask_token_id)) != adapter.mask_token_id
+        or int(backbone.get("mask_token_id", adapter.mask_token_id))
+        != adapter.mask_token_id
+        or (
+            backbone.get("identity") is not None
+            and backbone.get("identity")
+            != getattr(adapter, "_cid_backbone_identity", None)
+        )
     ):
         raise ValueError("Stage B checkpoint backbone geometry does not match")
 

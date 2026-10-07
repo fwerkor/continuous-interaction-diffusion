@@ -1918,6 +1918,7 @@ def _train_stage_a(args: argparse.Namespace) -> None:
         load_cid_adapter_from_pretrained,
         materialize_indexed_rollout_windows,
         shard_rollout_windows,
+        stage_a_adamw_parameter_groups,
         stage_a_gradient_accumulation_steps,
         stage_b_consumed_windows_by_bucket,
         trajectory_rollout_windows,
@@ -2126,24 +2127,25 @@ def _train_stage_a(args: argparse.Namespace) -> None:
                 device_type=device_type,
                 dtype=dtype,
             )
-        trainable_parameters = tuple(
-            parameter for parameter in adapter.parameters() if parameter.requires_grad
+        stage_a_optimizer_groups = stage_a_adamw_parameter_groups(
+            adapter,
+            weight_decay=args.weight_decay,
         )
         if args.zero_redundancy_optimizer and distributed:
             from torch.distributed.optim import ZeroRedundancyOptimizer
 
             stage_a_optimizer = ZeroRedundancyOptimizer(
-                trainable_parameters,
+                stage_a_optimizer_groups,
                 optimizer_class=torch.optim.AdamW,
                 lr=args.learning_rate,
-                weight_decay=args.weight_decay,
+                weight_decay=0.0,
                 fused=device_type == "cuda",
             )
         else:
             stage_a_optimizer = torch.optim.AdamW(
-                trainable_parameters,
+                stage_a_optimizer_groups,
                 lr=args.learning_rate,
-                weight_decay=args.weight_decay,
+                weight_decay=0.0,
                 fused=device_type == "cuda",
             )
         trainer = CIDTrainer(
@@ -2194,6 +2196,11 @@ def _train_stage_a(args: argparse.Namespace) -> None:
                 f"{checkpoint.stem}.optimizer-rank-{shard_rank:04d}{checkpoint.suffix}"
             )
 
+        def stage_a_rng_shard_path(checkpoint: Path, shard_rank: int) -> Path:
+            return checkpoint.with_name(
+                f"{checkpoint.stem}.rng-rank-{shard_rank:04d}{checkpoint.suffix}"
+            )
+
         def save_stage_a_checkpoint(
             checkpoint: Path,
             *,
@@ -2208,6 +2215,12 @@ def _train_stage_a(args: argparse.Namespace) -> None:
                 )
                 torch.save(stage_a_optimizer.optim.state_dict(), optimizer_temporary)
                 optimizer_temporary.replace(optimizer_shard)
+                dist.barrier()
+            if distributed:
+                rng_shard = stage_a_rng_shard_path(checkpoint, rank)
+                rng_temporary = rng_shard.with_name(f".{rng_shard.name}.tmp")
+                torch.save(trainer.local_rng_state(), rng_temporary)
+                rng_temporary.replace(rng_shard)
                 dist.barrier()
             if rank == 0:
                 trainer.save_checkpoint(
@@ -2266,7 +2279,17 @@ def _train_stage_a(args: argparse.Namespace) -> None:
             else None
         )
         if distributed:
-            trainer.reseed(args.seed + rank + trainer.state.transitions_seen * 104729)
+            if args.resume and not world_size_changed:
+                rng_shard = stage_a_rng_shard_path(Path(args.resume), rank)
+                if not rng_shard.exists():
+                    raise FileNotFoundError(
+                        f"missing Stage A RNG shard for rank {rank}: {rng_shard}"
+                    )
+                trainer.restore_local_rng_state(
+                    torch.load(rng_shard, map_location="cpu", weights_only=False)
+                )
+            else:
+                trainer.reseed(args.seed + rank + trainer.state.transitions_seen * 104729)
         if trainer.state.rollout_windows_seen_in_epoch == 0 and not (
             world_size_changed and saved_partial_windows
         ):
@@ -4434,8 +4457,18 @@ def main() -> None:
         type=int,
         help="token chunk size for exact frozen-backbone RMSNorm evaluation",
     )
-    train.add_argument("--timestep-min", type=float, default=0.05)
-    train.add_argument("--timestep-max", type=float, default=1.0)
+    train.add_argument(
+        "--timestep-min",
+        type=float,
+        default=0.05,
+        help="minimum sampled Display diffusion timestep; TCT thought noise comes from cell state",
+    )
+    train.add_argument(
+        "--timestep-max",
+        type=float,
+        default=1.0,
+        help="maximum sampled Display diffusion timestep; TCT thought noise comes from cell state",
+    )
     train.add_argument("--rollout-horizon", type=int, default=3)
     train.add_argument(
         "--flatten-teacher-forcing-horizon",
@@ -4584,8 +4617,18 @@ def main() -> None:
     )
     train_full.add_argument("--min-learning-rate-ratio", type=float, default=0.1)
     train_full.add_argument("--max-grad-norm", type=float, default=1.0)
-    train_full.add_argument("--timestep-min", type=float, default=0.05)
-    train_full.add_argument("--timestep-max", type=float, default=1.0)
+    train_full.add_argument(
+        "--timestep-min",
+        type=float,
+        default=0.05,
+        help="minimum sampled Display diffusion timestep; TCT thought noise comes from cell state",
+    )
+    train_full.add_argument(
+        "--timestep-max",
+        type=float,
+        default=1.0,
+        help="maximum sampled Display diffusion timestep; TCT thought noise comes from cell state",
+    )
     train_full.add_argument("--rollout-horizon", type=int, default=3)
     train_full.add_argument(
         "--rollout-allocation-threshold",
