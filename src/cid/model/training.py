@@ -64,6 +64,7 @@ from cid.model.encoding import (
     stable_text,
 )
 from cid.model.illada import ILLaDACIDAdapter
+from cid.model.loading import backbone_identity_matches, tokenizer_source_identity
 from cid.model.losses import CIDLoss, CIDTargets, cid_loss
 from cid.model.materialize import (
     ArgumentCandidate,
@@ -91,6 +92,15 @@ _PORTABLE_LENGTH_BAND_SIZE = 64
 
 class CIDRolloutRecoveryError(ValueError):
     """A closed-loop model state cannot be reconciled with the teacher under runtime limits."""
+
+
+def _validate_tokenizer_identity(saved_identity: object, tokenizer: Any | None) -> None:
+    if saved_identity is None:
+        return
+    if tokenizer is None:
+        raise ValueError("checkpoint tokenizer identity requires the tokenizer used for loading")
+    if saved_identity != tokenizer_source_identity(tokenizer):
+        raise ValueError("checkpoint tokenizer identity does not match the current tokenizer")
 
 
 def _distributed_all_true(value: bool, *, device: torch.device) -> bool:
@@ -2508,6 +2518,7 @@ class CIDTrainer:
             ),
             "data_order_version": self.data_order_version,
             "dataset_sha256": dataset_sha256,
+            "tokenizer_identity": tokenizer_source_identity(self.tensorizer.tokenizer),
         }
         if epoch_progress is not None:
             payload["epoch_progress"] = dict(epoch_progress)
@@ -2642,13 +2653,16 @@ class CIDTrainer:
             or str(backbone["model_type"]) != str(self.adapter.backbone.config.model_type)
             or int(backbone.get("mask_token_id", self.adapter.mask_token_id))
             != self.adapter.mask_token_id
-            or (
-                backbone.get("identity") is not None
-                and backbone.get("identity")
-                != getattr(self.adapter, "_cid_backbone_identity", None)
+            or not backbone_identity_matches(
+                self.adapter,
+                backbone.get("identity"),
             )
         ):
             raise ValueError("checkpoint backbone geometry does not match this adapter")
+        _validate_tokenizer_identity(
+            checkpoint.get("tokenizer_identity"),
+            self.tensorizer.tokenizer,
+        )
 
         saved_state = checkpoint["model_state"]
         with torch.no_grad():
@@ -3086,6 +3100,7 @@ def load_cid_adapter_checkpoint(
     adapter: ILLaDACIDAdapter,
     path: str | Path,
     *,
+    tokenizer: Any | None = None,
     expected_semantic_pooling: str | None = None,
 ) -> CIDTrainerState:
     """Load the CID model state from a trainer checkpoint without restoring an optimizer."""
@@ -3108,12 +3123,10 @@ def load_cid_adapter_checkpoint(
         or int(backbone["vocab_size"]) != adapter.vocab_size
         or str(backbone["model_type"]) != str(adapter.backbone.config.model_type)
         or int(backbone.get("mask_token_id", adapter.mask_token_id)) != adapter.mask_token_id
-        or (
-            backbone.get("identity") is not None
-            and backbone.get("identity") != getattr(adapter, "_cid_backbone_identity", None)
-        )
+        or not backbone_identity_matches(adapter, backbone.get("identity"))
     ):
         raise ValueError("checkpoint backbone geometry does not match this adapter")
+    _validate_tokenizer_identity(checkpoint.get("tokenizer_identity"), tokenizer)
     if checkpoint["adapter_config"] != asdict(adapter.config):
         raise ValueError("checkpoint CID adapter configuration does not match this adapter")
 
@@ -6421,6 +6434,7 @@ def save_stage_b_checkpoint(
             ),
             "world_size": dist.get_world_size(),
             "dataset_sha256": dataset_sha256,
+            "tokenizer_identity": tokenizer_source_identity(trainer.tensorizer.tokenizer),
             "semantic_pooling": getattr(trainer.config, "semantic_pooling", "mean-v1"),
             "semantic_embedding_snapshot": _semantic_snapshot_metadata(semantic_snapshot),
             "adapter_config": asdict(trainer.adapter.config),
@@ -6490,13 +6504,16 @@ def load_stage_b_checkpoint(
         or str(backbone["model_type"]) != str(trainer.adapter.backbone.config.model_type)
         or int(backbone.get("mask_token_id", trainer.adapter.mask_token_id))
         != trainer.adapter.mask_token_id
-        or (
-            backbone.get("identity") is not None
-            and backbone.get("identity")
-            != getattr(trainer.adapter, "_cid_backbone_identity", None)
+        or not backbone_identity_matches(
+            trainer.adapter,
+            backbone.get("identity"),
         )
     ):
         raise ValueError("Stage B checkpoint backbone geometry does not match")
+    _validate_tokenizer_identity(
+        metadata.get("tokenizer_identity"),
+        trainer.tensorizer.tokenizer,
+    )
 
     with _stage_b_sharded_state_dict_context(model):
         model_state = model.state_dict()
@@ -6594,13 +6611,10 @@ def load_stage_b_model_checkpoint(
         or str(backbone["model_type"]) != str(adapter.backbone.config.model_type)
         or int(backbone.get("mask_token_id", adapter.mask_token_id))
         != adapter.mask_token_id
-        or (
-            backbone.get("identity") is not None
-            and backbone.get("identity")
-            != getattr(adapter, "_cid_backbone_identity", None)
-        )
+        or not backbone_identity_matches(adapter, backbone.get("identity"))
     ):
         raise ValueError("Stage B checkpoint backbone geometry does not match")
+    _validate_tokenizer_identity(metadata.get("tokenizer_identity"), tokenizer)
 
     semantic_encoder = None
     if version == 6:
