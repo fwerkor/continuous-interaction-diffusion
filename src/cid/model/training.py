@@ -1324,6 +1324,12 @@ class CIDTrainer:
                         coverage[index] += 1
             if tuple(coverage) != tuple(int(selected) for selected in resolved_sample_mask):
                 raise ValueError("loss groups must partition the valid sample mask exactly")
+        # This boundary is reached by both rollout training and flattened
+        # teacher forcing.  In the latter case a global batch size is already
+        # known, so cache reclamation must not depend on the size all-reduce.
+        # Reclaim before collation to leave room for both the batch and the
+        # backbone's temporary NPU convolution workspaces.
+        self._maybe_release_npu_cache()
         training_batch = collate_training_steps(
             samples,
             pad_token_id=int(self.pad_token_id),
@@ -1336,7 +1342,6 @@ class CIDTrainer:
         )
         training_batch.batch.sample_mask = valid_rows
         if global_effective_batch_size is None:
-            self._maybe_release_npu_cache()
             global_effective_batch_size = self._distributed_global_batch_size(effective_batch_size)
         if global_effective_batch_size < effective_batch_size:
             raise ValueError("global valid-example count cannot be below the local count")

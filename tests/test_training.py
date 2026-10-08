@@ -3746,6 +3746,34 @@ def test_training_rollout_masks_unrecoverable_recovery_without_crashing(monkeypa
     assert trainer.state.epochs_completed == 1
 
 
+def test_stage_a_cache_reclaimed_before_collation_with_explicit_batch(monkeypatch) -> None:
+    adapter = make_adapter(seed=158)
+    tensorizer = ILLaDATrajectoryTensorizer(adapter, TinyTokenizer())
+    trainer = CIDTrainer(
+        adapter,
+        tensorizer,
+        CIDTrainerConfig(timestep_min=0.0, timestep_max=0.0),
+    )
+    sample = tensorizer.tensorize(make_trajectory(), source_step=0, timestep=0.0)
+    events = []
+    original_collate = cid_training.collate_training_steps
+
+    def reclaim() -> None:
+        events.append("reclaim")
+
+    def collate(*args, **kwargs):
+        events.append("collate")
+        return original_collate(*args, **kwargs)
+
+    monkeypatch.setattr(trainer, "_maybe_release_npu_cache", reclaim)
+    monkeypatch.setattr(cid_training, "collate_training_steps", collate)
+    trainer._forward_backward((sample,), global_effective_batch_size=1)
+    assert events[:2] == ["reclaim", "collate"]
+    events.clear()
+    trainer._forward_backward((sample,))
+    assert events[:2] == ["reclaim", "collate"]
+
+
 def test_valid_example_accumulation_ignores_masked_rows() -> None:
     adapter = make_adapter(seed=159)
     tensorizer = ILLaDATrajectoryTensorizer(adapter, TinyTokenizer())
