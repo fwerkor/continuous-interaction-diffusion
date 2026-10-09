@@ -2045,6 +2045,16 @@ def test_semantic_state_guard_rejects_nonfinite_and_runaway_state() -> None:
             torch.full_like(safe, encoder.semantic_noise_scale * 64.0)
         )
 
+    assert encoder.validate_semantic_state(safe, report_rms_excess=True) is None
+    runaway = torch.full_like(safe, encoder.semantic_noise_scale * 64.0)
+    assert encoder.validate_semantic_state(runaway, report_rms_excess=True) == pytest.approx(
+        encoder.semantic_noise_scale * 64.0
+    )
+    with pytest.raises(FloatingPointError, match="non-finite"):
+        encoder.validate_semantic_state(
+            torch.full_like(safe, float("nan")), report_rms_excess=True
+        )
+
 
 def test_stage_a_checkpoint_rejects_previous_neural_contract(tmp_path) -> None:
     adapter = make_adapter(seed=145)

@@ -1,5 +1,6 @@
 from __future__ import annotations
 
+import logging
 from dataclasses import dataclass
 from typing import Any
 
@@ -27,6 +28,8 @@ from cid.model.loading import load_cid_tokenizer
 from cid.model.materialize import CIDMaterializer, ClosedWorldMaterializationCatalog
 from cid.model.tensors import CIDTensorBatch, build_percept_routing_masks, semantic_batch_as_tensor
 from cid.state import CognitiveRole, FactItem
+
+logger = logging.getLogger(__name__)
 
 
 class ILLaDAContextTensorizer:
@@ -246,6 +249,8 @@ class ILLaDANeuralPolicy:
         self.forward_model = forward_model or adapter
         self.generator = torch.Generator(device=self.tensorizer.text_encoder.device)
         self.generator.manual_seed(self.config.seed)
+        self.semantic_rms_exceedances = 0
+        self.peak_semantic_rms: float | None = None
 
     def step(self, context: ModelContext) -> ModelUpdate:
         diffusion_step = context.diffusion_step
@@ -256,7 +261,20 @@ class ILLaDANeuralPolicy:
         )
         with torch.no_grad():
             output = self.forward_model(batch)
-            self.tensorizer.text_encoder.validate_semantic_state(output.thought_semantic)
+            exceeded_rms = self.tensorizer.text_encoder.validate_semantic_state(
+                output.thought_semantic, report_rms_excess=True
+            )
+            if exceeded_rms is not None:
+                self.semantic_rms_exceedances += 1
+                self.peak_semantic_rms = max(self.peak_semantic_rms or 0.0, exceeded_rms)
+                if self.semantic_rms_exceedances == 1:
+                    logger.warning(
+                        "CID inference semantic RMS %.6g exceeds diagnostic threshold %.6g "
+                        "at diffusion step %d; continuing inference",
+                        exceeded_rms,
+                        self.tensorizer.text_encoder.semantic_noise_scale * 32.0,
+                        diffusion_step,
+                    )
             display_ids = self.scheduler.refine_display(
                 batch.display_ids,
                 output.display_logits,

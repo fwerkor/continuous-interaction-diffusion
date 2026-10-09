@@ -203,30 +203,38 @@ class ILLaDATextEncoder:
         semantic: Tensor,
         *,
         max_rms_multiple: float = 32.0,
-    ) -> None:
+        report_rms_excess: bool = False,
+    ) -> float | None:
         if max_rms_multiple <= 0.0:
             raise ValueError("max_rms_multiple must be positive")
         values = semantic.detach().float()
         if values.numel() == 0:
-            return
+            return None
         finite = torch.isfinite(values).all()
-        limit = float(self.semantic_noise_scale) * max_rms_multiple
-        bounded = values.square().mean(dim=-1).le(limit * limit).all()
         if values.device.type in {"cuda", "npu"} and hasattr(torch, "_assert_async"):
             torch._assert_async(finite, "CID semantic state contains non-finite values")
+        elif not bool(finite):
+            raise FloatingPointError("CID semantic state contains non-finite values")
+
+        limit = float(self.semantic_noise_scale) * max_rms_multiple
+        squared_rms = values.square().mean(dim=-1)
+        if report_rms_excess:
+            maximum_rms = float(squared_rms.max().sqrt())
+            return maximum_rms if maximum_rms > limit else None
+
+        bounded = squared_rms.le(limit * limit).all()
+        if values.device.type in {"cuda", "npu"} and hasattr(torch, "_assert_async"):
             torch._assert_async(
                 bounded,
                 "CID semantic state RMS exceeded the neural-contract limit",
             )
-            return
-        if not bool(finite):
-            raise FloatingPointError("CID semantic state contains non-finite values")
-        if not bool(bounded):
-            maximum_rms = float(values.square().mean(dim=-1).sqrt().max())
+        elif not bool(bounded):
+            maximum_rms = float(squared_rms.max().sqrt())
             raise FloatingPointError(
                 "CID semantic state RMS exceeded the neural-contract limit: "
                 f"{maximum_rms:.6g} > {limit:.6g}"
             )
+        return None
 
     def tokenize(self, text: str, *, add_special_tokens: bool) -> Tensor:
         if not text:
