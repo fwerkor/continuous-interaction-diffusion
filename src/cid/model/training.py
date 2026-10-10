@@ -90,7 +90,7 @@ from cid.state import (
     DisplayCanvas,
 )
 
-CID_NEURAL_CONTRACT_VERSION = 5
+CID_NEURAL_CONTRACT_VERSION = 6
 STAGE_B_SEMANTIC_SNAPSHOT_FILENAME = "semantic-embedding.pt"
 _PORTABLE_LENGTH_BAND_SIZE = 64
 

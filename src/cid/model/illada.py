@@ -639,6 +639,7 @@ class ILLaDACIDConfig:
     max_anchor_slots: int = 4
     max_link_slots: int = 8
     external_dropout: float = 0.0
+    semantic_head_version: int = 1  # Legacy checkpoints omit this field.
 
     def __post_init__(self) -> None:
         if self.max_thought_slots <= 0 or self.max_display_tokens <= 0:
@@ -665,6 +666,8 @@ class ILLaDACIDConfig:
             raise ValueError("grounding slot capacities must be positive")
         if not 0.0 <= self.external_dropout < 1.0:
             raise ValueError("external_dropout must be in [0, 1)")
+        if self.semantic_head_version not in (1, 2):
+            raise ValueError("semantic_head_version must be 1 or 2")
 
 
 class ILLaDACIDAdapter(nn.Module):
@@ -765,6 +768,7 @@ class ILLaDACIDAdapter(nn.Module):
             max_argument_slots=self.config.max_argument_slots,
             max_anchor_slots=self.config.max_anchor_slots,
             max_link_slots=self.config.max_link_slots,
+            semantic_head_version=self.config.semantic_head_version,
         )
 
         nn.init.zeros_(self.channel_embedding.weight)

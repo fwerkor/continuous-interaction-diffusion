@@ -97,6 +97,25 @@ def test_cid_model_round_trips_as_one_safetensors_file(tmp_path: Path) -> None:
     assert torch.equal(restored.semantic_embedding_weight, expected_semantic)
 
 
+def test_v6_unified_model_requires_stable_semantic_head() -> None:
+    legacy = _tiny_cid_config()
+    with pytest.raises(ValueError, match="semantic_head_version=2"):
+        CIDConfig(
+            backbone_config=legacy.backbone_config,
+            adapter_config=legacy.adapter_config,
+            semantic_embedding=legacy.semantic_embedding,
+            neural_contract_version=6,
+        )
+    stable = CIDConfig(
+        backbone_config=legacy.backbone_config,
+        adapter_config={**legacy.adapter_config, "semantic_head_version": 2},
+        semantic_embedding=legacy.semantic_embedding,
+        neural_contract_version=6,
+    )
+    model = CIDModel(stable)
+    assert model.adapter.output_heads.semantic_head_version == 2
+
+
 def test_unified_state_prefixes_legacy_components() -> None:
     backbone = {"lfm2.embed_tokens.weight": torch.ones(2, 3)}
     cid = {"channel_embedding.weight": torch.full((3, 3), 2.0)}

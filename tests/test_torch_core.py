@@ -30,6 +30,7 @@ def test_need_decoding_depends_on_provisional_thought_state() -> None:
         max_argument_slots=2,
         max_anchor_slots=2,
         max_link_slots=2,
+        semantic_head_version=1,
     )
     base_thought = torch.zeros(1, 2, 8)
     thought_hidden = torch.randn(1, 2, 8)
@@ -51,6 +52,120 @@ def test_need_decoding_depends_on_provisional_thought_state() -> None:
     gradient = heads.thought_delta.weight.grad
     assert gradient is not None
     assert gradient.abs().sum() > 0
+
+
+def _make_semantic_v2_heads() -> CIDOutputHeads:
+    return CIDOutputHeads(
+        d_model=32,
+        num_roles=3,
+        num_lifecycles=4,
+        num_anchor_kinds=2,
+        num_link_relations=2,
+        num_object_kinds=2,
+        num_refresh_actions=3,
+        max_need_slots=2,
+        max_argument_slots=2,
+        max_anchor_slots=2,
+        max_link_slots=2,
+        semantic_head_version=2,
+    )
+
+
+def _semantic_v2_forward(heads: CIDOutputHeads, hidden: torch.Tensor):
+    return heads(
+        base_thought=torch.zeros_like(hidden),
+        thought_hidden=hidden,
+        thought_occupancy=torch.ones((*hidden.shape[:2], 1)),
+        display_hidden=torch.randn(hidden.shape[0], 3, hidden.shape[-1]),
+        display_logits=torch.randn(hidden.shape[0], 3, 16),
+        source_memory=torch.randn(hidden.shape[0], 2, hidden.shape[-1]),
+    )
+
+
+def test_v2_route_gradient_cannot_update_semantic_prediction() -> None:
+    torch.manual_seed(29)
+    heads = _make_semantic_v2_heads()
+    with torch.no_grad():
+        heads.thought_delta.weight.zero_()
+        heads.thought_delta.bias.zero_()
+    output = _semantic_v2_forward(heads, torch.randn(1, 3, 32))
+    route_loss = torch.nn.functional.binary_cross_entropy_with_logits(
+        output.need_target_cell_logits[:, 0, 0], torch.tensor([[1.0, 0.0, 0.0]])
+    )
+    route_gradients = torch.autograd.grad(
+        route_loss,
+        tuple(heads.thought_delta.parameters()),
+        retain_graph=True,
+        allow_unused=True,
+    )
+    assert all(gradient is None for gradient in route_gradients)
+    route_loss.backward()
+    for parameter in (heads.cell_route_query.weight, heads.cell_route_key.weight):
+        assert parameter.grad is not None
+        assert torch.isfinite(parameter.grad).all()
+        assert parameter.grad.norm() < 1_000
+    assert heads.source_query.weight.grad is None
+
+    thought_loss = output.thought_semantic.square().mean()
+    thought_gradient = torch.autograd.grad(
+        thought_loss,
+        heads.thought_delta.weight,
+        allow_unused=True,
+    )[0]
+    assert thought_gradient is not None
+    assert torch.isfinite(thought_gradient).all()
+
+
+def test_v2_route_is_independent_of_semantic_scale_and_delta() -> None:
+    torch.manual_seed(31)
+    heads = _make_semantic_v2_heads()
+    hidden = torch.randn(1, 3, 32)
+    torch.manual_seed(32)
+    before = _semantic_v2_forward(heads, hidden)
+    with torch.no_grad():
+        heads.thought_delta.bias.fill_(100.0)
+    heads.set_semantic_scale(0.02)
+    torch.manual_seed(32)
+    after = _semantic_v2_forward(heads, hidden)
+    assert torch.allclose(before.need_target_cell_logits, after.need_target_cell_logits)
+    assert torch.allclose(before.need_logits, after.need_logits)
+    assert not torch.allclose(before.thought_semantic, after.thought_semantic)
+    assert after.thought_semantic.float().square().mean(dim=-1).sqrt().max() <= 0.08001
+    assert heads.cell_route_width == min(hidden.shape[-1], 128)
+
+
+def test_v2_zero_delta_preserves_zero_and_small_teacher_states() -> None:
+    torch.manual_seed(33)
+    heads = _make_semantic_v2_heads()
+    heads.set_semantic_scale(0.02)
+    with torch.no_grad():
+        heads.thought_delta.weight.zero_()
+        heads.thought_delta.bias.zero_()
+    hidden = torch.randn(1, 3, 32)
+    result = _semantic_v2_forward(heads, hidden)
+    assert torch.count_nonzero(result.thought_semantic) == 0
+
+    teacher = torch.randn_like(hidden) * 0.008
+    result = heads(
+        base_thought=teacher,
+        thought_hidden=hidden,
+        thought_occupancy=torch.ones((1, 3, 1)),
+        display_hidden=torch.randn(1, 3, 32),
+        display_logits=torch.randn(1, 3, 16),
+        source_memory=torch.randn(1, 2, 32),
+    )
+    assert torch.equal(result.thought_semantic, teacher)
+
+
+def test_zero_grounding_query_has_bounded_cosine_gradient() -> None:
+    query = torch.zeros((1, 1, 1, 32), requires_grad=True)
+    target = torch.full_like(query, 0.001)
+    mask = torch.ones((1, 1, 1), dtype=torch.bool)
+    loss = loss_module._masked_cosine_loss(query, target, mask)
+    loss.backward()
+    assert query.grad is not None
+    assert torch.isfinite(query.grad).all()
+    assert query.grad.norm() < 2_000
 
 
 def test_allocation_loss_reserves_thirty_percent_positive_gradient_mass() -> None:

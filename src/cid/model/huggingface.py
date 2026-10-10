@@ -30,8 +30,7 @@ class CIDConfig(PretrainedConfig):
         backbone_config: Mapping[str, Any] | None = None,
         adapter_config: Mapping[str, Any] | None = None,
         semantic_embedding: Mapping[str, Any] | None = None,
-        neural_contract_version: int = 5,
-        base_model: str | None = None,
+        neural_contract_version: int = 6,        base_model: str | None = None,
         release_name: str | None = None,
         **kwargs: Any,
     ) -> None:
@@ -42,6 +41,12 @@ class CIDConfig(PretrainedConfig):
         self.neural_contract_version = int(neural_contract_version)
         self.base_model = base_model
         self.release_name = release_name
+        if (
+            self.neural_contract_version >= 6
+            and self.adapter_config
+            and self.adapter_config.get("semantic_head_version") != 2
+        ):
+            raise ValueError("neural contract v6 requires semantic_head_version=2")
 
         supported_backbones = {"lfm2", *AR_CID_MODEL_TYPES}
         if (

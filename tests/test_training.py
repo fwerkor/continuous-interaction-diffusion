@@ -2601,7 +2601,7 @@ def test_stage_b_fsdp_runs_full_parameter_optimizer_step_on_cpu(tmp_path) -> Non
         )
         metadata = json.loads((checkpoint / "metadata.json").read_text(encoding="utf-8"))
         assert metadata["format_version"] == 6
-        assert metadata["neural_contract_version"] == 5
+        assert metadata["neural_contract_version"] == 6
         assert metadata["semantic_embedding_snapshot"]["file"] == "semantic-embedding.pt"
 
         restored_adapter = make_adapter(seed=91)

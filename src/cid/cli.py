@@ -1950,6 +1950,7 @@ def _train_stage_a(args: argparse.Namespace) -> None:
         max_thought_slots=args.thought_capacity,
         max_display_tokens=args.max_display_tokens,
         display_canvas_tokens=args.display_canvas_tokens,
+        semantic_head_version=2,
     )
     dataset_manifest = inspect_dataset(args.data)
     validate_neural_training_contract(
@@ -3099,6 +3100,7 @@ def _train_stage_b(args: argparse.Namespace) -> None:
             max_thought_slots=args.thought_capacity,
             max_display_tokens=args.max_display_tokens,
             display_canvas_tokens=args.display_canvas_tokens,
+            semantic_head_version=2,
         )
         dataset_manifest = inspect_dataset(args.data)
         validate_neural_training_contract(

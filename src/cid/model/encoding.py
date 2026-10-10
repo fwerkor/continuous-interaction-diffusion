@@ -71,6 +71,7 @@ class ILLaDATextEncoder:
         self.d_model = adapter.d_model
         self.pooling_mode = pooling_mode
         self.semantic_noise_scale = _semantic_noise_scale(self._embedding.weight)
+        adapter.output_heads.set_semantic_scale(self.semantic_noise_scale)
         self._is_frozen_snapshot = False
         self._token_cache: OrderedDict[tuple[str, bool], Tensor] = OrderedDict()
         self._detached_text_cache: OrderedDict[str, Tensor] = OrderedDict()
@@ -105,6 +106,7 @@ class ILLaDATextEncoder:
         snapshot.d_model = adapter.d_model
         snapshot.pooling_mode = pooling_mode
         snapshot.semantic_noise_scale = _semantic_noise_scale(weight)
+        adapter.output_heads.set_semantic_scale(snapshot.semantic_noise_scale)
         snapshot._is_frozen_snapshot = True
         snapshot._token_cache = OrderedDict()
         snapshot._detached_text_cache = OrderedDict()
@@ -163,6 +165,7 @@ class ILLaDATextEncoder:
             or snapshot.semantic_noise_scale <= 0.0
         ):
             raise ValueError("frozen semantic embedding noise scale is invalid")
+        adapter.output_heads.set_semantic_scale(snapshot.semantic_noise_scale)
         snapshot._is_frozen_snapshot = True
         snapshot._token_cache = OrderedDict()
         snapshot._detached_text_cache = OrderedDict()
