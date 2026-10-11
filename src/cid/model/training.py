@@ -3887,6 +3887,15 @@ class ILLaDATrajectoryTensorizer:
                 dtype=dtype,
             )
 
+        # The dataset's <|cid_unknown|> means an unresolved Display position,
+        # and is encoded using the same [MASK] ID as diffusion corruption.
+        # [MASK] is an *input placeholder*, not a valid completed output token:
+        # supervising it as a correct CE class teaches the model to keep the
+        # canvas unresolved (and produces empty text after decoding). This can
+        # occur on ordinary teacher-forced unchanged-unknown transitions as
+        # well as partially-known answer drafts.
+        display_labels[display_labels == self.adapter.mask_token_id] = -100
+
         rollout_routes = (
             {}
             if rollout_state is None
