@@ -5082,6 +5082,37 @@ def test_training_display_unknown_marker_maps_to_model_mask_token() -> None:
     assert not sample.batch.display_padding_mask.any()
 
 
+def test_training_never_supervises_unresolved_display_mask_as_answer() -> None:
+    adapter = make_adapter(seed=177)
+    tensorizer = ILLaDATrajectoryTensorizer(adapter, TinyTokenizer())
+    base = make_trajectory()
+    unknown = replace(
+        base,
+        display_targets=(
+            DisplayTarget(step=0, text=DISPLAY_UNKNOWN_MARKER),
+            DisplayTarget(step=1, text=DISPLAY_UNKNOWN_MARKER),
+        ),
+    )
+    for step in (-1, 0):
+        sample = tensorizer.tensorize(unknown, source_step=step, timestep=1.0)
+        assert sample.targets.display_ids.ne(adapter.mask_token_id).all()
+        assert sample.batch.display_ids[0, 0] == adapter.mask_token_id
+
+    partial = replace(
+        base,
+        display_targets=(
+            DisplayTarget(step=0, text=f"A{DISPLAY_UNKNOWN_MARKER}C"),
+            DisplayTarget(step=1, text=f"A{DISPLAY_UNKNOWN_MARKER}C"),
+        ),
+    )
+    sample = tensorizer.tensorize(partial, source_step=0, timestep=1.0)
+    target = sample.targets.display_ids[0]
+    assert target.ne(adapter.mask_token_id).all()
+    assert target.eq(-100).any()
+    assert target.eq(tensorizer.eos_token_id).any()
+    assert target.ge(0).any()
+
+
 def test_training_rejects_legacy_process_status_display_targets() -> None:
     adapter = make_adapter(seed=149)
     tensorizer = ILLaDATrajectoryTensorizer(adapter, TinyTokenizer())
