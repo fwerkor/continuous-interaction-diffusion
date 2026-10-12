@@ -55,3 +55,9 @@ A paired, fixed-features 150-update head-only experiment through the real tensor
 This is a controlled **supervision proof**, not full 0.4B model quality: only two Need logits were optimized against fixed, actual CID model features and a tiny model. No improvements in real 128-step exact answers are claimed.
 
 As checked on unist2, all A6000 GPUs 0–7 were already occupied by CUDA processes: GPUs 0–3 on the existing 0.4B Stage B job and GPUs 4–7 by a separate root-owned job. Consequently no new actual 0.4B A/B run was started or any GPU job interrupted; this blocks the full-model acceptance gate, not the correctness of the CPU code tests.
+
+## Checkpoint migration guard
+
+The clean integration branch records \`supervision_contract_version=2\` in new Stage A and Stage B training checkpoints. A resumed optimizer is rejected if that marker is missing or mismatched; this prevents continuing old randomly supervised action heads under the new set-matched objective. Likewise, \`train-full --init-cid-checkpoint\` requires a corrected Stage A checkpoint by default. The inference-only \`load_cid_adapter_checkpoint\` interface remains compatible with old checkpoints to preserve historical baselines and released artifacts. No existing running GPU job is stopped or migrated implicitly.
+
+This *training-only* compatibility marker is separate from \`CID_NEURAL_CONTRACT_VERSION\` and the public CID v1 architecture, so no neural geometry/schema modification is claimed.

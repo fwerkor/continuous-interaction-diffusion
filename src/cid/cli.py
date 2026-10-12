@@ -3229,6 +3229,7 @@ def _train_stage_b(args: argparse.Namespace) -> None:
                     args.init_cid_checkpoint,
                     tokenizer=tokenizer,
                     expected_semantic_pooling=args.semantic_pooling,
+                    require_current_supervision=True,
                 )
             snapshot = ILLaDATextEncoder.from_frozen_snapshot(
                 model,
