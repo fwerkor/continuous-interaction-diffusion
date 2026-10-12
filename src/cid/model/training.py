@@ -91,6 +91,8 @@ from cid.state import (
 )
 
 CID_NEURAL_CONTRACT_VERSION = 6
+# Bump independently of neural geometry when teacher labels/loss semantics change.
+CID_SUPERVISION_CONTRACT_VERSION = 2
 STAGE_B_SEMANTIC_SNAPSHOT_FILENAME = "semantic-embedding.pt"
 _PORTABLE_LENGTH_BAND_SIZE = 64
 
@@ -2597,6 +2599,7 @@ class CIDTrainer:
         payload = {
             "format_version": self.CHECKPOINT_VERSION,
             "neural_contract_version": CID_NEURAL_CONTRACT_VERSION,
+            "supervision_contract_version": CID_SUPERVISION_CONTRACT_VERSION,
             "trainer_config": asdict(self.config),
             "trainer_state": asdict(self.state),
             "adapter_config": asdict(self.adapter.config),
@@ -2667,6 +2670,11 @@ class CIDTrainer:
             raise ValueError("unsupported CID trainer checkpoint version")
         if checkpoint.get("neural_contract_version") != CID_NEURAL_CONTRACT_VERSION:
             raise ValueError("CID trainer checkpoint neural contract is incompatible")
+        if checkpoint.get("supervision_contract_version") != CID_SUPERVISION_CONTRACT_VERSION:
+            raise ValueError(
+                "CID training checkpoint uses incompatible Need/Display supervision; "
+                "start a fresh Stage A/B run instead of resuming old optimizer state"
+            )
         if (
             expected_dataset_sha256 is not None
             and checkpoint.get("dataset_sha256") != expected_dataset_sha256
@@ -3423,14 +3431,23 @@ def load_cid_adapter_checkpoint(
     *,
     tokenizer: Any | None = None,
     expected_semantic_pooling: str | None = None,
+    require_current_supervision: bool = False,
 ) -> CIDTrainerState:
-    """Load the CID model state from a trainer checkpoint without restoring an optimizer."""
+    """Load neural weights for inference, optionally enforcing training supervision."""
 
     checkpoint = torch.load(path, map_location="cpu", weights_only=False)
     if checkpoint.get("format_version") not in CIDTrainer.SUPPORTED_CHECKPOINT_VERSIONS:
         raise ValueError("unsupported CID trainer checkpoint version")
     if checkpoint.get("neural_contract_version") != CID_NEURAL_CONTRACT_VERSION:
         raise ValueError("CID trainer checkpoint neural contract is incompatible")
+    if (
+        require_current_supervision
+        and checkpoint.get("supervision_contract_version") != CID_SUPERVISION_CONTRACT_VERSION
+    ):
+        raise ValueError(
+            "Stage B cannot fine-tune a checkpoint trained with incompatible "
+            "Need/Display supervision; start from a corrected Stage A checkpoint"
+        )
     saved_trainer_config = dict(checkpoint.get("trainer_config", {}))
     saved_pooling = str(saved_trainer_config.get("semantic_pooling", "mean-v1"))
     if expected_semantic_pooling is not None and saved_pooling != expected_semantic_pooling:
@@ -6898,6 +6915,7 @@ def save_stage_b_checkpoint(
         metadata = {
             "format_version": 6,
             "neural_contract_version": CID_NEURAL_CONTRACT_VERSION,
+            "supervision_contract_version": CID_SUPERVISION_CONTRACT_VERSION,
             "kind": "cid-stage-b-fsdp",
             "model_state_layout": "fsdp-sharded-dcp",
             "optimizer_state_layout": (
@@ -6946,6 +6964,11 @@ def load_stage_b_checkpoint(
         raise ValueError("unsupported Stage B checkpoint format")
     if metadata.get("neural_contract_version") != CID_NEURAL_CONTRACT_VERSION:
         raise ValueError("Stage B checkpoint neural contract is incompatible")
+    if metadata.get("supervision_contract_version") != CID_SUPERVISION_CONTRACT_VERSION:
+        raise ValueError(
+            "Stage B resume requires a checkpoint with current Need/Display "
+            "supervision; old optimizer states must not be mixed with corrected training"
+        )
     if metadata.get("model_state_layout") != "fsdp-sharded-dcp":
         raise ValueError("unsupported Stage B checkpoint state layout")
     saved_world_size = int(metadata["world_size"])

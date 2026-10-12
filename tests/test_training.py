@@ -2637,6 +2637,18 @@ def test_stage_b_fsdp_runs_full_parameter_optimizer_step_on_cpu(tmp_path) -> Non
             forward_model=restored_fsdp,
             gradient_clipper=restored_fsdp.clip_grad_norm_,
         )
+        saved_metadata = (checkpoint / "metadata.json").read_text(encoding="utf-8")
+        legacy_metadata = json.loads(saved_metadata)
+        legacy_metadata.pop("supervision_contract_version")
+        (checkpoint / "metadata.json").write_text(
+            json.dumps(legacy_metadata), encoding="utf-8"
+        )
+        with pytest.raises(ValueError, match="current Need/Display supervision"):
+            load_stage_b_checkpoint(
+                restored_fsdp, restored_optimizer, restored_trainer, checkpoint,
+            )
+        (checkpoint / "metadata.json").write_text(saved_metadata, encoding="utf-8")
+
         with pytest.raises(ValueError, match="dataset SHA-256"):
             load_stage_b_checkpoint(
                 restored_fsdp,
@@ -5613,3 +5625,37 @@ def test_materialized_display_reference_excludes_unknown_and_partial_answers() -
     assert torch.equal(reference(complete, **kw), expected)
     with pytest.raises(ValueError, match="physical canvas"):
         reference(torch.ones((1, 8), dtype=torch.long), **kw)
+
+def test_training_checkpoint_refuses_legacy_need_display_supervision_but_inference_loads(
+    tmp_path,
+) -> None:
+    from cid.model.training import CID_SUPERVISION_CONTRACT_VERSION
+
+    adapter = make_adapter(seed=196)
+    tokenizer = TinyTokenizer()
+    trainer = CIDTrainer(
+        adapter,
+        ILLaDATrajectoryTensorizer(adapter, tokenizer),
+        CIDTrainerConfig(),
+    )
+    saved = tmp_path / "current-supervision.pt"
+    trainer.save_checkpoint(saved)
+    state = torch.load(saved, map_location="cpu", weights_only=False)
+    assert state["supervision_contract_version"] == CID_SUPERVISION_CONTRACT_VERSION
+    state.pop("supervision_contract_version")
+    legacy = tmp_path / "old-supervision.pt"
+    torch.save(state, legacy)
+
+    with pytest.raises(ValueError, match="incompatible Need/Display supervision"):
+        trainer.load_checkpoint(legacy)
+    # Historical releases still load for inference/diagnostics, without
+    # laundering their inconsistent labels into new optimizer training.
+    load_cid_adapter_checkpoint(adapter, legacy, tokenizer=tokenizer)
+    with pytest.raises(ValueError, match="incompatible Need/Display supervision"):
+        load_cid_adapter_checkpoint(
+            adapter,
+            legacy,
+            tokenizer=tokenizer,
+            require_current_supervision=True,
+        )
+    trainer.load_checkpoint(saved)
