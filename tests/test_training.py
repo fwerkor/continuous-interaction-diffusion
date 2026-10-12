@@ -5082,6 +5082,43 @@ def test_training_display_unknown_marker_maps_to_model_mask_token() -> None:
     assert not sample.batch.display_padding_mask.any()
 
 
+def test_unknown_display_does_not_reward_answer_completion_eos() -> None:
+    adapter = make_adapter(seed=181)
+    tensorizer = ILLaDATrajectoryTensorizer(adapter, TinyTokenizer())
+    base = make_trajectory()
+    unresolved = replace(
+        base,
+        display_targets=(
+            DisplayTarget(step=0, text=DISPLAY_UNKNOWN_MARKER),
+            DisplayTarget(step=1, text=DISPLAY_UNKNOWN_MARKER),
+        ),
+    )
+    for step in (-1, 0):
+        for timestep in (0.0, 0.5, 1.0):
+            sample = tensorizer.tensorize(unresolved, source_step=step, timestep=timestep)
+            assert sample.targets.display_ids.eq(-100).all()
+            # Explicit unknown positions remain as fillable MASK inputs.
+            assert sample.batch.display_ids[0, 0] == adapter.mask_token_id
+
+    # Partially known drafts must retain EOS and known-content supervision.
+    partial = replace(
+        base,
+        display_targets=(
+            DisplayTarget(step=0, text=f"A{DISPLAY_UNKNOWN_MARKER}C"),
+            DisplayTarget(step=1, text=f"A{DISPLAY_UNKNOWN_MARKER}C"),
+        ),
+    )
+    partial_sample = tensorizer.tensorize(
+        partial, source_step=0, timestep=1.0,
+    )
+    assert (partial_sample.targets.display_ids == tensorizer.eos_token_id).any()
+    assert (partial_sample.targets.display_ids >= 0).any()
+
+    # A real completed known answer still requires answer-boundary learning.
+    known_sample = tensorizer.tensorize(base, source_step=0, timestep=1.0)
+    assert (known_sample.targets.display_ids == tensorizer.eos_token_id).any()
+
+
 def test_training_never_supervises_unresolved_display_mask_as_answer() -> None:
     adapter = make_adapter(seed=177)
     tensorizer = ILLaDATrajectoryTensorizer(adapter, TinyTokenizer())
