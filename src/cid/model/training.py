@@ -1,7 +1,6 @@
 from __future__ import annotations
 
 import gc
-import hashlib
 import json
 import math
 import os
@@ -5271,16 +5270,12 @@ class ILLaDATrajectoryTensorizer:
                     f"cell {cell_id!r} requires {len(ordered)} information-need slots but "
                     f"adapter supports {self.adapter.config.max_need_slots}"
                 )
-            slot_offset = int.from_bytes(
-                hashlib.blake2b(
-                    f"{example.example_id}\0{cell_id}".encode()
-                ).digest()[:8],
-                "little",
-            ) % self.adapter.config.max_need_slots
+            # Output Need slot labels must be observable from model inputs.
+            # Hashing example_id/cell_id (neither is passed to the model)
+            # produced contradictory targets for identical model batches.
+            # Use stable, distinct slots within each owner cell instead.
             for need_slot, binding in enumerate(ordered):
-                schedule[(cell_id, binding.need_id)] = (
-                    slot_offset + need_slot
-                ) % self.adapter.config.max_need_slots
+                schedule[(cell_id, binding.need_id)] = need_slot
         return schedule
 
     def _thought_snapshot(

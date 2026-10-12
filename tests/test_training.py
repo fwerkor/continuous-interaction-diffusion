@@ -1234,21 +1234,38 @@ def test_trajectory_tensorizer_supervises_one_need_owner_with_multi_region_route
     assert sample.targets.need_target_display_mask[0, 1, 0, :3].all()
 
 
-def test_trajectory_tensorizer_spreads_need_supervision_across_available_slots() -> None:
+def test_need_slots_do_not_depend_on_unobservable_example_id() -> None:
     base = make_trajectory()
     tensorizer = ILLaDATrajectoryTensorizer(make_adapter(seed=126), TinyTokenizer())
-    observed: set[int] = set()
-
+    owner = base.binding_targets[0].owner_cell
+    assert owner is not None
+    expected = tensorizer._binding_slot_schedule(base)
+    assert expected[(owner.identifier, base.binding_targets[0].need_id)] == 0
     for index in range(64):
-        example = replace(base, example_id=f"need-slot-spread-{index}")
-        binding = example.binding_targets[0]
-        owner = binding.owner_cell
-        assert owner is not None
-        schedule = tensorizer._binding_slot_schedule(example)
-        observed.add(schedule[(owner.identifier, binding.need_id)])
-        assert tensorizer._binding_slot_schedule(example) == schedule
+        clone = replace(base, example_id=f"unobservable-identity-{index}")
+        assert tensorizer._binding_slot_schedule(clone) == expected
 
-    assert observed == set(range(tensorizer.adapter.config.max_need_slots))
+
+def test_training_need_source_routes_invariant_to_unobservable_example_id() -> None:
+    base = make_trajectory()
+    tensorizer = ILLaDATrajectoryTensorizer(make_adapter(seed=126), TinyTokenizer())
+    initial = tensorizer.tensorize(base, source_step=0, timestep=1.0)
+    altered = tensorizer.tensorize(
+        replace(base, example_id="completely-different-identity"),
+        source_step=0,
+        timestep=1.0,
+    )
+    assert torch.equal(initial.batch.prompt_ids, altered.batch.prompt_ids)
+    assert torch.equal(initial.targets.need_targets, altered.targets.need_targets)
+    assert torch.equal(initial.targets.source_targets, altered.targets.source_targets)
+    assert torch.equal(
+        initial.targets.argument_presence_targets,
+        altered.targets.argument_presence_targets,
+    )
+    assert torch.equal(
+        initial.targets.need_target_cell_targets,
+        altered.targets.need_target_cell_targets,
+    )
 
 
 def test_trajectory_tensorizer_keeps_multiple_bindings_on_one_cell_distinct() -> None:
