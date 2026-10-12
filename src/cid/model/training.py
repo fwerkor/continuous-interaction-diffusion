@@ -582,6 +582,34 @@ def _metric_tensor_values(values: Mapping[str, Tensor]) -> dict[str, float]:
     return dict(zip(names, host_values, strict=True))
 
 
+
+def _materialized_complete_display_reference(
+    target_text_ids: Tensor,
+    *,
+    canvas_length: int,
+    mask_token_id: int,
+    eos_token_id: int,
+) -> Tensor:
+    """Only score complete answers, not unknown placeholders or transport EOS."""
+    if target_text_ids.ndim != 2 or target_text_ids.shape[0] != 1:
+        raise ValueError("Display reference must be one token row")
+    count = target_text_ids.shape[1]
+    if count >= canvas_length:
+        raise ValueError("Display reference exceeds physical canvas")
+    reference = torch.full(
+        (1, canvas_length),
+        -100,
+        dtype=target_text_ids.dtype,
+        device=target_text_ids.device,
+    )
+    # Partially-known drafts have no complete reference answer yet.
+    # Their known visible tokens remain supervised by the neural CE objective.
+    if bool((target_text_ids == mask_token_id).any()):
+        return reference
+    reference[:, :count] = target_text_ids
+    reference[:, count] = eos_token_id
+    return reference
+
 def _cid_behavior_counts(
     output: CIDTensorOutput,
     targets: CIDTargets,
@@ -2286,11 +2314,13 @@ class CIDTrainer:
                                     "validation target display exceeds its physical canvas"
                                 )
                             materialized_display_targets[
-                                row_index : row_index + 1, :target_length
-                            ] = target_text_ids
-                            materialized_display_targets[
-                                row_index, target_length
-                            ] = self.tensorizer.eos_token_id
+                                row_index : row_index + 1, :display_length
+                            ] = _materialized_complete_display_reference(
+                                target_text_ids,
+                                canvas_length=display_length,
+                                mask_token_id=self.adapter.mask_token_id,
+                                eos_token_id=self.tensorizer.eos_token_id,
+                            )
                         _accumulate_metric_tensors(
                             behavior_counts,
                             _cid_behavior_counts(
