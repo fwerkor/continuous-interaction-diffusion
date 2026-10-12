@@ -1302,6 +1302,46 @@ def test_trajectory_tensorizer_keeps_multiple_bindings_on_one_cell_distinct() ->
     assert sample.targets.argument_mask[0, 1, second_slot, :2].all()
 
 
+def test_multi_need_slot_order_does_not_depend_on_hidden_need_ids() -> None:
+    base = make_trajectory()
+    first = replace(
+        base.binding_targets[0],
+        need_id="z-hidden-first",
+        first_need_step=1,
+        executable_step=1,
+        arguments={"key": "latency_ms", "scope": "production"},
+    )
+    second = replace(
+        first,
+        need_id="a-hidden-second",
+        arguments={"key": "latency_p95", "scope": "production"},
+    )
+    example = replace(base, binding_targets=(first, second))
+    tensorizer = ILLaDATrajectoryTensorizer(make_adapter(seed=126), TinyTokenizer())
+    slots = tensorizer._binding_slot_schedule(example)
+    owner = first.owner_cell
+    assert owner is not None
+    assert slots[(owner.identifier, first.need_id)] == 0
+    assert slots[(owner.identifier, second.need_id)] == 1
+
+    renamed = replace(
+        example,
+        binding_targets=(
+            replace(first, need_id="a-renamed"),
+            replace(second, need_id="z-renamed"),
+        ),
+    )
+    new_slots = tensorizer._binding_slot_schedule(renamed)
+    assert new_slots[(owner.identifier, "a-renamed")] == 0
+    assert new_slots[(owner.identifier, "z-renamed")] == 1
+
+    lhs = tensorizer.tensorize(example, source_step=0, timestep=1.0)
+    rhs = tensorizer.tensorize(renamed, source_step=0, timestep=1.0)
+    assert torch.equal(lhs.targets.need_targets, rhs.targets.need_targets)
+    assert torch.equal(lhs.targets.source_targets, rhs.targets.source_targets)
+    assert torch.equal(lhs.targets.argument_embeddings, rhs.targets.argument_embeddings)
+
+
 def test_order_aware_text_encoder_distinguishes_reversed_token_order() -> None:
     adapter = make_adapter(seed=127)
     tokenizer = TinyTokenizer()

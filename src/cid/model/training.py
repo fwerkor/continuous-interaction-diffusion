@@ -5263,8 +5263,24 @@ class ILLaDATrajectoryTensorizer:
                 by_cell.setdefault(owner.identifier, []).append(binding)
 
         schedule: dict[tuple[str, str], int] = {}
+        # Slot order follows properties represented by the trajectory context.
+        # Synthetic need_id strings are only a final tie breaker for requests
+        # otherwise identical at this interface.
+        source_rank = {
+            str(source.get("name", "")): index
+            for index, source in enumerate(example.source_descriptors)
+        }
         for cell_id, bindings in by_cell.items():
-            ordered = sorted(bindings, key=lambda item: (item.first_need_step, item.need_id))
+            ordered = sorted(
+                bindings,
+                key=lambda item: (
+                    item.first_need_step,
+                    source_rank.get(item.source, len(source_rank)),
+                    json.dumps(item.arguments, sort_keys=True, ensure_ascii=False),
+                    str(item.freshness),
+                    item.need_id,
+                ),
+            )
             if len(ordered) > self.adapter.config.max_need_slots:
                 raise ValueError(
                     f"cell {cell_id!r} requires {len(ordered)} information-need slots but "
