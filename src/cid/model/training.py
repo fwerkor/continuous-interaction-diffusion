@@ -358,11 +358,6 @@ def collate_training_steps(
         ),
         link_target_embeddings=_pad_slot_targets(steps, "link_target_embeddings"),
         link_mask=_pad_slot_targets(steps, "link_mask"),
-        need_permutation_groups=tuple(
-            (batch_index, thought_slot, width)
-            for batch_index, step in enumerate(steps)
-            for _, thought_slot, width in step.targets.need_permutation_groups
-        ),
     )
     return CIDTrainingBatch(
         example_ids=tuple(step.example_id for step in steps),
@@ -5018,14 +5013,6 @@ class ILLaDATrajectoryTensorizer:
 
         source_names = tuple(str(item.get("name", "")) for item in example.source_descriptors)
         binding_slots = self._binding_slot_schedule(example)
-        need_permutation_groups = []
-        owner_need_counts: dict[str, int] = {}
-        for binding in example.binding_targets:
-            if (owner := binding.owner_cell) is not None:
-                owner_need_counts[owner.identifier] = owner_need_counts.get(owner.identifier, 0) + 1
-        for owner_id, count in owner_need_counts.items():
-            if count > 1 and owner_id in target_output_slots:
-                need_permutation_groups.append((0, target_output_slots[owner_id], count))
         bindings = tuple(
             binding for binding in example.binding_targets if binding.first_need_step <= target_step
         )
@@ -5165,7 +5152,6 @@ class ILLaDATrajectoryTensorizer:
             link_target_kind_targets=link_target_kind_targets,
             link_target_embeddings=link_target_embeddings,
             link_mask=link_mask,
-            need_permutation_groups=tuple(need_permutation_groups),
         )
 
     @staticmethod
