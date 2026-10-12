@@ -187,6 +187,11 @@ def _llada_moe_sdpa_forward(
             sdpa_mask = key_mask[..., : key_states.shape[-2]]
         else:
             raise ValueError("CID LLaDA-MoE attention mask must be rank 2 or rank 4")
+        # Ascend FlashAttentionScore does not support an implicit broadcast over
+        # the query axis ([B, 1, 1, K]).  PyTorch SDPA does, so materialize
+        # the equivalent [B, 1, Q, K] mask only for NPU dispatch.
+        if hidden_states.device.type == "npu" and sdpa_mask.shape[-2] == 1:
+            sdpa_mask = sdpa_mask.expand(-1, -1, query_states.shape[-2], -1).contiguous()
         if hidden_states.device.type == "cuda":
             query_states = query_states.contiguous()
             key_states = key_states.contiguous()
