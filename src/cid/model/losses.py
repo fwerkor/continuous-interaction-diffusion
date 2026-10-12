@@ -1,7 +1,7 @@
 from __future__ import annotations
 
 from collections.abc import Callable
-from dataclasses import dataclass
+from dataclasses import dataclass, replace
 
 import torch
 from torch import Tensor
@@ -79,6 +79,9 @@ class CIDTargets:
     link_target_kind_targets: Tensor
     link_target_embeddings: Tensor
     link_mask: Tensor
+    # (batch, owner TCT slot, reserved Need slot count). These are teacher-only
+    # permutation groups; no unobservable binding identity is sent to the network.
+    need_permutation_groups: tuple[tuple[int, int, int], ...] = ()
 
 
 @dataclass(frozen=True, slots=True)
@@ -118,6 +121,10 @@ def cid_loss(
     batch_mask: Tensor | None = None,
 ) -> CIDLoss:
     w = weights or CIDLossWeights()
+    if targets.need_permutation_groups:
+        targets = _align_permutation_invariant_needs(
+            output, targets, w, batch_mask=batch_mask
+        )
     if batch_mask is None:
         batch_mask = torch.ones(
             output.thought_semantic.shape[0],
@@ -360,6 +367,181 @@ def cid_loss(
         link_ground=link_ground,
         auxiliary=auxiliary,
     )
+
+
+_NEED_ACTION_TARGET_FIELDS = (
+    "need_targets",
+    "source_targets",
+    "need_target_cell_targets",
+    "need_target_cell_mask",
+    "need_target_display_targets",
+    "need_target_display_mask",
+    "argument_presence_targets",
+    "argument_presence_mask",
+    "argument_embeddings",
+    "argument_mask",
+    "refresh_targets",
+)
+
+
+def _align_permutation_invariant_needs(
+    output: CIDTensorOutput,
+    targets: CIDTargets,
+    weights: CIDLossWeights,
+    *,
+    batch_mask: Tensor | None,
+) -> CIDTargets:
+    """Match a *whole* executable action, never its hidden training-slot identity.
+
+    Only owners with two or more binding identities take this path. Ordinary
+    single-Need training retains exactly its established supervision and speed.
+    The matching cost is detached, while all matched losses still differentiate
+    through the normal prediction heads.
+    """
+    # Do not copy high-dimensional per-action embedding targets for the usual
+    # single-Need batch or when the optimal permutation is the identity.
+    fields: dict[str, Tensor] = {}
+    need_capacity = int(targets.need_targets.shape[-1])
+    for batch, owner, width in targets.need_permutation_groups:
+        if not (0 <= batch < targets.need_targets.shape[0]):
+            raise ValueError("Need permutation batch index is out of range")
+        if not (0 <= owner < targets.need_targets.shape[1]):
+            raise ValueError("Need permutation owner slot is out of range")
+        if not (2 <= width <= need_capacity):
+            raise ValueError("Need permutation width exceeds configured slot capacity")
+        if batch_mask is not None and not bool(batch_mask[batch]):
+            continue
+        if not bool(targets.thought_mask[batch, owner]):
+            continue
+
+        with torch.no_grad():
+            cost = _joint_need_assignment_cost(output, targets, weights, batch, owner, width)
+            if not bool(torch.isfinite(cost).all()):
+                raise FloatingPointError("nonfinite Need action matching cost")
+            # Existing Hungarian assignment expects target rows, prediction columns.
+            target_to_prediction = _linear_assignment_matrix(cost.T.float().cpu().tolist())
+            prediction_to_target = [0] * width
+            for target_slot, prediction_slot in enumerate(target_to_prediction):
+                prediction_to_target[prediction_slot] = target_slot
+
+        indices = torch.tensor(
+            prediction_to_target,
+            dtype=torch.long,
+            device=targets.need_targets.device,
+        )
+        if prediction_to_target == list(range(width)):
+            continue
+        for name in _NEED_ACTION_TARGET_FIELDS:
+            if name == "argument_embeddings" and not bool(
+                targets.argument_mask[batch, owner, :width].any()
+            ):
+                continue
+            if name not in fields:
+                fields[name] = getattr(targets, name).clone()
+            original = getattr(targets, name)[batch, owner, :width]
+            fields[name][batch, owner, :width] = original.index_select(0, indices)
+
+    return replace(targets, **fields, need_permutation_groups=())
+
+
+def _joint_need_assignment_cost(
+    output: CIDTensorOutput,
+    targets: CIDTargets,
+    w: CIDLossWeights,
+    batch: int,
+    owner: int,
+    width: int,
+) -> Tensor:
+    """Weighted prediction-slot x teacher-action costs, on the target device.
+
+    Normalize by the *whole example's* component denominators: each possible
+    assignment preserves those denominators. Consequently the matching agrees
+    with the loss actually used for learning (up to floating-point tie breaks).
+    """
+    device = targets.need_targets.device
+    costs = torch.zeros((width, width), device=device, dtype=torch.float32)
+    valid_slots = targets.thought_mask[batch].bool()
+    intents = targets.need_targets[batch].float()
+    all_positive = (intents >= 0.5) & valid_slots[:, None]
+    positive_count = all_positive.sum()
+    negative_count = (valid_slots.sum() * intents.shape[-1]) - positive_count
+    positive_weight = (
+        (negative_count.float() / positive_count.clamp_min(1).float())
+        * (NEED_INTENT_TARGET_POSITIVE_MASS / (1.0 - NEED_INTENT_TARGET_POSITIVE_MASS))
+    ).clamp(min=1.0, max=NEED_INTENT_POSITIVE_WEIGHT_CAP)
+    intent_denominator = (
+        negative_count.float() + positive_count.float() * positive_weight
+    ).clamp_min(1.0)
+    prediction = output.need_logits[batch, owner, :width].detach().float()
+    target = targets.need_targets[batch, owner, :width].float()
+    per_target_weight = torch.where(target >= 0.5, positive_weight, 1.0)
+    costs += (
+        w.intent
+        * (F.softplus(prediction[:, None]) - prediction[:, None] * target[None, :])
+        * per_target_weight[None, :]
+        / intent_denominator
+    )
+
+    def add_binary(name: str, target_name: str, mask_name: str, weight: float) -> None:
+        nonlocal costs
+        if not weight:
+            return
+        logits = getattr(output, name)[batch, owner, :width].detach().float()
+        labels = getattr(targets, target_name)[batch, owner, :width].float()
+        valid = getattr(targets, mask_name)[batch, owner, :width].float()
+        denominator = getattr(targets, mask_name)[batch].sum().clamp_min(1).float()
+        per_element = F.softplus(logits[:, None]) - logits[:, None] * labels[None, :]
+        costs += weight * (per_element * valid[None, :]).flatten(start_dim=2).sum(-1) / denominator
+
+    if w.source and output.source_logits.shape[-1]:
+        labels = targets.source_targets[batch, owner, :width].long()
+        valid = (labels != -100).float()
+        logprob = F.log_softmax(output.source_logits[batch, owner, :width].detach().float(), dim=-1)
+        denominator = (targets.source_targets[batch] != -100).sum().clamp_min(1).float()
+        costs += w.source * (-logprob[:, labels.clamp_min(0)] * valid[None, :]) / denominator
+
+    add_binary(
+        "need_target_cell_logits",
+        "need_target_cell_targets",
+        "need_target_cell_mask",
+        w.need_cell_route,
+    )
+    add_binary(
+        "need_target_display_logits",
+        "need_target_display_targets",
+        "need_target_display_mask",
+        w.need_display_route,
+    )
+    add_binary(
+        "argument_presence_logits",
+        "argument_presence_targets",
+        "argument_presence_mask",
+        w.argument_presence,
+    )
+    if w.argument_ground:
+        predictions = output.argument_query[batch, owner, :width].detach().float()
+        embeddings = targets.argument_embeddings[batch, owner, :width].float()
+        valid = targets.argument_mask[batch, owner, :width].float()
+        denominator = targets.argument_mask[batch].sum().clamp_min(1).float()
+        similarity = F.cosine_similarity(
+            predictions[:, None], embeddings[None, :], dim=-1, eps=1e-3
+        )
+        costs += w.argument_ground * ((1.0 - similarity) * valid[None, :]).sum(-1) / denominator
+
+    if w.refresh and output.refresh_logits.shape[-1]:
+        labels = targets.refresh_targets[batch, owner, :width].long()
+        valid = (labels != -100).float()
+        logprob = F.log_softmax(
+            output.refresh_logits[batch, owner, :width].detach().float(), dim=-1
+        )
+        target_logprob = logprob[:, labels.clamp_min(0)]
+        focal = (
+            -(1.0 - target_logprob.exp()).clamp_min(0.0).pow(REFRESH_FOCAL_GAMMA) * target_logprob
+        )
+        denominator = (targets.refresh_targets[batch] != -100).sum().clamp_min(1).float()
+        costs += w.refresh * focal * valid[None, :] / denominator
+
+    return costs
 
 
 def _differentiable_zero(tensor: Tensor) -> Tensor:
