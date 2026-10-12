@@ -5530,3 +5530,18 @@ def test_detached_text_batch_cache_respects_vector_budget() -> None:
     assert encoder._detached_batch_cache_vectors == sum(
         int(value.shape[1]) for value in encoder._detached_batch_cache.values()
     )
+
+
+
+def test_materialized_display_reference_excludes_unknown_and_partial_answers() -> None:
+    reference = cid_training._materialized_complete_display_reference
+    unknown = torch.tensor([[5]])
+    partial = torch.tensor([[11, 5, 12]])
+    complete = torch.tensor([[11, 12]])
+    kw = {"canvas_length": 8, "mask_token_id": 5, "eos_token_id": 2}
+    assert torch.all(reference(unknown, **kw) == -100)
+    assert torch.all(reference(partial, **kw) == -100)
+    expected = torch.tensor([[11, 12, 2, -100, -100, -100, -100, -100]])
+    assert torch.equal(reference(complete, **kw), expected)
+    with pytest.raises(ValueError, match="physical canvas"):
+        reference(torch.ones((1, 8), dtype=torch.long), **kw)
