@@ -3895,6 +3895,14 @@ class ILLaDATrajectoryTensorizer:
         # occur on ordinary teacher-forced unchanged-unknown transitions as
         # well as partially-known answer drafts.
         display_labels[display_labels == self.adapter.mask_token_id] = -100
+        if target_display == DISPLAY_UNKNOWN_MARKER:
+            # The trailing EOS in the transport encoding of a wholly unknown
+            # answer is only a physical canvas sentinel. It does not certify
+            # that a finished answer exists. Rewarding it teaches the model
+            # to close the Display immediately after an unresolved [MASK].
+            # Readiness/waiting must be supervised by cognitive/need state,
+            # not by positive output-token or EOS labels here.
+            display_labels.fill_(-100)
 
         rollout_routes = (
             {}
