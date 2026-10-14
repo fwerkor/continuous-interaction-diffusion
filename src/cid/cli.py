@@ -3229,7 +3229,10 @@ def _train_stage_b(args: argparse.Namespace) -> None:
                     args.init_cid_checkpoint,
                     tokenizer=tokenizer,
                     expected_semantic_pooling=args.semantic_pooling,
-                    require_current_supervision=True,
+                    # Stage B starts a NEW optimizer. Older Stage A weights
+                    # remain valid initialization even if its teacher-label
+                    # semantics predate the current contract. Only resuming
+                    # an old optimizer under changed supervision is rejected.
                 )
             snapshot = ILLaDATextEncoder.from_frozen_snapshot(
                 model,
