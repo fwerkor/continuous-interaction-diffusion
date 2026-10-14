@@ -18,6 +18,7 @@ from cid.model.diffusion import (
     denoising_noise_level,
     denoising_reveal_fraction,
 )
+from cid.model.display_revision import DisplayRevisionController
 from cid.model.encoding import (
     ILLaDATextEncoder,
     canonical_fact_text,
@@ -207,6 +208,7 @@ class ILLaDAContextTensorizer:
             device=device,
         )
 
+
 @dataclass(frozen=True, slots=True)
 class ILLaDANeuralPolicyConfig:
     denoising_steps: int = 8
@@ -251,9 +253,11 @@ class ILLaDANeuralPolicy:
         self.generator.manual_seed(self.config.seed)
         self.semantic_rms_exceedances = 0
         self.peak_semantic_rms: float | None = None
+        self.display_revision_controller = DisplayRevisionController()
 
     def step(self, context: ModelContext) -> ModelUpdate:
         diffusion_step = context.diffusion_step
+        self.display_revision_controller.observe_context(context)
         batch = self.tensorizer(
             context,
             generator=self.generator,
@@ -275,7 +279,8 @@ class ILLaDANeuralPolicy:
                         self.tensorizer.text_encoder.semantic_noise_scale * 32.0,
                         diffusion_step,
                     )
-            display_ids = self.scheduler.refine_display(
+            display_ids = self.display_revision_controller.refine_display(
+                self.scheduler,
                 batch.display_ids,
                 output.display_logits,
                 reveal_fraction=denoising_reveal_fraction(
