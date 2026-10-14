@@ -2637,6 +2637,18 @@ def test_stage_b_fsdp_runs_full_parameter_optimizer_step_on_cpu(tmp_path) -> Non
             forward_model=restored_fsdp,
             gradient_clipper=restored_fsdp.clip_grad_norm_,
         )
+        saved_metadata = (checkpoint / "metadata.json").read_text(encoding="utf-8")
+        legacy_metadata = json.loads(saved_metadata)
+        legacy_metadata.pop("supervision_contract_version")
+        (checkpoint / "metadata.json").write_text(
+            json.dumps(legacy_metadata), encoding="utf-8"
+        )
+        with pytest.raises(ValueError, match="current Need/Display supervision"):
+            load_stage_b_checkpoint(
+                restored_fsdp, restored_optimizer, restored_trainer, checkpoint,
+            )
+        (checkpoint / "metadata.json").write_text(saved_metadata, encoding="utf-8")
+
         with pytest.raises(ValueError, match="dataset SHA-256"):
             load_stage_b_checkpoint(
                 restored_fsdp,
@@ -5082,6 +5094,74 @@ def test_training_display_unknown_marker_maps_to_model_mask_token() -> None:
     assert not sample.batch.display_padding_mask.any()
 
 
+def test_unknown_display_does_not_reward_answer_completion_eos() -> None:
+    adapter = make_adapter(seed=181)
+    tensorizer = ILLaDATrajectoryTensorizer(adapter, TinyTokenizer())
+    base = make_trajectory()
+    unresolved = replace(
+        base,
+        display_targets=(
+            DisplayTarget(step=0, text=DISPLAY_UNKNOWN_MARKER),
+            DisplayTarget(step=1, text=DISPLAY_UNKNOWN_MARKER),
+        ),
+    )
+    for step in (-1, 0):
+        for timestep in (0.0, 0.5, 1.0):
+            sample = tensorizer.tensorize(unresolved, source_step=step, timestep=timestep)
+            assert sample.targets.display_ids.eq(-100).all()
+            # Explicit unknown positions remain as fillable MASK inputs.
+            assert sample.batch.display_ids[0, 0] == adapter.mask_token_id
+
+    # Partially known drafts must retain EOS and known-content supervision.
+    partial = replace(
+        base,
+        display_targets=(
+            DisplayTarget(step=0, text=f"A{DISPLAY_UNKNOWN_MARKER}C"),
+            DisplayTarget(step=1, text=f"A{DISPLAY_UNKNOWN_MARKER}C"),
+        ),
+    )
+    partial_sample = tensorizer.tensorize(
+        partial, source_step=0, timestep=1.0,
+    )
+    assert (partial_sample.targets.display_ids == tensorizer.eos_token_id).any()
+    assert (partial_sample.targets.display_ids >= 0).any()
+
+    # A real completed known answer still requires answer-boundary learning.
+    known_sample = tensorizer.tensorize(base, source_step=0, timestep=1.0)
+    assert (known_sample.targets.display_ids == tensorizer.eos_token_id).any()
+
+
+def test_training_never_supervises_unresolved_display_mask_as_answer() -> None:
+    adapter = make_adapter(seed=177)
+    tensorizer = ILLaDATrajectoryTensorizer(adapter, TinyTokenizer())
+    base = make_trajectory()
+    unknown = replace(
+        base,
+        display_targets=(
+            DisplayTarget(step=0, text=DISPLAY_UNKNOWN_MARKER),
+            DisplayTarget(step=1, text=DISPLAY_UNKNOWN_MARKER),
+        ),
+    )
+    for step in (-1, 0):
+        sample = tensorizer.tensorize(unknown, source_step=step, timestep=1.0)
+        assert sample.targets.display_ids.ne(adapter.mask_token_id).all()
+        assert sample.batch.display_ids[0, 0] == adapter.mask_token_id
+
+    partial = replace(
+        base,
+        display_targets=(
+            DisplayTarget(step=0, text=f"A{DISPLAY_UNKNOWN_MARKER}C"),
+            DisplayTarget(step=1, text=f"A{DISPLAY_UNKNOWN_MARKER}C"),
+        ),
+    )
+    sample = tensorizer.tensorize(partial, source_step=0, timestep=1.0)
+    target = sample.targets.display_ids[0]
+    assert target.ne(adapter.mask_token_id).all()
+    assert target.eq(-100).any()
+    assert target.eq(tensorizer.eos_token_id).any()
+    assert target.ge(0).any()
+
+
 def test_training_rejects_legacy_process_status_display_targets() -> None:
     adapter = make_adapter(seed=149)
     tensorizer = ILLaDATrajectoryTensorizer(adapter, TinyTokenizer())
@@ -5545,3 +5625,37 @@ def test_materialized_display_reference_excludes_unknown_and_partial_answers() -
     assert torch.equal(reference(complete, **kw), expected)
     with pytest.raises(ValueError, match="physical canvas"):
         reference(torch.ones((1, 8), dtype=torch.long), **kw)
+
+def test_training_checkpoint_refuses_legacy_need_display_supervision_but_inference_loads(
+    tmp_path,
+) -> None:
+    from cid.model.training import CID_SUPERVISION_CONTRACT_VERSION
+
+    adapter = make_adapter(seed=196)
+    tokenizer = TinyTokenizer()
+    trainer = CIDTrainer(
+        adapter,
+        ILLaDATrajectoryTensorizer(adapter, tokenizer),
+        CIDTrainerConfig(),
+    )
+    saved = tmp_path / "current-supervision.pt"
+    trainer.save_checkpoint(saved)
+    state = torch.load(saved, map_location="cpu", weights_only=False)
+    assert state["supervision_contract_version"] == CID_SUPERVISION_CONTRACT_VERSION
+    state.pop("supervision_contract_version")
+    legacy = tmp_path / "old-supervision.pt"
+    torch.save(state, legacy)
+
+    with pytest.raises(ValueError, match="incompatible Need/Display supervision"):
+        trainer.load_checkpoint(legacy)
+    # Historical releases still load for inference/diagnostics, without
+    # laundering their inconsistent labels into new optimizer training.
+    load_cid_adapter_checkpoint(adapter, legacy, tokenizer=tokenizer)
+    with pytest.raises(ValueError, match="incompatible Need/Display supervision"):
+        load_cid_adapter_checkpoint(
+            adapter,
+            legacy,
+            tokenizer=tokenizer,
+            require_current_supervision=True,
+        )
+    trainer.load_checkpoint(saved)
