@@ -1234,21 +1234,18 @@ def test_trajectory_tensorizer_supervises_one_need_owner_with_multi_region_route
     assert sample.targets.need_target_display_mask[0, 1, 0, :3].all()
 
 
-def test_trajectory_tensorizer_spreads_need_supervision_across_available_slots() -> None:
+def test_trajectory_tensorizer_single_need_uses_stable_first_slot() -> None:
     base = make_trajectory()
     tensorizer = ILLaDATrajectoryTensorizer(make_adapter(seed=126), TinyTokenizer())
-    observed: set[int] = set()
+    binding = base.binding_targets[0]
+    owner = binding.owner_cell
+    assert owner is not None
 
     for index in range(64):
-        example = replace(base, example_id=f"need-slot-spread-{index}")
-        binding = example.binding_targets[0]
-        owner = binding.owner_cell
-        assert owner is not None
-        schedule = tensorizer._binding_slot_schedule(example)
-        observed.add(schedule[(owner.identifier, binding.need_id)])
-        assert tensorizer._binding_slot_schedule(example) == schedule
-
-    assert observed == set(range(tensorizer.adapter.config.max_need_slots))
+        example = replace(base, example_id=f"need-slot-{index}")
+        assert tensorizer._binding_slot_schedule(example) == {
+            (owner.identifier, binding.need_id): 0,
+        }
 
 
 def test_trajectory_tensorizer_keeps_multiple_bindings_on_one_cell_distinct() -> None:
@@ -1276,7 +1273,10 @@ def test_trajectory_tensorizer_keeps_multiple_bindings_on_one_cell_distinct() ->
 
     sample = tensorizer.tensorize(example, source_step=0, timestep=1.0)
 
-    assert first_slot != second_slot
+    assert (first_slot, second_slot) == (0, 1)
+    assert tensorizer._binding_slot_schedule(
+        replace(example, binding_targets=(second, first), example_id="different-id")
+    ) == schedule
     assert sample.targets.need_targets[0, 1, [first_slot, second_slot]].tolist() == [1.0, 1.0]
     assert sample.targets.source_targets[0, 1, [first_slot, second_slot]].tolist() == [0, 0]
     assert sample.targets.argument_presence_targets[0, 1, first_slot, :2].tolist() == [1.0, 1.0]
