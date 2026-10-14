@@ -1922,6 +1922,7 @@ def _train_stage_a(args: argparse.Namespace) -> None:
         ILLaDACIDConfig,
         ILLaDATrajectoryTensorizer,
         balance_rollout_windows_by_semantic_task,
+        load_cid_adapter_checkpoint,
         load_cid_adapter_from_pretrained,
         materialize_indexed_rollout_windows,
         shard_rollout_windows,
@@ -1936,6 +1937,8 @@ def _train_stage_a(args: argparse.Namespace) -> None:
     from cid.model.encoding import ILLaDATextEncoder
     from cid.model.loading import load_cid_tokenizer
 
+    if args.resume and args.init_cid_checkpoint:
+        raise ValueError("--resume and --init-cid-checkpoint are mutually exclusive")
     if args.thought_capacity != 128:
         raise ValueError("CID v1 Stage A requires --thought-capacity 128")
     if args.dtype == "fp16":
@@ -2000,6 +2003,15 @@ def _train_stage_a(args: argparse.Namespace) -> None:
             # CID modules in FP32. Autocast below preserves low-precision compute while
             # AdamW updates and moments remain FP32 instead of being quantized away.
             model.set_cid_modules_dtype(torch.float32)
+            if args.init_cid_checkpoint:
+                # Cross-supervision-contract migrations are weight-only warm starts.
+                # Do not carry obsolete optimizer moments or partial-epoch gradients.
+                load_cid_adapter_checkpoint(
+                    model,
+                    args.init_cid_checkpoint,
+                    tokenizer=load_cid_tokenizer(args.model),
+                    expected_semantic_pooling=args.semantic_pooling,
+                )
             return model.to(device)
 
         adapter = None
@@ -4353,6 +4365,10 @@ def main() -> None:
     train.add_argument("--output-dir", required=True)
     train.add_argument("--model", default="GSAI-ML/iLLaDA-8B-Base")
     train.add_argument("--resume")
+    train.add_argument(
+        "--init-cid-checkpoint",
+        help="Stage A weight-only warm start; reset optimizer and training cursor",
+    )
     train.add_argument("--device", choices=("auto", "cuda", "npu", "cpu"), default="auto")
     train.add_argument("--dtype", choices=("bf16", "fp32"), default="bf16")
     train.add_argument("--epochs", type=int, default=1)

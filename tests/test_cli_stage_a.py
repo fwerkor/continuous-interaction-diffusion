@@ -93,3 +93,19 @@ def test_stage_a_parser_supplies_selective_checkpoint_defaults(monkeypatch) -> N
     assert captured["selective_checkpoint_prompt_tokens"] == 512
     assert captured["stage_a_async_activation_offload"] is False
     assert captured["stage_a_async_gradient_reduction"] is False
+
+
+def test_stage_a_parser_accepts_weight_only_checkpoint(monkeypatch) -> None:
+    captured = {}
+    monkeypatch.setattr(
+        sys,
+        "argv",
+        [
+            "cid", "train", "--data", "train.jsonl", "--output-dir", "out",
+            "--init-cid-checkpoint", "previous/stage-a-latest.pt",
+        ],
+    )
+    monkeypatch.setattr(cid_cli, "_train_stage_a", lambda args: captured.update(vars(args)))
+    cid_cli.main()
+    assert captured["init_cid_checkpoint"] == "previous/stage-a-latest.pt"
+    assert captured["resume"] is None
