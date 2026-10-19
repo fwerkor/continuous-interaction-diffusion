@@ -7,6 +7,10 @@ free-rollout metrics produced by the trainer are per-transition head diagnostics
 reported as end-to-end task success. Stage A therefore also runs a bounded set of held-out examples
 through the actual runtime from an empty TCT and canonical unresolved Display after each epoch.
 
+For public end-to-end benchmarks, see [CID public benchmark scoring](benchmark-scoring.md)
+for the separate Task Accuracy and Answer Discovery Rate definitions and auditing
+requirements. Answer discovery is not synonymous with a correct final answer.
+
 ## Per-runtime interaction metrics
 
 `cid.metrics.summarize_runtime()` reports both step-level interaction behavior and wall-clock runtime
