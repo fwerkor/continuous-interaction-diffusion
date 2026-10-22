@@ -15,7 +15,6 @@ from __future__ import annotations
 import argparse
 import json
 import re
-import sys
 import unicodedata
 from collections import Counter
 from pathlib import Path
@@ -119,7 +118,7 @@ def _choice_index(output: str, record: dict) -> int | None:
         if len(found) == 1:
             return found[0]
 
-    for i, (choice, label) in enumerate(zip(choices, labels)):
+    for i, (choice, label) in enumerate(zip(choices, labels, strict=False)):
         if (_normalize_qa(output) == _normalize_qa(str(choice))
                 or output.casefold() == str(label).casefold()):
             return i
@@ -261,8 +260,14 @@ def score_dataset(dataset_dir: Path) -> dict:
         "answer_discovery_rate": counts["answer_discovery"] / examples,
         "review_pending": counts["needs_semantic_review"],
         "rule_version": "cid-dual-v1",
-        "task_accuracy_definition": "Unambiguous semantically equivalent final answer; conservative deterministic matcher; ambiguous examples require review.",
-        "answer_discovery_definition": "Correct answer generated anywhere, including Known: and even if an explicit final answer is wrong.",
+        "task_accuracy_definition": (
+            "Unambiguous semantically equivalent final answer; conservative deterministic "
+            "matcher; ambiguous examples require review."
+        ),
+        "answer_discovery_definition": (
+            "Correct answer generated anywhere, including Known: and even if an explicit "
+            "final answer is wrong."
+        ),
     }
     (dataset_dir / "cid-dual-metrics.json").write_text(
         json.dumps(result, ensure_ascii=False, indent=2) + "\n")
