@@ -1425,6 +1425,10 @@ def _benchmark(args: argparse.Namespace) -> None:
             else:
                 forward_model = adapter
 
+        if args.stage_c_adapter:
+            from cid.stage_c import load_display_adapter
+
+            load_display_adapter(args.stage_c_adapter, adapter)
         adapter.eval()
         forward_model.eval()
         data_path = Path(args.data)
@@ -4191,10 +4195,44 @@ def main() -> None:
         help="validate and persist responses from the current interactive teacher batch",
     )
     agent_commit.add_argument("--workspace", default=".cid/teacher-agent")
+    stage_c_data = subparsers.add_parser(
+        "prepare-stage-c-data", help="stream public chat SFT data without reasoning traces"
+    )
+    stage_c_data.add_argument("--output", required=True)
+    stage_c_data.add_argument(
+        "--dataset", default="nvidia/Nemotron-SFT-Instruction-Following-Chat-v4"
+    )
+    stage_c_data.add_argument(
+        "--splits", nargs="+",
+        default=["chat", "instruction_following_for_response_length_control"],
+    )
+    stage_c_data.add_argument("--max-per-split", type=int, default=20000)
+    stage_c_data.add_argument("--seed", type=int, default=42)
+    stage_c = subparsers.add_parser(
+        "train-display", help="Stage C: frozen CID with Display-only low-rank diffusion SFT"
+    )
+    stage_c.add_argument("--data", required=True, help="prompt/answer or chat messages JSONL")
+    stage_c.add_argument("--checkpoint", required=True, help="Stage B .pt or unified CID release")
+    stage_c.add_argument("--checkpoint-kind", choices=("stage-b", "release"), default="release")
+    stage_c.add_argument("--model", default="GSAI-ML/iLLaDA-8B-Base")
+    stage_c.add_argument("--output-dir", required=True)
+    stage_c.add_argument("--device", choices=("auto", "cuda", "npu", "cpu"), default="auto")
+    stage_c.add_argument("--dtype", choices=("bf16", "fp32"), default="bf16")
+    stage_c.add_argument("--rank", type=int, default=32)
+    stage_c.add_argument("--alpha", type=float)
+    stage_c.add_argument("--epochs", type=int, default=1)
+    stage_c.add_argument("--seed", type=int, default=42)
+    stage_c.add_argument("--learning-rate", type=float, default=1e-4)
+    stage_c.add_argument("--thought-steps", type=int, default=2)
+    stage_c.add_argument("--max-answer-tokens", type=int, default=512)
+    stage_c.add_argument("--max-examples", type=int)
+    stage_c.add_argument("--log-every", type=int, default=20)
+    stage_c.add_argument("--checkpoint-every", type=int, default=500)
     benchmark = subparsers.add_parser(
         "benchmark",
         help="run a neural CID checkpoint on deterministic replay trajectories",
     )
+    benchmark.add_argument("--stage-c-adapter", help="optional Display-only Stage C checkpoint")
     benchmark.add_argument("--data", required=True)
     benchmark.add_argument("--checkpoint", required=True)
     benchmark.add_argument(
@@ -4819,6 +4857,18 @@ def main() -> None:
         _train_stage_a(args)
     elif args.command == "train-full":
         _train_stage_b(args)
+    elif args.command == "train-display":
+        from cid.stage_c import train_stage_c
+
+        train_stage_c(args)
+    elif args.command == "prepare-stage-c-data":
+        from cid.stage_c import export_nemotron_sft
+
+        counts = export_nemotron_sft(
+            args.output, dataset=args.dataset, splits=args.splits,
+            max_per_split=args.max_per_split, seed=args.seed,
+        )
+        print(counts)
 
 
 if __name__ == "__main__":

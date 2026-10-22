@@ -775,6 +775,9 @@ class ILLaDACIDAdapter(nn.Module):
             max_link_slots=self.config.max_link_slots,
             semantic_head_version=self.config.semantic_head_version,
         )
+        # Stage C is an optional, Display-only output residual.  It never changes
+        # the shared backbone or the T/Need/control heads.
+        self.stage_c_display: nn.Module | None = None
 
         nn.init.zeros_(self.channel_embedding.weight)
         nn.init.zeros_(self.role_projection.weight)
@@ -1172,12 +1175,15 @@ class ILLaDACIDAdapter(nn.Module):
 
         t_hidden = hidden[:, :thought_slots]
         y_hidden = hidden[:, thought_slots + prompt_length :]
+        display_logits = self.output_embeddings(y_hidden)
+        if self.stage_c_display is not None:
+            display_logits = display_logits + self.stage_c_display(y_hidden)
         output = self.output_heads(
             base_thought=thought,
             thought_hidden=t_hidden,
             thought_occupancy=neural_occupancy,
             display_hidden=y_hidden,
-            display_logits=self.output_embeddings(y_hidden),
+            display_logits=display_logits,
             source_memory=source_memory,
             source_padding_mask=batch.source_padding_mask,
         )

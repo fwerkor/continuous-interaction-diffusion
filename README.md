@@ -72,6 +72,7 @@ src/cid/teacher_agent.py    Resumable interactive/LSM teacher workspace adapter
 src/cid/metrics.py          CID-specific interaction metrics
 docs/architecture.md        Concrete v0 architecture decisions
 docs/training.md            Staged training plan
+docs/stage-c.md             Optional frozen Display-only language adaptation
 docs/evaluation.md          Runtime/task evaluation metric contract
 docs/public-datasets.md     Pinned public-task sources, licenses, and quotas
 examples/                   Small executable runtime examples

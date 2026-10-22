@@ -16,6 +16,7 @@ dependencies = []
 [project.optional-dependencies]
 engine = ["cid-engine>=0.8.1"]
 train = ["torch>=2.1", "transformers>=4.57.1,<5"]
+stage-c = ["torch>=2.1", "transformers>=4.57.1,<5", "datasets>=3.0"]
 data = ["huggingface-hub>=0.34", "pandas>=2.2", "pyarrow>=17", "sympy>=1.14"]
 dev = ["numpy>=1.26", "pytest>=8.3", "pytest-asyncio>=0.24", "ruff>=0.9", "sympy>=1.14"]
 
