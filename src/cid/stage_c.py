@@ -268,14 +268,29 @@ def make_display_batch(
         # Runtime begins [MASK, EOS, MASK...]. Frequent tiny prefixes are
         # essential; uniform random prefixes alone scarcely visit this state.
         draw = float(torch.rand((), generator=generator, device=device))
-        if count == 1 or draw < 0.35:
+        if count == 1 or draw >= 0.82:
+            # Explicit true-terminal samples counter the otherwise overwhelming
+            # continuation gradient at a live EOS boundary.
+            prefix = count
+        elif draw < 0.32:
             prefix = 1
-        elif draw < 0.80:
+        elif draw < 0.55:
             prefix = int(
                 torch.randint(1, min(count, 64) + 1, (), generator=generator, device=device)
             )
-        else:
+        elif draw < 0.75:
             prefix = int(torch.randint(1, count + 1, (), generator=generator, device=device))
+        else:
+            # Near-end states train both the final content and actual EOS.
+            prefix = int(
+                torch.randint(
+                    max(1, count - continuation_tokens),
+                    count + 1,
+                    (),
+                    generator=generator,
+                    device=device,
+                )
+            )
         window_end = min(count, prefix + continuation_tokens)
         size = min(
             adapter.config.max_display_tokens,

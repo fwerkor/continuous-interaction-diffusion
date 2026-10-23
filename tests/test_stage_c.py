@@ -306,6 +306,7 @@ def test_runtime_prefix_supervises_eos_replacement_and_latent_tail():
     generator = torch.Generator().manual_seed(17)
     found_initial = False
     saw_mid_sentence = False
+    terminal_samples = 0
     for _ in range(80):
         batch, labels = make_display_batch(
             tensorizer,
@@ -325,12 +326,14 @@ def test_runtime_prefix_supervises_eos_replacement_and_latent_tail():
             assert int(labels[0, eos]) == int(target[eos])
             saw_mid_sentence = True
         else:
+            terminal_samples += 1
             assert int(labels[0, eos]) == adapter.eos_token_id
         if eos == 1 and actual[0] == adapter.mask_token_id:
             found_initial = True
             assert int(labels[0, 0]) == int(target[0])
             assert int(labels[0, 1]) == int(target[1])
     assert found_initial and saw_mid_sentence
+    assert terminal_samples >= 8
 
 
 def test_runtime_prefix_preserves_true_terminal_eos():

@@ -57,8 +57,10 @@ gradients. You may set `--thought-steps 0` to ablate T conditioning.
 denoising, the default `--rollout-probability 0.75` trains on genuine
 runtime-shaped Display states: a partly masked prefix, a current EOS, and a
 masked latent tail. The current EOS must predict the next answer token;
-future tokens are supervised in a bounded `--continuation-tokens 16` window,
-and EOS is supervised **only** at the actual answer ending. Tiny prefixes,
+future tokens are supervised in a bounded `--continuation-tokens 16` window.
+A substantial share of prefix samples land at, or near, the **true answer
+ending** and explicitly supervise keeping EOS there; this counters unlimited
+expansion without inventing EOS labels at arbitrary truncation boundaries. Tiny prefixes,
 including the exact `[MASK, EOS, MASK...]` initial condition, are oversampled.
 The remaining 25% of batches retain full-answer diffusion denoising. This
 addresses a specific training/inference mismatch but does not change CID's
