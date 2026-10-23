@@ -242,6 +242,8 @@ def make_display_batch(
     *,
     generator: torch.Generator,
     maximum_tokens: int = 512,
+    rollout_probability: float = 0.75,
+    continuation_tokens: int = 16,
 ) -> tuple[Any, Tensor]:
     from cid.contracts import ModelContext
     from cid.state import DisplayCanvas, FactSnapshot
@@ -251,32 +253,89 @@ def make_display_batch(
     count = int(target.shape[1])
     if count < 1 or count + 1 > min(maximum_tokens, adapter.config.max_display_tokens):
         raise ValueError("Stage C answer exceeds Display training token budget")
-    size = min(
-        adapter.config.max_display_tokens, max(adapter.config.display_canvas_tokens, count + 1)
-    )
+    if not 0.0 <= rollout_probability <= 1.0:
+        raise ValueError("rollout_probability must be in [0, 1]")
+    if continuation_tokens <= 0:
+        raise ValueError("continuation_tokens must be positive")
+    mask_id = adapter.mask_token_id
+    eos_id = adapter.eos_token_id
+    device = tensorizer.text_encoder.device
+    target = target.to(device)
+    # Full-sequence denoising remains a control objective; the main objective
+    # instead models inference states with a live EOS boundary.
+    use_rollout = bool(torch.rand((), generator=generator, device=device) < rollout_probability)
+    if use_rollout:
+        # Runtime begins [MASK, EOS, MASK...]. Frequent tiny prefixes are
+        # essential; uniform random prefixes alone scarcely visit this state.
+        draw = float(torch.rand((), generator=generator, device=device))
+        if count == 1 or draw < 0.35:
+            prefix = 1
+        elif draw < 0.80:
+            prefix = int(
+                torch.randint(1, min(count, 64) + 1, (), generator=generator, device=device)
+            )
+        else:
+            prefix = int(torch.randint(1, count + 1, (), generator=generator, device=device))
+        window_end = min(count, prefix + continuation_tokens)
+        size = min(
+            adapter.config.max_display_tokens,
+            max(adapter.config.display_canvas_tokens, window_end + 1),
+        )
+        ids = torch.full((1, size), mask_id, dtype=torch.long, device=device)
+        labels = torch.full_like(ids, -100)
+        ids[0, :prefix] = target[0, :prefix]
+        ids[0, prefix] = eos_id
+        # Exactly one boundary token is "incorrect" in this condition: the
+        # prediction at current EOS must become the next answer token.  The
+        # latent tail is masked, as in CID Runtime, not filled with a future
+        # clean answer and then randomly corrupted.
+        if prefix < count:
+            labels[0, prefix:window_end] = target[0, prefix:window_end]
+        else:
+            labels[0, prefix] = eos_id  # true completion: keep terminal EOS
+        if window_end == count and prefix < count and count < size:
+            labels[0, count] = eos_id  # EOS only at genuine answer end
+        # Earlier Display tokens may still be unresolved during runtime
+        # diffusion; do not always assume a perfectly filled prefix.
+        if prefix > 0:
+            masked = torch.rand((prefix,), generator=generator, device=device) < (
+                0.75 if prefix == 1 else 0.12
+            )
+            ids[0, :prefix][masked] = mask_id
+            labels[0, :prefix][masked] = target[0, :prefix][masked]
+        timestep = torch.rand((1,), device=device, generator=generator) * 0.95 + 0.05
+        display_noise = timestep.view(1, 1, 1).expand(1, size, 1)
+    else:
+        size = min(
+            adapter.config.max_display_tokens,
+            max(adapter.config.display_canvas_tokens, count + 1),
+        )
+        clean = torch.full((1, size), mask_id, dtype=torch.long, device=device)
+        clean[:, :count] = target
+        clean[:, count] = eos_id
+        eligible = torch.zeros_like(clean, dtype=torch.bool)
+        eligible[:, : count + 1] = True
+        timestep = torch.rand((1,), device=device, generator=generator) * 0.95 + 0.05
+        corrupted = tensorizer.scheduler.corrupt_display(
+            clean, timestep, eligible_mask=eligible, generator=generator
+        )
+        ids = corrupted.token_ids
+        labels = corrupted.labels
+        display_noise = corrupted.noise
     if (
         adapter.config.max_thought_slots
-        + len(tensorizer.text_encoder.tokenize(example.prompt, add_special_tokens=True)[0])
+        + int(tensorizer.text_encoder.tokenize(example.prompt, add_special_tokens=True).shape[1])
         + size
         > adapter.max_position_embeddings
     ):
         raise ValueError("Stage C prompt and Display exceed backbone context length")
-    mask_id = adapter.mask_token_id
-    device = tensorizer.text_encoder.device
-    tokens = torch.full((1, size), mask_id, dtype=torch.long, device=device)
-    tokens[:, :count] = target.to(device)
-    tokens[:, count] = adapter.eos_token_id
-    eligible = torch.zeros_like(tokens, dtype=torch.bool)
-    eligible[:, : count + 1] = True
-    timestep = torch.rand((1,), device=device, generator=generator) * 0.95 + 0.05
-    corrupted = tensorizer.scheduler.corrupt_display(
-        tokens, timestep, eligible_mask=eligible, generator=generator
-    )
     context = ModelContext(
         facts=FactSnapshot(0, {}),
         thought=thought,
-        display=DisplayCanvas.initial_unresolved(
-            length=size, mask_token_id=mask_id, eos_token_id=adapter.eos_token_id
+        display=DisplayCanvas(
+            token_ids=tuple(int(v) for v in ids[0].tolist()),
+            mask_token_id=mask_id,
+            eos_token_id=eos_id,
         ),
         sources=(),
         percepts=(),
@@ -284,9 +343,8 @@ def make_display_batch(
         prompt=example.prompt,
     )
     batch = tensorizer(context, generator=generator, display_noise_level=float(timestep.item()))
-    batch.display_ids = corrupted.token_ids
-    batch.display_noise = corrupted.noise.to(dtype=batch.display_noise.dtype)
-    return batch, corrupted.labels
+    batch.display_noise = display_noise.to(dtype=batch.display_noise.dtype)
+    return batch, labels
 
 
 def frozen_thought_rollout(
@@ -416,6 +474,10 @@ def train_stage_c(args: Any) -> None:
         raise ValueError("Stage C epochs must be positive and thought steps nonnegative")
     if args.learning_rate <= 0.0:
         raise ValueError("Stage C learning rate must be positive")
+    if not 0 <= args.rollout_probability <= 1 or args.continuation_tokens <= 0:
+        raise ValueError("invalid Stage C rollout sampling configuration")
+    if args.max_steps is not None and args.max_steps <= 0:
+        raise ValueError("max_steps must be positive")
     device_type = resolve_torch_device_type(torch, args.device)
     configure_torch_accelerator(torch, device_type, 0)
     device = torch.device(device_type)
@@ -472,6 +534,8 @@ def train_stage_c(args: Any) -> None:
                     example,
                     generator=generator,
                     maximum_tokens=args.max_answer_tokens,
+                    rollout_probability=args.rollout_probability,
+                    continuation_tokens=args.continuation_tokens,
                 )
             except ValueError as exc:
                 if "exceeds" in str(exc):
@@ -496,6 +560,8 @@ def train_stage_c(args: Any) -> None:
                     base_checkpoint=str(args.checkpoint),
                     base_kind=args.checkpoint_kind,
                 )
+            if args.max_steps is not None and completed >= args.max_steps:
+                break
         if seen == 0:
             raise ValueError("no Stage C samples fit configured context and Display limits")
         save_display_adapter(
@@ -510,6 +576,8 @@ def train_stage_c(args: Any) -> None:
             base_checkpoint=str(args.checkpoint),
             base_kind=args.checkpoint_kind,
         )
+        if args.max_steps is not None and completed >= args.max_steps:
+            break
     print(
         f"stage=C complete steps={completed} adapter={Path(args.output_dir) / 'stage-c-latest.pt'}"
     )

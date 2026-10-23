@@ -228,6 +228,9 @@ def test_train_display_cli_smoke_on_tiny_cid(tmp_path, monkeypatch):
         seed=3,
         log_every=1,
         checkpoint_every=1,
+        rollout_probability=0.75,
+        continuation_tokens=16,
+        max_steps=None,
     )
     before = {name: parameter.clone() for name, parameter in adapter.named_parameters()}
     stage_c.train_stage_c(args)
@@ -289,3 +292,81 @@ def test_nemotron_export_streams_only_selected_answers(tmp_path, monkeypatch):
     assert len(records) == 1
     assert records[0]["answer"] == "Hello"
     assert "private reasoning" not in json.dumps(records)
+
+
+def test_runtime_prefix_supervises_eos_replacement_and_latent_tail():
+    from cid.state import CognitiveField
+
+    adapter = make_small_adapter(display_tokens=12)
+    text_encoder = ILLaDATextEncoder(adapter, SmallTokenizer())
+    tensorizer = ILLaDAContextTensorizer(adapter, text_encoder.tokenizer, text_encoder=text_encoder)
+    thought = CognitiveField.empty(4, 32)
+    example = StageCExample("Hi", "a moderately long sentence of training text")
+    target = text_encoder.tokenize(example.answer, add_special_tokens=False)[0]
+    generator = torch.Generator().manual_seed(17)
+    found_initial = False
+    saw_mid_sentence = False
+    for _ in range(80):
+        batch, labels = make_display_batch(
+            tensorizer,
+            thought,
+            example,
+            generator=generator,
+            rollout_probability=1.0,
+            continuation_tokens=6,
+        )
+        actual = batch.display_ids[0]
+        eos_positions = torch.where(actual == adapter.eos_token_id)[0].tolist()
+        assert len(eos_positions) == 1
+        eos = eos_positions[0]
+        assert torch.all(actual[eos + 1 :] == adapter.mask_token_id)
+        assert torch.all(labels[0, eos + 7 :] == -100)
+        if eos < len(target):
+            assert int(labels[0, eos]) == int(target[eos])
+            saw_mid_sentence = True
+        else:
+            assert int(labels[0, eos]) == adapter.eos_token_id
+        if eos == 1 and actual[0] == adapter.mask_token_id:
+            found_initial = True
+            assert int(labels[0, 0]) == int(target[0])
+            assert int(labels[0, 1]) == int(target[1])
+    assert found_initial and saw_mid_sentence
+
+
+def test_runtime_prefix_preserves_true_terminal_eos():
+    from cid.state import CognitiveField
+
+    adapter = make_small_adapter(display_tokens=12)
+    encoder = ILLaDATextEncoder(adapter, SmallTokenizer())
+    tensorizer = ILLaDAContextTensorizer(adapter, encoder.tokenizer, text_encoder=encoder)
+    thought = CognitiveField.empty(4, 32)
+    example = StageCExample("Hi", "a")
+    batch, labels = make_display_batch(
+        tensorizer,
+        thought,
+        example,
+        generator=torch.Generator().manual_seed(11),
+        rollout_probability=1.0,
+    )
+    assert int(batch.display_ids[0, 1]) == adapter.eos_token_id
+    assert int(labels[0, 1]) == adapter.eos_token_id
+    assert (labels[0, 2:] == -100).all()
+
+
+def test_original_denoising_objective_still_available():
+    from cid.state import CognitiveField
+
+    adapter = make_small_adapter(display_tokens=12)
+    encoder = ILLaDATextEncoder(adapter, SmallTokenizer())
+    tensorizer = ILLaDAContextTensorizer(adapter, encoder.tokenizer, text_encoder=encoder)
+    thought = CognitiveField.empty(4, 32)
+    batch, labels = make_display_batch(
+        tensorizer,
+        thought,
+        StageCExample("Hi", "abcdef"),
+        generator=torch.Generator().manual_seed(22),
+        rollout_probability=0,
+    )
+    assert batch.display_ids.shape == labels.shape
+    assert (labels != -100).any()
+    assert int(batch.display_ids.max()) < adapter.vocab_size

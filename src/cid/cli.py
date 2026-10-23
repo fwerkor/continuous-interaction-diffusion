@@ -4226,6 +4226,15 @@ def main() -> None:
     stage_c.add_argument("--thought-steps", type=int, default=2)
     stage_c.add_argument("--max-answer-tokens", type=int, default=512)
     stage_c.add_argument("--max-examples", type=int)
+    stage_c.add_argument("--max-steps", type=int, help="maximum optimizer steps for pilots")
+    stage_c.add_argument(
+        "--rollout-probability", type=float, default=0.75,
+        help="fraction of batches supervised on native [prefix, EOS, latent tail] states",
+    )
+    stage_c.add_argument(
+        "--continuation-tokens", type=int, default=16,
+        help="supervised lookahead tokens after a live EOS boundary",
+    )
     stage_c.add_argument("--log-every", type=int, default=20)
     stage_c.add_argument("--checkpoint-every", type=int, default=500)
     benchmark = subparsers.add_parser(

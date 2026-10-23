@@ -53,6 +53,21 @@ the public chat data). That T state conditions a standard masked Display
 Diffusion cross-entropy step. Only the two fp32 low-rank matrices receive
 gradients. You may set `--thought-steps 0` to ablate T conditioning.
 
+**EOS-boundary training (revised):** Unlike the original full-answer-only
+denoising, the default `--rollout-probability 0.75` trains on genuine
+runtime-shaped Display states: a partly masked prefix, a current EOS, and a
+masked latent tail. The current EOS must predict the next answer token;
+future tokens are supervised in a bounded `--continuation-tokens 16` window,
+and EOS is supervised **only** at the actual answer ending. Tiny prefixes,
+including the exact `[MASK, EOS, MASK...]` initial condition, are oversampled.
+The remaining 25% of batches retain full-answer diffusion denoising. This
+addresses a specific training/inference mismatch but does not change CID's
+convergence control or guarantee fluent replies.
+
+A short experimental run can use `--max-steps 1000` with
+`--checkpoint-every 100`. The dataset still needs a held-out validation
+split; Stage C loss alone is not evidence of improved natural language.
+
 The trainer skips samples whose answer (including EOS) or combined prompt,
 TCT and Display exceed model capacity. `--max-answer-tokens` defaults to 512;
 the Display canvas expands to fit targets up to the configured maximum. For
