@@ -1,0 +1,8 @@
+file,prompts,reference_cases,substring_hits,converged,median_tokens,ge32_tokens
+eval-60-base-c64.json,60,37,18,59,3.0,0
+eval-60-hidden512-c256.json,60,37,2,53,4.0,8
+eval-60-hidden512-c64.json,60,37,13,56,5.0,8
+eval-60-linear32-c256.json,60,37,12,53,7.0,10
+eval-60-linear32-c64.json,60,37,18,56,6.0,5
+eval-60-nonlinear128-c256.json,60,37,6,55,6.0,5
+eval-60-nonlinear128-c64.json,60,37,18,57,6.0,3
