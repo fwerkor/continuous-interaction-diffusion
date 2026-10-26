@@ -5,6 +5,7 @@ import asyncio
 import math
 import re
 import time
+from tokenize import TokenError
 import unicodedata
 from collections import Counter, defaultdict
 from collections.abc import Mapping
@@ -740,7 +741,7 @@ class DeterministicSymbolicMathSource(_StepDelayedSource):
             value: Any = await asyncio.to_thread(
                 _evaluate_symbolic, operation, expression, variables
             )
-        except (ArithmeticError, SyntaxError, TypeError, ValueError, OverflowError) as exc:
+        except (ArithmeticError, SyntaxError, TokenError, TypeError, ValueError, OverflowError) as exc:
             value = {
                 "operation": operation,
                 "expression": expression,
