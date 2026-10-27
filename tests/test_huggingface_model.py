@@ -71,9 +71,10 @@ def _tiny_cid_config() -> CIDConfig:
             "d_model": 32,
             "vocab_size": 64,
             "dtype": "torch.bfloat16",
+            "semantic_noise_scale": 0.02,
             "tensor_key": "semantic_embedding_weight",
         },
-        neural_contract_version=4,
+        neural_contract_version=5,
     )
 
 
@@ -94,6 +95,25 @@ def test_cid_model_round_trips_as_one_safetensors_file(tmp_path: Path) -> None:
     restored = CIDModel.from_pretrained(tmp_path, low_cpu_mem_usage=True)
     assert restored.semantic_embedding_weight.dtype is torch.bfloat16
     assert torch.equal(restored.semantic_embedding_weight, expected_semantic)
+
+
+def test_v6_unified_model_requires_stable_semantic_head() -> None:
+    legacy = _tiny_cid_config()
+    with pytest.raises(ValueError, match="semantic_head_version=2"):
+        CIDConfig(
+            backbone_config=legacy.backbone_config,
+            adapter_config=legacy.adapter_config,
+            semantic_embedding=legacy.semantic_embedding,
+            neural_contract_version=6,
+        )
+    stable = CIDConfig(
+        backbone_config=legacy.backbone_config,
+        adapter_config={**legacy.adapter_config, "semantic_head_version": 2},
+        semantic_embedding=legacy.semantic_embedding,
+        neural_contract_version=6,
+    )
+    model = CIDModel(stable)
+    assert model.adapter.output_heads.semantic_head_version == 2
 
 
 def test_unified_state_prefixes_legacy_components() -> None:

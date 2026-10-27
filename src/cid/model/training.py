@@ -31,7 +31,11 @@ from cid.data import (
     load_indexed_jsonl,
     training_transition_source_steps,
 )
-from cid.defaults import DEFAULT_DISPLAY_REVISION_FRACTION, DEFAULT_DISPLAY_REVISION_MARGIN
+from cid.defaults import (
+    DEFAULT_DISPLAY_REPETITION_SCORE_MULTIPLIER,
+    DEFAULT_DISPLAY_REVISION_FRACTION,
+    DEFAULT_DISPLAY_REVISION_MARGIN,
+)
 from cid.grounding import (
     STRONG_LINK_RELATIONS,
     AnchorKind,
@@ -60,6 +64,11 @@ from cid.model.encoding import (
     stable_text,
 )
 from cid.model.illada import ILLaDACIDAdapter
+from cid.model.loading import (
+    backbone_identity_matches,
+    tokenizer_identity_matches,
+    tokenizer_source_identity,
+)
 from cid.model.losses import CIDLoss, CIDTargets, cid_loss
 from cid.model.materialize import (
     ArgumentCandidate,
@@ -80,13 +89,24 @@ from cid.state import (
     DisplayCanvas,
 )
 
-CID_NEURAL_CONTRACT_VERSION = 4
+CID_NEURAL_CONTRACT_VERSION = 6
+# Bump independently of neural geometry when teacher labels/loss semantics change.
+CID_SUPERVISION_CONTRACT_VERSION = 2
 STAGE_B_SEMANTIC_SNAPSHOT_FILENAME = "semantic-embedding.pt"
 _PORTABLE_LENGTH_BAND_SIZE = 64
 
 
 class CIDRolloutRecoveryError(ValueError):
     """A closed-loop model state cannot be reconciled with the teacher under runtime limits."""
+
+
+def _validate_tokenizer_identity(saved_identity: object, tokenizer: Any | None) -> None:
+    if saved_identity is None:
+        return
+    if tokenizer is None:
+        raise ValueError("checkpoint tokenizer identity requires the tokenizer used for loading")
+    if not tokenizer_identity_matches(tokenizer, saved_identity):
+        raise ValueError("checkpoint tokenizer identity does not match the current tokenizer")
 
 
 def _distributed_all_true(value: bool, *, device: torch.device) -> bool:
@@ -121,6 +141,7 @@ def _semantic_snapshot_metadata(state: Mapping[str, Any]) -> dict[str, Any]:
         "pooling_mode": str(state["pooling_mode"]),
         "d_model": int(state["d_model"]),
         "vocab_size": int(weight.shape[0]),
+        "semantic_noise_scale": float(state["semantic_noise_scale"]),
         "dtype": str(weight.dtype),
     }
 
@@ -369,6 +390,9 @@ class CIDTrainerConfig:
     rollout_denoising_steps: int = 8
     rollout_display_revision_fraction: float = DEFAULT_DISPLAY_REVISION_FRACTION
     rollout_display_revision_margin: float = DEFAULT_DISPLAY_REVISION_MARGIN
+    rollout_display_repetition_score_multiplier: float = (
+        DEFAULT_DISPLAY_REPETITION_SCORE_MULTIPLIER
+    )
     semantic_pooling: str = "order-aware-v2"
     seed: int = 0
 
@@ -417,6 +441,8 @@ class CIDTrainerConfig:
             raise ValueError("rollout_denoising_steps must be positive")
         if self.rollout_display_revision_margin < 0.0:
             raise ValueError("rollout_display_revision_margin must be non-negative")
+        if not 0.0 < self.rollout_display_repetition_score_multiplier <= 1.0:
+            raise ValueError("rollout_display_repetition_score_multiplier must be in (0, 1]")
         if self.semantic_pooling not in {"mean-v1", "order-aware-v2"}:
             raise ValueError("unsupported semantic_pooling mode")
 
@@ -556,6 +582,34 @@ def _metric_tensor_values(values: Mapping[str, Tensor]) -> dict[str, float]:
     host_values = torch.stack(tuple(values[name] for name in names)).detach().cpu().tolist()
     return dict(zip(names, host_values, strict=True))
 
+
+
+def _materialized_complete_display_reference(
+    target_text_ids: Tensor,
+    *,
+    canvas_length: int,
+    mask_token_id: int,
+    eos_token_id: int,
+) -> Tensor:
+    """Only score complete answers, not unknown placeholders or transport EOS."""
+    if target_text_ids.ndim != 2 or target_text_ids.shape[0] != 1:
+        raise ValueError("Display reference must be one token row")
+    count = target_text_ids.shape[1]
+    if count >= canvas_length:
+        raise ValueError("Display reference exceeds physical canvas")
+    reference = torch.full(
+        (1, canvas_length),
+        -100,
+        dtype=target_text_ids.dtype,
+        device=target_text_ids.device,
+    )
+    # Partially-known drafts have no complete reference answer yet.
+    # Their known visible tokens remain supervised by the neural CE objective.
+    if bool((target_text_ids == mask_token_id).any()):
+        return reference
+    reference[:, :count] = target_text_ids
+    reference[:, count] = eos_token_id
+    return reference
 
 def _cid_behavior_counts(
     output: CIDTensorOutput,
@@ -723,9 +777,12 @@ class CIDTrainer:
         if not self._trainable:
             raise ValueError("trainer requires at least one trainable parameter")
         self.optimizer = optimizer or torch.optim.AdamW(
-            (parameter for _, parameter in self._trainable),
+            stage_a_adamw_parameter_groups(
+                adapter,
+                weight_decay=self.config.weight_decay,
+            ),
             lr=self.config.learning_rate,
-            weight_decay=self.config.weight_decay,
+            weight_decay=0.0,
         )
         # FSDP CPU offload keeps the live parameter shards on host memory between
         # forwards, while tensorization and diffusion corruption still happen on the
@@ -753,6 +810,13 @@ class CIDTrainer:
         self._stage_a_manual_sync_required = False
         self._stage_a_backward_cpu_stash_active = False
         self._stage_a_gradient_stash_hook_handles: list[object] = []
+        self._gradient_diagnostics_enabled = os.environ.get(
+            "CID_GRADIENT_DIAGNOSTICS", ""
+        ).strip().lower() in {"1", "true", "yes", "on"}
+        self._pending_gradient_example_ids: list[str] = []
+        self._npu_cache_release_min_free_bytes = int(
+            float(os.environ.get("CID_NPU_CACHE_RELEASE_MIN_FREE_GIB", "0")) * 1024**3
+        )
         if (
             getattr(self.forward_model, "_cid_stage_a_ddp", False)
             and self.cpu_gradient_stash_threshold_tokens is not None
@@ -857,6 +921,48 @@ class CIDTrainer:
             # rollout state. Coverage-only correction for a blocked runtime row does not.
             advance_state.append(real_row and (not scheduled_rollout or runtime_ready))
         return tuple(use_rollout_flags), tuple(execute_rows), tuple(advance_state)
+
+    def _maybe_release_npu_cache(self) -> None:
+        """Return reclaimable allocator cache before HCCL when NPU free HBM is low."""
+        threshold = self._npu_cache_release_min_free_bytes
+        device = self.tensorizer.text_encoder.device
+        if threshold <= 0 or device.type != "npu":
+            return
+        npu = getattr(torch, "npu", None)
+        if npu is None or not hasattr(npu, "mem_get_info") or not hasattr(npu, "empty_cache"):
+            return
+        free_before, total = npu.mem_get_info(device)
+        if int(free_before) >= threshold:
+            return
+        reserved = int(npu.memory_reserved(device))
+        allocated = int(npu.memory_allocated(device))
+        reclaimable = max(0, reserved - allocated)
+        if reclaimable < 256 * 1024**2:
+            return
+        npu.empty_cache()
+        if self._gradient_diagnostics_enabled:
+            free_after, _ = npu.mem_get_info(device)
+            rank = (
+                torch.distributed.get_rank()
+                if torch.distributed.is_available() and torch.distributed.is_initialized()
+                else 0
+            )
+            print(
+                "CID_NPU_CACHE_RELEASE "
+                + json.dumps(
+                    {
+                        "rank": rank,
+                        "free_before_gib": int(free_before) / 1024**3,
+                        "free_after_gib": int(free_after) / 1024**3,
+                        "allocated_gib": allocated / 1024**3,
+                        "reserved_gib": reserved / 1024**3,
+                        "reclaimable_gib": reclaimable / 1024**3,
+                        "total_gib": int(total) / 1024**3,
+                    },
+                    sort_keys=True,
+                ),
+                flush=True,
+            )
 
     def _distributed_global_batch_size(self, local_rows: int) -> int:
         if local_rows < 0:
@@ -1247,6 +1353,12 @@ class CIDTrainer:
                         coverage[index] += 1
             if tuple(coverage) != tuple(int(selected) for selected in resolved_sample_mask):
                 raise ValueError("loss groups must partition the valid sample mask exactly")
+        # This boundary is reached by both rollout training and flattened
+        # teacher forcing.  In the latter case a global batch size is already
+        # known, so cache reclamation must not depend on the size all-reduce.
+        # Reclaim before collation to leave room for both the batch and the
+        # backbone's temporary NPU convolution workspaces.
+        self._maybe_release_npu_cache()
         training_batch = collate_training_steps(
             samples,
             pad_token_id=int(self.pad_token_id),
@@ -1318,22 +1430,27 @@ class CIDTrainer:
         # saved-tensor path and retain the blocking implementation as a compatibility
         # fallback for older engine builds.
         saved_tensor_context = nullcontext()
+        accelerator_type = training_batch.batch.thought_semantic.device.type
         if (
             stage_a_ddp
-            and training_batch.batch.thought_semantic.device.type == "cuda"
+            and accelerator_type in {"cuda", "npu"}
             and sequence_tokens >= self.stage_a_activation_offload_threshold_tokens
         ):
             parameter_storages = {
                 parameter.untyped_storage().data_ptr()
                 for parameter in self.forward_model.parameters()
-                if parameter.device.type == "cuda"
+                if parameter.device.type == accelerator_type
             }
             offload_budget_bytes = (
                 self.stage_a_activation_offload_budget_bytes
                 if self.stage_a_activation_offload_budget_bytes is not None
                 else (12 if sequence_tokens >= 1024 else 8) * 1024**3
             )
-            if self.stage_a_async_activation_offload and self._stage_a_activation_offloader is None:
+            if (
+                accelerator_type == "cuda"
+                and self.stage_a_async_activation_offload
+                and self._stage_a_activation_offloader is None
+            ):
                 engine = cuda_engine(
                     training_batch.batch.thought_semantic,
                     capability="AsyncPinnedActivationOffloader",
@@ -1371,7 +1488,7 @@ class CIDTrainer:
 
                 def pack_saved_tensor(tensor: torch.Tensor) -> object:
                     nonlocal offloaded_bytes
-                    if tensor.device.type != "cuda" or not tensor.requires_grad:
+                    if tensor.device.type != accelerator_type or not tensor.requires_grad:
                         return tensor
                     if tensor.untyped_storage().data_ptr() in parameter_storages:
                         return tensor
@@ -1451,6 +1568,18 @@ class CIDTrainer:
                     raise FloatingPointError(
                         f"non-finite CID loss for training micro-batch: {names}"
                     )
+                if self._gradient_diagnostics_enabled:
+                    self._pending_gradient_example_ids.extend(
+                        example_id
+                        for example_id, selected in zip(
+                            training_batch.example_ids,
+                            resolved_sample_mask,
+                            strict=True,
+                        )
+                        if selected
+                    )
+                    if len(self._pending_gradient_example_ids) > 256:
+                        del self._pending_gradient_example_ids[:-256]
                 if reducer is not None:
                     reducer.start()
                     reducer_started = True
@@ -1588,6 +1717,7 @@ class CIDTrainer:
             ),
             revision_fraction=self.config.rollout_display_revision_fraction,
             revision_margin=self.config.rollout_display_revision_margin,
+            repetition_score_multiplier=self.config.rollout_display_repetition_score_multiplier,
         )
 
         materializer_config = CIDMaterializerConfig()
@@ -1824,10 +1954,12 @@ class CIDTrainer:
         terminal = converged and not unresolved_binding and not pending_terminal_refresh
         quiescent = (equilibrium and unresolved_binding) or (converged and pending_terminal_refresh)
 
+        rollout_semantic = output.thought_semantic[
+            batch_index : batch_index + 1, slot_slice
+        ].detach()
+        self.tensorizer.text_encoder.validate_semantic_state(rollout_semantic)
         return CIDRolloutState(
-            thought_semantic=output.thought_semantic[
-                batch_index : batch_index + 1, slot_slice
-            ].detach(),
+            thought_semantic=rollout_semantic,
             role_features=torch.sigmoid(
                 output.role_logits[batch_index : batch_index + 1, slot_slice].float()
             ).detach(),
@@ -2162,6 +2294,9 @@ class CIDTrainer:
                                 ),
                                 revision_fraction=self.config.rollout_display_revision_fraction,
                                 revision_margin=self.config.rollout_display_revision_margin,
+                                repetition_score_multiplier=(
+                                    self.config.rollout_display_repetition_score_multiplier
+                                ),
                             )
                             example = microbatch[row_index].example
                             if not isinstance(example, TrajectoryExample):
@@ -2180,11 +2315,13 @@ class CIDTrainer:
                                     "validation target display exceeds its physical canvas"
                                 )
                             materialized_display_targets[
-                                row_index : row_index + 1, :target_length
-                            ] = target_text_ids
-                            materialized_display_targets[
-                                row_index, target_length
-                            ] = self.tensorizer.eos_token_id
+                                row_index : row_index + 1, :display_length
+                            ] = _materialized_complete_display_reference(
+                                target_text_ids,
+                                canvas_length=display_length,
+                                mask_token_id=self.adapter.mask_token_id,
+                                eos_token_id=self.tensorizer.eos_token_id,
+                            )
                         _accumulate_metric_tensors(
                             behavior_counts,
                             _cid_behavior_counts(
@@ -2320,6 +2457,16 @@ class CIDTrainer:
         self.generator.manual_seed(seed)
         self.shuffle_rng.seed(seed)
 
+    def local_rng_state(self) -> dict[str, Any]:
+        return {
+            "generator_state": self.generator.get_state().cpu(),
+            "shuffle_state": self.shuffle_rng.getstate(),
+        }
+
+    def restore_local_rng_state(self, state: Mapping[str, Any]) -> None:
+        self.generator.set_state(state["generator_state"])
+        self.shuffle_rng.setstate(state["shuffle_state"])
+
     def flush(self) -> None:
         if self._pending_accumulation:
             self._optimizer_step()
@@ -2406,8 +2553,12 @@ class CIDTrainer:
         saved_config.setdefault("semantic_pooling", "mean-v1")
         saved_config.setdefault("lr_schedule", "cosine")
         saved_config.setdefault("lr_decay_start_steps", 0)
+        saved_config.setdefault("rollout_display_repetition_score_multiplier", 1.0)
         current_config = asdict(self.config)
         saved_config["gradient_accumulation_steps"] = current_config["gradient_accumulation_steps"]
+        saved_config["rollout_display_repetition_score_multiplier"] = current_config[
+            "rollout_display_repetition_score_multiplier"
+        ]
         if saved_config != current_config:
             raise ValueError("checkpoint trainer configuration does not match this trainer")
         trainer_state = state["trainer_state"]
@@ -2447,6 +2598,7 @@ class CIDTrainer:
         payload = {
             "format_version": self.CHECKPOINT_VERSION,
             "neural_contract_version": CID_NEURAL_CONTRACT_VERSION,
+            "supervision_contract_version": CID_SUPERVISION_CONTRACT_VERSION,
             "trainer_config": asdict(self.config),
             "trainer_state": asdict(self.state),
             "adapter_config": asdict(self.adapter.config),
@@ -2455,11 +2607,17 @@ class CIDTrainer:
                 "hidden_size": self.adapter.d_model,
                 "vocab_size": self.adapter.vocab_size,
                 "mask_token_id": self.adapter.mask_token_id,
+                "identity": getattr(self.adapter, "_cid_backbone_identity", None),
             },
             "trainable_names": self.trainable_parameter_names,
             "model_state": trainable_state,
             "optimizer_state": (
                 self.optimizer.state_dict() if include_optimizer_state else None
+            ),
+            "optimizer_parameter_names": (
+                _optimizer_parameter_names(self.optimizer, self._trainable)
+                if include_optimizer_state
+                else None
             ),
             "generator_state": self.generator.get_state().cpu(),
             "shuffle_state": self.shuffle_rng.getstate(),
@@ -2474,6 +2632,7 @@ class CIDTrainer:
             ),
             "data_order_version": self.data_order_version,
             "dataset_sha256": dataset_sha256,
+            "tokenizer_identity": tokenizer_source_identity(self.tensorizer.tokenizer),
         }
         if epoch_progress is not None:
             payload["epoch_progress"] = dict(epoch_progress)
@@ -2510,6 +2669,11 @@ class CIDTrainer:
             raise ValueError("unsupported CID trainer checkpoint version")
         if checkpoint.get("neural_contract_version") != CID_NEURAL_CONTRACT_VERSION:
             raise ValueError("CID trainer checkpoint neural contract is incompatible")
+        if checkpoint.get("supervision_contract_version") != CID_SUPERVISION_CONTRACT_VERSION:
+            raise ValueError(
+                "CID training checkpoint uses incompatible Need/Display supervision; "
+                "start a fresh Stage A/B run instead of resuming old optimizer state"
+            )
         if (
             expected_dataset_sha256 is not None
             and checkpoint.get("dataset_sha256") != expected_dataset_sha256
@@ -2546,6 +2710,7 @@ class CIDTrainer:
                 )
         saved_trainer_config = dict(checkpoint["trainer_config"])
         saved_trainer_config.setdefault("semantic_pooling", "mean-v1")
+        saved_trainer_config.setdefault("rollout_display_repetition_score_multiplier", 1.0)
         current_trainer_config = asdict(self.config)
         world_size_changed = (
             saved_world_size is not None and int(saved_world_size) != current_world_size
@@ -2570,6 +2735,13 @@ class CIDTrainer:
                 and int(checkpoint.get("pending_examples", 0)) == 0
                 and int(checkpoint.get("pending_global_examples", 0)) == 0
             )
+            if clean_epoch_boundary:
+                saved_without_geometry.pop(
+                    "rollout_display_repetition_score_multiplier", None
+                )
+                current_without_geometry.pop(
+                    "rollout_display_repetition_score_multiplier", None
+                )
             if saved_world_size is None:
                 # Legacy epoch-boundary checkpoints predate world-size metadata. Preserve their
                 # historical local-geometry compatibility rule; partial-epoch legacy checkpoints
@@ -2600,8 +2772,16 @@ class CIDTrainer:
             or str(backbone["model_type"]) != str(self.adapter.backbone.config.model_type)
             or int(backbone.get("mask_token_id", self.adapter.mask_token_id))
             != self.adapter.mask_token_id
+            or not backbone_identity_matches(
+                self.adapter,
+                backbone.get("identity"),
+            )
         ):
             raise ValueError("checkpoint backbone geometry does not match this adapter")
+        _validate_tokenizer_identity(
+            checkpoint.get("tokenizer_identity"),
+            self.tensorizer.tokenizer,
+        )
 
         saved_state = checkpoint["model_state"]
         with torch.no_grad():
@@ -2611,7 +2791,17 @@ class CIDTrainer:
                 )
         optimizer_state = checkpoint.get("optimizer_state")
         if optimizer_state is not None:
-            self.optimizer.load_state_dict(optimizer_state)
+            saved_optimizer_names = checkpoint.get("optimizer_parameter_names")
+            load_optimizer_state_by_parameter_name(
+                self.optimizer,
+                optimizer_state,
+                self._trainable,
+                saved_parameter_names=(
+                    tuple(tuple(str(name) for name in group) for group in saved_optimizer_names)
+                    if saved_optimizer_names is not None
+                    else None
+                ),
+            )
         semantic_snapshot = checkpoint.get("semantic_embedding_snapshot")
         if semantic_snapshot is not None:
             current_encoder = self.tensorizer.text_encoder
@@ -2704,9 +2894,134 @@ class CIDTrainer:
             "epoch_progress": checkpoint.get("epoch_progress"),
         }
 
+    def _stable_gradient_l2_norm(
+        self,
+        named_parameters: tuple[tuple[str, torch.nn.Parameter], ...],
+    ) -> tuple[float, list[tuple[float, str]]]:
+        """Compute an overflow-resistant L2 norm for finite gradients."""
+
+        total_norm = 0.0
+        maxima: list[tuple[float, str]] = []
+        for name, parameter in named_parameters:
+            gradient = parameter.grad
+            if gradient is None:
+                continue
+            max_abs = float(gradient.detach().abs().max().float().cpu())
+            maxima.append((max_abs, name))
+            if max_abs == 0.0:
+                continue
+            normalized = gradient.detach().to(dtype=torch.float32, copy=True)
+            normalized.div_(max_abs)
+            normalized_norm = float(torch.linalg.vector_norm(normalized).cpu())
+            del normalized
+            total_norm = math.hypot(total_norm, max_abs * normalized_norm)
+        maxima.sort(reverse=True)
+        return total_norm, maxima
+
+    def _gradient_failure_diagnostics(
+        self,
+        named_parameters: tuple[tuple[str, torch.nn.Parameter], ...],
+    ) -> tuple[bool, tuple[str, ...]]:
+        finite_checks: list[Tensor] = []
+        finite_names: list[str] = []
+        for name, parameter in named_parameters:
+            if parameter.grad is None:
+                continue
+            finite_checks.append(torch.isfinite(parameter.grad.detach()).all())
+            finite_names.append(name)
+        if not finite_checks:
+            return True, ()
+        finite_values = torch.stack(finite_checks).detach().cpu().tolist()
+        offending = tuple(
+            name
+            for name, finite in zip(finite_names, finite_values, strict=True)
+            if not finite
+        )
+        return not offending, offending
+
+    def _emit_gradient_diagnostic(
+        self,
+        *,
+        reported_gradient_norm: float,
+        elementwise_finite: bool,
+        offending_parameters: tuple[str, ...],
+        stable_gradient_norm: float | None = None,
+        largest_gradient_maxima: list[tuple[float, str]] | None = None,
+        recovered: bool = False,
+        stage: str = "post_sync",
+    ) -> None:
+        if not self._gradient_diagnostics_enabled and not recovered:
+            return
+        rank = (
+            torch.distributed.get_rank()
+            if torch.distributed.is_available() and torch.distributed.is_initialized()
+            else 0
+        )
+        payload = {
+            "rank": rank,
+            "stage": stage,
+            "next_optimizer_step": self.state.optimizer_steps + 1,
+            "reported_gradient_norm": reported_gradient_norm,
+            "elementwise_finite": elementwise_finite,
+            "offending_parameters": list(offending_parameters[:16]),
+            "stable_gradient_norm": stable_gradient_norm,
+            "largest_gradient_maxima": [
+                {"parameter": name, "max_abs": value}
+                for value, name in (largest_gradient_maxima or [])[:12]
+            ],
+            "example_ids": list(self._pending_gradient_example_ids),
+            "recovered": recovered,
+        }
+        print(
+            "CID_GRADIENT_DIAGNOSTIC " + json.dumps(payload, sort_keys=True),
+            flush=True,
+        )
+
     def _optimizer_step(self) -> None:
         if self._stage_a_stash_has_data():
             self._restore_stage_a_gradients_from_cpu()
+        if self._pending_ddp_unsynced and self._gradient_diagnostics_enabled:
+            pre_sync_named_parameters = tuple(
+                (name, parameter)
+                for name, parameter in self._trainable
+                if parameter.grad is not None
+            )
+            (
+                local_pre_sync_finite,
+                pre_sync_offending_parameters,
+            ) = self._gradient_failure_diagnostics(pre_sync_named_parameters)
+            pre_sync_flag = torch.tensor(
+                int(local_pre_sync_finite),
+                device=self.tensorizer.text_encoder.device,
+                dtype=torch.int32,
+            )
+            if torch.distributed.is_available() and torch.distributed.is_initialized():
+                torch.distributed.all_reduce(
+                    pre_sync_flag,
+                    op=torch.distributed.ReduceOp.SUM,
+                )
+                global_pre_sync_finite = (
+                    int(pre_sync_flag.item()) == torch.distributed.get_world_size()
+                )
+            else:
+                global_pre_sync_finite = local_pre_sync_finite
+            if not global_pre_sync_finite:
+                self._emit_gradient_diagnostic(
+                    reported_gradient_norm=float("nan"),
+                    elementwise_finite=local_pre_sync_finite,
+                    offending_parameters=pre_sync_offending_parameters,
+                    stage="pre_sync",
+                )
+                self.optimizer.zero_grad(set_to_none=True)
+                self._pending_accumulation = 0
+                self._pending_examples = 0
+                self._pending_global_examples = 0
+                self._pending_ddp_unsynced = False
+                self._pending_fsdp_unsynced = False
+                self._pending_gradient_example_ids.clear()
+                raise FloatingPointError(
+                    "non-finite CID gradient detected before Stage A gradient synchronization"
+                )
         if self._pending_ddp_unsynced:
             self._sync_pending_stage_a_ddp_gradients()
         if self._pending_fsdp_unsynced:
@@ -2721,19 +3036,84 @@ class CIDTrainer:
         for _, parameter in self._trainable:
             if parameter.grad is not None:
                 parameter.grad.div_(normalizer)
+
+        named_parameters = tuple(
+            (name, parameter)
+            for name, parameter in self._trainable
+            if parameter.grad is not None
+        )
+        parameters = tuple(parameter for _, parameter in named_parameters)
+        recovered_norm_overflow = False
+        local_elementwise_finite = True
+        offending_parameters: tuple[str, ...] = ()
+        stable_gradient_norm: float | None = None
+        largest_gradient_maxima: list[tuple[float, str]] | None = None
+
         if self.gradient_clipper is None:
-            gradient_norm = torch.nn.utils.clip_grad_norm_(
-                (parameter for _, parameter in self._trainable),
-                self.config.max_grad_norm,
-            )
+            gradients = tuple(parameter.grad for parameter in parameters)
+            gradient_norm = torch.nn.utils.get_total_norm(gradients)
+            local_norm_finite = bool(torch.isfinite(gradient_norm.detach()).all())
+            if local_norm_finite:
+                torch.nn.utils.clip_grads_with_norm_(
+                    parameters,
+                    self.config.max_grad_norm,
+                    gradient_norm,
+                )
+            else:
+                (
+                    local_elementwise_finite,
+                    offending_parameters,
+                ) = self._gradient_failure_diagnostics(named_parameters)
+                if local_elementwise_finite:
+                    (
+                        stable_gradient_norm,
+                        largest_gradient_maxima,
+                    ) = self._stable_gradient_l2_norm(named_parameters)
+                    if (
+                        math.isfinite(stable_gradient_norm)
+                        and stable_gradient_norm <= torch.finfo(torch.float32).max
+                    ):
+                        gradient_norm = torch.tensor(
+                            stable_gradient_norm,
+                            device=self.tensorizer.text_encoder.device,
+                            dtype=torch.float32,
+                        )
+                        torch.nn.utils.clip_grads_with_norm_(
+                            parameters,
+                            self.config.max_grad_norm,
+                            gradient_norm,
+                        )
+                        local_norm_finite = True
+                        recovered_norm_overflow = True
         else:
             gradient_norm = self.gradient_clipper(self.config.max_grad_norm)
+            local_norm_finite = (
+                bool(torch.isfinite(gradient_norm.detach()).all())
+                if isinstance(gradient_norm, Tensor)
+                else math.isfinite(float(gradient_norm))
+            )
+            if not local_norm_finite:
+                (
+                    local_elementwise_finite,
+                    offending_parameters,
+                ) = self._gradient_failure_diagnostics(named_parameters)
+
         if isinstance(gradient_norm, Tensor):
-            finite_gradient_norm = bool(torch.isfinite(gradient_norm.detach()).all())
             reported_gradient_norm = float(gradient_norm.detach().float().cpu())
         else:
             reported_gradient_norm = float(gradient_norm)
-            finite_gradient_norm = math.isfinite(reported_gradient_norm)
+
+        if recovered_norm_overflow:
+            self._emit_gradient_diagnostic(
+                reported_gradient_norm=reported_gradient_norm,
+                elementwise_finite=True,
+                offending_parameters=(),
+                stable_gradient_norm=stable_gradient_norm,
+                largest_gradient_maxima=largest_gradient_maxima,
+                recovered=True,
+            )
+
+        finite_gradient_norm = local_norm_finite
         if torch.distributed.is_available() and torch.distributed.is_initialized():
             finite_flag = torch.tensor(
                 int(finite_gradient_norm),
@@ -2743,12 +3123,20 @@ class CIDTrainer:
             torch.distributed.all_reduce(finite_flag, op=torch.distributed.ReduceOp.SUM)
             finite_gradient_norm = int(finite_flag.item()) == torch.distributed.get_world_size()
         if not finite_gradient_norm:
+            self._emit_gradient_diagnostic(
+                reported_gradient_norm=reported_gradient_norm,
+                elementwise_finite=local_elementwise_finite,
+                offending_parameters=offending_parameters,
+                stable_gradient_norm=stable_gradient_norm,
+                largest_gradient_maxima=largest_gradient_maxima,
+            )
             self.optimizer.zero_grad(set_to_none=True)
             self._pending_accumulation = 0
             self._pending_examples = 0
             self._pending_global_examples = 0
             self._pending_ddp_unsynced = False
             self._pending_fsdp_unsynced = False
+            self._pending_gradient_example_ids.clear()
             raise FloatingPointError(
                 "non-finite CID gradient norm on at least one rank before optimizer step; "
                 f"local_norm={reported_gradient_norm}"
@@ -2761,6 +3149,7 @@ class CIDTrainer:
         self._pending_ddp_unsynced = False
         self._pending_fsdp_unsynced = False
         self._stage_a_manual_sync_required = False
+        self._pending_gradient_example_ids.clear()
         self.state = CIDTrainerState(
             transitions_seen=self.state.transitions_seen,
             optimizer_steps=self.state.optimizer_steps + 1,
@@ -3039,15 +3428,25 @@ def load_cid_adapter_checkpoint(
     adapter: ILLaDACIDAdapter,
     path: str | Path,
     *,
+    tokenizer: Any | None = None,
     expected_semantic_pooling: str | None = None,
+    require_current_supervision: bool = False,
 ) -> CIDTrainerState:
-    """Load the CID model state from a trainer checkpoint without restoring an optimizer."""
+    """Load neural weights for inference, optionally enforcing training supervision."""
 
     checkpoint = torch.load(path, map_location="cpu", weights_only=False)
     if checkpoint.get("format_version") not in CIDTrainer.SUPPORTED_CHECKPOINT_VERSIONS:
         raise ValueError("unsupported CID trainer checkpoint version")
     if checkpoint.get("neural_contract_version") != CID_NEURAL_CONTRACT_VERSION:
         raise ValueError("CID trainer checkpoint neural contract is incompatible")
+    if (
+        require_current_supervision
+        and checkpoint.get("supervision_contract_version") != CID_SUPERVISION_CONTRACT_VERSION
+    ):
+        raise ValueError(
+            "Stage B cannot fine-tune a checkpoint trained with incompatible "
+            "Need/Display supervision; start from a corrected Stage A checkpoint"
+        )
     saved_trainer_config = dict(checkpoint.get("trainer_config", {}))
     saved_pooling = str(saved_trainer_config.get("semantic_pooling", "mean-v1"))
     if expected_semantic_pooling is not None and saved_pooling != expected_semantic_pooling:
@@ -3061,8 +3460,10 @@ def load_cid_adapter_checkpoint(
         or int(backbone["vocab_size"]) != adapter.vocab_size
         or str(backbone["model_type"]) != str(adapter.backbone.config.model_type)
         or int(backbone.get("mask_token_id", adapter.mask_token_id)) != adapter.mask_token_id
+        or not backbone_identity_matches(adapter, backbone.get("identity"))
     ):
         raise ValueError("checkpoint backbone geometry does not match this adapter")
+    _validate_tokenizer_identity(checkpoint.get("tokenizer_identity"), tokenizer)
     if checkpoint["adapter_config"] != asdict(adapter.config):
         raise ValueError("checkpoint CID adapter configuration does not match this adapter")
 
@@ -3305,17 +3706,16 @@ class ILLaDATrajectoryTensorizer:
             input_retired_at = rollout_state.retired_at
 
         timestep_tensor = torch.tensor([timestep], device=device)
-        thought_timesteps = (
-            timestep_tensor
-            if rollout_state is None
-            else rollout_state.local_noise.to(device=device, dtype=torch.float32).squeeze(-1)
-        )
+        # Thought corruption must match the state carried by the runtime. The sampled
+        # training timestep remains a Display augmentation only; replacing low-noise
+        # TCT state with an unrelated uniform high-noise timestep destroys semantic SNR.
+        thought_timesteps = state_noise.to(device=device, dtype=torch.float32).squeeze(-1)
         thought_corruption = self.scheduler.corrupt_thought(
             thought_semantic,
             thought_timesteps,
             occupancy,
+            noise_scale=self.text_encoder.semantic_noise_scale,
             generator=generator,
-            _timesteps_validated=rollout_state is None,
         )
         target_control = self._training_target_control_snapshot(
             occupancy,
@@ -3502,6 +3902,23 @@ class ILLaDATrajectoryTensorizer:
                 device=device,
                 dtype=dtype,
             )
+
+        # The dataset's <|cid_unknown|> means an unresolved Display position,
+        # and is encoded using the same [MASK] ID as diffusion corruption.
+        # [MASK] is an *input placeholder*, not a valid completed output token:
+        # supervising it as a correct CE class teaches the model to keep the
+        # canvas unresolved (and produces empty text after decoding). This can
+        # occur on ordinary teacher-forced unchanged-unknown transitions as
+        # well as partially-known answer drafts.
+        display_labels[display_labels == self.adapter.mask_token_id] = -100
+        if target_display == DISPLAY_UNKNOWN_MARKER:
+            # The trailing EOS in the transport encoding of a wholly unknown
+            # answer is only a physical canvas sentinel. It does not certify
+            # that a finished answer exists. Rewarding it teaches the model
+            # to close the Display immediately after an unresolved [MASK].
+            # Readiness/waiting must be supervised by cognitive/need state,
+            # not by positive output-token or EOS labels here.
+            display_labels.fill_(-100)
 
         rollout_routes = (
             {}
@@ -5992,6 +6409,160 @@ def stage_b_optimizer_steps_per_epoch(
     return optimizer_steps
 
 
+_CID_ADAMW_NO_DECAY_PARAMETER_NAMES = frozenset(
+    {
+        "need_display_query_scale",
+        "need_display_query_bias",
+    }
+)
+
+
+def _adamw_uses_weight_decay(name: str, parameter: torch.nn.Parameter) -> bool:
+    """Return whether an AdamW parameter should receive decoupled weight decay."""
+    if parameter.ndim < 2:
+        return False
+    return name.rsplit(".", 1)[-1] not in _CID_ADAMW_NO_DECAY_PARAMETER_NAMES
+
+
+def _optimizer_parameter_names(
+    optimizer: torch.optim.Optimizer,
+    named_parameters: tuple[tuple[str, torch.nn.Parameter], ...],
+) -> tuple[tuple[str, ...], ...]:
+    name_by_id = {id(parameter): name for name, parameter in named_parameters}
+    groups: list[tuple[str, ...]] = []
+    for group in optimizer.param_groups:
+        try:
+            groups.append(tuple(name_by_id[id(parameter)] for parameter in group["params"]))
+        except KeyError as exc:
+            raise ValueError("optimizer contains a parameter outside the supplied model") from exc
+    return tuple(groups)
+
+
+def _legacy_stage_a_optimizer_parameter_names(
+    optimizer_state: Mapping[str, Any],
+    named_parameters: tuple[tuple[str, torch.nn.Parameter], ...],
+) -> tuple[tuple[str, ...], ...] | None:
+    """Infer pre-no-decay-fix Stage A group membership from the historical ndim rule."""
+    buckets: dict[str, list[str]] = {"cid-decay": [], "cid-no-decay": []}
+    for name, parameter in named_parameters:
+        if not parameter.requires_grad:
+            continue
+        key = "cid-decay" if parameter.ndim >= 2 else "cid-no-decay"
+        buckets[key].append(name)
+
+    inferred: list[tuple[str, ...]] = []
+    for group in optimizer_state.get("param_groups", ()):
+        group_name = str(group.get("group_name", ""))
+        if group_name not in buckets:
+            return None
+        names = tuple(buckets[group_name])
+        if len(names) != len(group.get("params", ())):
+            return None
+        inferred.append(names)
+    return tuple(inferred)
+
+
+def load_optimizer_state_by_parameter_name(
+    optimizer: torch.optim.Optimizer,
+    optimizer_state: Mapping[str, Any],
+    named_parameters: tuple[tuple[str, torch.nn.Parameter], ...],
+    *,
+    saved_parameter_names: tuple[tuple[str, ...], ...] | None = None,
+) -> None:
+    """Load optimizer state across parameter-group membership changes without losing moments."""
+    saved_groups = tuple(optimizer_state.get("param_groups", ()))
+    if saved_parameter_names is None:
+        saved_parameter_names = _legacy_stage_a_optimizer_parameter_names(
+            optimizer_state, named_parameters
+        )
+    if saved_parameter_names is None or len(saved_parameter_names) != len(saved_groups):
+        optimizer.load_state_dict(dict(optimizer_state))
+        return
+
+    saved_state_by_name: dict[str, Any] = {}
+    for group, names in zip(saved_groups, saved_parameter_names, strict=True):
+        saved_ids = tuple(group.get("params", ()))
+        if len(saved_ids) != len(names):
+            optimizer.load_state_dict(dict(optimizer_state))
+            return
+        for saved_id, name in zip(saved_ids, names, strict=True):
+            state = optimizer_state.get("state", {}).get(saved_id)
+            if state is not None:
+                saved_state_by_name[name] = state
+
+    current_names = _optimizer_parameter_names(optimizer, named_parameters)
+    template = optimizer.state_dict()
+    template_groups = tuple(template["param_groups"])
+    if len(current_names) != len(template_groups):
+        raise ValueError("optimizer parameter-name layout does not match its state dict")
+
+    saved_group_by_name = {
+        str(group.get("group_name", index)): group
+        for index, group in enumerate(saved_groups)
+    }
+    migrated_state: dict[Any, Any] = {}
+    migrated_groups: list[dict[str, Any]] = []
+    for index, (actual_group, template_group, names) in enumerate(
+        zip(optimizer.param_groups, template_groups, current_names, strict=True)
+    ):
+        group_name = str(actual_group.get("group_name", index))
+        saved_group = saved_group_by_name.get(group_name)
+        if saved_group is None:
+            optimizer.load_state_dict(dict(optimizer_state))
+            return
+        current_ids = tuple(template_group["params"])
+        if len(current_ids) != len(names):
+            raise ValueError("optimizer parameter-name layout changed during migration")
+        for current_id, name in zip(current_ids, names, strict=True):
+            state = saved_state_by_name.get(name)
+            if state is not None:
+                migrated_state[current_id] = state
+
+        migrated_group = dict(saved_group)
+        migrated_group["params"] = list(current_ids)
+        migrated_group["weight_decay"] = float(actual_group.get("weight_decay", 0.0))
+        migrated_group["group_name"] = group_name
+        if "lr_scale" in actual_group:
+            migrated_group["lr_scale"] = actual_group["lr_scale"]
+        migrated_groups.append(migrated_group)
+
+    optimizer.load_state_dict(
+        {
+            "state": migrated_state,
+            "param_groups": migrated_groups,
+        }
+    )
+
+
+def stage_a_adamw_parameter_groups(
+    adapter: ILLaDACIDAdapter,
+    *,
+    weight_decay: float = 0.01,
+) -> list[dict[str, object]]:
+    """Build Stage A AdamW groups without decaying biases or one-dimensional controls."""
+    if not math.isfinite(weight_decay) or weight_decay < 0.0:
+        raise ValueError("weight_decay must be finite and non-negative")
+    buckets: dict[bool, list[torch.nn.Parameter]] = {True: [], False: []}
+    for name, parameter in adapter.named_parameters():
+        if parameter.requires_grad:
+            buckets[_adamw_uses_weight_decay(name, parameter)].append(parameter)
+    groups: list[dict[str, object]] = []
+    for use_decay in (True, False):
+        parameters = buckets[use_decay]
+        if not parameters:
+            continue
+        groups.append(
+            {
+                "params": parameters,
+                "weight_decay": weight_decay if use_decay else 0.0,
+                "group_name": "cid-decay" if use_decay else "cid-no-decay",
+            }
+        )
+    if not groups:
+        raise ValueError("Stage A AdamW requires trainable parameters")
+    return groups
+
+
 def stage_b_adamw_parameter_groups(
     adapter: ILLaDACIDAdapter,
     *,
@@ -6035,7 +6606,7 @@ def stage_b_adamw_parameter_groups(
             family = "backbone"
         else:
             family = "cid"
-        use_decay = parameter.ndim >= 2
+        use_decay = _adamw_uses_weight_decay(name, parameter)
         buckets.setdefault((family, use_decay), []).append(parameter)
 
     groups: list[dict[str, object]] = []
@@ -6335,6 +6906,7 @@ def save_stage_b_checkpoint(
         metadata = {
             "format_version": 6,
             "neural_contract_version": CID_NEURAL_CONTRACT_VERSION,
+            "supervision_contract_version": CID_SUPERVISION_CONTRACT_VERSION,
             "kind": "cid-stage-b-fsdp",
             "model_state_layout": "fsdp-sharded-dcp",
             "optimizer_state_layout": (
@@ -6342,6 +6914,7 @@ def save_stage_b_checkpoint(
             ),
             "world_size": dist.get_world_size(),
             "dataset_sha256": dataset_sha256,
+            "tokenizer_identity": tokenizer_source_identity(trainer.tensorizer.tokenizer),
             "semantic_pooling": getattr(trainer.config, "semantic_pooling", "mean-v1"),
             "semantic_embedding_snapshot": _semantic_snapshot_metadata(semantic_snapshot),
             "adapter_config": asdict(trainer.adapter.config),
@@ -6350,6 +6923,7 @@ def save_stage_b_checkpoint(
                 "hidden_size": trainer.adapter.d_model,
                 "vocab_size": trainer.adapter.vocab_size,
                 "mask_token_id": trainer.adapter.mask_token_id,
+                "identity": getattr(trainer.adapter, "_cid_backbone_identity", None),
             },
         }
         if epoch_progress is not None:
@@ -6381,6 +6955,11 @@ def load_stage_b_checkpoint(
         raise ValueError("unsupported Stage B checkpoint format")
     if metadata.get("neural_contract_version") != CID_NEURAL_CONTRACT_VERSION:
         raise ValueError("Stage B checkpoint neural contract is incompatible")
+    if metadata.get("supervision_contract_version") != CID_SUPERVISION_CONTRACT_VERSION:
+        raise ValueError(
+            "Stage B resume requires a checkpoint with current Need/Display "
+            "supervision; old optimizer states must not be mixed with corrected training"
+        )
     if metadata.get("model_state_layout") != "fsdp-sharded-dcp":
         raise ValueError("unsupported Stage B checkpoint state layout")
     saved_world_size = int(metadata["world_size"])
@@ -6410,8 +6989,16 @@ def load_stage_b_checkpoint(
         or str(backbone["model_type"]) != str(trainer.adapter.backbone.config.model_type)
         or int(backbone.get("mask_token_id", trainer.adapter.mask_token_id))
         != trainer.adapter.mask_token_id
+        or not backbone_identity_matches(
+            trainer.adapter,
+            backbone.get("identity"),
+        )
     ):
         raise ValueError("Stage B checkpoint backbone geometry does not match")
+    _validate_tokenizer_identity(
+        metadata.get("tokenizer_identity"),
+        trainer.tensorizer.tokenizer,
+    )
 
     with _stage_b_sharded_state_dict_context(model):
         model_state = model.state_dict()
@@ -6507,9 +7094,12 @@ def load_stage_b_model_checkpoint(
         int(backbone["hidden_size"]) != adapter.d_model
         or int(backbone["vocab_size"]) != adapter.vocab_size
         or str(backbone["model_type"]) != str(adapter.backbone.config.model_type)
-        or int(backbone.get("mask_token_id", adapter.mask_token_id)) != adapter.mask_token_id
+        or int(backbone.get("mask_token_id", adapter.mask_token_id))
+        != adapter.mask_token_id
+        or not backbone_identity_matches(adapter, backbone.get("identity"))
     ):
         raise ValueError("Stage B checkpoint backbone geometry does not match")
+    _validate_tokenizer_identity(metadata.get("tokenizer_identity"), tokenizer)
 
     semantic_encoder = None
     if version == 6:

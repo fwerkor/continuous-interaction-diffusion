@@ -414,7 +414,10 @@ def _masked_cosine_loss(
     *,
     batch_mask: Tensor | None = None,
 ) -> Tensor:
-    cosine = F.cosine_similarity(query, target, dim=-1)
+    # Zero or initially untrained grounding queries must not create enormous
+    # gradients through cosine normalization. Nonzero token embeddings and
+    # ordinary query vectors have norms far above this floor.
+    cosine = F.cosine_similarity(query, target, dim=-1, eps=1e-3)
     return _masked_element_mean(
         1.0 - cosine,
         mask,

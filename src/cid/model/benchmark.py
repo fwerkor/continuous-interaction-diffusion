@@ -6,7 +6,11 @@ from typing import Any
 import torch
 
 from cid.data import TrajectoryExample
-from cid.defaults import DEFAULT_DISPLAY_REVISION_FRACTION, DEFAULT_DISPLAY_REVISION_MARGIN
+from cid.defaults import (
+    DEFAULT_DISPLAY_REPETITION_SCORE_MULTIPLIER,
+    DEFAULT_DISPLAY_REVISION_FRACTION,
+    DEFAULT_DISPLAY_REVISION_MARGIN,
+)
 from cid.evaluation import (
     ReplayEvaluationResult,
     RuntimeTaskEvaluation,
@@ -42,6 +46,8 @@ class NeuralBenchmarkCaseResult:
     evaluation: RuntimeTaskEvaluation
     strict_exact_display: bool | None
     trace_events: tuple[dict[str, Any], ...]
+    semantic_rms_exceedances: int = 0
+    peak_semantic_rms: float | None = None
 
     def to_dict(self) -> dict[str, Any]:
         return {
@@ -52,6 +58,8 @@ class NeuralBenchmarkCaseResult:
             "evaluation": asdict(self.evaluation),
             "strict_exact_display": self.strict_exact_display,
             "trace_events": list(self.trace_events),
+            "semantic_rms_exceedances": self.semantic_rms_exceedances,
+            "peak_semantic_rms": self.peak_semantic_rms,
         }
 
 
@@ -67,6 +75,7 @@ async def run_neural_benchmark_case(
     display_canvas_tokens: int | None = None,
     display_revision_fraction: float = DEFAULT_DISPLAY_REVISION_FRACTION,
     display_revision_margin: float = DEFAULT_DISPLAY_REVISION_MARGIN,
+    display_repetition_score_multiplier: float = DEFAULT_DISPLAY_REPETITION_SCORE_MULTIPLIER,
     materializer_config: CIDMaterializerConfig | None = None,
     runtime_config: RuntimeConfig | None = None,
     max_steps: int | None = None,
@@ -87,6 +96,7 @@ async def run_neural_benchmark_case(
             denoising_steps=denoising_steps,
             display_revision_fraction=display_revision_fraction,
             display_revision_margin=display_revision_margin,
+            display_repetition_score_multiplier=display_repetition_score_multiplier,
             seed=seed,
         ),
         forward_model=forward_model,
@@ -139,6 +149,8 @@ async def run_neural_benchmark_case(
         evaluation=evaluation,
         strict_exact_display=strict_exact_display,
         trace_events=_decode_display_trace_events(replay.runtime.trace.to_dicts(), tokenizer),
+        semantic_rms_exceedances=policy.semantic_rms_exceedances,
+        peak_semantic_rms=policy.peak_semantic_rms,
     )
 
 

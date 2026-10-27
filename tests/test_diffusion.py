@@ -61,6 +61,30 @@ def test_thought_corruption_preserves_empty_slots() -> None:
     assert corruption.noise[0, 1, 0] == 0.0
 
 
+def test_thought_corruption_scales_gaussian_to_semantic_space() -> None:
+    scheduler = CIDDiffusionScheduler(mask_token_id=5)
+    semantic = torch.zeros(1, 2, 128)
+    occupancy = torch.ones(1, 2, 1)
+
+    unscaled = scheduler.corrupt_thought(
+        semantic,
+        torch.tensor([1.0]),
+        occupancy,
+        noise_scale=1.0,
+        generator=torch.Generator().manual_seed(23),
+    )
+    scaled = scheduler.corrupt_thought(
+        semantic,
+        torch.tensor([1.0]),
+        occupancy,
+        noise_scale=0.02,
+        generator=torch.Generator().manual_seed(23),
+    )
+
+    assert torch.allclose(scaled.epsilon, unscaled.epsilon * 0.02)
+    assert torch.allclose(scaled.semantic, unscaled.semantic * 0.02)
+
+
 def test_thought_corruption_supports_per_slot_diffusion_levels() -> None:
     scheduler = CIDDiffusionScheduler(mask_token_id=5)
     semantic = torch.ones(1, 3, 4)
@@ -167,6 +191,7 @@ def test_chunked_display_refinement_matches_full_softmax_reference() -> None:
         reveal_fraction=0.5,
         revision_fraction=0.25,
         revision_margin=0.05,
+        repetition_score_multiplier=1.0,
     )
 
     assert torch.equal(actual, expected)
@@ -190,6 +215,101 @@ def test_display_prediction_is_not_changed_by_softmax_rounding() -> None:
     assert revealed.tolist() == [[1]]
 
 
+def test_display_repetition_score_multiplier_demotes_consecutive_repeat() -> None:
+    scheduler = CIDDiffusionScheduler(mask_token_id=5)
+    tokens = torch.tensor([[7, 7, 5]])
+    logits = torch.zeros(1, 3, 16)
+    logits[0, 0, 7] = 20.0
+    logits[0, 1, 7] = 20.0
+    logits[0, 2, 7] = 4.0
+    logits[0, 2, 8] = 3.0
+
+    baseline = scheduler.refine_display(
+        tokens,
+        logits,
+        reveal_fraction=1.0,
+        revision_fraction=0.0,
+        revision_margin=0.0,
+        repetition_score_multiplier=1.0,
+    )
+    suppressed = scheduler.refine_display(
+        tokens,
+        logits,
+        reveal_fraction=1.0,
+        revision_fraction=0.0,
+        revision_margin=0.0,
+        repetition_score_multiplier=0.5,
+    )
+
+    assert baseline.tolist() == [[7, 7, 7]]
+    # The third 7 would extend a run of length two, so its score is multiplied
+    # by 0.5**2 and token 8 wins instead.
+    assert suppressed.tolist() == [[7, 7, 8]]
+
+
+def test_display_repetition_score_multiplier_can_break_existing_run() -> None:
+    scheduler = CIDDiffusionScheduler(mask_token_id=5)
+    tokens = torch.tensor([[7, 7, 7]])
+    logits = torch.zeros(1, 3, 16)
+    logits[0, 0, 7] = 20.0
+    logits[0, 1, 7] = 20.0
+    logits[0, 2, 7] = 4.0
+    logits[0, 2, 8] = 3.0
+
+    refined = scheduler.refine_display(
+        tokens,
+        logits,
+        reveal_fraction=1.0,
+        revision_fraction=1.0,
+        revision_margin=0.0,
+        repetition_score_multiplier=0.5,
+    )
+
+    assert refined.tolist() == [[7, 7, 8]]
+
+
+def test_display_repetition_score_multiplier_penalizes_right_side_run() -> None:
+    scheduler = CIDDiffusionScheduler(mask_token_id=5)
+    tokens = torch.tensor([[7, 7, 7]])
+    logits = torch.zeros(1, 3, 16)
+    logits[0, 0, 7] = 4.0
+    logits[0, 0, 8] = 3.0
+    logits[0, 1, 7] = 20.0
+    logits[0, 2, 7] = 20.0
+
+    refined = scheduler.refine_display(
+        tokens,
+        logits,
+        reveal_fraction=1.0,
+        revision_fraction=1.0,
+        revision_margin=0.0,
+        repetition_score_multiplier=0.5,
+    )
+
+    assert refined.tolist() == [[8, 7, 7]]
+
+
+def test_display_repetition_score_multiplier_ignores_nonlocal_history() -> None:
+    scheduler = CIDDiffusionScheduler(mask_token_id=5)
+    tokens = torch.tensor([[7, 8, 5]])
+    logits = torch.zeros(1, 3, 16)
+    logits[0, 0, 7] = 20.0
+    logits[0, 1, 8] = 20.0
+    logits[0, 2, 7] = 4.0
+    logits[0, 2, 9] = 3.0
+
+    refined = scheduler.refine_display(
+        tokens,
+        logits,
+        reveal_fraction=1.0,
+        revision_fraction=0.0,
+        revision_margin=0.0,
+        repetition_score_multiplier=0.5,
+    )
+
+    assert refined.tolist() == [[7, 8, 7]]
+
+
 def test_display_refinement_uses_position_stable_tie_breaking() -> None:
     scheduler = CIDDiffusionScheduler(mask_token_id=5)
     tokens = torch.tensor([[5, 5, 5, 8]])
@@ -201,6 +321,7 @@ def test_display_refinement_uses_position_stable_tie_breaking() -> None:
         reveal_fraction=0.5,
         revision_fraction=0.0,
         revision_margin=0.0,
+        repetition_score_multiplier=1.0,
     )
 
     assert revealed.tolist() == [[0, 0, 5, 8]]

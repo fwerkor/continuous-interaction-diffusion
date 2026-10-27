@@ -29,10 +29,29 @@ class TinyLFMConfig:
     eos_token_id = 7
 
 
+class TinyLFMMLP(nn.Module):
+    def __init__(self, hidden_size: int) -> None:
+        super().__init__()
+        intermediate_size = hidden_size * 2
+        self.w1 = nn.Linear(hidden_size, intermediate_size, bias=False)
+        self.w3 = nn.Linear(hidden_size, intermediate_size, bias=False)
+        self.w2 = nn.Linear(intermediate_size, hidden_size, bias=False)
+
+    def forward(self, x):
+        return self.w2(torch.nn.functional.silu(self.w1(x)) * self.w3(x))
+
+
+class TinyLFMLayer(nn.Module):
+    def __init__(self, hidden_size: int) -> None:
+        super().__init__()
+        self.feed_forward = TinyLFMMLP(hidden_size)
+
+
 class TinyLFMHidden(nn.Module):
     def __init__(self, hidden_size: int) -> None:
         super().__init__()
         self.projection = nn.Linear(hidden_size, hidden_size, bias=False)
+        self.layers = nn.ModuleList([TinyLFMLayer(hidden_size)])
         self.last_attention_mask = None
         self.last_position_ids = None
         self.last_inputs_embeds = None
@@ -114,7 +133,7 @@ def test_lfm_adapter_uses_native_bidirectional_hidden_backbone() -> None:
     assert backbone.lfm2.last_position_ids[0].tolist() == [0, 1, 8, 9, 10, 11, 12, 13, 14]
 
 
-def test_lfm_retired_slots_expose_only_physical_occupancy_marker() -> None:
+def test_lfm_retired_slots_ignore_semantic_controls_but_remain_physically_visible() -> None:
     backbone = TinyLFMBackbone()
     adapter = LFMCIDAdapter(
         backbone,
@@ -146,18 +165,21 @@ def test_lfm_retired_slots_expose_only_physical_occupancy_marker() -> None:
     adapter(mutated)
     mutated_seed = backbone.lfm2.last_inputs_embeds[:, 1]
 
-    assert not torch.equal(empty_seed, retired_seed)
+    assert torch.equal(empty_seed, retired_seed)
     assert torch.equal(retired_seed, mutated_seed)
     assert retired_attention[0, 1]
     assert not torch.equal(empty_output.allocation_logits, retired_output.allocation_logits)
 
 
-def test_lfm_adapter_skips_illada_specific_chunk_patches() -> None:
+def test_lfm_adapter_installs_lfm2_mlp_chunking_and_skips_illada_norm_patch() -> None:
     adapter = LFMCIDAdapter(TinyLFMBackbone())
 
     adapter.set_mlp_chunk_size(128)
     adapter.set_norm_chunk_size(128)
 
+    mlp = adapter.hidden_backbone().layers[0].feed_forward
+    assert mlp._cid_mlp_chunk_size == 128
+    assert mlp.forward.__func__.__name__ == "_chunked_lfm2_mlp_forward"
     assert adapter.hidden_backbone() is adapter.backbone.lfm2
 
 

@@ -1,5 +1,7 @@
 from __future__ import annotations
 
+import math
+
 import torch
 from torch import Tensor, nn
 from torch.nn import functional as F
@@ -16,6 +18,7 @@ class CIDExternalFusion(nn.Module):
         dropout: float = 0.0,
         normalize_output: bool = True,
         gate_init_bias: float | None = None,
+        zero_output_init: bool = False,
     ) -> None:
         super().__init__()
         self.external_type_embedding = nn.Embedding(2, d_model)
@@ -34,6 +37,20 @@ class CIDExternalFusion(nn.Module):
         )
         self.external_gate = nn.Linear(d_model * 2, d_model)
         self.final_norm = nn.LayerNorm(d_model) if normalize_output else nn.Identity()
+        self.percept_residual = True
+        nn.init.zeros_(self.external_type_embedding.weight)
+        first_percept = self.percept_projection[0]
+        final_percept = self.percept_projection[2]
+        if isinstance(first_percept, nn.Linear) and first_percept.bias is not None:
+            nn.init.zeros_(first_percept.bias)
+        if isinstance(final_percept, nn.Linear):
+            nn.init.zeros_(final_percept.weight)
+            if final_percept.bias is not None:
+                nn.init.zeros_(final_percept.bias)
+        if zero_output_init:
+            nn.init.zeros_(self.external_attention.out_proj.weight)
+            if self.external_attention.out_proj.bias is not None:
+                nn.init.zeros_(self.external_attention.out_proj.bias)
         if gate_init_bias is not None:
             nn.init.zeros_(self.external_gate.weight)
             nn.init.constant_(self.external_gate.bias, gate_init_bias)
@@ -53,8 +70,11 @@ class CIDExternalFusion(nn.Module):
         context_summary = (seed_hidden * context_weight).sum(dim=1, keepdim=True)
         context_summary = context_summary / context_weight.sum(dim=1, keepdim=True).clamp_min(1.0)
         percept_context = context_summary.expand(-1, percepts.shape[1], -1)
-        projected_percepts = self.percept_projection(
+        percept_update = self.percept_projection(
             torch.cat((percepts, percept_context), dim=-1)
+        )
+        projected_percepts = (
+            percepts + percept_update if self.percept_residual else percept_update
         )
         external_available = self._external_available(
             batch_size=hidden.shape[0],
@@ -250,8 +270,13 @@ class CIDOutputHeads(nn.Module):
         max_argument_slots: int,
         max_anchor_slots: int,
         max_link_slots: int,
+        semantic_head_version: int = 2,
     ) -> None:
         super().__init__()
+        if semantic_head_version not in (1, 2):
+            raise ValueError("unsupported semantic head version")
+        self.semantic_head_version = semantic_head_version
+        self.semantic_scale = 1.0 / math.sqrt(d_model)
         self.d_model = d_model
         self.num_anchor_kinds = num_anchor_kinds
         self.num_link_relations = num_link_relations
@@ -270,6 +295,14 @@ class CIDOutputHeads(nn.Module):
         self.lifecycle_head = nn.Linear(d_model, num_lifecycles)
         self.need_head = nn.Linear(d_model, max_need_slots)
         self.source_query = nn.Linear(d_model, max_need_slots * d_model, bias=False)
+        if semantic_head_version == 2:
+            # Cell routing has its own low-dimensional matching space; source
+            # descriptors remain in the pretrained embedding space.
+            self.cell_route_width = min(d_model, 128)
+            self.cell_route_query = nn.Linear(
+                d_model, max_need_slots * self.cell_route_width, bias=False
+            )
+            self.cell_route_key = nn.Linear(d_model, self.cell_route_width, bias=False)
         self.need_cell_route_scale = nn.Parameter(torch.full((max_need_slots,), 4.0))
         self.need_cell_route_bias = nn.Parameter(torch.full((max_need_slots,), -2.0))
         self.need_display_route_scale = nn.Parameter(torch.full((max_need_slots,), 4.0))
@@ -293,6 +326,11 @@ class CIDOutputHeads(nn.Module):
         self.refresh_head = nn.Linear(d_model, max_need_slots * num_refresh_actions)
         self.num_refresh_actions = num_refresh_actions
 
+    def set_semantic_scale(self, scale: float) -> None:
+        if not math.isfinite(scale) or scale <= 0.0:
+            raise ValueError("semantic scale must be finite and positive")
+        self.semantic_scale = float(scale)
+
     def forward(
         self,
         *,
@@ -305,11 +343,25 @@ class CIDOutputHeads(nn.Module):
         source_padding_mask: Tensor | None = None,
     ) -> CIDTensorOutput:
         batch_size, thought_slots, _ = thought_hidden.shape
-        provisional_thought = base_thought + self.thought_delta(thought_hidden)
-        need_hidden = F.layer_norm(
-            thought_hidden + provisional_thought,
-            (self.d_model,),
-        )
+        if self.semantic_head_version == 1:
+            # Version-1 checkpoints retain their original routing and update semantics.
+            provisional_thought = base_thought + self.thought_delta(thought_hidden)
+            need_hidden = F.layer_norm(
+                thought_hidden + provisional_thought,
+                (self.d_model,),
+            )
+        else:
+            # Semantic vectors are pooled token embeddings with a much smaller RMS
+            # than backbone hidden states. Route supervision must not optimize their
+            # magnitude through normalization at (or near) an unallocated zero slot.
+            need_hidden = F.layer_norm(thought_hidden, (self.d_model,), eps=1e-4)
+            semantic_delta = self.thought_delta(need_hidden) * self.semantic_scale
+            proposed = base_thought + semantic_delta
+            # Bound repeated rollout updates without distorting ordinary teacher
+            # targets. A zero residual and zero input remain exactly zero.
+            rms = proposed.float().square().mean(dim=-1, keepdim=True).add(1e-12).sqrt()
+            rescale = (4.0 * self.semantic_scale / rms).clamp(max=1.0)
+            provisional_thought = proposed * rescale.to(dtype=proposed.dtype)
         occupancy_weight = thought_occupancy.to(dtype=thought_hidden.dtype).clamp(0.0, 1.0)
         occupied_count = occupancy_weight.sum(dim=1)
         occupied_summary = (thought_hidden * occupancy_weight).sum(dim=1)
@@ -323,12 +375,22 @@ class CIDOutputHeads(nn.Module):
         need_query = self.source_query(need_hidden).view(
             batch_size, thought_slots, self.max_need_slots, self.d_model
         )
-        need_query = F.normalize(need_query, dim=-1)
+        need_query = F.normalize(
+            need_query, dim=-1, eps=1.0 if self.semantic_head_version == 2 else 1e-12
+        )
         normalized_sources = F.normalize(source_memory, dim=-1)
         source_logits = torch.einsum("bnkd,bsd->bnks", need_query, normalized_sources)
-        normalized_thought = F.normalize(provisional_thought, dim=-1)
+        if self.semantic_head_version == 2:
+            cell_queries = self.cell_route_query(need_hidden).view(
+                batch_size, thought_slots, self.max_need_slots, self.cell_route_width
+            )
+            cell_queries = F.normalize(cell_queries, dim=-1, eps=1.0)
+            cell_keys = F.normalize(self.cell_route_key(need_hidden), dim=-1, eps=1.0)
+        else:
+            cell_queries = need_query
+            cell_keys = F.normalize(provisional_thought, dim=-1)
         need_target_cell_logits = torch.einsum(
-            "bnkd,bmd->bnkm", need_query, normalized_thought
+            "bnkd,bmd->bnkm", cell_queries, cell_keys
         )
         need_target_cell_logits = (
             need_target_cell_logits * self.need_cell_route_scale[None, None, :, None]
@@ -338,8 +400,11 @@ class CIDOutputHeads(nn.Module):
             need_query * self.need_display_query_scale[None, None, :, :]
             + self.need_display_query_bias[None, None, :, :],
             dim=-1,
+            eps=1.0 if self.semantic_head_version == 2 else 1e-12,
         )
-        normalized_display = F.normalize(display_hidden, dim=-1)
+        normalized_display = F.normalize(
+            display_hidden, dim=-1, eps=1.0 if self.semantic_head_version == 2 else 1e-12
+        )
         need_target_display_logits = torch.einsum(
             "bnkd,bld->bnkl", display_query, normalized_display
         )

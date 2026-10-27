@@ -1,18 +1,24 @@
 from __future__ import annotations
 
+import logging
 from dataclasses import dataclass
 from typing import Any
 
 import torch
 
 from cid.contracts import ModelContext, ModelUpdate, Percept
-from cid.defaults import DEFAULT_DISPLAY_REVISION_FRACTION, DEFAULT_DISPLAY_REVISION_MARGIN
+from cid.defaults import (
+    DEFAULT_DISPLAY_REPETITION_SCORE_MULTIPLIER,
+    DEFAULT_DISPLAY_REVISION_FRACTION,
+    DEFAULT_DISPLAY_REVISION_MARGIN,
+)
 from cid.lifecycle import MODELED_LIFECYCLES
 from cid.model.diffusion import (
     CIDDiffusionScheduler,
     denoising_noise_level,
     denoising_reveal_fraction,
 )
+from cid.model.display_revision import DisplayRevisionController
 from cid.model.encoding import (
     ILLaDATextEncoder,
     canonical_fact_text,
@@ -23,6 +29,8 @@ from cid.model.loading import load_cid_tokenizer
 from cid.model.materialize import CIDMaterializer, ClosedWorldMaterializationCatalog
 from cid.model.tensors import CIDTensorBatch, build_percept_routing_masks, semantic_batch_as_tensor
 from cid.state import CognitiveRole, FactItem
+
+logger = logging.getLogger(__name__)
 
 
 class ILLaDAContextTensorizer:
@@ -114,6 +122,7 @@ class ILLaDAContextTensorizer:
             thought_semantic,
             local_noise.squeeze(-1),
             slot_occupancy,
+            noise_scale=self.text_encoder.semantic_noise_scale,
             generator=generator,
         )
         display_ids = torch.tensor(
@@ -199,11 +208,13 @@ class ILLaDAContextTensorizer:
             device=device,
         )
 
+
 @dataclass(frozen=True, slots=True)
 class ILLaDANeuralPolicyConfig:
     denoising_steps: int = 8
     display_revision_fraction: float = DEFAULT_DISPLAY_REVISION_FRACTION
     display_revision_margin: float = DEFAULT_DISPLAY_REVISION_MARGIN
+    display_repetition_score_multiplier: float = DEFAULT_DISPLAY_REPETITION_SCORE_MULTIPLIER
     seed: int = 0
 
     def __post_init__(self) -> None:
@@ -213,6 +224,8 @@ class ILLaDANeuralPolicyConfig:
             raise ValueError("display_revision_fraction must be in [0, 1]")
         if self.display_revision_margin < 0.0:
             raise ValueError("display_revision_margin must be non-negative")
+        if not 0.0 < self.display_repetition_score_multiplier <= 1.0:
+            raise ValueError("display_repetition_score_multiplier must be in (0, 1]")
 
 
 class ILLaDANeuralPolicy:
@@ -238,9 +251,13 @@ class ILLaDANeuralPolicy:
         self.forward_model = forward_model or adapter
         self.generator = torch.Generator(device=self.tensorizer.text_encoder.device)
         self.generator.manual_seed(self.config.seed)
+        self.semantic_rms_exceedances = 0
+        self.peak_semantic_rms: float | None = None
+        self.display_revision_controller = DisplayRevisionController()
 
     def step(self, context: ModelContext) -> ModelUpdate:
         diffusion_step = context.diffusion_step
+        self.display_revision_controller.observe_context(context)
         batch = self.tensorizer(
             context,
             generator=self.generator,
@@ -248,7 +265,22 @@ class ILLaDANeuralPolicy:
         )
         with torch.no_grad():
             output = self.forward_model(batch)
-            display_ids = self.scheduler.refine_display(
+            exceeded_rms = self.tensorizer.text_encoder.validate_semantic_state(
+                output.thought_semantic, report_rms_excess=True
+            )
+            if exceeded_rms is not None:
+                self.semantic_rms_exceedances += 1
+                self.peak_semantic_rms = max(self.peak_semantic_rms or 0.0, exceeded_rms)
+                if self.semantic_rms_exceedances == 1:
+                    logger.warning(
+                        "CID inference semantic RMS %.6g exceeds diagnostic threshold %.6g "
+                        "at diffusion step %d; continuing inference",
+                        exceeded_rms,
+                        self.tensorizer.text_encoder.semantic_noise_scale * 32.0,
+                        diffusion_step,
+                    )
+            display_ids = self.display_revision_controller.refine_display(
+                self.scheduler,
                 batch.display_ids,
                 output.display_logits,
                 reveal_fraction=denoising_reveal_fraction(
@@ -256,6 +288,7 @@ class ILLaDANeuralPolicy:
                 ),
                 revision_fraction=self.config.display_revision_fraction,
                 revision_margin=self.config.display_revision_margin,
+                repetition_score_multiplier=self.config.display_repetition_score_multiplier,
             )
         return self.materializer.materialize(
             output,

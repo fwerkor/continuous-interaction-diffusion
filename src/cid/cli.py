@@ -43,6 +43,7 @@ from cid.defaults import (
     DEFAULT_ARGUMENT_PRESENCE_THRESHOLD,
     DEFAULT_BINDING_THRESHOLD,
     DEFAULT_CONVERGENCE_THRESHOLD,
+    DEFAULT_DISPLAY_REPETITION_SCORE_MULTIPLIER,
     DEFAULT_DISPLAY_REVISION_FRACTION,
     DEFAULT_DISPLAY_REVISION_MARGIN,
     DEFAULT_LINK_PRESENCE_THRESHOLD,
@@ -1175,7 +1176,7 @@ def _benchmark(args: argparse.Namespace) -> None:
     )
     from cid.model.benchmark import run_neural_benchmark_case
     from cid.model.encoding import ILLaDATextEncoder
-    from cid.model.loading import load_cid_tokenizer
+    from cid.model.loading import apply_neural_contract_compatibility, load_cid_tokenizer
 
     checkpoint = Path(args.checkpoint)
     release = args.checkpoint_kind == "release"
@@ -1274,14 +1275,21 @@ def _benchmark(args: argparse.Namespace) -> None:
                     embedding_device="cpu",
                 )
             else:
+                legacy_contract_version = int(release_config.get("neural_contract_version", 4))
                 load_cid_adapter_parameter_state(
                     adapter,
                     load_safetensors(str(checkpoint / "cid_adapter.safetensors"), device="cpu"),
                 )
-                semantic_state = torch.load(
-                    checkpoint / "semantic-embedding.pt",
-                    map_location="cpu",
-                    weights_only=False,
+                semantic_state = apply_neural_contract_compatibility(
+                    adapter,
+                    dict(
+                        torch.load(
+                            checkpoint / "semantic-embedding.pt",
+                            map_location="cpu",
+                            weights_only=False,
+                        )
+                    ),
+                    neural_contract_version=legacy_contract_version,
                 )
                 text_encoder = ILLaDATextEncoder.from_frozen_snapshot_state(
                     adapter,
@@ -1387,7 +1395,7 @@ def _benchmark(args: argparse.Namespace) -> None:
                 else:
                     forward_model = adapter
             else:
-                load_cid_adapter_checkpoint(adapter, checkpoint)
+                load_cid_adapter_checkpoint(adapter, checkpoint, tokenizer=tokenizer)
                 forward_model = (
                     wrap_npu_autocast(torch, adapter, dtype=dtype)
                     if device_type == "npu"
@@ -1398,7 +1406,7 @@ def _benchmark(args: argparse.Namespace) -> None:
                 # Stage A keeps trainable CID modules in FP32 even though the frozen
                 # backbone is stored and computed in low precision.
                 adapter.set_cid_modules_dtype(torch.float32)
-            load_cid_adapter_checkpoint(adapter, checkpoint)
+            load_cid_adapter_checkpoint(adapter, checkpoint, tokenizer=tokenizer)
             text_encoder = ILLaDATextEncoder(
                 adapter, tokenizer, pooling_mode=semantic_pooling
             )
@@ -1417,6 +1425,10 @@ def _benchmark(args: argparse.Namespace) -> None:
             else:
                 forward_model = adapter
 
+        if args.stage_c_adapter:
+            from cid.stage_c import load_display_adapter
+
+            load_display_adapter(args.stage_c_adapter, adapter)
         adapter.eval()
         forward_model.eval()
         data_path = Path(args.data)
@@ -1470,6 +1482,7 @@ def _benchmark(args: argparse.Namespace) -> None:
                     display_canvas_tokens=args.display_canvas_tokens,
                     display_revision_fraction=args.display_revision_fraction,
                     display_revision_margin=args.display_revision_margin,
+                    display_repetition_score_multiplier=args.display_repetition_score_multiplier,
                     materializer_config=materializer_config,
                     runtime_config=runtime_config,
                     seed=args.seed,
@@ -1548,6 +1561,9 @@ def _benchmark(args: argparse.Namespace) -> None:
                     "max_wall_time_s": args.max_wall_time_s,
                     "display_revision_fraction": args.display_revision_fraction,
                     "display_revision_margin": args.display_revision_margin,
+                    "display_repetition_score_multiplier": (
+                        args.display_repetition_score_multiplier
+                    ),
                     "allocation_threshold": args.allocation_threshold,
                     "convergence_threshold": args.convergence_threshold,
                     "need_threshold": args.need_threshold,
@@ -1910,9 +1926,11 @@ def _train_stage_a(args: argparse.Namespace) -> None:
         ILLaDACIDConfig,
         ILLaDATrajectoryTensorizer,
         balance_rollout_windows_by_semantic_task,
+        load_cid_adapter_checkpoint,
         load_cid_adapter_from_pretrained,
         materialize_indexed_rollout_windows,
         shard_rollout_windows,
+        stage_a_adamw_parameter_groups,
         stage_a_gradient_accumulation_steps,
         stage_b_consumed_windows_by_bucket,
         trajectory_rollout_windows,
@@ -1923,6 +1941,8 @@ def _train_stage_a(args: argparse.Namespace) -> None:
     from cid.model.encoding import ILLaDATextEncoder
     from cid.model.loading import load_cid_tokenizer
 
+    if args.resume and args.init_cid_checkpoint:
+        raise ValueError("--resume and --init-cid-checkpoint are mutually exclusive")
     if args.thought_capacity != 128:
         raise ValueError("CID v1 Stage A requires --thought-capacity 128")
     if args.dtype == "fp16":
@@ -1937,6 +1957,7 @@ def _train_stage_a(args: argparse.Namespace) -> None:
         max_thought_slots=args.thought_capacity,
         max_display_tokens=args.max_display_tokens,
         display_canvas_tokens=args.display_canvas_tokens,
+        semantic_head_version=2,
     )
     dataset_manifest = inspect_dataset(args.data)
     validate_neural_training_contract(
@@ -1986,6 +2007,15 @@ def _train_stage_a(args: argparse.Namespace) -> None:
             # CID modules in FP32. Autocast below preserves low-precision compute while
             # AdamW updates and moments remain FP32 instead of being quantized away.
             model.set_cid_modules_dtype(torch.float32)
+            if args.init_cid_checkpoint:
+                # Cross-supervision-contract migrations are weight-only warm starts.
+                # Do not carry obsolete optimizer moments or partial-epoch gradients.
+                load_cid_adapter_checkpoint(
+                    model,
+                    args.init_cid_checkpoint,
+                    tokenizer=load_cid_tokenizer(args.model),
+                    expected_semantic_pooling=args.semantic_pooling,
+                )
             return model.to(device)
 
         adapter = None
@@ -2073,6 +2103,10 @@ def _train_stage_a(args: argparse.Namespace) -> None:
                 )
             else:
                 adapter.set_gradient_checkpointing(True)
+        if args.attention_query_chunk_size is not None:
+            if args.attention_query_chunk_size <= 0:
+                raise ValueError("--attention-query-chunk-size must be positive")
+            adapter.set_attention_query_chunk_size(args.attention_query_chunk_size)
         if args.mlp_chunk_size is not None:
             if args.mlp_chunk_size <= 0:
                 raise ValueError("--mlp-chunk-size must be positive")
@@ -2121,24 +2155,25 @@ def _train_stage_a(args: argparse.Namespace) -> None:
                 device_type=device_type,
                 dtype=dtype,
             )
-        trainable_parameters = tuple(
-            parameter for parameter in adapter.parameters() if parameter.requires_grad
+        stage_a_optimizer_groups = stage_a_adamw_parameter_groups(
+            adapter,
+            weight_decay=args.weight_decay,
         )
         if args.zero_redundancy_optimizer and distributed:
             from torch.distributed.optim import ZeroRedundancyOptimizer
 
             stage_a_optimizer = ZeroRedundancyOptimizer(
-                trainable_parameters,
+                stage_a_optimizer_groups,
                 optimizer_class=torch.optim.AdamW,
                 lr=args.learning_rate,
-                weight_decay=args.weight_decay,
+                weight_decay=0.0,
                 fused=device_type == "cuda",
             )
         else:
             stage_a_optimizer = torch.optim.AdamW(
-                trainable_parameters,
+                stage_a_optimizer_groups,
                 lr=args.learning_rate,
-                weight_decay=args.weight_decay,
+                weight_decay=0.0,
                 fused=device_type == "cuda",
             )
         trainer = CIDTrainer(
@@ -2158,6 +2193,9 @@ def _train_stage_a(args: argparse.Namespace) -> None:
                 rollout_horizon=args.rollout_horizon,
                 rollout_allocation_threshold=args.rollout_allocation_threshold,
                 rollout_max_allocations_per_step=args.rollout_max_allocations_per_step,
+                rollout_display_repetition_score_multiplier=(
+                    args.rollout_display_repetition_score_multiplier
+                ),
                 teacher_forcing_epochs=args.teacher_forcing_epochs,
                 rollout_ramp_epochs=args.rollout_ramp_epochs,
                 semantic_pooling=args.semantic_pooling,
@@ -2186,6 +2224,11 @@ def _train_stage_a(args: argparse.Namespace) -> None:
                 f"{checkpoint.stem}.optimizer-rank-{shard_rank:04d}{checkpoint.suffix}"
             )
 
+        def stage_a_rng_shard_path(checkpoint: Path, shard_rank: int) -> Path:
+            return checkpoint.with_name(
+                f"{checkpoint.stem}.rng-rank-{shard_rank:04d}{checkpoint.suffix}"
+            )
+
         def save_stage_a_checkpoint(
             checkpoint: Path,
             *,
@@ -2200,6 +2243,12 @@ def _train_stage_a(args: argparse.Namespace) -> None:
                 )
                 torch.save(stage_a_optimizer.optim.state_dict(), optimizer_temporary)
                 optimizer_temporary.replace(optimizer_shard)
+                dist.barrier()
+            if distributed:
+                rng_shard = stage_a_rng_shard_path(checkpoint, rank)
+                rng_temporary = rng_shard.with_name(f".{rng_shard.name}.tmp")
+                torch.save(trainer.local_rng_state(), rng_temporary)
+                rng_temporary.replace(rng_shard)
                 dist.barrier()
             if rank == 0:
                 trainer.save_checkpoint(
@@ -2258,7 +2307,17 @@ def _train_stage_a(args: argparse.Namespace) -> None:
             else None
         )
         if distributed:
-            trainer.reseed(args.seed + rank + trainer.state.transitions_seen * 104729)
+            if args.resume and not world_size_changed:
+                rng_shard = stage_a_rng_shard_path(Path(args.resume), rank)
+                if not rng_shard.exists():
+                    raise FileNotFoundError(
+                        f"missing Stage A RNG shard for rank {rank}: {rng_shard}"
+                    )
+                trainer.restore_local_rng_state(
+                    torch.load(rng_shard, map_location="cpu", weights_only=False)
+                )
+            else:
+                trainer.reseed(args.seed + rank + trainer.state.transitions_seen * 104729)
         if trainer.state.rollout_windows_seen_in_epoch == 0 and not (
             world_size_changed and saved_partial_windows
         ):
@@ -3057,6 +3116,7 @@ def _train_stage_b(args: argparse.Namespace) -> None:
             max_thought_slots=args.thought_capacity,
             max_display_tokens=args.max_display_tokens,
             display_canvas_tokens=args.display_canvas_tokens,
+            semantic_head_version=2,
         )
         dataset_manifest = inspect_dataset(args.data)
         validate_neural_training_contract(
@@ -3183,7 +3243,12 @@ def _train_stage_b(args: argparse.Namespace) -> None:
                 load_cid_adapter_checkpoint(
                     model,
                     args.init_cid_checkpoint,
+                    tokenizer=tokenizer,
                     expected_semantic_pooling=args.semantic_pooling,
+                    # Stage B starts a NEW optimizer. Older Stage A weights
+                    # remain valid initialization even if its teacher-label
+                    # semantics predate the current contract. Only resuming
+                    # an old optimizer under changed supervision is rejected.
                 )
             snapshot = ILLaDATextEncoder.from_frozen_snapshot(
                 model,
@@ -3272,6 +3337,9 @@ def _train_stage_b(args: argparse.Namespace) -> None:
                 rollout_horizon=args.rollout_horizon,
                 rollout_allocation_threshold=args.rollout_allocation_threshold,
                 rollout_max_allocations_per_step=args.rollout_max_allocations_per_step,
+                rollout_display_repetition_score_multiplier=(
+                    args.rollout_display_repetition_score_multiplier
+                ),
                 teacher_forcing_epochs=args.teacher_forcing_epochs,
                 rollout_ramp_epochs=args.rollout_ramp_epochs,
                 semantic_pooling=args.semantic_pooling,
@@ -4127,10 +4195,53 @@ def main() -> None:
         help="validate and persist responses from the current interactive teacher batch",
     )
     agent_commit.add_argument("--workspace", default=".cid/teacher-agent")
+    stage_c_data = subparsers.add_parser(
+        "prepare-stage-c-data", help="stream public chat SFT data without reasoning traces"
+    )
+    stage_c_data.add_argument("--output", required=True)
+    stage_c_data.add_argument(
+        "--dataset", default="nvidia/Nemotron-SFT-Instruction-Following-Chat-v4"
+    )
+    stage_c_data.add_argument(
+        "--splits", nargs="+",
+        default=["chat", "instruction_following_for_response_length_control"],
+    )
+    stage_c_data.add_argument("--max-per-split", type=int, default=20000)
+    stage_c_data.add_argument("--seed", type=int, default=42)
+    stage_c = subparsers.add_parser(
+        "train-display", help="Stage C: frozen CID with Display-only low-rank diffusion SFT"
+    )
+    stage_c.add_argument("--data", required=True, help="prompt/answer or chat messages JSONL")
+    stage_c.add_argument("--checkpoint", required=True, help="Stage B .pt or unified CID release")
+    stage_c.add_argument("--checkpoint-kind", choices=("stage-b", "release"), default="release")
+    stage_c.add_argument("--model", default="GSAI-ML/iLLaDA-8B-Base")
+    stage_c.add_argument("--output-dir", required=True)
+    stage_c.add_argument("--device", choices=("auto", "cuda", "npu", "cpu"), default="auto")
+    stage_c.add_argument("--dtype", choices=("bf16", "fp32"), default="bf16")
+    stage_c.add_argument("--rank", type=int, default=32)
+    stage_c.add_argument("--alpha", type=float)
+    stage_c.add_argument("--epochs", type=int, default=1)
+    stage_c.add_argument("--seed", type=int, default=42)
+    stage_c.add_argument("--learning-rate", type=float, default=1e-4)
+    stage_c.add_argument("--thought-steps", type=int, default=2)
+    stage_c.add_argument("--max-answer-tokens", type=int, default=512)
+    stage_c.add_argument("--max-examples", type=int)
+    stage_c.add_argument("--max-steps", type=int, help="maximum optimizer steps for pilots")
+    stage_c.add_argument(
+        "--rollout-probability", type=float, default=0.75,
+        help="fraction of batches supervised on native [prefix, EOS, latent tail] states",
+    )
+    stage_c.add_argument(
+        "--continuation-tokens", type=int, default=16,
+        help="supervised lookahead tokens after a live EOS boundary",
+    )
+    stage_c.add_argument("--log-every", type=int, default=20)
+    stage_c.add_argument("--checkpoint-every", type=int, default=500)
     benchmark = subparsers.add_parser(
         "benchmark",
         help="run a neural CID checkpoint on deterministic replay trajectories",
     )
+    benchmark.add_argument("--stage-c-adapter", help="optional Display-only Stage C checkpoint")
     benchmark.add_argument("--data", required=True)
     benchmark.add_argument("--checkpoint", required=True)
     benchmark.add_argument(
@@ -4170,6 +4281,15 @@ def main() -> None:
         "--display-revision-margin",
         type=float,
         default=DEFAULT_DISPLAY_REVISION_MARGIN,
+    )
+    policy_tuning.add_argument(
+        "--display-repetition-score-multiplier",
+        type=float,
+        default=DEFAULT_DISPLAY_REPETITION_SCORE_MULTIPLIER,
+        help=(
+            "score multiplier for consecutive equal Display tokens adjacent to a candidate; "
+            "left and right run lengths contribute to the exponent"
+        ),
     )
     materializer_tuning = benchmark.add_argument_group("materialization tuning")
     materializer_tuning.add_argument(
@@ -4292,6 +4412,10 @@ def main() -> None:
     train.add_argument("--output-dir", required=True)
     train.add_argument("--model", default="GSAI-ML/iLLaDA-8B-Base")
     train.add_argument("--resume")
+    train.add_argument(
+        "--init-cid-checkpoint",
+        help="Stage A weight-only warm start; reset optimizer and training cursor",
+    )
     train.add_argument("--device", choices=("auto", "cuda", "npu", "cpu"), default="auto")
     train.add_argument("--dtype", choices=("bf16", "fp32"), default="bf16")
     train.add_argument("--epochs", type=int, default=1)
@@ -4405,6 +4529,11 @@ def main() -> None:
     train.add_argument("--lr-decay-steps", type=int, default=0)
     train.add_argument("--min-learning-rate-ratio", type=float, default=0.1)
     train.add_argument(
+        "--attention-query-chunk-size",
+        type=int,
+        help="query-token chunk size for exact LLaDA-MoE SDPA evaluation",
+    )
+    train.add_argument(
         "--mlp-chunk-size",
         type=int,
         help="token chunk size for exact frozen-backbone MLP evaluation",
@@ -4414,8 +4543,18 @@ def main() -> None:
         type=int,
         help="token chunk size for exact frozen-backbone RMSNorm evaluation",
     )
-    train.add_argument("--timestep-min", type=float, default=0.05)
-    train.add_argument("--timestep-max", type=float, default=1.0)
+    train.add_argument(
+        "--timestep-min",
+        type=float,
+        default=0.05,
+        help="minimum sampled Display diffusion timestep; TCT thought noise comes from cell state",
+    )
+    train.add_argument(
+        "--timestep-max",
+        type=float,
+        default=1.0,
+        help="maximum sampled Display diffusion timestep; TCT thought noise comes from cell state",
+    )
     train.add_argument("--rollout-horizon", type=int, default=3)
     train.add_argument(
         "--flatten-teacher-forcing-horizon",
@@ -4437,6 +4576,15 @@ def main() -> None:
         type=int,
         default=DEFAULT_MAX_ALLOCATIONS_PER_STEP,
         help="maximum new cognitive cells materialized by one training rollout step",
+    )
+    train.add_argument(
+        "--rollout-display-repetition-score-multiplier",
+        type=float,
+        default=DEFAULT_DISPLAY_REPETITION_SCORE_MULTIPLIER,
+        help=(
+            "score multiplier for consecutive equal Display tokens adjacent to a candidate during "
+            "closed-loop rollout; left and right run lengths contribute to the exponent"
+        ),
     )
     train.add_argument(
         "--semantic-pooling",
@@ -4555,8 +4703,18 @@ def main() -> None:
     )
     train_full.add_argument("--min-learning-rate-ratio", type=float, default=0.1)
     train_full.add_argument("--max-grad-norm", type=float, default=1.0)
-    train_full.add_argument("--timestep-min", type=float, default=0.05)
-    train_full.add_argument("--timestep-max", type=float, default=1.0)
+    train_full.add_argument(
+        "--timestep-min",
+        type=float,
+        default=0.05,
+        help="minimum sampled Display diffusion timestep; TCT thought noise comes from cell state",
+    )
+    train_full.add_argument(
+        "--timestep-max",
+        type=float,
+        default=1.0,
+        help="maximum sampled Display diffusion timestep; TCT thought noise comes from cell state",
+    )
     train_full.add_argument("--rollout-horizon", type=int, default=3)
     train_full.add_argument(
         "--rollout-allocation-threshold",
@@ -4569,6 +4727,15 @@ def main() -> None:
         type=int,
         default=DEFAULT_MAX_ALLOCATIONS_PER_STEP,
         help="maximum new cognitive cells materialized by one training rollout step",
+    )
+    train_full.add_argument(
+        "--rollout-display-repetition-score-multiplier",
+        type=float,
+        default=DEFAULT_DISPLAY_REPETITION_SCORE_MULTIPLIER,
+        help=(
+            "score multiplier for consecutive equal Display tokens adjacent to a candidate during "
+            "closed-loop rollout; left and right run lengths contribute to the exponent"
+        ),
     )
     train_full.add_argument(
         "--semantic-pooling",
@@ -4699,6 +4866,18 @@ def main() -> None:
         _train_stage_a(args)
     elif args.command == "train-full":
         _train_stage_b(args)
+    elif args.command == "train-display":
+        from cid.stage_c import train_stage_c
+
+        train_stage_c(args)
+    elif args.command == "prepare-stage-c-data":
+        from cid.stage_c import export_nemotron_sft
+
+        counts = export_nemotron_sft(
+            args.output, dataset=args.dataset, splits=args.splits,
+            max_per_split=args.max_per_split, seed=args.seed,
+        )
+        print(counts)
 
 
 if __name__ == "__main__":

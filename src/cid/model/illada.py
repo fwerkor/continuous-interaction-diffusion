@@ -45,6 +45,20 @@ def _chunked_illada_mlp_forward(module: nn.Module, x: torch.Tensor) -> torch.Ten
     return torch.cat(outputs, dim=1)
 
 
+def _chunked_lfm2_mlp_forward(module: nn.Module, x: torch.Tensor) -> torch.Tensor:
+    chunk_size = int(module._cid_mlp_chunk_size)
+
+    def run_chunk(chunk: torch.Tensor) -> torch.Tensor:
+        return module.w2(torch.nn.functional.silu(module.w1(chunk)) * module.w3(chunk))
+
+    if x.ndim != 3 or x.shape[1] <= chunk_size:
+        return run_chunk(x)
+    outputs = []
+    for start in range(0, x.shape[1], chunk_size):
+        outputs.append(run_chunk(x[:, start : start + chunk_size]))
+    return torch.cat(outputs, dim=1)
+
+
 def _chunked_illada_rms_norm_forward(
     module: nn.Module,
     hidden_states: torch.Tensor,
@@ -173,19 +187,51 @@ def _llada_moe_sdpa_forward(
             sdpa_mask = key_mask[..., : key_states.shape[-2]]
         else:
             raise ValueError("CID LLaDA-MoE attention mask must be rank 2 or rank 4")
+        # Ascend FlashAttentionScore does not support an implicit broadcast over
+        # the query axis ([B, 1, 1, K]).  PyTorch SDPA does, so materialize
+        # the equivalent [B, 1, Q, K] mask only for NPU dispatch.
+        if hidden_states.device.type == "npu" and sdpa_mask.shape[-2] == 1:
+            sdpa_mask = sdpa_mask.expand(-1, -1, query_states.shape[-2], -1).contiguous()
         if hidden_states.device.type == "cuda":
             query_states = query_states.contiguous()
             key_states = key_states.contiguous()
             value_states = value_states.contiguous()
 
-    attention_output = torch.nn.functional.scaled_dot_product_attention(
-        query_states,
-        key_states,
-        value_states,
-        attn_mask=sdpa_mask,
-        dropout_p=module.attention_dropout if module.training else 0.0,
-        is_causal=False,
-    )
+    dropout_p = module.attention_dropout if module.training else 0.0
+    query_chunk_size = int(getattr(module, "_cid_query_chunk_size", 0))
+    if query_chunk_size > 0 and query_states.shape[-2] > query_chunk_size:
+        if dropout_p != 0.0:
+            raise RuntimeError("exact LLaDA-MoE attention query chunking requires zero dropout")
+        attention_chunks = []
+        for start in range(0, query_states.shape[-2], query_chunk_size):
+            end = min(start + query_chunk_size, query_states.shape[-2])
+            chunk_mask = sdpa_mask
+            if (
+                sdpa_mask is not None
+                and sdpa_mask.ndim == 4
+                and sdpa_mask.shape[-2] != 1
+            ):
+                chunk_mask = sdpa_mask[..., start:end, :]
+            attention_chunks.append(
+                torch.nn.functional.scaled_dot_product_attention(
+                    query_states[..., start:end, :],
+                    key_states,
+                    value_states,
+                    attn_mask=chunk_mask,
+                    dropout_p=0.0,
+                    is_causal=False,
+                )
+            )
+        attention_output = torch.cat(attention_chunks, dim=-2)
+    else:
+        attention_output = torch.nn.functional.scaled_dot_product_attention(
+            query_states,
+            key_states,
+            value_states,
+            attn_mask=sdpa_mask,
+            dropout_p=dropout_p,
+            is_causal=False,
+        )
     attention_output = attention_output.transpose(1, 2).contiguous().view(
         batch_size, sequence_length, module.hidden_size
     )
@@ -415,6 +461,30 @@ def _npu_grouped_llada_moe_forward(
     return output.reshape(batch_size, sequence_length, hidden_dim)
 
 
+def _chunked_frozen_llada_moe_forward(
+    module: nn.Module,
+    hidden_states: torch.Tensor,
+) -> torch.Tensor:
+    """Evaluate packed frozen MoE experts in exact token chunks when requested."""
+    implementations = {
+        "torch-grouped": _grouped_llada_moe_forward,
+        "torch": _packed_llada_moe_forward,
+        "npu": _npu_grouped_llada_moe_forward,
+    }
+    backend = module._cid_moe_backend
+    implementation = implementations[backend]
+    chunk_size = int(getattr(module, "_cid_moe_chunk_size", 0))
+    if hidden_states.ndim != 3 or chunk_size <= 0 or hidden_states.shape[1] <= chunk_size:
+        return implementation(module, hidden_states)
+    return torch.cat(
+        [
+            implementation(module, hidden_states[:, start : start + chunk_size])
+            for start in range(0, hidden_states.shape[1], chunk_size)
+        ],
+        dim=1,
+    )
+
+
 def _pack_frozen_llada_moe_layer(
     module: nn.Module,
     *,
@@ -449,14 +519,10 @@ def _pack_frozen_llada_moe_layer(
     )
     module._cid_act_fn = experts[0].act_fn
     module.experts = nn.ModuleList()
-    if backend == "torch-grouped":
-        module.forward = MethodType(_grouped_llada_moe_forward, module)
-    elif backend == "torch":
-        module.forward = MethodType(_packed_llada_moe_forward, module)
-    elif backend == "npu":
-        module.forward = MethodType(_npu_grouped_llada_moe_forward, module)
-    else:
+    if backend not in {"torch-grouped", "torch", "npu"}:
         raise ValueError(f"unsupported grouped MoE backend: {backend}")
+    module._cid_moe_backend = backend
+    module.forward = MethodType(_chunked_frozen_llada_moe_forward, module)
 
 
 def _pack_trainable_llada_moe_layer(module: nn.Module) -> None:
@@ -578,6 +644,7 @@ class ILLaDACIDConfig:
     max_anchor_slots: int = 4
     max_link_slots: int = 8
     external_dropout: float = 0.0
+    semantic_head_version: int = 1  # Legacy checkpoints omit this field.
 
     def __post_init__(self) -> None:
         if self.max_thought_slots <= 0 or self.max_display_tokens <= 0:
@@ -604,6 +671,8 @@ class ILLaDACIDConfig:
             raise ValueError("grounding slot capacities must be positive")
         if not 0.0 <= self.external_dropout < 1.0:
             raise ValueError("external_dropout must be in [0, 1)")
+        if self.semantic_head_version not in (1, 2):
+            raise ValueError("semantic_head_version must be 1 or 2")
 
 
 class ILLaDACIDAdapter(nn.Module):
@@ -690,6 +759,7 @@ class ILLaDACIDAdapter(nn.Module):
             dropout=self.config.external_dropout,
             normalize_output=False,
             gate_init_bias=-6.0,
+            zero_output_init=True,
         )
         self.output_heads = CIDOutputHeads(
             d_model=self.d_model,
@@ -703,9 +773,17 @@ class ILLaDACIDAdapter(nn.Module):
             max_argument_slots=self.config.max_argument_slots,
             max_anchor_slots=self.config.max_anchor_slots,
             max_link_slots=self.config.max_link_slots,
+            semantic_head_version=self.config.semantic_head_version,
         )
+        # Stage C is an optional, Display-only output residual.  It never changes
+        # the shared backbone or the T/Need/control heads.
+        self.stage_c_display: nn.Module | None = None
 
         nn.init.zeros_(self.channel_embedding.weight)
+        nn.init.zeros_(self.role_projection.weight)
+        nn.init.zeros_(self.lifecycle_projection.weight)
+        nn.init.zeros_(self.scalar_projection.weight)
+        nn.init.zeros_(self.occupancy_projection.weight)
         nn.init.zeros_(self.display_noise_projection.weight)
         nn.init.zeros_(self.output_heads.thought_delta.weight)
         nn.init.zeros_(self.output_heads.thought_delta.bias)
@@ -883,13 +961,46 @@ class ILLaDACIDAdapter(nn.Module):
         else:
             method()
 
+    def set_attention_query_chunk_size(self, chunk_size: int | None) -> None:
+        """Chunk non-causal LLaDA-MoE attention queries without changing key context."""
+        if chunk_size is None:
+            return
+        if chunk_size <= 0:
+            raise ValueError("attention query chunk size must be positive")
+        if not self.is_llada_moe:
+            return
+        if float(getattr(self.backbone.config, "attention_dropout", 0.0)) != 0.0:
+            raise RuntimeError("exact attention query chunking requires zero attention dropout")
+        for attention in self._llada_moe_attention_modules:
+            attention._cid_query_chunk_size = int(chunk_size)
+
     def set_mlp_chunk_size(self, chunk_size: int | None) -> None:
         """Chunk token-wise iLLaDA MLP evaluation without changing its function."""
         if chunk_size is None:
             return
         if chunk_size <= 0:
             raise ValueError("MLP chunk size must be positive")
-        if self.is_llada_moe or self.backbone_family == "lfm2":
+        if self.is_llada_moe:
+            decoder = self.hidden_backbone()
+            layers = getattr(decoder, "layers", None)
+            if layers is None or len(layers) == 0:
+                raise RuntimeError("LLaDA-MoE decoder does not expose layers for MLP chunking")
+            for layer in layers:
+                moe = getattr(layer, "mlp", None)
+                if moe is not None and hasattr(moe, "experts"):
+                    moe._cid_moe_chunk_size = int(chunk_size)
+            return
+        if self.backbone_family == "lfm2":
+            decoder = self.hidden_backbone()
+            layers = getattr(decoder, "layers", None)
+            if layers is None or len(layers) == 0:
+                raise RuntimeError("LFM2 decoder does not expose layers for MLP chunking")
+            for layer in layers:
+                mlp = getattr(layer, "feed_forward", None)
+                if mlp is None or any(not hasattr(mlp, name) for name in ("w1", "w2", "w3")):
+                    raise RuntimeError("LFM2 decoder layer does not expose the expected MLP")
+                mlp._cid_mlp_chunk_size = int(chunk_size)
+                mlp.forward = MethodType(_chunked_lfm2_mlp_forward, mlp)
             return
         decoder = self.hidden_backbone()
         layers = getattr(decoder, "layers", None)
@@ -1064,12 +1175,15 @@ class ILLaDACIDAdapter(nn.Module):
 
         t_hidden = hidden[:, :thought_slots]
         y_hidden = hidden[:, thought_slots + prompt_length :]
+        display_logits = self.output_embeddings(y_hidden)
+        if self.stage_c_display is not None:
+            display_logits = display_logits + self.stage_c_display(y_hidden)
         output = self.output_heads(
             base_thought=thought,
             thought_hidden=t_hidden,
             thought_occupancy=neural_occupancy,
             display_hidden=y_hidden,
-            display_logits=self.output_embeddings(y_hidden),
+            display_logits=display_logits,
             source_memory=source_memory,
             source_padding_mask=batch.source_padding_mask,
         )

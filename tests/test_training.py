@@ -59,6 +59,7 @@ load_stage_b_semantic_encoder = cid_model.load_stage_b_semantic_encoder
 save_stage_b_checkpoint = cid_model.save_stage_b_checkpoint
 shard_rollout_windows = cid_model.shard_rollout_windows
 shard_transitions = cid_model.shard_transitions
+stage_a_adamw_parameter_groups = cid_model.stage_a_adamw_parameter_groups
 stage_a_gradient_accumulation_steps = cid_model.stage_a_gradient_accumulation_steps
 stage_b_adamw_parameter_groups = cid_model.stage_b_adamw_parameter_groups
 stage_b_consumed_windows_by_bucket = cid_model.stage_b_consumed_windows_by_bucket
@@ -72,6 +73,7 @@ wrap_stage_b_fsdp = cid_model.wrap_stage_b_fsdp
 cid_loss = cid_model.cid_loss
 target_positive_mass_bce = cid_losses._target_positive_mass_binary_cross_entropy
 chunked_illada_mlp_forward = import_module("cid.model.illada")._chunked_illada_mlp_forward
+chunked_lfm2_mlp_forward = import_module("cid.model.illada")._chunked_lfm2_mlp_forward
 chunked_illada_rms_norm_forward = import_module("cid.model.illada")._chunked_illada_rms_norm_forward
 
 
@@ -292,6 +294,28 @@ def test_chunked_ar_mlp_matches_unchunked_forward_and_input_gradient() -> None:
     assert torch.allclose(chunked_grad, reference_grad, rtol=1e-6, atol=1e-6)
 
 
+def test_chunked_lfm2_mlp_matches_unchunked_forward_and_input_gradient() -> None:
+    torch.manual_seed(13)
+    module = SimpleNamespace(
+        w1=nn.Linear(16, 48, bias=False),
+        w3=nn.Linear(16, 48, bias=False),
+        w2=nn.Linear(48, 16, bias=False),
+        _cid_mlp_chunk_size=7,
+    )
+    reference_input = torch.randn(2, 23, 16, requires_grad=True)
+    chunked_input = reference_input.detach().clone().requires_grad_(True)
+
+    reference = module.w2(
+        torch.nn.functional.silu(module.w1(reference_input)) * module.w3(reference_input)
+    )
+    chunked = chunked_lfm2_mlp_forward(module, chunked_input)
+    reference_grad = torch.autograd.grad(reference.sum(), reference_input)[0]
+    chunked_grad = torch.autograd.grad(chunked.sum(), chunked_input)[0]
+
+    assert torch.allclose(chunked, reference, rtol=1e-6, atol=1e-6)
+    assert torch.allclose(chunked_grad, reference_grad, rtol=1e-6, atol=1e-6)
+
+
 def test_chunked_illada_rms_norm_matches_unchunked_forward_and_gradient() -> None:
     torch.manual_seed(12)
     weight = nn.Parameter(torch.randn(16))
@@ -317,6 +341,21 @@ def test_chunked_illada_rms_norm_matches_unchunked_forward_and_gradient() -> Non
     assert torch.allclose(chunked, reference, rtol=1e-6, atol=1e-6)
     assert torch.allclose(chunked_grads[0], reference_grads[0], rtol=1e-6, atol=1e-6)
     assert torch.allclose(chunked_grads[1], reference_grads[1], rtol=1e-6, atol=1e-6)
+
+
+def test_teacher_thought_corruption_uses_runtime_cell_noise_not_display_timestep() -> None:
+    adapter = make_adapter(seed=171)
+    tensorizer = ILLaDATrajectoryTensorizer(adapter, TinyTokenizer())
+
+    sample = tensorizer.tensorize(
+        make_trajectory(),
+        source_step=0,
+        timestep=0.95,
+        generator=torch.Generator().manual_seed(7),
+    )
+
+    assert sample.batch.local_noise[0, 0, 0].item() == pytest.approx(0.5)
+    assert sample.batch.local_noise[0, 0, 0].item() != pytest.approx(0.95)
 
 
 def test_trajectory_tensorizer_retired_tombstone_blocks_slot_without_pressure() -> None:
@@ -882,6 +921,30 @@ def test_optimizer_step_rejects_nonfinite_gradient_before_parameter_update() -> 
     assert trainer.state.optimizer_steps == 0
 
 
+def test_optimizer_step_recovers_finite_l2_norm_overflow() -> None:
+    adapter = make_adapter(seed=167)
+    trainer = CIDTrainer(
+        adapter,
+        ILLaDATrajectoryTensorizer(adapter, TinyTokenizer()),
+        CIDTrainerConfig(learning_rate=1e-3),
+    )
+    parameter = next(parameter for _, parameter in trainer._trainable)
+    parameter.grad = torch.full_like(parameter, 1e20)
+    trainer._pending_accumulation = 1
+    trainer._pending_examples = 1
+    trainer._pending_global_examples = 1
+
+    raw_norm = torch.nn.utils.get_total_norm([parameter.grad])
+    assert torch.isinf(raw_norm)
+
+    trainer._optimizer_step()
+
+    assert trainer.state.optimizer_steps == 1
+    assert trainer.pending_accumulation_steps == 0
+    assert parameter.grad is None
+    assert torch.isfinite(parameter).all()
+
+
 def test_distributed_all_true_requires_unanimous_rank_readiness(monkeypatch) -> None:
     monkeypatch.setattr(torch.distributed, "is_available", lambda: True)
     monkeypatch.setattr(torch.distributed, "is_initialized", lambda: True)
@@ -1126,21 +1189,25 @@ def test_one_shot_need_is_supervised_before_but_not_after_its_observation() -> N
 
     adapter = make_adapter(seed=125)
     tensorizer = ILLaDATrajectoryTensorizer(adapter, TinyTokenizer())
+    binding = example.binding_targets[0]
+    owner = binding.owner_cell
+    assert owner is not None
+    need_slot = tensorizer._binding_slot_schedule(example)[(owner.identifier, binding.need_id)]
     bootstrap = tensorizer.tensorize(example, source_step=-1, timestep=1.0)
     assimilate = tensorizer.tensorize(example, source_step=0, timestep=1.0)
 
-    assert bootstrap.targets.need_targets[0, 0, 0] == 1
-    assert bootstrap.targets.source_targets[0, 0, 0] == 0
-    assert assimilate.targets.need_targets[0, 0, 0] == 0
-    assert assimilate.targets.source_targets[0, 0, 0] == -100
+    assert bootstrap.targets.need_targets[0, 0, need_slot] == 1
+    assert bootstrap.targets.source_targets[0, 0, need_slot] == 0
+    assert assimilate.targets.need_targets[0, 0, need_slot] == 0
+    assert assimilate.targets.source_targets[0, 0, need_slot] == -100
 
     persistent = replace(
         example,
         binding_targets=(replace(example.binding_targets[0], freshness=FreshnessDemand.ALWAYS),),
     )
     refresh = tensorizer.tensorize(persistent, source_step=0, timestep=1.0)
-    assert refresh.targets.need_targets[0, 0, 0] == 1
-    assert refresh.targets.source_targets[0, 0, 0] == 0
+    assert refresh.targets.need_targets[0, 0, need_slot] == 1
+    assert refresh.targets.source_targets[0, 0, need_slot] == 0
 
 
 def test_trajectory_tensorizer_supervises_one_need_owner_with_multi_region_routes() -> None:
@@ -1167,6 +1234,20 @@ def test_trajectory_tensorizer_supervises_one_need_owner_with_multi_region_route
     assert sample.targets.need_target_display_mask[0, 1, 0, :3].all()
 
 
+def test_trajectory_tensorizer_single_need_uses_stable_first_slot() -> None:
+    base = make_trajectory()
+    tensorizer = ILLaDATrajectoryTensorizer(make_adapter(seed=126), TinyTokenizer())
+    binding = base.binding_targets[0]
+    owner = binding.owner_cell
+    assert owner is not None
+
+    for index in range(64):
+        example = replace(base, example_id=f"need-slot-{index}")
+        assert tensorizer._binding_slot_schedule(example) == {
+            (owner.identifier, binding.need_id): 0,
+        }
+
+
 def test_trajectory_tensorizer_keeps_multiple_bindings_on_one_cell_distinct() -> None:
     base = make_trajectory()
     first = replace(
@@ -1184,15 +1265,24 @@ def test_trajectory_tensorizer_keeps_multiple_bindings_on_one_cell_distinct() ->
     )
     example = replace(base, binding_targets=(first, second))
     tensorizer = ILLaDATrajectoryTensorizer(make_adapter(seed=126), TinyTokenizer())
+    owner = first.owner_cell
+    assert owner is not None
+    schedule = tensorizer._binding_slot_schedule(example)
+    first_slot = schedule[(owner.identifier, first.need_id)]
+    second_slot = schedule[(owner.identifier, second.need_id)]
 
     sample = tensorizer.tensorize(example, source_step=0, timestep=1.0)
 
-    assert sample.targets.need_targets[0, 1, :2].tolist() == [1.0, 1.0]
-    assert sample.targets.source_targets[0, 1, :2].tolist() == [0, 0]
-    assert sample.targets.argument_presence_targets[0, 1, 0, :2].tolist() == [1.0, 1.0]
-    assert sample.targets.argument_presence_targets[0, 1, 1, :2].tolist() == [1.0, 1.0]
-    assert sample.targets.argument_mask[0, 1, 0, :2].all()
-    assert sample.targets.argument_mask[0, 1, 1, :2].all()
+    assert (first_slot, second_slot) == (0, 1)
+    assert tensorizer._binding_slot_schedule(
+        replace(example, binding_targets=(second, first), example_id="different-id")
+    ) == schedule
+    assert sample.targets.need_targets[0, 1, [first_slot, second_slot]].tolist() == [1.0, 1.0]
+    assert sample.targets.source_targets[0, 1, [first_slot, second_slot]].tolist() == [0, 0]
+    assert sample.targets.argument_presence_targets[0, 1, first_slot, :2].tolist() == [1.0, 1.0]
+    assert sample.targets.argument_presence_targets[0, 1, second_slot, :2].tolist() == [1.0, 1.0]
+    assert sample.targets.argument_mask[0, 1, first_slot, :2].all()
+    assert sample.targets.argument_mask[0, 1, second_slot, :2].all()
 
 
 def test_order_aware_text_encoder_distinguishes_reversed_token_order() -> None:
@@ -1748,7 +1838,7 @@ def test_trainer_checkpoint_restores_trainable_state_optimizer_and_progress(tmp_
 
     inference_adapter = make_adapter(seed=77)
     inference_adapter.set_backbone_trainable(True)
-    loaded_state = load_cid_adapter_checkpoint(inference_adapter, path)
+    loaded_state = load_cid_adapter_checkpoint(inference_adapter, path, tokenizer=TinyTokenizer())
     assert loaded_state == CIDTrainerState(
         transitions_seen=4,
         optimizer_steps=2,
@@ -1879,7 +1969,90 @@ def test_stage_b_init_rejects_semantic_pooling_mismatch(tmp_path) -> None:
         load_cid_adapter_checkpoint(
             make_adapter(seed=152),
             checkpoint,
+            tokenizer=TinyTokenizer(),
             expected_semantic_pooling="order-aware-v2",
+        )
+
+
+def test_trainer_local_rng_state_round_trips_exactly() -> None:
+    adapter = make_adapter(seed=173)
+    trainer = CIDTrainer(
+        adapter,
+        ILLaDATrajectoryTensorizer(adapter, TinyTokenizer()),
+        CIDTrainerConfig(seed=19),
+    )
+    state = trainer.local_rng_state()
+    expected_torch = torch.rand(5, generator=trainer.generator)
+    expected_python = tuple(trainer.shuffle_rng.random() for _ in range(3))
+
+    trainer.reseed(999)
+    trainer.restore_local_rng_state(state)
+
+    assert torch.equal(expected_torch, torch.rand(5, generator=trainer.generator))
+    assert expected_python == tuple(trainer.shuffle_rng.random() for _ in range(3))
+
+
+def test_stage_a_checkpoint_rejects_different_backbone_identity(tmp_path) -> None:
+    adapter = make_adapter(seed=174)
+    adapter._cid_backbone_identity = "local-edge-sha256:a"
+    trainer = CIDTrainer(
+        adapter,
+        ILLaDATrajectoryTensorizer(adapter, TinyTokenizer()),
+    )
+    path = tmp_path / "identity.pt"
+    trainer.save_checkpoint(path)
+
+    restored_adapter = make_adapter(seed=174)
+    restored_adapter._cid_backbone_identity = "local-edge-sha256:b"
+    restored = CIDTrainer(
+        restored_adapter,
+        ILLaDATrajectoryTensorizer(restored_adapter, TinyTokenizer()),
+    )
+    with pytest.raises(ValueError, match="backbone geometry"):
+        restored.load_checkpoint(path)
+
+
+def test_stage_a_checkpoint_rejects_different_tokenizer_identity(tmp_path) -> None:
+    adapter = make_adapter(seed=176)
+    tokenizer = TinyTokenizer()
+    trainer = CIDTrainer(
+        adapter,
+        ILLaDATrajectoryTensorizer(adapter, tokenizer),
+    )
+    path = tmp_path / "tokenizer-identity.pt"
+    trainer.save_checkpoint(path)
+
+    restored_adapter = make_adapter(seed=176)
+    restored_tokenizer = TinyTokenizer()
+    restored_tokenizer.special_tokens_map = {"mask_token": "<different-mask>"}
+    restored = CIDTrainer(
+        restored_adapter,
+        ILLaDATrajectoryTensorizer(restored_adapter, restored_tokenizer),
+    )
+    with pytest.raises(ValueError, match="tokenizer identity"):
+        restored.load_checkpoint(path)
+
+
+def test_semantic_state_guard_rejects_nonfinite_and_runaway_state() -> None:
+    adapter = make_adapter(seed=175)
+    encoder = ILLaDATextEncoder(adapter, TinyTokenizer())
+    safe = torch.zeros(1, 2, adapter.d_model)
+    encoder.validate_semantic_state(safe)
+    with pytest.raises(FloatingPointError, match="non-finite"):
+        encoder.validate_semantic_state(torch.full_like(safe, float("inf")))
+    with pytest.raises(FloatingPointError, match="RMS exceeded"):
+        encoder.validate_semantic_state(
+            torch.full_like(safe, encoder.semantic_noise_scale * 64.0)
+        )
+
+    assert encoder.validate_semantic_state(safe, report_rms_excess=True) is None
+    runaway = torch.full_like(safe, encoder.semantic_noise_scale * 64.0)
+    assert encoder.validate_semantic_state(runaway, report_rms_excess=True) == pytest.approx(
+        encoder.semantic_noise_scale * 64.0
+    )
+    with pytest.raises(FloatingPointError, match="non-finite"):
+        encoder.validate_semantic_state(
+            torch.full_like(safe, float("nan")), report_rms_excess=True
         )
 
 
@@ -1907,7 +2080,7 @@ def test_stage_a_checkpoint_rejects_previous_neural_contract(tmp_path) -> None:
     with pytest.raises(ValueError, match="neural contract"):
         restored.load_checkpoint(incompatible)
     with pytest.raises(ValueError, match="neural contract"):
-        load_cid_adapter_checkpoint(restored_adapter, incompatible)
+        load_cid_adapter_checkpoint(restored_adapter, incompatible, tokenizer=TinyTokenizer())
 
 
 def test_trainer_checkpoint_restores_pending_gradient_accumulation(tmp_path) -> None:
@@ -2428,7 +2601,7 @@ def test_stage_b_fsdp_runs_full_parameter_optimizer_step_on_cpu(tmp_path) -> Non
         )
         metadata = json.loads((checkpoint / "metadata.json").read_text(encoding="utf-8"))
         assert metadata["format_version"] == 6
-        assert metadata["neural_contract_version"] == 4
+        assert metadata["neural_contract_version"] == 6
         assert metadata["semantic_embedding_snapshot"]["file"] == "semantic-embedding.pt"
 
         restored_adapter = make_adapter(seed=91)
@@ -2464,6 +2637,18 @@ def test_stage_b_fsdp_runs_full_parameter_optimizer_step_on_cpu(tmp_path) -> Non
             forward_model=restored_fsdp,
             gradient_clipper=restored_fsdp.clip_grad_norm_,
         )
+        saved_metadata = (checkpoint / "metadata.json").read_text(encoding="utf-8")
+        legacy_metadata = json.loads(saved_metadata)
+        legacy_metadata.pop("supervision_contract_version")
+        (checkpoint / "metadata.json").write_text(
+            json.dumps(legacy_metadata), encoding="utf-8"
+        )
+        with pytest.raises(ValueError, match="current Need/Display supervision"):
+            load_stage_b_checkpoint(
+                restored_fsdp, restored_optimizer, restored_trainer, checkpoint,
+            )
+        (checkpoint / "metadata.json").write_text(saved_metadata, encoding="utf-8")
+
         with pytest.raises(ValueError, match="dataset SHA-256"):
             load_stage_b_checkpoint(
                 restored_fsdp,
@@ -2787,10 +2972,10 @@ def test_existing_cell_noise_delta_uses_model_visible_corruption_level() -> None
 
     sample = tensorizer.tensorize(make_trajectory(), source_step=0, timestep=0.8)
 
-    # c0's target noise is 0.3. The model sees local_noise=0.8 after corruption,
-    # so runtime-compatible delta supervision is 0.3 - 0.8, not 0.3 - 0.5.
-    assert sample.batch.local_noise[0, 0, 0] == pytest.approx(0.8)
-    assert sample.targets.noise_delta[0, 0, 0] == pytest.approx(-0.5)
+    # c0's runtime state carries noise=0.5. Display timestep augmentation must not
+    # overwrite that TCT noise level, so delta supervision is 0.3 - 0.5.
+    assert sample.batch.local_noise[0, 0, 0] == pytest.approx(0.5)
+    assert sample.targets.noise_delta[0, 0, 0] == pytest.approx(-0.2)
     assert sample.targets.revision_targets[0, 0] == int(cid_model.RevisionAction.STABILIZE)
 
 
@@ -3523,6 +3708,17 @@ def test_free_rollout_records_unrecoverable_recovery_without_crashing(monkeypatc
 
 
 def test_training_rollout_masks_unrecoverable_recovery_without_crashing(monkeypatch) -> None:
+    class NonConvergingModel(nn.Module):
+        def __init__(self, adapter) -> None:
+            super().__init__()
+            self.adapter = adapter
+
+        def forward(self, batch):
+            output = self.adapter(batch)
+            output.convergence_logits = torch.full_like(output.convergence_logits, -20.0)
+            output.need_logits = torch.full_like(output.need_logits, -20.0)
+            return output
+
     adapter = make_adapter(seed=160)
     tensorizer = ILLaDATrajectoryTensorizer(adapter, TinyTokenizer())
     trainer = CIDTrainer(
@@ -3535,6 +3731,7 @@ def test_training_rollout_masks_unrecoverable_recovery_without_crashing(monkeypa
             teacher_forcing_epochs=0,
             rollout_ramp_epochs=0,
         ),
+        forward_model=NonConvergingModel(adapter),
     )
     original_tensorize = tensorizer.tensorize
 
@@ -3569,6 +3766,34 @@ def test_training_rollout_masks_unrecoverable_recovery_without_crashing(monkeypa
 
     assert report.transitions == 3
     assert trainer.state.epochs_completed == 1
+
+
+def test_stage_a_cache_reclaimed_before_collation_with_explicit_batch(monkeypatch) -> None:
+    adapter = make_adapter(seed=158)
+    tensorizer = ILLaDATrajectoryTensorizer(adapter, TinyTokenizer())
+    trainer = CIDTrainer(
+        adapter,
+        tensorizer,
+        CIDTrainerConfig(timestep_min=0.0, timestep_max=0.0),
+    )
+    sample = tensorizer.tensorize(make_trajectory(), source_step=0, timestep=0.0)
+    events = []
+    original_collate = cid_training.collate_training_steps
+
+    def reclaim() -> None:
+        events.append("reclaim")
+
+    def collate(*args, **kwargs):
+        events.append("collate")
+        return original_collate(*args, **kwargs)
+
+    monkeypatch.setattr(trainer, "_maybe_release_npu_cache", reclaim)
+    monkeypatch.setattr(cid_training, "collate_training_steps", collate)
+    trainer._forward_backward((sample,), global_effective_batch_size=1)
+    assert events[:2] == ["reclaim", "collate"]
+    events.clear()
+    trainer._forward_backward((sample,))
+    assert events[:2] == ["reclaim", "collate"]
 
 
 def test_valid_example_accumulation_ignores_masked_rows() -> None:
@@ -4436,6 +4661,80 @@ def test_stage_b_optimizer_step_count_matches_bucket_padding() -> None:
     )
 
 
+def test_stage_a_adamw_groups_do_not_decay_gate_biases() -> None:
+    adapter = make_adapter(seed=172)
+    groups = stage_a_adamw_parameter_groups(adapter, weight_decay=0.01)
+    by_name = {str(group["group_name"]): group for group in groups}
+
+    assert by_name["cid-decay"]["weight_decay"] == pytest.approx(0.01)
+    assert by_name["cid-no-decay"]["weight_decay"] == pytest.approx(0.0)
+    no_decay_ids = {id(parameter) for parameter in by_name["cid-no-decay"]["params"]}
+    decay_ids = {id(parameter) for parameter in by_name["cid-decay"]["params"]}
+    assert id(adapter.external_fusion.external_gate.bias) in no_decay_ids
+    assert id(adapter.output_heads.need_display_query_scale) in no_decay_ids
+    assert id(adapter.output_heads.need_display_query_bias) in no_decay_ids
+    assert id(adapter.role_projection.weight) in decay_ids
+
+
+def test_stage_a_checkpoint_migrates_legacy_ndim_optimizer_groups(tmp_path) -> None:
+    adapter = make_adapter(seed=173)
+    legacy_buckets: dict[bool, list[torch.nn.Parameter]] = {True: [], False: []}
+    for parameter in adapter.parameters():
+        if parameter.requires_grad:
+            legacy_buckets[parameter.ndim >= 2].append(parameter)
+    legacy_groups = [
+        {
+            "params": legacy_buckets[use_decay],
+            "weight_decay": 0.01 if use_decay else 0.0,
+            "group_name": "cid-decay" if use_decay else "cid-no-decay",
+        }
+        for use_decay in (True, False)
+        if legacy_buckets[use_decay]
+    ]
+    legacy_optimizer = torch.optim.AdamW(legacy_groups, lr=1e-3, weight_decay=0.0)
+    trainer = CIDTrainer(
+        adapter,
+        ILLaDATrajectoryTensorizer(adapter, TinyTokenizer()),
+        CIDTrainerConfig(learning_rate=1e-3, weight_decay=0.01),
+        optimizer=legacy_optimizer,
+    )
+    for parameter in adapter.parameters():
+        if parameter.requires_grad:
+            parameter.grad = torch.ones_like(parameter)
+    legacy_optimizer.step()
+    legacy_optimizer.zero_grad(set_to_none=True)
+    expected_step = legacy_optimizer.state[
+        adapter.output_heads.need_display_query_scale
+    ]["step"].detach().clone()
+
+    checkpoint = tmp_path / "legacy-stage-a.pt"
+    trainer.save_checkpoint(checkpoint)
+    payload = torch.load(checkpoint, map_location="cpu", weights_only=False)
+    payload.pop("optimizer_parameter_names")
+    torch.save(payload, checkpoint)
+
+    restored_adapter = make_adapter(seed=173)
+    restored = CIDTrainer(
+        restored_adapter,
+        ILLaDATrajectoryTensorizer(restored_adapter, TinyTokenizer()),
+        CIDTrainerConfig(learning_rate=1e-3, weight_decay=0.01),
+    )
+    restored.load_checkpoint(checkpoint)
+
+    no_decay_group = next(
+        group
+        for group in restored.optimizer.param_groups
+        if group.get("group_name") == "cid-no-decay"
+    )
+    no_decay_ids = {id(parameter) for parameter in no_decay_group["params"]}
+    assert id(restored_adapter.output_heads.need_display_query_scale) in no_decay_ids
+    assert id(restored_adapter.output_heads.need_display_query_bias) in no_decay_ids
+    assert torch.equal(
+        restored.optimizer.state[restored_adapter.output_heads.need_display_query_scale]["step"],
+        expected_step,
+    )
+
+
 def test_stage_b_adamw_groups_split_backbone_cid_and_no_decay() -> None:
     adapter = make_adapter()
     adapter.set_backbone_trainable(True)
@@ -4452,6 +4751,11 @@ def test_stage_b_adamw_groups_split_backbone_cid_and_no_decay() -> None:
     assert by_name["cid-decay"]["lr_scale"] == pytest.approx(1.0)
     assert by_name["backbone-decay"]["weight_decay"] == pytest.approx(0.01)
     assert by_name["cid-no-decay"]["weight_decay"] == pytest.approx(0.0)
+    cid_no_decay_ids = {
+        id(parameter) for parameter in by_name["cid-no-decay"]["params"]
+    }
+    assert id(adapter.output_heads.need_display_query_scale) in cid_no_decay_ids
+    assert id(adapter.output_heads.need_display_query_bias) in cid_no_decay_ids
 
     grouped = {id(parameter) for group in groups for parameter in group["params"]}
     trainable = {id(parameter) for parameter in adapter.parameters() if parameter.requires_grad}
@@ -4621,7 +4925,7 @@ def test_revision_target_tracks_logical_state_change_not_sampled_diffusion_noise
 
     sample = tensorizer.tensorize(make_trajectory(), source_step=0, timestep=0.1)
 
-    assert sample.targets.noise_delta[0, 0, 0] == pytest.approx(0.2)
+    assert sample.targets.noise_delta[0, 0, 0] == pytest.approx(-0.2)
     assert sample.targets.revision_targets[0, 0] == int(cid_model.RevisionAction.STABILIZE)
 
 
@@ -4788,6 +5092,74 @@ def test_training_display_unknown_marker_maps_to_model_mask_token() -> None:
     assert sample.batch.display_ids[0, 0] == adapter.mask_token_id
     assert sample.batch.display_ids[0, 1] == tensorizer.eos_token_id
     assert not sample.batch.display_padding_mask.any()
+
+
+def test_unknown_display_does_not_reward_answer_completion_eos() -> None:
+    adapter = make_adapter(seed=181)
+    tensorizer = ILLaDATrajectoryTensorizer(adapter, TinyTokenizer())
+    base = make_trajectory()
+    unresolved = replace(
+        base,
+        display_targets=(
+            DisplayTarget(step=0, text=DISPLAY_UNKNOWN_MARKER),
+            DisplayTarget(step=1, text=DISPLAY_UNKNOWN_MARKER),
+        ),
+    )
+    for step in (-1, 0):
+        for timestep in (0.0, 0.5, 1.0):
+            sample = tensorizer.tensorize(unresolved, source_step=step, timestep=timestep)
+            assert sample.targets.display_ids.eq(-100).all()
+            # Explicit unknown positions remain as fillable MASK inputs.
+            assert sample.batch.display_ids[0, 0] == adapter.mask_token_id
+
+    # Partially known drafts must retain EOS and known-content supervision.
+    partial = replace(
+        base,
+        display_targets=(
+            DisplayTarget(step=0, text=f"A{DISPLAY_UNKNOWN_MARKER}C"),
+            DisplayTarget(step=1, text=f"A{DISPLAY_UNKNOWN_MARKER}C"),
+        ),
+    )
+    partial_sample = tensorizer.tensorize(
+        partial, source_step=0, timestep=1.0,
+    )
+    assert (partial_sample.targets.display_ids == tensorizer.eos_token_id).any()
+    assert (partial_sample.targets.display_ids >= 0).any()
+
+    # A real completed known answer still requires answer-boundary learning.
+    known_sample = tensorizer.tensorize(base, source_step=0, timestep=1.0)
+    assert (known_sample.targets.display_ids == tensorizer.eos_token_id).any()
+
+
+def test_training_never_supervises_unresolved_display_mask_as_answer() -> None:
+    adapter = make_adapter(seed=177)
+    tensorizer = ILLaDATrajectoryTensorizer(adapter, TinyTokenizer())
+    base = make_trajectory()
+    unknown = replace(
+        base,
+        display_targets=(
+            DisplayTarget(step=0, text=DISPLAY_UNKNOWN_MARKER),
+            DisplayTarget(step=1, text=DISPLAY_UNKNOWN_MARKER),
+        ),
+    )
+    for step in (-1, 0):
+        sample = tensorizer.tensorize(unknown, source_step=step, timestep=1.0)
+        assert sample.targets.display_ids.ne(adapter.mask_token_id).all()
+        assert sample.batch.display_ids[0, 0] == adapter.mask_token_id
+
+    partial = replace(
+        base,
+        display_targets=(
+            DisplayTarget(step=0, text=f"A{DISPLAY_UNKNOWN_MARKER}C"),
+            DisplayTarget(step=1, text=f"A{DISPLAY_UNKNOWN_MARKER}C"),
+        ),
+    )
+    sample = tensorizer.tensorize(partial, source_step=0, timestep=1.0)
+    target = sample.targets.display_ids[0]
+    assert target.ne(adapter.mask_token_id).all()
+    assert target.eq(-100).any()
+    assert target.eq(tensorizer.eos_token_id).any()
+    assert target.ge(0).any()
 
 
 def test_training_rejects_legacy_process_status_display_targets() -> None:
@@ -5238,3 +5610,52 @@ def test_detached_text_batch_cache_respects_vector_budget() -> None:
     assert encoder._detached_batch_cache_vectors == sum(
         int(value.shape[1]) for value in encoder._detached_batch_cache.values()
     )
+
+
+
+def test_materialized_display_reference_excludes_unknown_and_partial_answers() -> None:
+    reference = cid_training._materialized_complete_display_reference
+    unknown = torch.tensor([[5]])
+    partial = torch.tensor([[11, 5, 12]])
+    complete = torch.tensor([[11, 12]])
+    kw = {"canvas_length": 8, "mask_token_id": 5, "eos_token_id": 2}
+    assert torch.all(reference(unknown, **kw) == -100)
+    assert torch.all(reference(partial, **kw) == -100)
+    expected = torch.tensor([[11, 12, 2, -100, -100, -100, -100, -100]])
+    assert torch.equal(reference(complete, **kw), expected)
+    with pytest.raises(ValueError, match="physical canvas"):
+        reference(torch.ones((1, 8), dtype=torch.long), **kw)
+
+def test_training_checkpoint_refuses_legacy_need_display_supervision_but_inference_loads(
+    tmp_path,
+) -> None:
+    from cid.model.training import CID_SUPERVISION_CONTRACT_VERSION
+
+    adapter = make_adapter(seed=196)
+    tokenizer = TinyTokenizer()
+    trainer = CIDTrainer(
+        adapter,
+        ILLaDATrajectoryTensorizer(adapter, tokenizer),
+        CIDTrainerConfig(),
+    )
+    saved = tmp_path / "current-supervision.pt"
+    trainer.save_checkpoint(saved)
+    state = torch.load(saved, map_location="cpu", weights_only=False)
+    assert state["supervision_contract_version"] == CID_SUPERVISION_CONTRACT_VERSION
+    state.pop("supervision_contract_version")
+    legacy = tmp_path / "old-supervision.pt"
+    torch.save(state, legacy)
+
+    with pytest.raises(ValueError, match="incompatible Need/Display supervision"):
+        trainer.load_checkpoint(legacy)
+    # Historical releases still load for inference/diagnostics, without
+    # laundering their inconsistent labels into new optimizer training.
+    load_cid_adapter_checkpoint(adapter, legacy, tokenizer=tokenizer)
+    with pytest.raises(ValueError, match="incompatible Need/Display supervision"):
+        load_cid_adapter_checkpoint(
+            adapter,
+            legacy,
+            tokenizer=tokenizer,
+            require_current_supervision=True,
+        )
+    trainer.load_checkpoint(saved)

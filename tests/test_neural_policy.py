@@ -1,5 +1,6 @@
 from __future__ import annotations
 
+import logging
 from dataclasses import replace
 from importlib import import_module
 from types import SimpleNamespace
@@ -205,6 +206,49 @@ async def test_neural_policy_runs_tiny_illada_inside_async_runtime() -> None:
     assert result.display.token_ids == (7, 7, 7)
     # Detached text encodings are cached across runtime steps.
     assert tokenizer.prompts == ["Which value should I return?"]
+
+
+def test_inference_semantic_rms_warns_once_and_retains_nonfinite_guard(caplog) -> None:
+    adapter = ILLaDACIDAdapter(TinyBackbone(), freeze_backbone=True)
+    tensorizer = ILLaDAContextTensorizer(adapter, TinyTokenizer())
+    excessive = tensorizer.text_encoder.semantic_noise_scale * 64.0
+
+    class FixedSemanticOutput(nn.Module):
+        def __init__(self, value: float) -> None:
+            super().__init__()
+            self.value = value
+
+        def forward(self, batch):
+            output = adapter(batch)
+            return replace(
+                output,
+                thought_semantic=torch.full_like(output.thought_semantic, self.value),
+            )
+
+    model = FixedSemanticOutput(excessive)
+    policy = ILLaDANeuralPolicy(adapter, tensorizer, forward_model=model)
+    thought = CognitiveField.empty(capacity=2, width=TinyConfig.hidden_size)
+    context = ModelContext(
+        facts=FactStore().snapshot(),
+        thought=thought,
+        display=DisplayCanvas.masked(length=3, mask_token_id=5),
+        sources=(),
+        percepts=(),
+        step=0,
+        prompt="status",
+    )
+
+    with caplog.at_level(logging.WARNING, logger="cid.model.policy"):
+        policy.step(context)
+        policy.step(context)
+    assert policy.semantic_rms_exceedances == 2
+    assert policy.peak_semantic_rms == pytest.approx(excessive)
+    assert len([r for r in caplog.records if "semantic RMS" in r.message]) == 1
+
+    model.value = float("inf")
+    with pytest.raises(FloatingPointError, match="non-finite"):
+        policy.step(context)
+    assert policy.semantic_rms_exceedances == 2
 
 
 async def test_neural_policy_materializes_executable_need_and_reads_source() -> None:
