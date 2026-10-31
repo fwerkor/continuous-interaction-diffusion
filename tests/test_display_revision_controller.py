@@ -129,3 +129,80 @@ def test_configuration_does_not_mutate_caller_input() -> None:
     copy = x.clone()
     _run(model, x, _logits(4, 5, EOS))
     assert torch.equal(x, copy)
+
+
+def _loop_controller(*, tokenizer=None) -> DisplayRevisionController:
+    return DisplayRevisionController(
+        DisplayRevisionConfig(loop_repair_enabled=True), tokenizer=tokenizer
+    )
+
+
+def _direct_repair(controller: DisplayRevisionController, tokens: list[int]) -> torch.Tensor:
+    canvas = _canvas(*tokens, EOS)
+    controller._trusted = torch.full_like(canvas, -1)
+    controller._candidate = torch.full_like(canvas, -1)
+    controller._streak = torch.zeros_like(canvas)
+    return controller._repair_repeated_suffix(canvas, CIDDiffusionScheduler(MASK, EOS))
+
+
+def test_runaway_suffix_is_remasked_without_destroying_prefix_or_eos() -> None:
+    controller = _loop_controller()
+    prefix = list(range(10, 34))
+    tokens = prefix + [7] * 12
+    result = _direct_repair(controller, tokens)
+    assert result[0, : len(prefix) + 2].tolist() == prefix + [7, 7]
+    assert result[0, len(prefix) + 2 : len(tokens)].eq(MASK).all()
+    assert result[0, len(tokens)] == EOS
+    assert controller.loop_repairs == 1
+
+
+def test_normal_short_repetition_and_short_answer_are_not_truncated() -> None:
+    controller = _loop_controller()
+    for tokens in ([7] * 12, [2, 3, 4, 5, 6], [4, 5, 5, 5, 5, 5]):
+        output = _direct_repair(controller, tokens)
+        assert output[0, : len(tokens) + 1].tolist() == tokens + [EOS]
+    assert controller.loop_repairs == controller.loop_fallbacks == 0
+
+
+def test_loop_retries_are_bounded_and_only_truncate_abnormal_suffix() -> None:
+    controller = _loop_controller()
+    tokens = list(range(10, 34)) + [7] * 12
+    _direct_repair(controller, tokens)
+    _direct_repair(controller, tokens)
+    result = _direct_repair(controller, tokens)
+    assert controller.loop_repairs == 2
+    assert controller.loop_fallbacks == 1
+    assert result[0, :26].tolist() == list(range(10, 34)) + [7, 7]
+    assert result[0, 26] == EOS
+    _direct_repair(controller, tokens)
+    assert controller.loop_fallbacks == 1
+
+
+def test_character_loops_with_different_token_ids_are_detected() -> None:
+    class SingleCharacterTokenizer:
+        def decode(self, token_ids, **_kwargs):
+            return "".join("a" for _ in token_ids)
+
+    controller = _loop_controller(tokenizer=SingleCharacterTokenizer())
+    tokens = [7, 8, 9, 11, 13, 17, 19, 23, 29, 31] * 3
+    output = _direct_repair(controller, tokens)
+    assert controller.loop_repairs == 1
+    assert output[0, :3].tolist() == tokens[:3]
+    assert output[0, 3 : len(tokens)].eq(MASK).any()
+    assert output[0, len(tokens)] == EOS
+
+
+def test_loop_state_resets_after_new_evidence() -> None:
+    controller = _loop_controller()
+    _direct_repair(controller, list(range(10, 34)) + [7] * 12)
+    assert controller.loop_repairs == 1
+    controller.observe_context(_context(0))
+    controller.observe_context(_context(1, revision=1))
+    assert controller.loop_repairs == 0
+    assert controller.loop_fallbacks == 0
+
+
+@pytest.mark.parametrize("kwargs", [{"loop_min_tokens": 0}, {"loop_retries": -1}])
+def test_invalid_loop_config_rejected(kwargs) -> None:
+    with pytest.raises(ValueError):
+        DisplayRevisionConfig(**kwargs)

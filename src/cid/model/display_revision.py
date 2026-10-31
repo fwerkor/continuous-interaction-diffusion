@@ -2,7 +2,9 @@
 
 from __future__ import annotations
 
+import re
 from dataclasses import dataclass
+from typing import Any
 
 import torch
 from torch import Tensor
@@ -20,6 +22,9 @@ class DisplayRevisionConfig:
     correction_gain: float = 0.25
     correction_steps: int = 8
     max_burst_tokens: int = 16
+    loop_repair_enabled: bool = False
+    loop_min_tokens: int = 24
+    loop_retries: int = 2
 
     def __post_init__(self) -> None:
         for field in ("burst_probability", "anchor_probability", "correction_probability"):
@@ -29,6 +34,8 @@ class DisplayRevisionConfig:
             raise ValueError("correction_gain must be in [0, 1]")
         if self.correction_steps < 1 or self.max_burst_tokens < 1:
             raise ValueError("correction_steps and max_burst_tokens must be positive")
+        if self.loop_min_tokens < 1 or self.loop_retries < 0:
+            raise ValueError("loop_min_tokens must be positive and loop_retries non-negative")
 
 
 class DisplayRevisionController:
@@ -38,8 +45,11 @@ class DisplayRevisionController:
     A changed external evidence revision resets trust, not the Display content itself.
     """
 
-    def __init__(self, config: DisplayRevisionConfig | None = None) -> None:
+    def __init__(
+        self, config: DisplayRevisionConfig | None = None, *, tokenizer: Any | None = None
+    ) -> None:
         self.config = config or DisplayRevisionConfig()
+        self.tokenizer = tokenizer
         self.reset()
 
     def reset(self) -> None:
@@ -48,6 +58,11 @@ class DisplayRevisionController:
         self._streak: Tensor | None = None
         self._evidence: object = None
         self._last_step: int | None = None
+        self._loop_attempts: dict[int, int] = {}
+        self._loop_finalized: set[int] = set()
+        self.loop_repairs = 0
+        self.loop_fallbacks = 0
+        self.loop_detected = 0
 
     def observe_context(self, context: object) -> None:
         """Drop prior trust on a new run or any new external source/fact/percept."""
@@ -185,4 +200,79 @@ class DisplayRevisionController:
                         float(proposed_prob[row, pos]) >= self.config.anchor_probability
                     ):
                         trusted[pos] = token
+        if self.config.loop_repair_enabled:
+            result = self._repair_repeated_suffix(result, scheduler)
+        return result
+
+    @staticmethod
+    def _loop_start(tokens: list[int], mask_id: int) -> int | None:
+        # A runaway loop must still be repeating at the end of the visible answer.
+        # Two copies remain editable context; the extra copies are regenerated.
+        for width in range(1, min(12, len(tokens) // 6) + 1):
+            ending = tokens[-width:]
+            if mask_id in ending:
+                continue
+            if tokens[-6 * width :] == ending * 6:
+                start = len(tokens) - 6 * width
+                while start >= width and tokens[start - width : start] == ending:
+                    start -= width
+                return start + 2 * width
+        return None
+
+    def _decoded_loop_start(self, tokens: list[int], mask_id: int) -> int | None:
+        if self.tokenizer is None or mask_id in tokens:
+            return None
+        text = self.tokenizer.decode(
+            tokens, skip_special_tokens=True, clean_up_tokenization_spaces=False
+        )
+        match = re.search(r"(.{1,8})\1{5,}$", text, flags=re.DOTALL)
+        if match is None:
+            return None
+        # Convert a character boundary back into token space conservatively.
+        keep_characters = match.end() - 4 * len(match.group(1))
+        for index in range(2, len(tokens)):
+            prefix = self.tokenizer.decode(
+                tokens[:index], skip_special_tokens=True, clean_up_tokenization_spaces=False
+            )
+            if len(prefix) >= keep_characters:
+                return index
+        return None
+
+    def _repair_repeated_suffix(self, result: Tensor, scheduler: CIDDiffusionScheduler) -> Tensor:
+        assert self._trusted is not None
+        assert self._candidate is not None
+        assert self._streak is not None
+        eos_id = scheduler.eos_token_id
+        mask_id = scheduler.mask_token_id
+        assert eos_id is not None
+        with torch.no_grad():
+            for row in range(result.shape[0]):
+                if row in self._loop_finalized:
+                    continue
+                ids = result[row].tolist()
+                stop = ids.index(eos_id) if eos_id in ids else len(ids)
+                if stop < self.config.loop_min_tokens:
+                    continue
+                active = ids[:stop]
+                start = self._loop_start(active, mask_id)
+                if start is None:
+                    start = self._decoded_loop_start(active, mask_id)
+                if start is None or start < 2:
+                    continue
+                # Avoid cutting meaningful short results (IDs, true/false, codes)
+                # and cap retries for the entire trajectory, not per changing prefix.
+                self.loop_detected += 1
+                attempts = self._loop_attempts.get(row, 0)
+                if attempts < self.config.loop_retries:
+                    self._loop_attempts[row] = attempts + 1
+                    result[row, start:stop] = mask_id
+                    self.loop_repairs += 1
+                else:
+                    result[row, start] = eos_id
+                    result[row, start + 1 :] = mask_id
+                    self.loop_fallbacks += 1
+                    self._loop_finalized.add(row)
+                self._trusted[row, start:] = -1
+                self._candidate[row, start:] = -1
+                self._streak[row, start:] = 0
         return result

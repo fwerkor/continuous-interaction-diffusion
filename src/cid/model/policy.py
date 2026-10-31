@@ -18,7 +18,7 @@ from cid.model.diffusion import (
     denoising_noise_level,
     denoising_reveal_fraction,
 )
-from cid.model.display_revision import DisplayRevisionController
+from cid.model.display_revision import DisplayRevisionConfig, DisplayRevisionController
 from cid.model.encoding import (
     ILLaDATextEncoder,
     canonical_fact_text,
@@ -215,6 +215,8 @@ class ILLaDANeuralPolicyConfig:
     display_revision_fraction: float = DEFAULT_DISPLAY_REVISION_FRACTION
     display_revision_margin: float = DEFAULT_DISPLAY_REVISION_MARGIN
     display_repetition_score_multiplier: float = DEFAULT_DISPLAY_REPETITION_SCORE_MULTIPLIER
+    display_loop_repair: bool = True
+    display_reveal_cap: float = 0.25
     seed: int = 0
 
     def __post_init__(self) -> None:
@@ -226,6 +228,8 @@ class ILLaDANeuralPolicyConfig:
             raise ValueError("display_revision_margin must be non-negative")
         if not 0.0 < self.display_repetition_score_multiplier <= 1.0:
             raise ValueError("display_repetition_score_multiplier must be in (0, 1]")
+        if not 0.0 < self.display_reveal_cap <= 1.0:
+            raise ValueError("display_reveal_cap must be in (0, 1]")
 
 
 class ILLaDANeuralPolicy:
@@ -253,7 +257,10 @@ class ILLaDANeuralPolicy:
         self.generator.manual_seed(self.config.seed)
         self.semantic_rms_exceedances = 0
         self.peak_semantic_rms: float | None = None
-        self.display_revision_controller = DisplayRevisionController()
+        self.display_revision_controller = DisplayRevisionController(
+            DisplayRevisionConfig(loop_repair_enabled=self.config.display_loop_repair),
+            tokenizer=tensorizer.tokenizer,
+        )
 
     def step(self, context: ModelContext) -> ModelUpdate:
         diffusion_step = context.diffusion_step
@@ -283,8 +290,15 @@ class ILLaDANeuralPolicy:
                 self.scheduler,
                 batch.display_ids,
                 output.display_logits,
-                reveal_fraction=denoising_reveal_fraction(
-                    diffusion_step, self.config.denoising_steps
+                reveal_fraction=min(
+                    (
+                        self.config.display_reveal_cap
+                        if self.config.display_loop_repair
+                        and context.display.realized_length
+                        >= self.display_revision_controller.config.loop_min_tokens
+                        else 1.0
+                    ),
+                    denoising_reveal_fraction(diffusion_step, self.config.denoising_steps),
                 ),
                 revision_fraction=self.config.display_revision_fraction,
                 revision_margin=self.config.display_revision_margin,
