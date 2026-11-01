@@ -582,9 +582,12 @@ class CIDDiffusionScheduler:
             if not previous.numel() or not proposed.numel():
                 continue
             old_end, new_end = int(previous[0]), int(proposed[0])
-            if new_end < old_end and bool(
-                (after[row, :new_end] == self.mask_token_id).any()
+            if new_end < old_end and (
+                new_end == 0
+                or bool((after[row, :new_end] == self.mask_token_id).any())
             ):
+                # Empty answers are never a valid preallocated Display. An EOS
+                # cannot advance over unresolved tokens either.
                 after[row, new_end] = self.mask_token_id
                 after[row, old_end] = self.eos_token_id
         return after

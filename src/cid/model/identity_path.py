@@ -300,5 +300,33 @@ class IdentityPreservingPath(nn.Module):
         result.convergence_logits = result.convergence_logits.masked_fill(
             newly_allocated.any(dim=1), -20.0
         )
+        if self.training:
+            # The frozen native language path is an anchor, not merely an
+            # initialization. Penalize excessive changes in hidden space and
+            # especially a large EOS logit increase before the current EOS.
+            # This regularizer does not constrain Thought cells or tool
+            # routing; their task losses can still justify a correction.
+            native_norm = y_native.float().norm(dim=-1).detach().clamp_min(1.0)
+            shift_ratio = (y_hidden.float() - y_native.float()).norm(dim=-1) / native_norm
+            available = display_keys
+            eos_id = adapter.eos_token_id
+            positions = torch.arange(display_length, device=device)
+            boundary = torch.where(
+                (batch.display_ids == eos_id).any(dim=1, keepdim=True),
+                (batch.display_ids == eos_id).int().argmax(dim=1, keepdim=True),
+                torch.full((batch_size, 1), display_length, device=device),
+            )
+            before_eos = positions[None, :] < boundary
+            protected = available & (positions[None, :] <= boundary) & ~percept_evidence
+            excess = (shift_ratio - 0.12).relu()
+            preserve = (excess.square() * protected).sum() / protected.sum().clamp_min(1)
+            eos_mask = before_eos & available & ~percept_evidence
+            eos_rise = (
+                logits[..., eos_id].float() - base_logits[..., eos_id].float().detach()
+                - 1.5
+            ).relu()
+            eos_preserve = (eos_rise.square() * eos_mask).sum() / eos_mask.sum().clamp_min(1)
+            auxiliary = (auxiliary if auxiliary is not None else preserve.new_zeros(()))
+            auxiliary = auxiliary + 0.5 * preserve + 0.05 * eos_preserve
         result.auxiliary_loss = auxiliary
         return result

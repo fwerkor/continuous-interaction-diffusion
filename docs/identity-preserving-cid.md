@@ -93,3 +93,23 @@ It uses an eight-token initial MASK window followed by a revisable EOS,
 retaining the earlier bounded expansion mechanism. The vNext recommended
 training configuration remains the preallocated full-canvas mode.
 This selector is stored in adapter_config; the legacy joint default is unchanged.
+
+### Native Display preservation and empty-EOS recovery
+
+Stage A/B now penalize excessive hidden-state deviations from the frozen native
+Display path (only up to the current EOS boundary), with a tolerance of 12% of
+native hidden norm. The auxiliary penalty also discourages EOS logit increases
+larger than 1.5 over the native logit before the active boundary. Percept-targeted
+positions are excluded from both regularizers so grounded tool updates can
+modify Display. These are soft, training-only penalties: task supervision can
+override them and they add no inference forward passes.
+
+The preallocated runtime also rejects any EOS move to the first position, in
+addition to moves that cross unresolved MASK tokens. It preserves the prior EOS
+boundary and keeps the Display unresolved instead of generating a permanently
+empty answer. This check applies to both native-engine and PyTorch refinement.
+
+The coefficients (0.5 for excessive hidden-state deviation, 0.05 for EOS
+logit rise) are initial safeguards, not a proven optimal configuration. Use
+paired native-vs-CID rollout probes and semantic correctness to validate them
+before claiming that language capability has been restored.

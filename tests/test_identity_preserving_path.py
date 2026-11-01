@@ -344,3 +344,22 @@ def test_new_internal_thought_prevents_immediate_runtime_convergence() -> None:
     )
     assert update.thought.cells[0].occupied
     assert not update.converged
+
+
+def test_display_preservation_loss_is_trainable_and_neutral_when_inactive() -> None:
+    adapter = new_adapter().train()
+    batch = make_batch()
+    batch.slot_occupancy.zero_()
+    with torch.no_grad():
+        adapter.identity_path.display_gate.fill_(4.0)
+    neutral = adapter(batch)
+    assert neutral.auxiliary_loss is not None
+    torch.testing.assert_close(neutral.auxiliary_loss, torch.zeros_like(neutral.auxiliary_loss))
+    batch.slot_occupancy[0, 0] = 1
+    active = adapter(batch)
+    assert active.auxiliary_loss is not None
+    assert torch.isfinite(active.auxiliary_loss)
+    assert active.auxiliary_loss.item() > 0
+    active.auxiliary_loss.backward()
+    assert adapter.identity_path.display_gate.grad is not None
+    assert torch.isfinite(adapter.identity_path.display_gate.grad).all()

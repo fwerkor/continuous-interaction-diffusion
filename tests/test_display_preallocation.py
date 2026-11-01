@@ -269,3 +269,22 @@ def test_teacher_display_revision_preserves_stable_prefix_and_moves_eos() -> Non
     assert (state.targets.display_ids[0, :2] == -100).all()
     assert (state.targets.display_ids[0, 4:] == -100).all()
     assert (state.batch.display_noise == .625).all()
+
+
+def test_preallocated_refinement_cannot_collapse_to_empty_answer() -> None:
+    scheduler = CIDDiffusionScheduler(
+        mask_token_id=5, eos_token_id=6, display_initialization="preallocated",
+    )
+    canvas = torch.tensor([[5, 5, 5, 5, 5, 5, 5, 6]])
+    logits = torch.full((1, 8, 12), -6.0)
+    logits[..., 6] = 12.0
+    for fraction in (0.125, 0.5, 1.0):
+        revised = scheduler.refine_display(
+            canvas, logits,
+            reveal_fraction=fraction,
+            revision_fraction=0.25,
+            revision_margin=0.1,
+        )
+        assert revised[0, 0].item() != 6
+        assert revised[0, -1].item() == 6
+        assert torch.equal(canvas, torch.tensor([[5, 5, 5, 5, 5, 5, 5, 6]]))
