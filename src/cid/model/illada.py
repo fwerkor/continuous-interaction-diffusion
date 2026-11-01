@@ -6,6 +6,7 @@ from types import MethodType
 import torch
 from torch import nn
 
+from cid.defaults import DEFAULT_ALLOCATION_THRESHOLD, DEFAULT_MAX_ALLOCATIONS_PER_STEP
 from cid.grounding import AnchorKind, LinkRelation, ObjectKind
 from cid.lifecycle import MODELED_LIFECYCLES
 from cid.model.ar import (
@@ -14,6 +15,7 @@ from cid.model.ar import (
     prepare_ar_backbone_for_cid,
 )
 from cid.model.components import CIDExternalFusion, CIDOutputHeads
+from cid.model.identity_path import IdentityPreservingPath
 from cid.model.tensors import CIDTensorBatch, CIDTensorOutput, live_slot_occupancy
 
 ILLADA_8B_BASE = "GSAI-ML/iLLaDA-8B-Base"
@@ -645,6 +647,9 @@ class ILLaDACIDConfig:
     max_link_slots: int = 8
     external_dropout: float = 0.0
     semantic_head_version: int = 1  # Legacy checkpoints omit this field.
+    interaction_architecture: str = "joint"
+    identity_allocation_threshold: float = DEFAULT_ALLOCATION_THRESHOLD
+    identity_max_allocations_per_step: int = DEFAULT_MAX_ALLOCATIONS_PER_STEP
 
     def __post_init__(self) -> None:
         if self.max_thought_slots <= 0 or self.max_display_tokens <= 0:
@@ -673,6 +678,12 @@ class ILLaDACIDConfig:
             raise ValueError("external_dropout must be in [0, 1)")
         if self.semantic_head_version not in (1, 2):
             raise ValueError("semantic_head_version must be 1 or 2")
+        if self.interaction_architecture not in {"joint", "identity-preserving"}:
+            raise ValueError("interaction_architecture must be joint or identity-preserving")
+        if not 0.0 <= self.identity_allocation_threshold <= 1.0:
+            raise ValueError("identity_allocation_threshold must be in [0, 1]")
+        if self.identity_max_allocations_per_step <= 0:
+            raise ValueError("identity_max_allocations_per_step must be positive")
 
 
 class ILLaDACIDAdapter(nn.Module):
@@ -778,6 +789,12 @@ class ILLaDACIDAdapter(nn.Module):
         # Stage C is an optional, Display-only output residual.  It never changes
         # the shared backbone or the T/Need/control heads.
         self.stage_c_display: nn.Module | None = None
+        self.identity_path = (
+            IdentityPreservingPath(
+                self.d_model, num_heads, self.config.max_thought_slots,
+                dropout=self.config.external_dropout,
+            ) if self.config.interaction_architecture == "identity-preserving" else None
+        )
 
         nn.init.zeros_(self.channel_embedding.weight)
         nn.init.zeros_(self.role_projection.weight)
@@ -788,6 +805,14 @@ class ILLaDACIDAdapter(nn.Module):
         nn.init.zeros_(self.output_heads.thought_delta.weight)
         nn.init.zeros_(self.output_heads.thought_delta.bias)
         self._place_cid_modules_with_embeddings()
+        if self.identity_path is not None:
+            # These legacy input perturbation modules are absent from the new
+            # computation graph. Freeze them to avoid unused FSDP/DDP gradients.
+            for module in (
+                self.channel_embedding, self.occupancy_projection,
+                self.display_noise_projection, self.external_fusion,
+            ):
+                module.requires_grad_(False)
         self.set_backbone_trainable(not freeze_backbone)
 
     @classmethod
@@ -1056,6 +1081,8 @@ class ILLaDACIDAdapter(nn.Module):
         return self.backbone.get_output_embeddings()
 
     def forward(self, batch: CIDTensorBatch) -> CIDTensorOutput:
+        if self.identity_path is not None:
+            return self.identity_path(self, batch)
         batch_size, thought_slots, prompt_length, display_length = self._validate_batch(batch)
         model_dtype = self.input_embeddings.weight.dtype
         thought = batch.thought_semantic.to(dtype=model_dtype)
@@ -1410,6 +1437,7 @@ class ILLaDACIDAdapter(nn.Module):
             self.display_noise_projection,
             self.external_fusion,
             self.output_heads,
+            *((self.identity_path,) if self.identity_path is not None else ()),
         )
 
     def _place_cid_modules_with_embeddings(self) -> None:
