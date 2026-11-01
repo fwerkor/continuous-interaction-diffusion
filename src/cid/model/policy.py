@@ -144,7 +144,9 @@ class ILLaDAContextTensorizer:
         # The physical tail after EOS stays latent so later diffusion steps can move EOS and
         # expand the visible answer without changing the display canvas capacity.
         display_padding_mask = torch.zeros_like(display_ids, dtype=torch.bool)
-        prompt_ids = self.text_encoder.tokenize(context.prompt, add_special_tokens=True)
+        prompt_ids = self.text_encoder.tokenize_prompt(
+            context.prompt, protocol=self.adapter.config.backbone_protocol
+        )
 
         fact_memory = self.text_encoder.encode_texts(
             tuple(self._fact_text(item) for item in context.facts.items.values()),

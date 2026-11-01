@@ -129,7 +129,9 @@ class IdentityPreservingPath(nn.Module):
         prompt_keys = self._keys(batch.prompt_padding_mask, batch.prompt_ids)
         display_keys = self._keys(batch.display_padding_mask, batch.display_ids)
         keys = torch.cat((prompt_keys, display_keys), dim=1)
-        token_ids = torch.cat((batch.prompt_ids, batch.display_ids), dim=1)
+        token_ids = torch.cat(
+            (batch.prompt_ids, adapter.backbone_display_ids(batch.display_ids)), dim=1
+        )
         hidden, auxiliary = self._native_hidden(adapter, token_ids, keys, batch)
         y_native = hidden[:, prompt_length:, :]
         thought = batch.thought_semantic.to(dtype=dtype)

@@ -251,3 +251,54 @@ def test_generic_loader_dispatches_lfm_by_model_type(monkeypatch) -> None:
         )
     ]
     assert model_calls[0][0] == LFM2_DIFFUSION_350M
+
+
+def test_cid_answer_protocol_masks_structural_eos_in_identity_backbone() -> None:
+    backbone = TinyLFMBackbone()
+    config = ILLaDACIDConfig(
+        max_thought_slots=8,
+        max_display_tokens=16,
+        interaction_architecture="identity-preserving",
+        backbone_protocol="cid-answer",
+    )
+    adapter = LFMCIDAdapter(backbone, config)
+    batch = make_batch()
+    batch.display_ids[0] = torch.tensor([18, 7, 19, 16])
+    assert adapter.backbone_display_ids(batch.display_ids)[0].tolist() == [18, 16, 19, 16]
+    adapter(batch)
+    prompt_length = batch.prompt_ids.shape[1]
+    torch.testing.assert_close(
+        backbone.lfm2.last_inputs_embeds[0, prompt_length + 1],
+        backbone.get_input_embeddings().weight[16],
+    )
+    assert batch.display_ids[0, 1] == 7
+
+
+def test_cid_answer_protocol_requires_dedicated_student_token() -> None:
+    from cid.model.encoding import ILLaDATextEncoder
+
+    adapter = LFMCIDAdapter(
+        TinyLFMBackbone(),
+        ILLaDACIDConfig(
+            max_thought_slots=8, max_display_tokens=16,
+            backbone_protocol="cid-answer",
+        ),
+    )
+
+    class FormatTokenizer:
+        def __init__(self, *, aligned: bool):
+            self.aligned = aligned
+
+        def get_added_vocab(self):
+            return {"<|cid_answer|>": 55} if self.aligned else {}
+
+        def __call__(self, text, *, add_special_tokens, return_tensors):
+            assert add_special_tokens and return_tensors == "pt"
+            return {"input_ids": torch.tensor([[1, 26]])}
+
+    aligned = ILLaDATextEncoder(adapter, FormatTokenizer(aligned=True))
+    assert aligned.tokenize_prompt("Hello", protocol="cid-answer").tolist() == [[1, 26, 55]]
+    assert aligned.tokenize_prompt("Hello", protocol="cid").tolist() == [[1, 26]]
+    invalid = ILLaDATextEncoder(adapter, FormatTokenizer(aligned=False))
+    with pytest.raises(ValueError, match="LA-aligned tokenizer"):
+        invalid.tokenize_prompt("Hello", protocol="cid-answer")

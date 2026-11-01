@@ -261,6 +261,24 @@ class ILLaDATextEncoder:
         )
         return input_ids.to(device=self.device)
 
+    def tokenize_prompt(self, text: str, *, protocol: str = "cid") -> Tensor:
+        ids = self.tokenize(text, add_special_tokens=True)
+        if protocol == "cid":
+            return ids
+        if protocol != "cid-answer":
+            raise ValueError(f"unsupported CID prompt protocol: {protocol}")
+        token = "<|cid_answer|>"
+        vocab = self.tokenizer.get_added_vocab()
+        if token not in vocab:
+            raise ValueError("CID answer protocol requires an LA-aligned tokenizer")
+        answer_id = int(vocab[token])
+        if answer_id >= self._embedding.num_embeddings:
+            raise ValueError("CID answer token lies outside backbone embeddings")
+        return torch.cat(
+            (ids, torch.tensor([[answer_id]], dtype=ids.dtype, device=ids.device)),
+            dim=-1,
+        )
+
     def encode_one(self, text: str, *, detach: bool = False) -> Tensor:
         return self.encode_texts((text,), detach=detach)[0, 0]
 

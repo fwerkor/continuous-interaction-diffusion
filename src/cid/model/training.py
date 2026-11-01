@@ -89,6 +89,10 @@ from cid.state import (
     DisplayCanvas,
 )
 
+
+def _adapter_config_matches(saved: dict[str, Any], config: Any) -> bool:
+    return {"backbone_protocol": "cid", **saved} == asdict(config)
+
 CID_NEURAL_CONTRACT_VERSION = 6
 # Bump independently of neural geometry when teacher labels/loss semantics change.
 CID_SUPERVISION_CONTRACT_VERSION = 2
@@ -2761,7 +2765,7 @@ class CIDTrainer:
                 and saved_without_geometry == current_without_geometry
             ):
                 raise ValueError("checkpoint trainer configuration does not match this trainer")
-        if checkpoint["adapter_config"] != asdict(self.adapter.config):
+        if not _adapter_config_matches(checkpoint["adapter_config"], self.adapter.config):
             raise ValueError("checkpoint CID adapter configuration does not match this adapter")
         if tuple(checkpoint["trainable_names"]) != self.trainable_parameter_names:
             raise ValueError("checkpoint trainable parameter set does not match this adapter")
@@ -3464,7 +3468,7 @@ def load_cid_adapter_checkpoint(
     ):
         raise ValueError("checkpoint backbone geometry does not match this adapter")
     _validate_tokenizer_identity(checkpoint.get("tokenizer_identity"), tokenizer)
-    if checkpoint["adapter_config"] != asdict(adapter.config):
+    if not _adapter_config_matches(checkpoint["adapter_config"], adapter.config):
         raise ValueError("checkpoint CID adapter configuration does not match this adapter")
 
     load_cid_adapter_parameter_state(adapter, checkpoint["model_state"])
@@ -3793,7 +3797,9 @@ class ILLaDATrajectoryTensorizer:
                 diffusion_step, rollout_denoising_steps
             )
 
-        prompt_ids = self.text_encoder.tokenize(example.prompt, add_special_tokens=True)
+        prompt_ids = self.text_encoder.tokenize_prompt(
+            example.prompt, protocol=self.adapter.config.backbone_protocol
+        )
         target_display = self._display_text(example, supervision_step)
         target_text_ids = self._encode_display_text(target_display)
         realized_tokens = target_text_ids.shape[1]
@@ -7035,7 +7041,7 @@ def load_stage_b_checkpoint(
         and metadata.get("dataset_sha256") != expected_dataset_sha256
     ):
         raise ValueError("Stage B checkpoint dataset SHA-256 does not match training data")
-    if metadata["adapter_config"] != asdict(trainer.adapter.config):
+    if not _adapter_config_matches(metadata["adapter_config"], trainer.adapter.config):
         raise ValueError("Stage B checkpoint adapter configuration does not match")
     backbone = metadata["backbone"]
     if (
@@ -7142,7 +7148,7 @@ def load_stage_b_model_checkpoint(
         raise ValueError("Stage B checkpoint neural contract is incompatible")
     if metadata.get("model_state_layout") != "fsdp-sharded-dcp":
         raise ValueError("unsupported Stage B checkpoint model state layout")
-    if metadata["adapter_config"] != asdict(adapter.config):
+    if not _adapter_config_matches(metadata["adapter_config"], adapter.config):
         raise ValueError("Stage B checkpoint adapter configuration does not match")
     backbone = metadata["backbone"]
     if (

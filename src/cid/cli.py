@@ -1960,6 +1960,7 @@ def _train_stage_a(args: argparse.Namespace) -> None:
         max_display_tokens=args.max_display_tokens,
         display_canvas_tokens=args.display_canvas_tokens,
         semantic_head_version=2,
+        backbone_protocol=args.backbone_protocol,
         interaction_architecture=args.interaction_architecture,
         display_initialization=args.display_initialization,
         identity_initial_mask_tokens=args.identity_initial_mask_tokens,
@@ -3122,6 +3123,7 @@ def _train_stage_b(args: argparse.Namespace) -> None:
             max_display_tokens=args.max_display_tokens,
             display_canvas_tokens=args.display_canvas_tokens,
             semantic_head_version=2,
+            backbone_protocol=args.backbone_protocol,
             interaction_architecture=args.interaction_architecture,
             display_initialization=args.display_initialization,
             identity_initial_mask_tokens=args.identity_initial_mask_tokens,
@@ -4267,6 +4269,42 @@ def main() -> None:
     la.add_argument("--max-mask-probability", type=float, default=1.0)
     la.add_argument("--full-mask-probability", type=float, default=0.0)
     la.add_argument("--teacher-native-mask-only", action="store_true")
+    la_kl = subparsers.add_parser(
+        "train-la-format-kl",
+        help="prompt-only native teacher to CID format KL distillation; ignores dataset answers",
+    )
+    la_kl.add_argument("--model", required=True)
+    la_kl.add_argument("--teacher", required=True)
+    la_kl.add_argument("--data", required=True)
+    la_kl.add_argument("--teacher-generations")
+    la_kl.add_argument("--validation-data")
+    la_kl.add_argument("--output-dir", required=True)
+    la_kl.add_argument("--device", choices=("auto", "cuda", "cpu"), default="auto")
+    la_kl.add_argument("--dtype", choices=("bf16", "fp32"), default="bf16")
+    la_kl.add_argument("--learning-rate", type=float, default=8e-6)
+    la_kl.add_argument("--weight-decay", type=float, default=0.01)
+    la_kl.add_argument("--grad-clip", type=float, default=1.0)
+    la_kl.add_argument("--grad-accum", type=int, default=4)
+    la_kl.add_argument("--max-steps", type=int, default=30000)
+    la_kl.add_argument("--warmup-steps", type=int, default=250)
+    la_kl.add_argument("--decay-steps", type=int, default=24000)
+    la_kl.add_argument("--min-lr-ratio", type=float, default=0.1)
+    la_kl.add_argument("--temperature", type=float, default=2.0)
+    la_kl.add_argument("--canvas-buckets", default="64,128,192")
+    la_kl.add_argument("--max-content-positions", type=int, default=16)
+    la_kl.add_argument("--max-prompt-tokens", type=int, default=384)
+    la_kl.add_argument("--pseudo-probability", type=float, default=0.45)
+    la_kl.add_argument("--mask-min", type=float, default=0.25)
+    la_kl.add_argument("--mask-max", type=float, default=0.9)
+    la_kl.add_argument("--termination-weight", type=float, default=0.1)
+    la_kl.add_argument("--save-every", type=int, default=2000)
+    la_kl.add_argument("--log-every", type=int, default=250)
+    la_kl.add_argument("--keep-last", type=int, default=3)
+    la_kl.add_argument("--seed", type=int, default=20261102)
+    la_kl.add_argument("--max-examples", type=int)
+    la_kl.add_argument("--max-validation-examples", type=int, default=64)
+    la_kl.add_argument("--resume")
+
     stage_c = subparsers.add_parser(
         "train-display", help="Stage C: frozen CID with Display-only low-rank diffusion SFT"
     )
@@ -4676,6 +4714,7 @@ def main() -> None:
     )
     train.add_argument("--max-display-tokens", type=int, default=1536)
     train.add_argument("--display-canvas-tokens", type=int, default=64)
+    train.add_argument("--backbone-protocol", choices=("cid", "cid-answer"), default="cid")
     train.add_argument("--seed", type=int, default=0)
     train.add_argument("--max-examples", type=int)
     train.add_argument("--max-validation-examples", type=int)
@@ -4839,6 +4878,7 @@ def main() -> None:
     )
     train_full.add_argument("--max-display-tokens", type=int, default=1536)
     train_full.add_argument("--display-canvas-tokens", type=int, default=64)
+    train_full.add_argument("--backbone-protocol", choices=("cid", "cid-answer"), default="cid")
     train_full.add_argument("--seed", type=int, default=0)
     train_full.add_argument("--max-examples", type=int)
     train_full.add_argument("--max-validation-examples", type=int)
@@ -4973,6 +5013,10 @@ def main() -> None:
         from cid.la_training import train_language_alignment_v2
 
         train_language_alignment_v2(args)
+    elif args.command == "train-la-format-kl":
+        from cid.la_format_kl import train_prompt_only_format_kl
+
+        train_prompt_only_format_kl(args)
     elif args.command == "train-display":
         from cid.stage_c import train_stage_c
 

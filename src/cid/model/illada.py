@@ -647,6 +647,7 @@ class ILLaDACIDConfig:
     max_link_slots: int = 8
     external_dropout: float = 0.0
     semantic_head_version: int = 1  # Legacy checkpoints omit this field.
+    backbone_protocol: str = "cid"
     interaction_architecture: str = "joint"
     display_initialization: str | None = None
     identity_initial_mask_tokens: int = 8
@@ -654,6 +655,8 @@ class ILLaDACIDConfig:
     identity_max_allocations_per_step: int = DEFAULT_MAX_ALLOCATIONS_PER_STEP
 
     def __post_init__(self) -> None:
+        if self.backbone_protocol not in {"cid", "cid-answer"}:
+            raise ValueError("unsupported CID backbone protocol")
         if self.max_thought_slots <= 0 or self.max_display_tokens <= 0:
             raise ValueError("thought and display capacities must be positive")
         canvas = self.display_canvas_tokens
@@ -746,6 +749,8 @@ class ILLaDACIDAdapter(nn.Module):
         )
         if not 0 <= self.mask_token_id < self.vocab_size:
             raise ValueError("backbone mask token ID must be inside its vocabulary")
+        if self.config.backbone_protocol == "cid-answer" and model_type != "lfm2":
+            raise ValueError("cid-answer protocol currently supports LFM2 only")
         self.eos_token_id = int(
             getattr(
                 backbone_config,
@@ -1101,6 +1106,13 @@ class ILLaDACIDAdapter(nn.Module):
     def output_embeddings(self) -> nn.Module:
         return self.backbone.get_output_embeddings()
 
+    def backbone_display_ids(self, display_ids: torch.Tensor) -> torch.Tensor:
+        if self.config.backbone_protocol != "cid-answer":
+            return display_ids
+        return torch.where(
+            display_ids.eq(self.eos_token_id), self.mask_token_id, display_ids
+        )
+
     def forward(self, batch: CIDTensorBatch) -> CIDTensorOutput:
         if self.identity_path is not None:
             return self.identity_path(self, batch)
@@ -1145,7 +1157,7 @@ class ILLaDACIDAdapter(nn.Module):
             + self.channel_embedding.weight[1][None, None, :]
         )
         display_hidden = (
-            self.input_embeddings(batch.display_ids)
+            self.input_embeddings(self.backbone_display_ids(batch.display_ids))
             + self.display_noise_projection(display_noise)
             + self.channel_embedding.weight[2][None, None, :]
         )
