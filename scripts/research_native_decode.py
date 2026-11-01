@@ -29,6 +29,7 @@ def main():
     ap = argparse.ArgumentParser()
     ap.add_argument("--model", required=True)
     ap.add_argument("--native-template", action="store_true")
+    ap.add_argument("--english-19", action="store_true")
     ap.add_argument("--max-answer-tokens", type=int, default=64)
     ap.add_argument("--out", required=True)
     args = ap.parse_args()
@@ -37,7 +38,13 @@ def main():
     model.to("cuda").eval()
     output = []
     with torch.no_grad(), torch.autocast("cuda", dtype=torch.bfloat16):
-        for label, question in TASKS:
+        if args.english_19:
+            from evaluate_la_generation import PROMPTS
+
+            tasks = PROMPTS
+        else:
+            tasks = TASKS
+        for label, question in tasks:
             prompt = (
                 tok.apply_chat_template(
                     [{"role": "user", "content": question}],

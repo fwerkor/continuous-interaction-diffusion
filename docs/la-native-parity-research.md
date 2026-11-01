@@ -66,3 +66,31 @@ bare Prompt path.
 
 No model has yet passed production-quality English, executable code, tool and
 EOS acceptance gates; KL/no-KL matching requires additional checks.
+
+## Matched English-format parity experiment (19 held-out prompts)
+
+Same dataset (35,913 training records), random seed, exactly 2,400 optimizer
+steps, 4x gradient accumulation, LR schedule, 40% all-MASK examples, CID EOS
+target and official LFM2.5 confidence-greedy one-token sampler; only the
+teacher native-format KL term differs:
+
+| model | nonempty | native [/Answer] close |
+| --- | ---: | ---: |
+| unchanged 350M, native prompt | 19/19 | 19/19 |
+| bare Prompt SFT, no KL | 19/19 | 4/19 |
+| bare Prompt + native-format teacher KL (weight 1) | 19/19 | 17/19 |
+
+The original 350M in the test also makes arithmetic mistakes, so exact task
+accuracy cannot be judged from the presence of fluent paragraphs. These
+observations establish a strong answer-format retention effect, not equality
+of capabilities. The KD student is still verbose/repetitive on some questions.
+A separate step 3200 KD snapshot also obtained 17/19 native closings, showing
+the end-marker metric is not monotonically improved by more steps.
+
+Follow-up ablations of a naive minimum-distance constraint between simultaneous
+reveals did not reliably restore original generation at 4 or 8 tokens per pass.
+That experimental code was discarded rather than promoted. More sophisticated
+dependency-aware approaches remain a research direction.
+
+Large teacher parity should be assessed on genuine hold-out instructions and
+the full CID tool interaction suite, not on answer-boundary restoration alone.
