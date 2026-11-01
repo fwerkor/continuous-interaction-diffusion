@@ -152,6 +152,23 @@ def load_la_backbone(path: str, *, dtype: torch.dtype) -> tuple[LABackbone, Any]
             path, trust_remote_code=True, torch_dtype=dtype, attn_implementation="sdpa"
         )
         prepare_ar_backbone_for_cid(model, tokenizer)
+    elif family in {"illada", "llada"}:
+        # Both are noncausal diffusion models exposed through
+        # AutoModelForCausalLM; they do not use AR attention conversion.
+        from cid.model.illada import ILLADA_MASK_TOKEN_ID, LLADA_MOE_MASK_TOKEN_ID
+
+        kwargs = {"trust_remote_code": True, "torch_dtype": dtype}
+        if family == "llada":
+            kwargs["attn_implementation"] = "sdpa"
+        model = AutoModelForCausalLM.from_pretrained(path, **kwargs)
+        expected_mask = ILLADA_MASK_TOKEN_ID if family == "illada" else LLADA_MOE_MASK_TOKEN_ID
+        if tokenizer.mask_token_id is None:
+            native_token = tokenizer.convert_ids_to_tokens(expected_mask)
+            if tokenizer.convert_tokens_to_ids(native_token) != expected_mask:
+                raise ValueError("diffusion backbone MASK token cannot be recovered")
+            tokenizer.mask_token = native_token
+        if tokenizer.mask_token_id != expected_mask:
+            raise ValueError("diffusion backbone MASK token differs from CID runtime")
     else:
         model = AutoModelForMaskedLM.from_pretrained(
             path, trust_remote_code=True, torch_dtype=dtype
