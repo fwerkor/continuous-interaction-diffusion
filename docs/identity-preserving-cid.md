@@ -24,9 +24,9 @@ New Thought allocations also suppress convergence for the current step so the ru
 
 ## Entry points and compatibility
 
-Stage A: cid train ... --interaction-architecture identity-preserving --identity-initial-mask-tokens 8
+Stage A: cid train ... --interaction-architecture identity-preserving
 
-Stage B: cid train-full ... --interaction-architecture identity-preserving --identity-initial-mask-tokens 8
+Stage B: cid train-full ... --interaction-architecture identity-preserving
 
 Default remains joint for legacy checkpoint compatibility. The flag is saved in adapter_config, so unified CID checkpoints restore the same path. New Stage A/B training is required; old joint weights cannot be treated as an already-trained control head for this architecture.
 
@@ -42,6 +42,54 @@ A release gate requires real multi-step non-tool reasoning trajectories, tool be
 
 The new network keeps CIDTensorBatch/CIDTensorOutput and all preexisting Thought diffusion, allocation, Display revision and materialization operator signatures. A kernel or ABI change is not required on current evidence. The independent engine branch is reserved for compatibility regression; CANN requires testing on actual NPU hardware.
 
-## Mask window and EOS contract
+## Pretraining gate: preallocated MASK and revisable EOS
 
-Identity-preserving mode reserves eight unresolved [MASK] tokens followed by a movable EOS boundary by default. Stage A/B bootstrap and Runtime initializers use the same stored adapter setting (`--identity-initial-mask-tokens`), capped at physical canvas capacity minus EOS. The legacy joint path retains one MASK before EOS. The shared scheduler progressively reveals active masks while leaving the tail latent; later high-confidence boundary evidence permits bounded expansion. Latent MASK tokens are not completed-answer targets.
+New identity-preserving adapters default to the preallocated Display scheme.
+The existing joint path remains legacy. A new run begins with an editable
+MASK canvas and a movable fallback EOS at its final position:
+
+- Legacy: [MASK, EOS, MASK, ...]
+- Preallocated: [MASK, MASK, ..., MASK, EOS]
+
+An earlier EOS predicted by the model is accepted only when every position
+preceding it has already been revealed. Otherwise the earlier EOS is deferred
+and the previous EOS is retained, preventing incomplete high-confidence
+prefixes from prematurely closing the answer. The safeguard applies to both
+native cid-engine and PyTorch refinement. Structural insertion/deletion and
+revision remain supported. Existing clients providing the legacy initial
+canvas are upgraded at the first step for preallocated checkpoints only.
+
+Stage A/B bootstrap states use the exact same preallocated initial canvas.
+Supervised partially revealed states reveal each correct answer token with
+probability 1-t. When the true EOS remains concealed, only the last canvas
+position carries a provisional EOS. Teacher noise is quantized to the same
+discrete Runtime schedule k/D with k=1..D, normally D=8. The entire Display
+canvas receives the same noise level including latent tail. Unknown Display
+states are never supervised as completed empty answers. Closed-loop training
+still consumes real prior Display tokens and Runtime noise. Stage C also uses
+scheduled partial preallocated masking. Legacy training remains unchanged.
+
+An isolated Tiny LFM smoke test performed six Stage A optimizer steps and
+two Stage B closed-loop optimizer steps, with nonzero actual parameter changes
+in control attention, Display attention, and Need prediction heads on a
+source-backed tool trajectory. This confirms gradient and tool training
+connections, not real-world task correctness.
+
+A fixed StageC500 0.4B backbone and newly initialized identity controller
+were tested on six paired questions with fixed seeds. Initial EOS1, EOS24,
+and EOS-last preallocation converged 2/6, 0/6, and 0/6 respectively. Several
+preallocated answers improved their opening phrases, but long output,
+termination and Chinese quality remained poor. No Thought cells were
+allocated in the 18 runs. This establishes that proper Stage A/B training
+is still necessary, not that this untrained checkpoint already solves
+language generation. Full results are on ise2 at
+/data/cid4b/vnext-experiment-20261101/paired_runtime.json.
+
+### Optional bounded MASK window
+
+A separate compatibility experiment can be enabled with
+--display-initialization window --identity-initial-mask-tokens 8.
+It uses an eight-token initial MASK window followed by a revisable EOS,
+retaining the earlier bounded expansion mechanism. The vNext recommended
+training configuration remains the preallocated full-canvas mode.
+This selector is stored in adapter_config; the legacy joint default is unchanged.

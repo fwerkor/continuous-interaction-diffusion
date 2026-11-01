@@ -648,9 +648,10 @@ class ILLaDACIDConfig:
     external_dropout: float = 0.0
     semantic_head_version: int = 1  # Legacy checkpoints omit this field.
     interaction_architecture: str = "joint"
+    display_initialization: str | None = None
+    identity_initial_mask_tokens: int = 8
     identity_allocation_threshold: float = DEFAULT_ALLOCATION_THRESHOLD
     identity_max_allocations_per_step: int = DEFAULT_MAX_ALLOCATIONS_PER_STEP
-    identity_initial_mask_tokens: int = 8
 
     def __post_init__(self) -> None:
         if self.max_thought_slots <= 0 or self.max_display_tokens <= 0:
@@ -681,19 +682,29 @@ class ILLaDACIDConfig:
             raise ValueError("semantic_head_version must be 1 or 2")
         if self.interaction_architecture not in {"joint", "identity-preserving"}:
             raise ValueError("interaction_architecture must be joint or identity-preserving")
+        if self.display_initialization is None:
+            object.__setattr__(
+                self, "display_initialization",
+                "preallocated" if self.interaction_architecture == "identity-preserving"
+                else "legacy",
+            )
+        if self.display_initialization not in {"legacy", "window", "preallocated"}:
+            raise ValueError("display_initialization must be legacy, window or preallocated")
+        if self.identity_initial_mask_tokens <= 0:
+            raise ValueError("identity_initial_mask_tokens must be positive")
         if not 0.0 <= self.identity_allocation_threshold <= 1.0:
             raise ValueError("identity_allocation_threshold must be in [0, 1]")
         if self.identity_max_allocations_per_step <= 0:
             raise ValueError("identity_max_allocations_per_step must be positive")
-        if self.identity_initial_mask_tokens <= 0:
-            raise ValueError("identity_initial_mask_tokens must be positive")
 
     def initial_display_mask_tokens(self, canvas_length: int) -> int:
         if canvas_length < 2:
-            raise ValueError("Display bootstrap requires room for MASK and EOS")
-        if self.interaction_architecture == "joint":
-            return 1
-        return min(self.identity_initial_mask_tokens, canvas_length - 1)
+            raise ValueError("Display bootstrap needs MASK and EOS positions")
+        if self.display_initialization == "preallocated":
+            return canvas_length - 1
+        if self.display_initialization == "window":
+            return min(self.identity_initial_mask_tokens, canvas_length - 1)
+        return 1
 
 
 class ILLaDACIDAdapter(nn.Module):

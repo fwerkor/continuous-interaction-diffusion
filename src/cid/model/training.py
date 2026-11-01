@@ -3620,7 +3620,9 @@ class ILLaDATrajectoryTensorizer:
         eos_token_id = getattr(tokenizer, "eos_token_id", None)
         self.eos_token_id = adapter.eos_token_id if eos_token_id is None else int(eos_token_id)
         self.scheduler = scheduler or CIDDiffusionScheduler(
-            adapter.mask_token_id, adapter.eos_token_id
+            adapter.mask_token_id, adapter.eos_token_id,
+            display_initialization=adapter.config.display_initialization,
+            initial_mask_tokens=adapter.config.identity_initial_mask_tokens,
         )
         self.materializer = CIDMaterializer()
         self._runtime_argument_catalog_cache: (
@@ -3705,6 +3707,13 @@ class ILLaDATrajectoryTensorizer:
                 )
             input_retired_at = rollout_state.retired_at
 
+        if self.scheduler.display_initialization == "preallocated" and rollout_state is None:
+            # Quantize teacher corruption to the noise levels actually visited
+            # by Runtime's discrete iterative reveal schedule.
+            timestep = min(
+                rollout_denoising_steps,
+                max(1, math.ceil(timestep * rollout_denoising_steps)),
+            ) / rollout_denoising_steps
         timestep_tensor = torch.tensor([timestep], device=device)
         # Thought corruption must match the state carried by the runtime. The sampled
         # training timestep remains a Display augmentation only; replacing low-noise
@@ -3807,7 +3816,8 @@ class ILLaDATrajectoryTensorizer:
             rollout_state=rollout_state,
         )
         logical_length = (
-            self.adapter.config.max_thought_slots + prompt_ids.shape[1] + display_canvas_tokens
+            (0 if self.adapter.identity_path is not None else self.adapter.config.max_thought_slots)
+            + prompt_ids.shape[1] + display_canvas_tokens
         )
         if logical_length > self.adapter.max_position_embeddings:
             raise ValueError(
@@ -3826,9 +3836,11 @@ class ILLaDATrajectoryTensorizer:
         display_supervision_mask[:, : realized_tokens + 1] = True
 
         if rollout_state is None and source_step == -1:
-            # Match the inference bootstrap: empty Thought, unresolved Display
-            # window, and a movable EOS with latent capacity behind it. Teacher
-            # answers are not suitable as the initial runtime canvas.
+            # The virtual bootstrap transition must match inference exactly: an empty
+            # TCT plus one unresolved Display token followed by EOS, with the rest of
+            # the physical canvas kept as latent capacity.  Corrupting the teacher's
+            # step-0 answer draft here leaks a much easier initialization distribution
+            # than the runtime ever receives.
             display_input_ids = torch.full_like(
                 target_display_ids,
                 self.adapter.mask_token_id,
@@ -3855,38 +3867,59 @@ class ILLaDATrajectoryTensorizer:
             transition_mask = display_supervision_mask & (
                 source_display_ids != target_display_ids
             )
-            stable_mask = display_supervision_mask & ~transition_mask
-            display_corruption = self.scheduler.corrupt_display(
-                source_display_ids,
-                timestep_tensor,
-                eligible_mask=stable_mask,
-                vocab_size=self.adapter.vocab_size,
-                replacement_fraction=self.display_replacement_fraction,
-                generator=generator,
-                _timesteps_validated=True,
-            )
-            display_input_ids = display_corruption.token_ids
-            display_labels = display_corruption.labels
-            display_labels[transition_mask] = target_display_ids[transition_mask]
-            display_noise = display_corruption.noise * display_supervision_mask.unsqueeze(-1)
-            display_noise = torch.where(
-                transition_mask.unsqueeze(-1),
-                torch.ones_like(display_noise),
-                display_noise,
-            )
+            if self.scheduler.display_initialization == "preallocated":
+                # A prior teacher Display draft is already a genuine editable
+                # state. Real Runtime does not independently randomize stable
+                # text on every iteration; supervise the actual required edits.
+                display_input_ids = source_display_ids
+                display_labels = torch.full_like(target_display_ids, -100)
+                display_labels[transition_mask] = target_display_ids[transition_mask]
+                display_noise = torch.full(
+                    (*display_input_ids.shape, 1),
+                    timestep,
+                    device=device, dtype=dtype,
+                )
+            else:
+                stable_mask = display_supervision_mask & ~transition_mask
+                display_corruption = self.scheduler.corrupt_display(
+                    source_display_ids,
+                    timestep_tensor,
+                    eligible_mask=stable_mask,
+                    vocab_size=self.adapter.vocab_size,
+                    replacement_fraction=self.display_replacement_fraction,
+                    generator=generator,
+                    _timesteps_validated=True,
+                )
+                display_input_ids = display_corruption.token_ids
+                display_labels = display_corruption.labels
+                display_labels[transition_mask] = target_display_ids[transition_mask]
+                display_noise = display_corruption.noise * display_supervision_mask.unsqueeze(-1)
+                display_noise = torch.where(
+                    transition_mask.unsqueeze(-1),
+                    torch.ones_like(display_noise),
+                    display_noise,
+                )
         elif rollout_state is None:
-            display_corruption = self.scheduler.corrupt_display(
-                target_display_ids,
-                timestep_tensor,
-                eligible_mask=display_supervision_mask,
-                vocab_size=self.adapter.vocab_size,
-                replacement_fraction=self.display_replacement_fraction,
-                generator=generator,
-                _timesteps_validated=True,
-            )
+            if self.scheduler.display_initialization == "preallocated":
+                display_corruption = self.scheduler.corrupt_preallocated_display(
+                    target_display_ids, timestep_tensor, generator=generator,
+                )
+                display_noise = display_corruption.noise
+            else:
+                display_corruption = self.scheduler.corrupt_display(
+                    target_display_ids,
+                    timestep_tensor,
+                    eligible_mask=display_supervision_mask,
+                    vocab_size=self.adapter.vocab_size,
+                    replacement_fraction=self.display_replacement_fraction,
+                    generator=generator,
+                    _timesteps_validated=True,
+                )
+                display_noise = (
+                    display_corruption.noise * display_supervision_mask.unsqueeze(-1)
+                )
             display_input_ids = display_corruption.token_ids
             display_labels = display_corruption.labels
-            display_noise = display_corruption.noise * display_supervision_mask.unsqueeze(-1)
         else:
             display_input_ids = torch.full_like(target_display_ids, self.adapter.mask_token_id)
             previous_display = rollout_state.display_ids.to(device=device, dtype=torch.long)
@@ -3902,6 +3935,28 @@ class ILLaDATrajectoryTensorizer:
                 device=device,
                 dtype=dtype,
             )
+
+        if (
+            self.scheduler.display_initialization == "preallocated"
+            and target_display == DISPLAY_UNKNOWN_MARKER
+            and rollout_state is None
+        ):
+            # An unknown answer is not an empty answer. Keep its tentative
+            # EOS at the end until real content arrives. In particular, do
+            # not reveal the transport-only EOS at position zero.
+            display_input_ids.fill_(self.adapter.mask_token_id)
+            display_input_ids[:, -1] = self.eos_token_id
+
+        if self.scheduler.display_initialization == "preallocated":
+            # Runtime passes the same scalar denoising level to every position
+            # including latent tail positions. Teacher and rollout paths must
+            # preserve this condition instead of zeroing the unsupervised tail.
+            noise_level = (
+                float(rollout_display_noise_level)
+                if rollout_state is not None
+                else 1.0 if source_step == -1 else timestep
+            )
+            display_noise = torch.full_like(display_noise, noise_level)
 
         # The dataset's <|cid_unknown|> means an unresolved Display position,
         # and is encoded using the same [MASK] ID as diffusion corruption.

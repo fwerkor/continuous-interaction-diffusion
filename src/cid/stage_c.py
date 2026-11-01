@@ -261,66 +261,9 @@ def make_display_batch(
     eos_id = adapter.eos_token_id
     device = tensorizer.text_encoder.device
     target = target.to(device)
-    # Full-sequence denoising remains a control objective; the main objective
-    # instead models inference states with a live EOS boundary.
-    use_rollout = bool(torch.rand((), generator=generator, device=device) < rollout_probability)
-    if use_rollout:
-        # Runtime begins [MASK, EOS, MASK...]. Frequent tiny prefixes are
-        # essential; uniform random prefixes alone scarcely visit this state.
-        draw = float(torch.rand((), generator=generator, device=device))
-        if count == 1 or draw >= 0.82:
-            # Explicit true-terminal samples counter the otherwise overwhelming
-            # continuation gradient at a live EOS boundary.
-            prefix = count
-        elif draw < 0.32:
-            prefix = 1
-        elif draw < 0.55:
-            prefix = int(
-                torch.randint(1, min(count, 64) + 1, (), generator=generator, device=device)
-            )
-        elif draw < 0.75:
-            prefix = int(torch.randint(1, count + 1, (), generator=generator, device=device))
-        else:
-            # Near-end states train both the final content and actual EOS.
-            prefix = int(
-                torch.randint(
-                    max(1, count - continuation_tokens),
-                    count + 1,
-                    (),
-                    generator=generator,
-                    device=device,
-                )
-            )
-        window_end = min(count, prefix + continuation_tokens)
-        size = min(
-            adapter.config.max_display_tokens,
-            max(adapter.config.display_canvas_tokens, window_end + 1),
-        )
-        ids = torch.full((1, size), mask_id, dtype=torch.long, device=device)
-        labels = torch.full_like(ids, -100)
-        ids[0, :prefix] = target[0, :prefix]
-        ids[0, prefix] = eos_id
-        # Exactly one boundary token is "incorrect" in this condition: the
-        # prediction at current EOS must become the next answer token.  The
-        # latent tail is masked, as in CID Runtime, not filled with a future
-        # clean answer and then randomly corrupted.
-        if prefix < count:
-            labels[0, prefix:window_end] = target[0, prefix:window_end]
-        else:
-            labels[0, prefix] = eos_id  # true completion: keep terminal EOS
-        if window_end == count and prefix < count and count < size:
-            labels[0, count] = eos_id  # EOS only at genuine answer end
-        # Earlier Display tokens may still be unresolved during runtime
-        # diffusion; do not always assume a perfectly filled prefix.
-        if prefix > 0:
-            masked = torch.rand((prefix,), generator=generator, device=device) < (
-                0.75 if prefix == 1 else 0.12
-            )
-            ids[0, :prefix][masked] = mask_id
-            labels[0, :prefix][masked] = target[0, :prefix][masked]
-        timestep = torch.rand((1,), device=device, generator=generator) * 0.95 + 0.05
-        display_noise = timestep.view(1, 1, 1).expand(1, size, 1)
-    else:
+    if adapter.config.display_initialization == "preallocated":
+        from cid.model.diffusion import denoising_noise_level
+
         size = min(
             adapter.config.max_display_tokens,
             max(adapter.config.display_canvas_tokens, count + 1),
@@ -328,17 +271,100 @@ def make_display_batch(
         clean = torch.full((1, size), mask_id, dtype=torch.long, device=device)
         clean[:, :count] = target
         clean[:, count] = eos_id
-        eligible = torch.zeros_like(clean, dtype=torch.bool)
-        eligible[:, : count + 1] = True
-        timestep = torch.rand((1,), device=device, generator=generator) * 0.95 + 0.05
-        corrupted = tensorizer.scheduler.corrupt_display(
-            clean, timestep, eligible_mask=eligible, generator=generator
+        denoising_steps = 8
+        index = int(
+            torch.randint(
+                0, denoising_steps, (), generator=generator, device=device
+            )
         )
-        ids = corrupted.token_ids
-        labels = corrupted.labels
-        display_noise = corrupted.noise
+        timestep = torch.tensor(
+            [denoising_noise_level(index, denoising_steps)], device=device,
+        )
+        corruption = tensorizer.scheduler.corrupt_preallocated_display(
+            clean, timestep, generator=generator,
+        )
+        ids, labels, display_noise = (
+            corruption.token_ids, corruption.labels, corruption.noise
+        )
+    else:
+        # Full-sequence denoising remains a control objective; the main objective
+        # instead models inference states with a live EOS boundary.
+        use_rollout = bool(torch.rand((), generator=generator, device=device) < rollout_probability)
+        if use_rollout:
+            # Runtime begins [MASK, EOS, MASK...]. Frequent tiny prefixes are
+            # essential; uniform random prefixes alone scarcely visit this state.
+            draw = float(torch.rand((), generator=generator, device=device))
+            if count == 1 or draw >= 0.82:
+                # Explicit true-terminal samples counter the otherwise overwhelming
+                # continuation gradient at a live EOS boundary.
+                prefix = count
+            elif draw < 0.32:
+                prefix = 1
+            elif draw < 0.55:
+                prefix = int(
+                    torch.randint(1, min(count, 64) + 1, (), generator=generator, device=device)
+                )
+            elif draw < 0.75:
+                prefix = int(torch.randint(1, count + 1, (), generator=generator, device=device))
+            else:
+                # Near-end states train both the final content and actual EOS.
+                prefix = int(
+                    torch.randint(
+                        max(1, count - continuation_tokens),
+                        count + 1,
+                        (),
+                        generator=generator,
+                        device=device,
+                    )
+                )
+            window_end = min(count, prefix + continuation_tokens)
+            size = min(
+                adapter.config.max_display_tokens,
+                max(adapter.config.display_canvas_tokens, window_end + 1),
+            )
+            ids = torch.full((1, size), mask_id, dtype=torch.long, device=device)
+            labels = torch.full_like(ids, -100)
+            ids[0, :prefix] = target[0, :prefix]
+            ids[0, prefix] = eos_id
+            # Exactly one boundary token is "incorrect" in this condition: the
+            # prediction at current EOS must become the next answer token.  The
+            # latent tail is masked, as in CID Runtime, not filled with a future
+            # clean answer and then randomly corrupted.
+            if prefix < count:
+                labels[0, prefix:window_end] = target[0, prefix:window_end]
+            else:
+                labels[0, prefix] = eos_id  # true completion: keep terminal EOS
+            if window_end == count and prefix < count and count < size:
+                labels[0, count] = eos_id  # EOS only at genuine answer end
+            # Earlier Display tokens may still be unresolved during runtime
+            # diffusion; do not always assume a perfectly filled prefix.
+            if prefix > 0:
+                masked = torch.rand((prefix,), generator=generator, device=device) < (
+                    0.75 if prefix == 1 else 0.12
+                )
+                ids[0, :prefix][masked] = mask_id
+                labels[0, :prefix][masked] = target[0, :prefix][masked]
+            timestep = torch.rand((1,), device=device, generator=generator) * 0.95 + 0.05
+            display_noise = timestep.view(1, 1, 1).expand(1, size, 1)
+        else:
+            size = min(
+                adapter.config.max_display_tokens,
+                max(adapter.config.display_canvas_tokens, count + 1),
+            )
+            clean = torch.full((1, size), mask_id, dtype=torch.long, device=device)
+            clean[:, :count] = target
+            clean[:, count] = eos_id
+            eligible = torch.zeros_like(clean, dtype=torch.bool)
+            eligible[:, : count + 1] = True
+            timestep = torch.rand((1,), device=device, generator=generator) * 0.95 + 0.05
+            corrupted = tensorizer.scheduler.corrupt_display(
+                clean, timestep, eligible_mask=eligible, generator=generator
+            )
+            ids = corrupted.token_ids
+            labels = corrupted.labels
+            display_noise = corrupted.noise
     if (
-        adapter.config.max_thought_slots
+        (0 if adapter.identity_path is not None else adapter.config.max_thought_slots)
         + int(tensorizer.text_encoder.tokenize(example.prompt, add_special_tokens=True).shape[1])
         + size
         > adapter.max_position_embeddings
@@ -373,7 +399,7 @@ def frozen_thought_rollout(
     """Run the existing frozen CID policy, without any teacher T labels or updates."""
     from cid.model.policy import ILLaDANeuralPolicy, ILLaDANeuralPolicyConfig
     from cid.runtime import CIDRuntime, RuntimeConfig, SourceRegistry
-    from cid.state import CognitiveField, DisplayCanvas
+    from cid.state import CognitiveField
 
     initial = CognitiveField.empty(adapter.config.max_thought_slots, adapter.d_model)
     if steps == 0:
@@ -387,13 +413,8 @@ def frozen_thought_rollout(
         forward_model=forward_model,
     )
     runtime = CIDRuntime(SourceRegistry(), RuntimeConfig(max_steps=steps, max_wall_time_s=120))
-    display = DisplayCanvas.initial_unresolved(
-        length=adapter.config.display_canvas_tokens,
-        mask_token_id=adapter.mask_token_id,
-        eos_token_id=adapter.eos_token_id,
-        initial_mask_tokens=adapter.config.initial_display_mask_tokens(
-            adapter.config.display_canvas_tokens
-        ),
+    display = tensorizer.scheduler.initial_display(
+        adapter.config.display_canvas_tokens,
     )
     module = adapter.stage_c_display
     previous_enabled = module.enabled

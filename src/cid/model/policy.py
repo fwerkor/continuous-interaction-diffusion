@@ -1,7 +1,7 @@
 from __future__ import annotations
 
 import logging
-from dataclasses import dataclass
+from dataclasses import dataclass, replace
 from typing import Any
 
 import torch
@@ -44,7 +44,11 @@ class ILLaDAContextTensorizer:
         self.adapter = adapter
         self.tokenizer = tokenizer
         self.text_encoder = text_encoder or ILLaDATextEncoder(adapter, tokenizer)
-        self.scheduler = CIDDiffusionScheduler(adapter.mask_token_id, adapter.eos_token_id)
+        self.scheduler = CIDDiffusionScheduler(
+            adapter.mask_token_id, adapter.eos_token_id,
+            display_initialization=adapter.config.display_initialization,
+            initial_mask_tokens=adapter.config.identity_initial_mask_tokens,
+        )
         if self.text_encoder.d_model != adapter.d_model:
             raise ValueError("runtime text encoder width must match the CID adapter")
 
@@ -274,6 +278,23 @@ class ILLaDANeuralPolicy:
         )
 
     def step(self, context: ModelContext) -> ModelUpdate:
+        # Existing clients still provide the old one-token initial boundary.
+        # Upgrade that exact empty state only for explicitly selected vNext
+        # checkpoints, without silently affecting existing joint CID models.
+        if (
+            context.step == 0
+            and self.scheduler.display_initialization == "preallocated"
+            and context.display.token_ids
+            == (
+                self.scheduler.mask_token_id,
+                self.scheduler.eos_token_id,
+            )
+            + (self.scheduler.mask_token_id,) * (len(context.display.token_ids) - 2)
+        ):
+            context = replace(
+                context,
+                display=self.scheduler.initial_display(len(context.display.token_ids)),
+            )
         diffusion_step = context.diffusion_step
         self.display_revision_controller.observe_context(context)
         batch = self.tensorizer(

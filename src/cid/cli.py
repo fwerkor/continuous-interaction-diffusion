@@ -1959,6 +1959,7 @@ def _train_stage_a(args: argparse.Namespace) -> None:
         display_canvas_tokens=args.display_canvas_tokens,
         semantic_head_version=2,
         interaction_architecture=args.interaction_architecture,
+        display_initialization=args.display_initialization,
         identity_initial_mask_tokens=args.identity_initial_mask_tokens,
     )
     dataset_manifest = inspect_dataset(args.data)
@@ -3120,6 +3121,7 @@ def _train_stage_b(args: argparse.Namespace) -> None:
             display_canvas_tokens=args.display_canvas_tokens,
             semantic_head_version=2,
             interaction_architecture=args.interaction_architecture,
+            display_initialization=args.display_initialization,
             identity_initial_mask_tokens=args.identity_initial_mask_tokens,
         )
         dataset_manifest = inspect_dataset(args.data)
@@ -4600,12 +4602,17 @@ def main() -> None:
     train.add_argument("--rollout-ramp-epochs", type=int, default=2)
     train.add_argument("--thought-capacity", type=int, default=128)
     train.add_argument(
+        "--display-initialization",
+        choices=("legacy", "window", "preallocated"), default=None,
+        help="Default: preallocated for identity-preserving, legacy for joint",
+    )
+    train.add_argument("--identity-initial-mask-tokens", type=int, default=8)
+    train.add_argument(
         "--interaction-architecture",
         choices=("joint", "identity-preserving"),
         default="joint",
         help="Original joint inputs or native-language-preserving single-pass CID",
     )
-    train.add_argument("--identity-initial-mask-tokens", type=int, default=8)
     train.add_argument("--max-display-tokens", type=int, default=1536)
     train.add_argument("--display-canvas-tokens", type=int, default=64)
     train.add_argument("--seed", type=int, default=0)
@@ -4758,12 +4765,17 @@ def main() -> None:
     train_full.add_argument("--rollout-ramp-epochs", type=int, default=0)
     train_full.add_argument("--thought-capacity", type=int, default=128)
     train_full.add_argument(
+        "--display-initialization",
+        choices=("legacy", "window", "preallocated"), default=None,
+        help="Default: preallocated for identity-preserving, legacy for joint",
+    )
+    train_full.add_argument("--identity-initial-mask-tokens", type=int, default=8)
+    train_full.add_argument(
         "--interaction-architecture",
         choices=("joint", "identity-preserving"),
         default="joint",
         help="Original joint inputs or native-language-preserving single-pass CID",
     )
-    train_full.add_argument("--identity-initial-mask-tokens", type=int, default=8)
     train_full.add_argument("--max-display-tokens", type=int, default=1536)
     train_full.add_argument("--display-canvas-tokens", type=int, default=64)
     train_full.add_argument("--seed", type=int, default=0)

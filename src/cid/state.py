@@ -393,6 +393,30 @@ class DisplayCanvas:
             eos_token_id=eos_token_id,
         )
 
+    @classmethod
+    def initial_preallocated(
+        cls,
+        length: int,
+        mask_token_id: int,
+        *,
+        eos_token_id: int,
+    ) -> DisplayCanvas:
+        """Reserve the answer's editable MASK block before revealing tokens.
+
+        The last token is a movable EOS fallback. A model-predicted earlier EOS
+        can replace it after the prefix has been revealed. All other positions
+        are genuine unresolved Display tokens from the first step.
+        """
+        if length < 2:
+            raise ValueError("preallocated display requires at least two positions")
+        if eos_token_id < 0 or eos_token_id == mask_token_id:
+            raise ValueError("invalid preallocated EOS token")
+        return cls(
+            token_ids=(mask_token_id,) * (length - 1) + (eos_token_id,),
+            mask_token_id=mask_token_id,
+            eos_token_id=eos_token_id,
+        )
+
     @property
     def active_span_length(self) -> int:
         if self.eos_token_id is None:

@@ -8,6 +8,7 @@ import torch
 from torch import Tensor
 
 from cid.model.native_engine import accelerator_engine, cuda_engine
+from cid.state import DisplayCanvas
 
 _MAX_STRUCTURAL_EDIT_TOKENS = 32
 
@@ -49,7 +50,14 @@ class ThoughtCorruption:
 class CIDDiffusionScheduler:
     """Training corruption and iterative reveal utilities for CID T/Y state."""
 
-    def __init__(self, mask_token_id: int, eos_token_id: int | None = None) -> None:
+    def __init__(
+        self,
+        mask_token_id: int,
+        eos_token_id: int | None = None,
+        *,
+        display_initialization: str = "legacy",
+        initial_mask_tokens: int = 8,
+    ) -> None:
         if mask_token_id < 0:
             raise ValueError("mask_token_id must be non-negative")
         if eos_token_id is not None and eos_token_id < 0:
@@ -58,6 +66,81 @@ class CIDDiffusionScheduler:
             raise ValueError("EOS and MASK token IDs must differ")
         self.mask_token_id = mask_token_id
         self.eos_token_id = eos_token_id
+        if display_initialization not in {"legacy", "window", "preallocated"}:
+            raise ValueError("invalid Display initialization mode")
+        if display_initialization == "preallocated" and eos_token_id is None:
+            raise ValueError("preallocated Display requires EOS")
+        self.display_initialization = display_initialization
+        if initial_mask_tokens <= 0:
+            raise ValueError("initial_mask_tokens must be positive")
+        self.initial_mask_tokens = initial_mask_tokens
+
+    def initial_display(self, length: int) -> DisplayCanvas:
+        if self.eos_token_id is None:
+            return DisplayCanvas.masked(length, self.mask_token_id)
+        if self.display_initialization == "preallocated":
+            return DisplayCanvas.initial_preallocated(
+                length, self.mask_token_id, eos_token_id=self.eos_token_id,
+            )
+        return DisplayCanvas.initial_unresolved(
+            length, self.mask_token_id, eos_token_id=self.eos_token_id,
+            initial_mask_tokens=(
+                min(self.initial_mask_tokens, length - 1)
+                if self.display_initialization == "window"
+                else 1
+            ),
+        )
+
+    def corrupt_preallocated_display(
+        self,
+        target_ids: Tensor,
+        timestep: Tensor,
+        *,
+        generator: torch.Generator | None = None,
+    ) -> DisplayCorruption:
+        """Runtime-like partially revealed prefix, with a fallback EOS at canvas end.
+
+        Positions within the true answer/EOS are independently revealed with
+        probability (1-t). The true EOS is either revealed or hidden; if
+        hidden, only the last canvas position carries the provisional boundary.
+        The tail after the target EOS stays latent, never becomes a training
+        label. No random wrong-token replacements (Runtime never adds those).
+        """
+        if self.display_initialization != "preallocated" or self.eos_token_id is None:
+            raise ValueError("preallocated corruption requires preallocated strategy")
+        if target_ids.ndim != 2 or target_ids.shape[1] < 2:
+            raise ValueError("target_ids must be [batch, canvas>=2]")
+        values = self._batch_timesteps(
+            target_ids.shape[0], timestep, target_ids.device,
+        )
+        noise = values[:, None].expand_as(target_ids)
+        rows = torch.arange(target_ids.shape[1], device=target_ids.device)
+        true_eos = target_ids.eq(self.eos_token_id)
+        if not bool(true_eos.any(dim=1).all()):
+            raise ValueError("each target must have a true EOS")
+        boundaries = true_eos.long().argmax(dim=1)
+        active = rows[None, :] <= boundaries[:, None]
+        draws = torch.rand(
+            target_ids.shape, generator=generator, device=target_ids.device,
+        )
+        concealed = (draws < noise) & active
+        # At runtime, a fully noisy initial state is all MASK followed by a
+        # terminal EOS. It never includes a random replacement token.
+        corrupted = torch.full_like(target_ids, self.mask_token_id)
+        revealed = active & ~concealed
+        corrupted[revealed] = target_ids[revealed]
+        eos_hidden = concealed.gather(1, boundaries[:, None]).squeeze(1)
+        if bool(eos_hidden.any()):
+            corrupted[eos_hidden, -1] = self.eos_token_id
+        labels = target_ids.clone()
+        labels[~(active & (corrupted != target_ids))] = -100
+        return DisplayCorruption(
+            token_ids=corrupted,
+            labels=labels,
+            noise=noise.unsqueeze(-1),
+            masked=concealed,
+            replaced=torch.zeros_like(concealed),
+        )
 
     def corrupt_display(
         self,
@@ -288,7 +371,7 @@ class CIDDiffusionScheduler:
                 confidence, predicted, current_confidence = (
                     engine.display_token_statistics(token_ids, logits)
                 )
-            return engine.refine_display_from_statistics(
+            refined = engine.refine_display_from_statistics(
                 token_ids,
                 confidence,
                 predicted,
@@ -299,6 +382,7 @@ class CIDDiffusionScheduler:
                 revision_fraction=revision_fraction,
                 revision_margin=revision_margin,
             )
+            return self._defer_unresolved_eos(token_ids, refined)
         else:
             confidence = torch.empty(
                 token_ids.shape, dtype=torch.float32, device=logits.device
@@ -476,7 +560,34 @@ class CIDDiffusionScheduler:
                 ).flatten()
                 if eos_positions.numel():
                     result[batch_index, int(eos_positions[0]) + 1 :] = self.mask_token_id
-        return result
+        return self._defer_unresolved_eos(token_ids, result)
+
+    def _defer_unresolved_eos(self, before: Tensor, after: Tensor) -> Tensor:
+        """Keep an EOS move provisional until earlier Display MASKs resolve.
+
+        This prevents a spurious confident EOS at an arbitrary unfilled position
+        from collapsing a preallocated Display to a very short answer. The
+        already established boundary remains editable on subsequent steps.
+        It runs after both the native engine and the PyTorch fallback.
+        """
+        if self.display_initialization != "preallocated" or self.eos_token_id is None:
+            return after
+        for row in range(before.shape[0]):
+            previous = torch.nonzero(
+                before[row] == self.eos_token_id, as_tuple=False,
+            ).flatten()
+            proposed = torch.nonzero(
+                after[row] == self.eos_token_id, as_tuple=False,
+            ).flatten()
+            if not previous.numel() or not proposed.numel():
+                continue
+            old_end, new_end = int(previous[0]), int(proposed[0])
+            if new_end < old_end and bool(
+                (after[row, :new_end] == self.mask_token_id).any()
+            ):
+                after[row, new_end] = self.mask_token_id
+                after[row, old_end] = self.eos_token_id
+        return after
 
     def _structural_display_edit(
         self,
