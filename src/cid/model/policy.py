@@ -249,6 +249,17 @@ class ILLaDANeuralPolicy:
         self.adapter = adapter
         self.tensorizer = tensorizer
         self.materializer = materializer or CIDMaterializer()
+        if getattr(adapter, "identity_path", None) is not None:
+            allocation = self.materializer.config
+            if (
+                allocation.allocation_threshold != adapter.config.identity_allocation_threshold
+                or allocation.max_allocations_per_step
+                != adapter.config.identity_max_allocations_per_step
+            ):
+                raise ValueError(
+                    "identity-preserving Thought allocation parameters must match the "
+                    "runtime materializer's allocation threshold and step budget"
+                )
         self.catalog = catalog or ClosedWorldMaterializationCatalog()
         self.scheduler = scheduler or tensorizer.scheduler
         self.config = config or ILLaDANeuralPolicyConfig()
