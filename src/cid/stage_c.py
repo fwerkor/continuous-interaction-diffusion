@@ -391,6 +391,9 @@ def frozen_thought_rollout(
         length=adapter.config.display_canvas_tokens,
         mask_token_id=adapter.mask_token_id,
         eos_token_id=adapter.eos_token_id,
+        initial_mask_tokens=adapter.config.initial_display_mask_tokens(
+            adapter.config.display_canvas_tokens
+        ),
     )
     module = adapter.stage_c_display
     previous_enabled = module.enabled

@@ -24,9 +24,9 @@ New Thought allocations also suppress convergence for the current step so the ru
 
 ## Entry points and compatibility
 
-Stage A: cid train ... --interaction-architecture identity-preserving
+Stage A: cid train ... --interaction-architecture identity-preserving --identity-initial-mask-tokens 8
 
-Stage B: cid train-full ... --interaction-architecture identity-preserving
+Stage B: cid train-full ... --interaction-architecture identity-preserving --identity-initial-mask-tokens 8
 
 Default remains joint for legacy checkpoint compatibility. The flag is saved in adapter_config, so unified CID checkpoints restore the same path. New Stage A/B training is required; old joint weights cannot be treated as an already-trained control head for this architecture.
 
@@ -41,3 +41,7 @@ A release gate requires real multi-step non-tool reasoning trajectories, tool be
 ## cid-engine
 
 The new network keeps CIDTensorBatch/CIDTensorOutput and all preexisting Thought diffusion, allocation, Display revision and materialization operator signatures. A kernel or ABI change is not required on current evidence. The independent engine branch is reserved for compatibility regression; CANN requires testing on actual NPU hardware.
+
+## Mask window and EOS contract
+
+Identity-preserving mode reserves eight unresolved [MASK] tokens followed by a movable EOS boundary by default. Stage A/B bootstrap and Runtime initializers use the same stored adapter setting (`--identity-initial-mask-tokens`), capped at physical canvas capacity minus EOS. The legacy joint path retains one MASK before EOS. The shared scheduler progressively reveals active masks while leaving the tail latent; later high-confidence boundary evidence permits bounded expansion. Latent MASK tokens are not completed-answer targets.

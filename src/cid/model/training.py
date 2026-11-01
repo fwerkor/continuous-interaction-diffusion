@@ -3826,16 +3826,16 @@ class ILLaDATrajectoryTensorizer:
         display_supervision_mask[:, : realized_tokens + 1] = True
 
         if rollout_state is None and source_step == -1:
-            # The virtual bootstrap transition must match inference exactly: an empty
-            # TCT plus one unresolved Display token followed by EOS, with the rest of
-            # the physical canvas kept as latent capacity.  Corrupting the teacher's
-            # step-0 answer draft here leaks a much easier initialization distribution
-            # than the runtime ever receives.
+            # Match the inference bootstrap: empty Thought, unresolved Display
+            # window, and a movable EOS with latent capacity behind it. Teacher
+            # answers are not suitable as the initial runtime canvas.
             display_input_ids = torch.full_like(
                 target_display_ids,
                 self.adapter.mask_token_id,
             )
-            display_input_ids[:, 1] = self.eos_token_id
+            display_input_ids[
+                :, self.adapter.config.initial_display_mask_tokens(display_canvas_tokens)
+            ] = self.eos_token_id
             display_labels = target_display_ids.clone()
             display_labels[~display_supervision_mask] = -100
             display_labels[display_input_ids == target_display_ids] = -100

@@ -369,14 +369,12 @@ class DisplayCanvas:
         mask_token_id: int,
         *,
         eos_token_id: int,
+        initial_mask_tokens: int = 1,
     ) -> DisplayCanvas:
-        """Create the canonical unresolved CID display with an EOS boundary.
+        """Create a masked answer window followed by an editable EOS boundary.
 
-        The first token is unresolved answer content, the second token is the
-        current logical end of the answer, and the remaining physical canvas is
-        latent capacity.  This matches the neural training representation of
-        ``<|cid_unknown|>`` while still allowing later diffusion steps to revise
-        or move EOS and grow the answer.
+        The active window consists of unresolved output tokens. Positions after
+        EOS remain latent capacity for bounded expansion on later steps.
         """
 
         if length < 2:
@@ -385,8 +383,12 @@ class DisplayCanvas:
             raise ValueError("EOS token ID must be non-negative")
         if eos_token_id == mask_token_id:
             raise ValueError("EOS and MASK token IDs must differ")
+        if not 1 <= initial_mask_tokens < length:
+            raise ValueError("initial MASK window must fit before EOS")
         return cls(
-            token_ids=(mask_token_id, eos_token_id) + (mask_token_id,) * (length - 2),
+            token_ids=(mask_token_id,) * initial_mask_tokens
+            + (eos_token_id,)
+            + (mask_token_id,) * (length - initial_mask_tokens - 1),
             mask_token_id=mask_token_id,
             eos_token_id=eos_token_id,
         )

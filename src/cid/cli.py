@@ -1959,6 +1959,7 @@ def _train_stage_a(args: argparse.Namespace) -> None:
         display_canvas_tokens=args.display_canvas_tokens,
         semantic_head_version=2,
         interaction_architecture=args.interaction_architecture,
+        identity_initial_mask_tokens=args.identity_initial_mask_tokens,
     )
     dataset_manifest = inspect_dataset(args.data)
     validate_neural_training_contract(
@@ -3119,6 +3120,7 @@ def _train_stage_b(args: argparse.Namespace) -> None:
             display_canvas_tokens=args.display_canvas_tokens,
             semantic_head_version=2,
             interaction_architecture=args.interaction_architecture,
+            identity_initial_mask_tokens=args.identity_initial_mask_tokens,
         )
         dataset_manifest = inspect_dataset(args.data)
         validate_neural_training_contract(
@@ -4603,6 +4605,7 @@ def main() -> None:
         default="joint",
         help="Original joint inputs or native-language-preserving single-pass CID",
     )
+    train.add_argument("--identity-initial-mask-tokens", type=int, default=8)
     train.add_argument("--max-display-tokens", type=int, default=1536)
     train.add_argument("--display-canvas-tokens", type=int, default=64)
     train.add_argument("--seed", type=int, default=0)
@@ -4760,6 +4763,7 @@ def main() -> None:
         default="joint",
         help="Original joint inputs or native-language-preserving single-pass CID",
     )
+    train_full.add_argument("--identity-initial-mask-tokens", type=int, default=8)
     train_full.add_argument("--max-display-tokens", type=int, default=1536)
     train_full.add_argument("--display-canvas-tokens", type=int, default=64)
     train_full.add_argument("--seed", type=int, default=0)

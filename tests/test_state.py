@@ -141,3 +141,16 @@ def test_unresolved_display_bootstrap_has_mask_and_eos_boundary() -> None:
     assert canvas.realized_length == 1
     assert canvas.active_span_length == 2
     assert canvas.unresolved == 1
+
+
+def test_unresolved_display_preallocation_keeps_editable_eos_and_latent_tail() -> None:
+    canvas = DisplayCanvas.initial_unresolved(
+        length=12, mask_token_id=5, eos_token_id=2, initial_mask_tokens=8
+    )
+    assert canvas.token_ids == (5,) * 8 + (2,) + (5,) * 3
+    assert canvas.unresolved == 8
+    assert canvas.active_span_length == 9
+    with pytest.raises(ValueError, match="MASK window"):
+        DisplayCanvas.initial_unresolved(
+            length=8, mask_token_id=5, eos_token_id=2, initial_mask_tokens=8
+        )

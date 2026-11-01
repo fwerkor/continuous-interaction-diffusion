@@ -650,6 +650,7 @@ class ILLaDACIDConfig:
     interaction_architecture: str = "joint"
     identity_allocation_threshold: float = DEFAULT_ALLOCATION_THRESHOLD
     identity_max_allocations_per_step: int = DEFAULT_MAX_ALLOCATIONS_PER_STEP
+    identity_initial_mask_tokens: int = 8
 
     def __post_init__(self) -> None:
         if self.max_thought_slots <= 0 or self.max_display_tokens <= 0:
@@ -684,6 +685,15 @@ class ILLaDACIDConfig:
             raise ValueError("identity_allocation_threshold must be in [0, 1]")
         if self.identity_max_allocations_per_step <= 0:
             raise ValueError("identity_max_allocations_per_step must be positive")
+        if self.identity_initial_mask_tokens <= 0:
+            raise ValueError("identity_initial_mask_tokens must be positive")
+
+    def initial_display_mask_tokens(self, canvas_length: int) -> int:
+        if canvas_length < 2:
+            raise ValueError("Display bootstrap requires room for MASK and EOS")
+        if self.interaction_architecture == "joint":
+            return 1
+        return min(self.identity_initial_mask_tokens, canvas_length - 1)
 
 
 class ILLaDACIDAdapter(nn.Module):

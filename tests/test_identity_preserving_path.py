@@ -338,3 +338,158 @@ def test_new_internal_thought_prevents_immediate_runtime_convergence() -> None:
     )
     assert update.thought.cells[0].occupied
     assert not update.converged
+
+
+def test_stage_a_b_bootstrap_matches_runtime_canvas_and_noise() -> None:
+    from cid.contracts import ModelContext
+    from cid.model.policy import ILLaDAContextTensorizer
+    from cid.model.training import ILLaDATrajectoryTensorizer
+    from cid.state import CognitiveField, DisplayCanvas, FactStore
+
+    training = import_module("test_training")
+    tokenizer = training.TinyTokenizer()
+    adapter = training.ILLaDACIDAdapter(
+        training.TinyBackbone(),
+        ILLaDACIDConfig(
+            max_thought_slots=4, max_display_tokens=16,
+            interaction_architecture="identity-preserving",
+            identity_initial_mask_tokens=6, semantic_head_version=2,
+        ),
+        freeze_backbone=True,
+    )
+    example = training.make_trajectory()
+    trajectory = ILLaDATrajectoryTensorizer(adapter, tokenizer)
+    sample = trajectory.tensorize(example, source_step=-1, timestep=1.0)
+    runtime_canvas = DisplayCanvas.initial_unresolved(
+        length=sample.batch.display_ids.shape[1],
+        mask_token_id=adapter.mask_token_id,
+        eos_token_id=adapter.eos_token_id,
+        initial_mask_tokens=adapter.config.identity_initial_mask_tokens,
+    )
+    context = ModelContext(
+        facts=FactStore().snapshot(),
+        thought=CognitiveField.empty(
+            capacity=sample.batch.thought_semantic.shape[1], width=adapter.d_model
+        ),
+        display=runtime_canvas, sources=(), percepts=(), step=0,
+        prompt=example.prompt,
+    )
+    runtime_batch = ILLaDAContextTensorizer(adapter, tokenizer)(
+        context, display_noise_level=1.0
+    )
+    assert sample.batch.display_ids[0].tolist() == list(runtime_canvas.token_ids)
+    torch.testing.assert_close(sample.batch.display_ids, runtime_batch.display_ids)
+    torch.testing.assert_close(sample.batch.display_noise, runtime_batch.display_noise)
+    assert sample.batch.display_padding_mask.sum() == 0
+    assert runtime_batch.display_padding_mask.sum() == 0
+    assert sample.batch.display_ids[0, 6] == adapter.eos_token_id
+    assert not (sample.targets.display_ids[0] == adapter.mask_token_id).any()
+
+
+def test_mask_window_gradual_reveal_keeps_boundary_revision_possible() -> None:
+    from cid.model.diffusion import CIDDiffusionScheduler, denoising_reveal_fraction
+
+    scheduler = CIDDiffusionScheduler(mask_token_id=5, eos_token_id=2)
+    tokens = torch.tensor([[5] * 8 + [2] + [5] * 5])
+    logits = torch.full((1, 14, 20), -10.0)
+    for index in range(8):
+        logits[0, index, 7 + (index % 3)] = 20.0
+    logits[0, 8, 2] = 20.0
+    partial = scheduler.refine_display(
+        tokens, logits, reveal_fraction=denoising_reveal_fraction(0, 8),
+        revision_fraction=0.25, revision_margin=0.1,
+    )
+    assert int((partial[0, :8] != 5).sum()) == 1
+    assert partial[0, 8] == 2
+    assert torch.equal(partial[0, 9:], tokens[0, 9:])
+    # After the initial window is resolved, the EOS location remains movable.
+    logits[0, 8, 10] = 30.0
+    logits[0, 9, 2] = 30.0
+    expanded = scheduler.refine_display(
+        partial, logits, reveal_fraction=1.0 / 8,
+        revision_fraction=0.25, revision_margin=0.1,
+    )
+    assert expanded[0, 8] == 10
+    assert expanded[0, 9] == 2
+    assert torch.all(expanded[0, 10:] == 5)
+
+
+def test_joint_legacy_config_unaffected_by_identity_window() -> None:
+    config = ILLaDACIDConfig(
+        max_thought_slots=2, max_display_tokens=4,
+        identity_initial_mask_tokens=8,
+    )
+    assert config.interaction_architecture == "joint"
+    assert config.initial_display_mask_tokens(4) == 1
+    identity = replace(config, interaction_architecture="identity-preserving")
+    assert identity.initial_display_mask_tokens(4) == 3
+    with pytest.raises(ValueError, match="identity_initial_mask_tokens"):
+        ILLaDACIDConfig(
+            max_thought_slots=2, max_display_tokens=4,
+            interaction_architecture="identity-preserving",
+            identity_initial_mask_tokens=0,
+        )
+
+
+
+@pytest.mark.parametrize("freeze_backbone", (True, False), ids=("stage-a", "stage-b"))
+def test_preallocated_identity_training_updates_active_parameters(freeze_backbone: bool) -> None:
+    from cid.data import DisplayTarget
+    from cid.model.training import (
+        CIDTrainer,
+        CIDTrainerConfig,
+        ILLaDATrajectoryTensorizer,
+    )
+
+    training = import_module("test_training")
+    base = training.make_trajectory()
+    example = replace(
+        base,
+        example_id="identity-bootstrap-train",
+        source_descriptors=(),
+        binding_targets=(),
+        thought_targets=tuple(t for t in base.thought_targets if t.step == 0),
+        display_targets=(DisplayTarget(step=0, text="37"),),
+        grounding_targets=(),
+    )
+    adapter = training.ILLaDACIDAdapter(
+        training.TinyBackbone(),
+        ILLaDACIDConfig(
+            max_thought_slots=4,
+            max_display_tokens=16,
+            interaction_architecture="identity-preserving",
+            identity_initial_mask_tokens=8,
+            semantic_head_version=2,
+        ),
+        freeze_backbone=freeze_backbone,
+    )
+    tensorizer = ILLaDATrajectoryTensorizer(adapter, training.TinyTokenizer())
+    before = {
+        name: param.detach().clone()
+        for name, param in adapter.named_parameters()
+        if param.requires_grad and name.startswith("identity_path.")
+    }
+    report = CIDTrainer(
+        adapter,
+        tensorizer,
+        CIDTrainerConfig(timestep_min=1.0, timestep_max=1.0),
+    ).train_examples((example,), epochs=1, shuffle=False)
+    assert report.transitions == 1
+    assert any(
+        not torch.equal(before[name], param)
+        for name, param in adapter.named_parameters()
+        if name in before
+    )
+
+
+def test_source_descriptors_can_condition_display_without_existing_thought() -> None:
+    adapter = new_adapter().eval()
+    batch = make_batch()
+    batch.slot_occupancy.zero_()
+    with torch.no_grad():
+        plain = adapter(batch)
+        batch.source_memory = torch.randn(1, 2, adapter.d_model)
+        conditioned = adapter(batch)
+    assert not torch.equal(plain.display_logits, conditioned.display_logits)
+    assert conditioned.source_logits.shape[-1] == 2
+    assert torch.isfinite(conditioned.need_logits).all()

@@ -119,6 +119,7 @@ async def run_neural_benchmark_case(
         length=canvas_tokens,
         mask_token_id=adapter.mask_token_id,
         eos_token_id=adapter.eos_token_id,
+        initial_mask_tokens=adapter.config.initial_display_mask_tokens(canvas_tokens),
     )
     effective_runtime_config = runtime_config
     if max_steps is not None:
