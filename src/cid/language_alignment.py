@@ -225,6 +225,12 @@ def train_language_alignment(args: Any) -> None:
         )
     if args.distillation_weight < 0.0 or args.temperature <= 0.0:
         raise ValueError("invalid teacher parameters")
+    if not 0.0 < args.min_mask_probability <= 1.0:
+        raise ValueError("minimum LA mask probability must lie in (0, 1]")
+    if args.log_every <= 0 or args.save_every < 0:
+        raise ValueError("LA log interval must be positive and save interval nonnegative")
+    if args.canvas_tokens < 2 or args.max_answer_tokens < 2:
+        raise ValueError("invalid LA Display canvas or answer budget")
     if args.distillation_weight and not args.native_teacher:
         raise ValueError("native teacher model is required for distillation")
     device = torch.device(
@@ -389,3 +395,122 @@ def train_language_alignment(args: Any) -> None:
         if not seen or seen % args.grad_accum and steps == 0:
             raise ValueError("no usable LA training examples")
     print(f"LA complete steps={steps} output={out / f'la-step-{steps:06d}'}", flush=True)
+
+
+def open_perfectblend_example(record: dict[str, Any]) -> StageCExample | None:
+    conversation = record.get("conversations")
+    if not isinstance(conversation, list):
+        return None
+    for position, message in enumerate(conversation):
+        if not isinstance(message, dict) or message.get("from") != "human":
+            continue
+        prompt = message.get("value")
+        if not isinstance(prompt, str) or not prompt.strip():
+            return None
+        for response in conversation[position + 1 :]:
+            if not isinstance(response, dict):
+                continue
+            if response.get("from") == "human":
+                return None
+            if response.get("from") == "gpt":
+                answer = response.get("value")
+                if isinstance(answer, str) and answer.strip():
+                    return StageCExample(prompt.strip(), answer.strip())
+                return None
+    return None
+
+
+def prepare_la_data(
+    *,
+    model: str,
+    dataset: str,
+    output_dir: str,
+    max_scan: int,
+    max_examples: int,
+    max_prompt_tokens: int,
+    min_answer_tokens: int,
+    max_answer_tokens: int,
+    validation_fraction: float,
+    seed: int,
+) -> dict[str, Any]:
+    if (
+        max_scan < 1
+        or max_examples < 2
+        or min_answer_tokens < 1
+        or max_answer_tokens < min_answer_tokens
+        or max_prompt_tokens < 1
+        or not 0.0 < validation_fraction < 0.5
+    ):
+        raise ValueError("invalid LA data preparation limits")
+    from collections import Counter
+
+    from datasets import load_dataset
+    from transformers import AutoTokenizer
+
+    tokenizer = AutoTokenizer.from_pretrained(model, trust_remote_code=True)
+    stream = load_dataset(dataset, split="train", streaming=True)
+    stream = stream.shuffle(seed=seed, buffer_size=1000)
+    rng = random.Random(seed)
+    sources: Counter[str] = Counter()
+    rejected: Counter[str] = Counter()
+    seen: set[str] = set()
+    selected: list[dict[str, Any]] = []
+    scanned = 0
+    for record in stream:
+        scanned += 1
+        example = open_perfectblend_example(record)
+        if example is None:
+            rejected["unsupported"] += 1
+        elif example.prompt in seen:
+            rejected["duplicate"] += 1
+        elif len(example.prompt) > 1500 or not 15 <= len(example.answer) <= 600:
+            rejected["text_length"] += 1
+        else:
+            n_prompt = len(tokenizer.encode(example.prompt, add_special_tokens=True))
+            n_answer = len(tokenizer.encode(example.answer, add_special_tokens=False))
+            if (
+                n_prompt > max_prompt_tokens
+                or not min_answer_tokens <= n_answer <= max_answer_tokens
+            ):
+                rejected["token_budget"] += 1
+            else:
+                seen.add(example.prompt)
+                source = str(record.get("source") or "unknown")
+                sources[source] += 1
+                selected.append(
+                    {
+                        "prompt": example.prompt,
+                        "answer": example.answer,
+                        "source": source,
+                        "answer_tokens": n_answer,
+                    }
+                )
+        if len(selected) >= max_examples or scanned >= max_scan:
+            break
+    if len(selected) < 2:
+        raise ValueError("not enough qualifying instruction pairs for LA")
+    rng.shuffle(selected)
+    valid_count = max(1, round(len(selected) * validation_fraction))
+    valid = selected[:valid_count]
+    train = selected[valid_count:]
+    path = Path(output_dir)
+    path.mkdir(parents=True, exist_ok=True)
+    for name, examples in (("train", train), ("validation", valid)):
+        with (path / f"la-{name}.jsonl").open("w", encoding="utf-8") as handle:
+            for example in examples:
+                handle.write(json.dumps(example, ensure_ascii=False) + "\n")
+    result = {
+        "dataset": dataset,
+        "seed": seed,
+        "scanned": scanned,
+        "train": len(train),
+        "validation": len(valid),
+        "sources": dict(sources),
+        "rejected": dict(rejected),
+        "min_answer_tokens": min_answer_tokens,
+        "max_answer_tokens": max_answer_tokens,
+    }
+    (path / "la-data-manifest.json").write_text(
+        json.dumps(result, ensure_ascii=False, indent=2), encoding="utf-8"
+    )
+    return result

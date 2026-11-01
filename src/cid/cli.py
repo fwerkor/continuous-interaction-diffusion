@@ -4214,6 +4214,20 @@ def main() -> None:
     )
     stage_c_data.add_argument("--max-per-split", type=int, default=20000)
     stage_c_data.add_argument("--seed", type=int, default=42)
+    la_data = subparsers.add_parser(
+        "prepare-language-alignment-data",
+        help="export deduplicated public instruction pairs with held-out validation",
+    )
+    la_data.add_argument("--model", required=True)
+    la_data.add_argument("--dataset", default="mlabonne/open-perfectblend")
+    la_data.add_argument("--output-dir", required=True)
+    la_data.add_argument("--max-scan", type=int, default=60000)
+    la_data.add_argument("--max-examples", type=int, default=2500)
+    la_data.add_argument("--max-prompt-tokens", type=int, default=230)
+    la_data.add_argument("--min-answer-tokens", type=int, default=6)
+    la_data.add_argument("--max-answer-tokens", type=int, default=60)
+    la_data.add_argument("--validation-fraction", type=float, default=0.06)
+    la_data.add_argument("--seed", type=int, default=20261101)
     la = subparsers.add_parser(
         "train-language-alignment",
         help="pre-CID Backbone instruction alignment with masked diffusion",
@@ -4921,6 +4935,18 @@ def main() -> None:
         _train_stage_a(args)
     elif args.command == "train-full":
         _train_stage_b(args)
+    elif args.command == "prepare-language-alignment-data":
+        from cid.language_alignment import prepare_la_data
+
+        stats = prepare_la_data(
+            model=args.model, dataset=args.dataset, output_dir=args.output_dir,
+            max_scan=args.max_scan, max_examples=args.max_examples,
+            max_prompt_tokens=args.max_prompt_tokens,
+            min_answer_tokens=args.min_answer_tokens,
+            max_answer_tokens=args.max_answer_tokens,
+            validation_fraction=args.validation_fraction, seed=args.seed,
+        )
+        print(json.dumps(stats, ensure_ascii=False))
     elif args.command == "train-language-alignment":
         from cid.language_alignment import train_language_alignment
 

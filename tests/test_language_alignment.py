@@ -115,3 +115,23 @@ def test_la_objective_rejects_invalid_teacher_logits():
             content_mask=torch.tensor([True, False]),
             distillation_weight=0.1,
         )
+
+
+def test_open_perfectblend_instructions_are_extracted_without_future_messages():
+    from cid.language_alignment import open_perfectblend_example
+
+    record = {
+        "conversations": [
+            {"from": "human", "value": "  Explain the algorithm "},
+            {"from": "gpt", "value": "  One possible method... "},
+            {"from": "human", "value": "A follow-up"},
+            {"from": "gpt", "value": "Another answer"},
+        ],
+        "source": "test",
+    }
+    example = open_perfectblend_example(record)
+    assert example is not None
+    assert example.prompt == "Explain the algorithm"
+    assert example.answer == "One possible method..."
+    assert open_perfectblend_example({"conversations": [{"from": "human", "value": "hi"}]}) is None
+    assert open_perfectblend_example({"conversations": []}) is None

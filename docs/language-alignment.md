@@ -61,3 +61,17 @@ SFT and teacher KL with identical data, seeds, steps and evaluation harness.
 LA reduces initial distribution mismatch but does not guarantee language
 retention during Stage B. Test Stage B language replay separately before
 calling the full pipeline ready.
+
+For a reproducible pilot sample from the public 350M model's original
+instruction-data source (the default exporter replaces the inaccessible
+Nemotron v4 dataset):
+
+    cid prepare-language-alignment-data \
+      --model LiquidAI/LFM2.5-Encoder-350M-Diffusion \
+      --dataset mlabonne/open-perfectblend \
+      --max-examples 2500 --max-scan 60000 \
+      --output-dir data/la-pilot
+
+This writes deduplicated train/validation JSONL and a dataset manifest.
+Use the filenames la-train.jsonl and la-validation.jsonl from that directory.
+Review upstream source licenses before distributing any derivative dataset.
