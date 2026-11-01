@@ -75,3 +75,42 @@ Nemotron v4 dataset):
 This writes deduplicated train/validation JSONL and a dataset manifest.
 Use the filenames la-train.jsonl and la-validation.jsonl from that directory.
 Review upstream source licenses before distributing any derivative dataset.
+
+## English-first production pilot
+
+The language-alignment pipeline defaults to no Chinese oversampling
+(--zh-repeat 1.0). Mandarin examples remain for multilingual retention,
+while English conversation, explanations, writing, instruction following,
+mathematics, code and tool behavior are the primary acceptance targets.
+
+The production-mixture-v2 pilot contains 30,000 English-source and 5,913
+Chinese-source training examples. Source-based language tags do not
+represent independently verified automatic language identification.
+
+Production pilot:
+
+    cid train-language-alignment \
+      --model /path/to/LFM2.5-Encoder-350M-Diffusion \
+      --data data/production-mixture-v2/la-train.jsonl \
+      --validation-data data/production-mixture-v2/la-validation.jsonl \
+      --output-dir outputs/la-english-first \
+      --max-steps 3000 --save-every 400 --grad-accum 4 \
+      --canvas-buckets 64,128,192 --max-answer-tokens 192 \
+      --warmup-steps 50 --lr-decay-steps 4000 \
+      --learning-rate 1.6e-5 --eos-weight 0.8 --zh-repeat 1.0 \
+      --dtype bf16 --device cuda
+
+Resume using --resume outputs/la-english-first/la-step-NNNNNNN and unchanged
+data/model/optimizer settings. --max-steps means total optimizer updates.
+LA v2 saves the Backbone, tokenizer, optimizer, exact training-data order,
+RNG states and validation metrics. It verifies data SHA256 and hyperparams
+at resume. Keep full optimizer checkpoints private, and export only model
+weights to untrusted users.
+
+Run scripts/evaluate_la_generation.py to probe the preallocated Display
+sampler on 19 English-dominant prompts. Empty/repetition/template/code-syntax
+checks are diagnostics, not a semantic correctness or code-execution score.
+
+A lower masked-token validation loss alone cannot approve a model for
+production. Require English semantic quality, valid executable Python,
+tool use and EOS/length checks before replacing CID Stage A/B.

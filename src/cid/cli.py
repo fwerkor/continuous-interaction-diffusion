@@ -4248,11 +4248,21 @@ def main() -> None:
     la.add_argument("--max-examples", type=int)
     la.add_argument("--max-validation-examples", type=int, default=128)
     la.add_argument("--canvas-tokens", type=int, default=64)
-    la.add_argument("--max-answer-tokens", type=int, default=64)
+    la.add_argument("--max-answer-tokens", type=int, default=192)
     la.add_argument("--min-mask-probability", type=float, default=0.2)
     la.add_argument("--save-every", type=int, default=250)
     la.add_argument("--log-every", type=int, default=10)
     la.add_argument("--seed", type=int, default=42)
+    la.add_argument("--resume")
+    la.add_argument("--canvas-buckets", default="64,128,192")
+    la.add_argument("--eos-weight", type=float, default=0.8)
+    la.add_argument("--zh-repeat", type=float, default=1.0)
+    la.add_argument("--weight-decay", type=float, default=0.01)
+    la.add_argument("--warmup-steps", type=int, default=100)
+    la.add_argument("--lr-decay-steps", type=int, default=7000)
+    la.add_argument("--min-lr-ratio", type=float, default=0.1)
+    la.add_argument("--keep-last", type=int, default=2)
+    la.add_argument("--max-mask-probability", type=float, default=1.0)
     stage_c = subparsers.add_parser(
         "train-display", help="Stage C: frozen CID with Display-only low-rank diffusion SFT"
     )
@@ -4948,9 +4958,9 @@ def main() -> None:
         )
         print(json.dumps(stats, ensure_ascii=False))
     elif args.command == "train-language-alignment":
-        from cid.language_alignment import train_language_alignment
+        from cid.la_training import train_language_alignment_v2
 
-        train_language_alignment(args)
+        train_language_alignment_v2(args)
     elif args.command == "train-display":
         from cid.stage_c import train_stage_c
 
