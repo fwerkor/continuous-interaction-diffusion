@@ -4214,6 +4214,31 @@ def main() -> None:
     )
     stage_c_data.add_argument("--max-per-split", type=int, default=20000)
     stage_c_data.add_argument("--seed", type=int, default=42)
+    la = subparsers.add_parser(
+        "train-language-alignment",
+        help="pre-CID Backbone instruction alignment with masked diffusion",
+    )
+    la.add_argument("--model", required=True)
+    la.add_argument("--data", required=True)
+    la.add_argument("--validation-data")
+    la.add_argument("--output-dir", required=True)
+    la.add_argument("--native-teacher")
+    la.add_argument("--distillation-weight", type=float, default=0.0)
+    la.add_argument("--temperature", type=float, default=2.0)
+    la.add_argument("--device", choices=("auto", "cuda", "cpu"), default="auto")
+    la.add_argument("--dtype", choices=("fp32", "bf16"), default="bf16")
+    la.add_argument("--learning-rate", type=float, default=2e-5)
+    la.add_argument("--grad-accum", type=int, default=4)
+    la.add_argument("--grad-clip", type=float, default=1.0)
+    la.add_argument("--max-steps", type=int, default=1000)
+    la.add_argument("--max-examples", type=int)
+    la.add_argument("--max-validation-examples", type=int, default=128)
+    la.add_argument("--canvas-tokens", type=int, default=64)
+    la.add_argument("--max-answer-tokens", type=int, default=64)
+    la.add_argument("--min-mask-probability", type=float, default=0.2)
+    la.add_argument("--save-every", type=int, default=250)
+    la.add_argument("--log-every", type=int, default=10)
+    la.add_argument("--seed", type=int, default=42)
     stage_c = subparsers.add_parser(
         "train-display", help="Stage C: frozen CID with Display-only low-rank diffusion SFT"
     )
@@ -4896,6 +4921,10 @@ def main() -> None:
         _train_stage_a(args)
     elif args.command == "train-full":
         _train_stage_b(args)
+    elif args.command == "train-language-alignment":
+        from cid.language_alignment import train_language_alignment
+
+        train_language_alignment(args)
     elif args.command == "train-display":
         from cid.stage_c import train_stage_c
 
