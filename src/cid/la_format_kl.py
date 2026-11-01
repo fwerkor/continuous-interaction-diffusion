@@ -278,6 +278,8 @@ def train_prompt_only_format_kl(args: Any) -> None:
         raise ValueError("invalid checkpoint interval")
     if not 0 <= args.pseudo_probability <= 1:
         raise ValueError("invalid teacher-generation sampling probability")
+    if not 0 <= args.pseudo_full_mask_probability <= 1:
+        raise ValueError("invalid teacher-generation full-mask probability")
     if args.pseudo_probability and not args.teacher_generations:
         raise ValueError("teacher generation file required for pseudo states")
     if not 0 < args.mask_min <= args.mask_max <= 1:
@@ -354,6 +356,7 @@ def train_prompt_only_format_kl(args: Any) -> None:
         "max_content_positions": args.max_content_positions,
         "max_prompt_tokens": args.max_prompt_tokens,
         "pseudo_probability": args.pseudo_probability,
+        "pseudo_full_mask_probability": args.pseudo_full_mask_probability,
         "mask_min": args.mask_min,
         "mask_max": args.mask_max,
         "termination_weight": args.termination_weight,
@@ -383,7 +386,7 @@ def train_prompt_only_format_kl(args: Any) -> None:
         print("RESUMED", str(resume), "step", step, flush=True)
     if step >= args.max_steps:
         raise ValueError("requested max steps must exceed resumed checkpoint")
-    train_stat = {"all_mask": 0, "teacher_partial": 0}
+    train_stat = {"all_mask": 0, "teacher_partial": 0, "teacher_full_mask": 0}
 
     def run_pair(
         record: PromptOnly | TeacherDraft, *, mask_probability: float, width: int
@@ -455,7 +458,11 @@ def train_prompt_only_format_kl(args: Any) -> None:
             if not possible:
                 continue
             width = rng.choice(possible)
-            p = rng.uniform(args.mask_min, args.mask_max)
+            p = (
+                1.0
+                if rng.random() < args.pseudo_full_mask_probability
+                else rng.uniform(args.mask_min, args.mask_max)
+            )
         else:
             width = rng.choice(buckets)
             p = 1.0
@@ -470,7 +477,11 @@ def train_prompt_only_format_kl(args: Any) -> None:
         if not bool(torch.isfinite(loss)):
             raise FloatingPointError("pure KL loss became nonfinite")
         (loss / args.grad_accum).backward()
-        train_stat["teacher_partial" if is_pseudo else "all_mask"] += 1
+        sample_mode = (
+            "teacher_full_mask" if is_pseudo and p == 1.0
+            else "teacher_partial" if is_pseudo else "all_mask"
+        )
+        train_stat[sample_mode] += 1
         seen += 1
         if seen % args.grad_accum:
             continue
@@ -500,7 +511,7 @@ def train_prompt_only_format_kl(args: Any) -> None:
             "teacher_stop_kl": float(terminal),
             "grad_norm": float(grad_norm),
             "canvas": width,
-            "mode": "teacher_partial" if is_pseudo else "all_mask",
+            "mode": sample_mode,
             "source": "native_teacher" if is_pseudo else record.source,
             "language": record.language,
         }

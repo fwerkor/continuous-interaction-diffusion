@@ -404,7 +404,8 @@ class DisplayCanvas:
         """Reserve the answer's editable MASK block before revealing tokens.
 
         The last token is a movable EOS fallback. A model-predicted earlier EOS
-        can replace it after the prefix has been revealed. All other positions
+        can replace it while prefix MASK positions are still being resolved in
+        the CID-answer protocol. All other positions
         are genuine unresolved Display tokens from the first step.
         """
         if length < 2:

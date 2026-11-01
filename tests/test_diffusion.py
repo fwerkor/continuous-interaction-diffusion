@@ -493,3 +493,30 @@ def test_display_refinement_can_expand_one_unknown_slot_before_preserved_suffix(
     )
 
     assert refined.tolist() == [[9, 5, 8, 11, 12, 13, 14, 2, 5]]
+
+
+
+def test_aligned_preallocated_display_keeps_pending_eos_while_filling_prefix() -> None:
+    scheduler = CIDDiffusionScheduler(
+        mask_token_id=5, eos_token_id=2, display_initialization="preallocated",
+        allow_pending_eos=True,
+    )
+    tokens = torch.tensor([[9, 5, 5, 5, 5, 2]])
+    logits = torch.zeros(1, 6, 16)
+    logits[0, 1, 7] = 3.0
+    logits[0, 2, 8] = 3.0
+    logits[0, 3, 2] = 30.0
+    logits[0, 4, 10] = 3.0
+    refined = scheduler.refine_display(
+        tokens, logits, reveal_fraction=0.25,
+        revision_fraction=0.0, revision_margin=0.1,
+    )
+    assert refined.tolist() == [[9, 5, 5, 2, 5, 5]]
+    assert bool(refined[0, :3].eq(5).any())
+    logits[0, 1, 7] = 30.0
+    logits[0, 2, 8] = 30.0
+    refined = scheduler.refine_display(
+        refined, logits, reveal_fraction=1.0,
+        revision_fraction=0.0, revision_margin=0.1,
+    )
+    assert refined.tolist() == [[9, 7, 8, 2, 5, 5]]

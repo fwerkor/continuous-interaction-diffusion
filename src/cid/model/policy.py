@@ -48,6 +48,7 @@ class ILLaDAContextTensorizer:
             adapter.mask_token_id, adapter.eos_token_id,
             display_initialization=adapter.config.display_initialization,
             initial_mask_tokens=adapter.config.identity_initial_mask_tokens,
+            allow_pending_eos=adapter.config.backbone_protocol == "cid-answer",
         )
         if self.text_encoder.d_model != adapter.d_model:
             raise ValueError("runtime text encoder width must match the CID adapter")

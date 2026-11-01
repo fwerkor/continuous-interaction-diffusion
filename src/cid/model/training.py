@@ -3627,6 +3627,7 @@ class ILLaDATrajectoryTensorizer:
             adapter.mask_token_id, adapter.eos_token_id,
             display_initialization=adapter.config.display_initialization,
             initial_mask_tokens=adapter.config.identity_initial_mask_tokens,
+            allow_pending_eos=adapter.config.backbone_protocol == "cid-answer",
         )
         self.materializer = CIDMaterializer()
         self._runtime_argument_catalog_cache: (

@@ -3892,9 +3892,11 @@ def test_sparse_component_losses_are_invariant_to_microbatch_packing() -> None:
     )
     for name in component_names:
         expected = 0.5 * (getattr(individual[0], name) + getattr(individual[1], name))
-        assert getattr(joint, name) == pytest.approx(expected, rel=1e-5, abs=1e-6), name
+        assert float(getattr(joint, name)) == pytest.approx(
+            float(expected), rel=1e-5, abs=1e-6
+        ), name
     expected_total = 0.5 * (individual[0].total + individual[1].total)
-    assert joint.total == pytest.approx(expected_total, rel=1e-5, abs=1e-6)
+    assert float(joint.total) == pytest.approx(float(expected_total), rel=1e-5, abs=1e-6)
 
 
 def test_stage_a_legacy_resume_repair_is_limited_to_pre_v2_checkpoints() -> None:

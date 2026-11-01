@@ -57,6 +57,7 @@ class CIDDiffusionScheduler:
         *,
         display_initialization: str = "legacy",
         initial_mask_tokens: int = 8,
+        allow_pending_eos: bool = False,
     ) -> None:
         if mask_token_id < 0:
             raise ValueError("mask_token_id must be non-negative")
@@ -71,6 +72,7 @@ class CIDDiffusionScheduler:
         if display_initialization == "preallocated" and eos_token_id is None:
             raise ValueError("preallocated Display requires EOS")
         self.display_initialization = display_initialization
+        self.allow_pending_eos = bool(allow_pending_eos)
         if initial_mask_tokens <= 0:
             raise ValueError("initial_mask_tokens must be positive")
         self.initial_mask_tokens = initial_mask_tokens
@@ -563,12 +565,12 @@ class CIDDiffusionScheduler:
         return self._defer_unresolved_eos(token_ids, result)
 
     def _defer_unresolved_eos(self, before: Tensor, after: Tensor) -> Tensor:
-        """Keep an EOS move provisional until earlier Display MASKs resolve.
+        """Reject empty EOS, and optionally defer early EOS until prefix MASKs resolve.
 
-        This prevents a spurious confident EOS at an arbitrary unfilled position
-        from collapsing a preallocated Display to a very short answer. The
-        already established boundary remains editable on subsequent steps.
-        It runs after both the native engine and the PyTorch fallback.
+        Models aligned with a native teacher can predict the true termination
+        position before all preceding masks have been revealed. Keep that EOS
+        provisional; callers must still resolve the remaining prefix before
+        accepting a completed answer.
         """
         if self.display_initialization != "preallocated" or self.eos_token_id is None:
             return after
@@ -584,7 +586,10 @@ class CIDDiffusionScheduler:
             old_end, new_end = int(previous[0]), int(proposed[0])
             if new_end < old_end and (
                 new_end == 0
-                or bool((after[row, :new_end] == self.mask_token_id).any())
+                or (
+                    not self.allow_pending_eos
+                    and bool((after[row, :new_end] == self.mask_token_id).any())
+                )
             ):
                 # Empty answers are never a valid preallocated Display. An EOS
                 # cannot advance over unresolved tokens either.
