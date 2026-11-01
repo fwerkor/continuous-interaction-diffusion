@@ -439,3 +439,12 @@ def test_percept_target_masks_preserve_sparse_cell_slots() -> None:
     )
 
     assert thought_mask[0, :, 0].tolist() == [True, False, False, True]
+
+
+def test_quality_mode_validates_reveal_limit():
+    assert (
+        ILLaDANeuralPolicyConfig(display_max_reveals_per_step=1).display_max_reveals_per_step
+        == 1
+    )
+    with pytest.raises(ValueError, match="display_max_reveals_per_step"):
+        ILLaDANeuralPolicyConfig(display_max_reveals_per_step=-1)

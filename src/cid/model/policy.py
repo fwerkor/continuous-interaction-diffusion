@@ -221,6 +221,8 @@ class ILLaDANeuralPolicyConfig:
     display_repetition_score_multiplier: float = DEFAULT_DISPLAY_REPETITION_SCORE_MULTIPLIER
     display_loop_repair: bool = True
     display_reveal_cap: float = 0.25
+    display_max_reveals_per_step: int = 0
+    display_ban_non_eos_specials: bool = False
     seed: int = 0
 
     def __post_init__(self) -> None:
@@ -234,6 +236,8 @@ class ILLaDANeuralPolicyConfig:
             raise ValueError("display_repetition_score_multiplier must be in (0, 1]")
         if not 0.0 < self.display_reveal_cap <= 1.0:
             raise ValueError("display_reveal_cap must be in (0, 1]")
+        if self.display_max_reveals_per_step < 0:
+            raise ValueError("display_max_reveals_per_step must be non-negative")
 
 
 class ILLaDANeuralPolicy:
@@ -318,20 +322,35 @@ class ILLaDANeuralPolicy:
                         self.tensorizer.text_encoder.semantic_noise_scale * 32.0,
                         diffusion_step,
                     )
+            reveal = min(
+                (
+                    self.config.display_reveal_cap
+                    if self.config.display_loop_repair
+                    and context.display.realized_length
+                    >= self.display_revision_controller.config.loop_min_tokens
+                    else 1.0
+                ),
+                denoising_reveal_fraction(diffusion_step, self.config.denoising_steps),
+            )
+            if self.config.display_max_reveals_per_step:
+                reveal = min(
+                    reveal, self.config.display_max_reveals_per_step / batch.display_ids.shape[-1]
+                )
+            logits = output.display_logits
+            if self.config.display_ban_non_eos_specials:
+                tokenizer = self.tensorizer.text_encoder.tokenizer
+                banned = [
+                    int(x) for x in tokenizer.all_special_ids
+                    if x != self.scheduler.eos_token_id and 0 <= int(x) < logits.shape[-1]
+                ]
+                if banned:
+                    logits = logits.float().clone()
+                    logits[..., banned] = -1e9
             display_ids = self.display_revision_controller.refine_display(
                 self.scheduler,
                 batch.display_ids,
-                output.display_logits,
-                reveal_fraction=min(
-                    (
-                        self.config.display_reveal_cap
-                        if self.config.display_loop_repair
-                        and context.display.realized_length
-                        >= self.display_revision_controller.config.loop_min_tokens
-                        else 1.0
-                    ),
-                    denoising_reveal_fraction(diffusion_step, self.config.denoising_steps),
-                ),
+                logits,
+                reveal_fraction=reveal,
                 revision_fraction=self.config.display_revision_fraction,
                 revision_margin=self.config.display_revision_margin,
                 repetition_score_multiplier=self.config.display_repetition_score_multiplier,

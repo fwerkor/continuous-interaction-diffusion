@@ -1483,6 +1483,8 @@ def _benchmark(args: argparse.Namespace) -> None:
                     display_revision_fraction=args.display_revision_fraction,
                     display_revision_margin=args.display_revision_margin,
                     display_repetition_score_multiplier=args.display_repetition_score_multiplier,
+                    display_max_reveals_per_step=args.display_max_reveals_per_step,
+                    display_ban_non_eos_specials=args.display_ban_non_eos_specials,
                     materializer_config=materializer_config,
                     runtime_config=runtime_config,
                     seed=args.seed,
@@ -4263,6 +4265,8 @@ def main() -> None:
     la.add_argument("--min-lr-ratio", type=float, default=0.1)
     la.add_argument("--keep-last", type=int, default=2)
     la.add_argument("--max-mask-probability", type=float, default=1.0)
+    la.add_argument("--full-mask-probability", type=float, default=0.0)
+    la.add_argument("--teacher-native-mask-only", action="store_true")
     stage_c = subparsers.add_parser(
         "train-display", help="Stage C: frozen CID with Display-only low-rank diffusion SFT"
     )
@@ -4326,6 +4330,14 @@ def main() -> None:
             "fixed physical Display capacity for every benchmark task; defaults to the "
             "checkpoint display_canvas_tokens and never depends on target-answer length"
         ),
+    )
+    policy_tuning.add_argument(
+        "--display-max-reveals-per-step", type=int, default=0,
+        help="cap newly revealed Display tokens per denoising step; 0 disables",
+    )
+    policy_tuning.add_argument(
+        "--display-ban-non-eos-specials", action="store_true",
+        help="exclude non-EOS special tokens from generated Display content",
     )
     policy_tuning.add_argument(
         "--display-revision-fraction",

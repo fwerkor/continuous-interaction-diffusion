@@ -49,3 +49,32 @@ def test_la_dataset_rejects_empty_response(tmp_path):
     p.write_text('{"prompt":"a","answer":""}\n')
     with pytest.raises(ValueError, match="line 1"):
         read_la_records(str(p))
+
+
+def test_kd_full_mask_probability_bounds():
+    import argparse
+
+    from cid.la_training import train_language_alignment_v2
+
+    base = argparse.Namespace(
+        max_steps=1,
+        grad_accum=1,
+        learning_rate=1e-5,
+        min_mask_probability=0.2,
+        max_mask_probability=1.0,
+        save_every=1,
+        log_every=1,
+        keep_last=2,
+        zh_repeat=1.0,
+        eos_weight=0.8,
+        warmup_steps=1,
+        lr_decay_steps=100,
+        min_lr_ratio=0.1,
+        canvas_buckets="64",
+        max_answer_tokens=64,
+        distillation_weight=0.0,
+        native_teacher=None,
+        full_mask_probability=1.01,
+    )
+    with pytest.raises(ValueError, match="full-mask"):
+        train_language_alignment_v2(base)

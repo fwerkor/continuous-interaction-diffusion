@@ -264,6 +264,8 @@ def train_language_alignment_v2(args: Any) -> None:
         raise ValueError("canvas buckets must be increasing, unique and <= answer budget")
     if args.distillation_weight and not args.native_teacher:
         raise ValueError("distillation requires --native-teacher")
+    if not 0.0 <= args.full_mask_probability <= 1.0:
+        raise ValueError("full-mask sampling probability must lie in [0,1]")
 
     device = torch.device(
         "cuda"
@@ -321,6 +323,8 @@ def train_language_alignment_v2(args: Any) -> None:
         "temperature": args.temperature,
         "seed": args.seed,
         "min_mask_probability": args.min_mask_probability,
+        "full_mask_probability": args.full_mask_probability,
+        "teacher_native_mask_only": args.teacher_native_mask_only,
         "max_mask_probability": args.max_mask_probability,
         "weight_decay": args.weight_decay,
         "grad_clip": args.grad_clip,
@@ -378,7 +382,11 @@ def train_language_alignment_v2(args: Any) -> None:
             position = 0
         record = records[order[position]]
         position += 1
-        p = rng.uniform(args.min_mask_probability, args.max_mask_probability)
+        p = (
+            1.0
+            if rng.random() < args.full_mask_probability
+            else rng.uniform(args.min_mask_probability, args.max_mask_probability)
+        )
         try:
             sample = _make_example(
                 tok,
@@ -403,11 +411,18 @@ def train_language_alignment_v2(args: Any) -> None:
                     native=True,
                 )
                 prefix_len = teacher_sample.input_ids.numel() - sample.targets.numel()
+                teacher_canvas = sample.input_ids[-sample.targets.numel() :].clone()
+                if args.teacher_native_mask_only:
+                    # Official LFM2.5-Encoder sampling uses MASK-only answer space,
+                    # never the CID structural EOS sentinel at arbitrary boundaries.
+                    teacher_canvas[teacher_canvas.eq(teacher_tok.eos_token_id)] = (
+                        teacher_tok.mask_token_id
+                    )
                 teacher_sample = LASample(
                     input_ids=torch.cat(
                         (
                             teacher_sample.input_ids[:prefix_len],
-                            sample.input_ids[-sample.targets.numel() :],
+                            teacher_canvas,
                         )
                     ),
                     targets=sample.targets,
