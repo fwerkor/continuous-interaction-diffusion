@@ -141,3 +141,49 @@ def test_native_rejects_nonterminal_eos_and_wrong_shapes() -> None:
         decoder.refine(torch.tensor([[16, 16]]), torch.zeros(1, 2, 64))
     with pytest.raises(ValueError, match="shapes"):
         decoder.refine(torch.tensor([[16, 7]]), torch.zeros(1, 3, 64))
+
+
+def test_native_policy_materializes_one_reveal_per_cid_step() -> None:
+    from cid.contracts import ModelContext
+    from cid.model.materialize import CIDMaterializer, CIDMaterializerConfig
+    from cid.model.policy import (
+        ILLaDAContextTensorizer,
+        ILLaDANeuralPolicy,
+        ILLaDANeuralPolicyConfig,
+    )
+    from cid.state import CognitiveField, DisplayCanvas, FactStore
+
+    adapter = _native_adapter()
+    with torch.no_grad():
+        adapter.output_heads.allocation_head.weight.zero_()
+        adapter.output_heads.allocation_head.bias.fill_(-10)
+    tokenizer = NativeTokenizer()
+    tensorizer = ILLaDAContextTensorizer(adapter, tokenizer)
+    materializer = CIDMaterializer(
+        CIDMaterializerConfig(
+            allocation_threshold=adapter.config.identity_allocation_threshold,
+            max_allocations_per_step=adapter.config.identity_max_allocations_per_step,
+            need_threshold=1.0, anchor_presence_threshold=1.0,
+            link_presence_threshold=1.0,
+        )
+    )
+    policy = ILLaDANeuralPolicy(
+        adapter, tensorizer, materializer=materializer,
+        config=ILLaDANeuralPolicyConfig(denoising_steps=10),
+    )
+    context = ModelContext(
+        facts=FactStore().snapshot(),
+        thought=CognitiveField.empty(capacity=8, width=adapter.d_model),
+        display=DisplayCanvas.initial_preallocated(
+            length=8, mask_token_id=16, eos_token_id=7
+        ),
+        sources=(),
+        percepts=(),
+        step=0,
+        prompt="Hello!",
+    )
+    update = policy.step(context)
+    assert update.display.eos_token_id == 7
+    assert update.display.token_ids[-1] == 7
+    assert update.display.unresolved == context.display.unresolved - 1
+    assert update.display.token_ids != context.display.token_ids

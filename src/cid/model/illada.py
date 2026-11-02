@@ -685,7 +685,10 @@ class ILLaDACIDConfig:
             raise ValueError("semantic_head_version must be 1 or 2")
         if self.interaction_architecture not in {"joint", "identity-preserving"}:
             raise ValueError("interaction_architecture must be joint or identity-preserving")
-        if self.backbone_protocol == "lfm-native" and self.interaction_architecture != "identity-preserving":
+        if (
+            self.backbone_protocol == "lfm-native"
+            and self.interaction_architecture != "identity-preserving"
+        ):
             raise ValueError("lfm-native protocol requires identity-preserving architecture")
         if self.display_initialization is None:
             object.__setattr__(

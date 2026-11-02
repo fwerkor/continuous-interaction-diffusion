@@ -140,8 +140,8 @@ class IdentityPreservingPath(nn.Module):
             if not bool(batch.display_ids[:, -1].eq(adapter.eos_token_id).all()):
                 raise ValueError("lfm-native Display must end with the logical EOS sentinel")
             token_ids = token_ids[:, :-1]
-            keys = keys[:, :-1]
-        hidden, auxiliary = self._native_hidden(adapter, token_ids, keys, batch)
+        native_keys = keys[:, :-1] if native_protocol else keys
+        hidden, auxiliary = self._native_hidden(adapter, token_ids, native_keys, batch)
         if native_protocol:
             hidden = torch.cat(
                 (hidden, hidden.new_zeros((batch_size, 1, hidden.shape[-1]))), dim=1

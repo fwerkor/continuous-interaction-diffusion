@@ -262,9 +262,6 @@ class ILLaDATextEncoder:
         return input_ids.to(device=self.device)
 
     def tokenize_prompt(self, text: str, *, protocol: str = "cid") -> Tensor:
-        ids = self.tokenize(text, add_special_tokens=True)
-        if protocol == "cid":
-            return ids
         if protocol == "lfm-native":
             if self.tokenizer.chat_template is None:
                 raise ValueError("lfm-native protocol requires the original chat template")
@@ -274,6 +271,9 @@ class ILLaDATextEncoder:
                 add_generation_prompt=True,
             )
             return self.tokenize(template, add_special_tokens=True)
+        ids = self.tokenize(text, add_special_tokens=True)
+        if protocol == "cid":
+            return ids
         if protocol != "cid-answer":
             raise ValueError(f"unsupported CID prompt protocol: {protocol}")
         token = "<|cid_answer|>"

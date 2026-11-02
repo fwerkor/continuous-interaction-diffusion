@@ -12,13 +12,22 @@ from cid.model.lfm import LFMCIDAdapter
 from cid.model.lfm_native import LFMNativeDisplayDecoder
 from cid.model.tensors import CIDTensorBatch
 
-
 PROMPTS = (
     ("greeting", "Hello!"),
     ("identity", "Who are you?"),
     ("definition", "What is a computer?"),
-    ("code", "Write a Python function to reverse a string."),
-    ("zh", "你好，请用中文介绍一下自己。"),
+    ("tcp", "Explain TCP flow control in two sentences."),
+    ("history", "Briefly describe Chinese history."),
+    ("math", "What is 17 multiplied by 23?"),
+    ("reverse", "Write a Python function to reverse a string."),
+    ("sort", "Write a Python function that sorts a list of integers."),
+    (
+        "summary",
+        "Summarize: the server was overloaded, requests timed out, and capacity was increased.",
+    ),
+    ("format", 'Reply in JSON: name Alice, age 20.'),
+    ("zh_hello", "你好"),
+    ("zh_identity", "请用中文介绍一下自己。"),
 )
 
 
