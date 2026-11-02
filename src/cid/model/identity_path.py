@@ -132,7 +132,20 @@ class IdentityPreservingPath(nn.Module):
         token_ids = torch.cat(
             (batch.prompt_ids, adapter.backbone_display_ids(batch.display_ids)), dim=1
         )
+        # CID keeps a logical terminal EOS, but the original LFM diffusion
+        # model never sees this sentinel. Drop it before native inference so
+        # the remaining MASK window exactly matches the pretrained protocol.
+        native_protocol = adapter.config.backbone_protocol == "lfm-native"
+        if native_protocol:
+            if not bool(batch.display_ids[:, -1].eq(adapter.eos_token_id).all()):
+                raise ValueError("lfm-native Display must end with the logical EOS sentinel")
+            token_ids = token_ids[:, :-1]
+            keys = keys[:, :-1]
         hidden, auxiliary = self._native_hidden(adapter, token_ids, keys, batch)
+        if native_protocol:
+            hidden = torch.cat(
+                (hidden, hidden.new_zeros((batch_size, 1, hidden.shape[-1]))), dim=1
+            )
         y_native = hidden[:, prompt_length:, :]
         thought = batch.thought_semantic.to(dtype=dtype)
         occupancy = batch.slot_occupancy.to(dtype=dtype).clamp(0.0, 1.0)
@@ -222,7 +235,10 @@ class IdentityPreservingPath(nn.Module):
             t_hidden + first.thought_semantic.to(dtype=dtype)
         ]
         display_keys_list: list[Tensor] = [thought_keys]
-        base_evidence = active_thought.any(dim=1)
+        base_evidence = (
+            neural_occupancy.squeeze(-1).bool().any(dim=1)
+            if native_protocol else active_thought.any(dim=1)
+        )
         percept_evidence = torch.zeros(
             (batch_size, display_length), device=device, dtype=torch.bool,
         )

@@ -655,7 +655,7 @@ class ILLaDACIDConfig:
     identity_max_allocations_per_step: int = DEFAULT_MAX_ALLOCATIONS_PER_STEP
 
     def __post_init__(self) -> None:
-        if self.backbone_protocol not in {"cid", "cid-answer"}:
+        if self.backbone_protocol not in {"cid", "cid-answer", "lfm-native"}:
             raise ValueError("unsupported CID backbone protocol")
         if self.max_thought_slots <= 0 or self.max_display_tokens <= 0:
             raise ValueError("thought and display capacities must be positive")
@@ -685,6 +685,8 @@ class ILLaDACIDConfig:
             raise ValueError("semantic_head_version must be 1 or 2")
         if self.interaction_architecture not in {"joint", "identity-preserving"}:
             raise ValueError("interaction_architecture must be joint or identity-preserving")
+        if self.backbone_protocol == "lfm-native" and self.interaction_architecture != "identity-preserving":
+            raise ValueError("lfm-native protocol requires identity-preserving architecture")
         if self.display_initialization is None:
             object.__setattr__(
                 self, "display_initialization",
@@ -693,6 +695,8 @@ class ILLaDACIDConfig:
             )
         if self.display_initialization not in {"legacy", "window", "preallocated"}:
             raise ValueError("display_initialization must be legacy, window or preallocated")
+        if self.backbone_protocol == "lfm-native" and self.display_initialization != "preallocated":
+            raise ValueError("lfm-native protocol requires preallocated Display")
         if self.identity_initial_mask_tokens <= 0:
             raise ValueError("identity_initial_mask_tokens must be positive")
         if not 0.0 <= self.identity_allocation_threshold <= 1.0:
@@ -749,8 +753,8 @@ class ILLaDACIDAdapter(nn.Module):
         )
         if not 0 <= self.mask_token_id < self.vocab_size:
             raise ValueError("backbone mask token ID must be inside its vocabulary")
-        if self.config.backbone_protocol == "cid-answer" and model_type != "lfm2":
-            raise ValueError("cid-answer protocol currently supports LFM2 only")
+        if self.config.backbone_protocol in {"cid-answer", "lfm-native"} and model_type != "lfm2":
+            raise ValueError("LFM native and CID-answer protocols require an LFM2 backbone")
         self.eos_token_id = int(
             getattr(
                 backbone_config,
@@ -1107,7 +1111,7 @@ class ILLaDACIDAdapter(nn.Module):
         return self.backbone.get_output_embeddings()
 
     def backbone_display_ids(self, display_ids: torch.Tensor) -> torch.Tensor:
-        if self.config.backbone_protocol != "cid-answer":
+        if self.config.backbone_protocol not in {"cid-answer", "lfm-native"}:
             return display_ids
         return torch.where(
             display_ids.eq(self.eos_token_id), self.mask_token_id, display_ids

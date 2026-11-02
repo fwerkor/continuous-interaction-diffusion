@@ -25,6 +25,7 @@ from cid.model.encoding import (
     canonical_percept_text,
 )
 from cid.model.illada import ILLADA_8B_BASE, ILLaDACIDAdapter
+from cid.model.lfm_native import LFMNativeDisplayDecoder
 from cid.model.loading import load_cid_tokenizer
 from cid.model.materialize import CIDMaterializer, ClosedWorldMaterializationCatalog
 from cid.model.tensors import CIDTensorBatch, build_percept_routing_masks, semantic_batch_as_tensor
@@ -274,6 +275,13 @@ class ILLaDANeuralPolicy:
         self.catalog = catalog or ClosedWorldMaterializationCatalog()
         self.scheduler = scheduler or tensorizer.scheduler
         self.config = config or ILLaDANeuralPolicyConfig()
+        self.native_decoder = (
+            LFMNativeDisplayDecoder(
+                tensorizer.tokenizer,
+                mask_id=adapter.mask_token_id,
+                eos_id=adapter.eos_token_id,
+            ) if adapter.config.backbone_protocol == "lfm-native" else None
+        )
         self.forward_model = forward_model or adapter
         self.generator = torch.Generator(device=self.tensorizer.text_encoder.device)
         self.generator.manual_seed(self.config.seed)
@@ -303,7 +311,8 @@ class ILLaDANeuralPolicy:
                 display=self.scheduler.initial_display(len(context.display.token_ids)),
             )
         diffusion_step = context.diffusion_step
-        self.display_revision_controller.observe_context(context)
+        if self.native_decoder is None:
+            self.display_revision_controller.observe_context(context)
         batch = self.tensorizer(
             context,
             generator=self.generator,
@@ -325,6 +334,16 @@ class ILLaDANeuralPolicy:
                         self.tensorizer.text_encoder.semantic_noise_scale * 32.0,
                         diffusion_step,
                     )
+            if self.native_decoder is not None:
+                display_ids = self.native_decoder.refine(
+                    batch.display_ids, output.display_logits
+                )
+                return self.materializer.materialize(
+                    output,
+                    context,
+                    catalog=self.catalog,
+                    display_token_ids=tuple(int(token) for token in display_ids[0].tolist()),
+                )
             reveal = min(
                 (
                     self.config.display_reveal_cap
