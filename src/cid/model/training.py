@@ -64,6 +64,7 @@ from cid.model.encoding import (
     stable_text,
 )
 from cid.model.illada import ILLaDACIDAdapter
+from cid.model.lfm_native import LFMNativeDisplayDecoder
 from cid.model.loading import (
     backbone_identity_matches,
     tokenizer_identity_matches,
@@ -1713,16 +1714,22 @@ class CIDTrainer:
         previous_display_ids = input_batch.display_ids[
             batch_index : batch_index + 1, :display_length
         ]
-        display_ids = self.tensorizer.scheduler.refine_display(
-            previous_display_ids,
-            output.display_logits[batch_index : batch_index + 1, :display_length],
-            reveal_fraction=denoising_reveal_fraction(
-                sample.diffusion_step, self.config.rollout_denoising_steps
-            ),
-            revision_fraction=self.config.rollout_display_revision_fraction,
-            revision_margin=self.config.rollout_display_revision_margin,
-            repetition_score_multiplier=self.config.rollout_display_repetition_score_multiplier,
-        )
+        if self.tensorizer.adapter.config.backbone_protocol == "lfm-native":
+            display_ids = self.tensorizer.native_decoder.refine(
+                previous_display_ids,
+                output.display_logits[batch_index : batch_index + 1, :display_length],
+            )
+        else:
+            display_ids = self.tensorizer.scheduler.refine_display(
+                previous_display_ids,
+                output.display_logits[batch_index : batch_index + 1, :display_length],
+                reveal_fraction=denoising_reveal_fraction(
+                    sample.diffusion_step, self.config.rollout_denoising_steps
+                ),
+                revision_fraction=self.config.rollout_display_revision_fraction,
+                revision_margin=self.config.rollout_display_revision_margin,
+                repetition_score_multiplier=self.config.rollout_display_repetition_score_multiplier,
+            )
 
         materializer_config = CIDMaterializerConfig()
         equilibrium_flag = (
@@ -2285,22 +2292,33 @@ class CIDTrainer:
                             display_length = sample.batch.display_ids.shape[1]
                             materialized_display_ids[
                                 row_index : row_index + 1, :display_length
-                            ] = self.tensorizer.scheduler.refine_display(
-                                training_batch.batch.display_ids[
-                                    row_index : row_index + 1, :display_length
-                                ],
-                                output.display_logits[
-                                    row_index : row_index + 1, :display_length
-                                ],
-                                reveal_fraction=denoising_reveal_fraction(
-                                    sample.diffusion_step,
-                                    self.config.rollout_denoising_steps,
-                                ),
-                                revision_fraction=self.config.rollout_display_revision_fraction,
-                                revision_margin=self.config.rollout_display_revision_margin,
-                                repetition_score_multiplier=(
-                                    self.config.rollout_display_repetition_score_multiplier
-                                ),
+                            ] = (
+                                self.tensorizer.native_decoder.refine(
+                                    training_batch.batch.display_ids[
+                                        row_index : row_index + 1, :display_length
+                                    ],
+                                    output.display_logits[
+                                        row_index : row_index + 1, :display_length
+                                    ],
+                                )
+                                if self.tensorizer.native_decoder is not None
+                                else self.tensorizer.scheduler.refine_display(
+                                    training_batch.batch.display_ids[
+                                        row_index : row_index + 1, :display_length
+                                    ],
+                                    output.display_logits[
+                                        row_index : row_index + 1, :display_length
+                                    ],
+                                    reveal_fraction=denoising_reveal_fraction(
+                                        sample.diffusion_step,
+                                        self.config.rollout_denoising_steps,
+                                    ),
+                                    revision_fraction=self.config.rollout_display_revision_fraction,
+                                    revision_margin=self.config.rollout_display_revision_margin,
+                                    repetition_score_multiplier=(
+                                        self.config.rollout_display_repetition_score_multiplier
+                                    ),
+                                )
                             )
                             example = microbatch[row_index].example
                             if not isinstance(example, TrajectoryExample):
@@ -3630,6 +3648,13 @@ class ILLaDATrajectoryTensorizer:
             allow_pending_eos=adapter.config.backbone_protocol == "cid-answer",
         )
         self.materializer = CIDMaterializer()
+        self.native_decoder = (
+            LFMNativeDisplayDecoder(
+                tokenizer,
+                mask_id=adapter.mask_token_id,
+                eos_id=adapter.eos_token_id,
+            ) if adapter.config.backbone_protocol == "lfm-native" else None
+        )
         self._runtime_argument_catalog_cache: (
             tuple[int, ClosedWorldMaterializationCatalog] | None
         ) = None
@@ -3973,6 +3998,19 @@ class ILLaDATrajectoryTensorizer:
         # occur on ordinary teacher-forced unchanged-unknown transitions as
         # well as partially-known answer drafts.
         display_labels[display_labels == self.adapter.mask_token_id] = -100
+        if self.adapter.config.backbone_protocol == "lfm-native":
+            # The original LFM generates a lexical [/Answer] delimiter, not
+            # the CID transport EOS. Keep EOS exclusively as a hidden state
+            # sentinel, never a student language-class target.
+            display_labels[display_labels == self.eos_token_id] = -100
+            display_input_ids[
+                :, :-1
+            ] = torch.where(
+                display_input_ids[:, :-1] == self.eos_token_id,
+                self.adapter.mask_token_id,
+                display_input_ids[:, :-1],
+            )
+            display_input_ids[:, -1] = self.eos_token_id
         if target_display == DISPLAY_UNKNOWN_MARKER:
             # The trailing EOS in the transport encoding of a wholly unknown
             # answer is only a physical canvas sentinel. It does not certify

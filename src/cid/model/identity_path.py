@@ -37,8 +37,9 @@ class IdentityPreservingPath(nn.Module):
         self.display_norm = nn.LayerNorm(d_model)
         self.display_noise_condition = nn.Linear(1, d_model, bias=False)
         nn.init.zeros_(self.display_noise_condition.weight)
-        self.display_gate = nn.Parameter(torch.tensor(-3.0))
-        self.control_gate = nn.Parameter(torch.tensor(-2.0))
+        # FSDP rejects scalar params: retain the same scalar broadcast behavior.
+        self.display_gate = nn.Parameter(torch.tensor([-3.0]))
+        self.control_gate = nn.Parameter(torch.tensor([-2.0]))
         self.num_heads = num_heads
         nn.init.normal_(self.thought_queries, std=0.02)
 
@@ -128,6 +129,18 @@ class IdentityPreservingPath(nn.Module):
         device = batch.display_ids.device
         prompt_keys = self._keys(batch.prompt_padding_mask, batch.prompt_ids)
         display_keys = self._keys(batch.display_padding_mask, batch.display_ids)
+        native_protocol = adapter.config.backbone_protocol == "lfm-native"
+        if native_protocol:
+            # In packed Stage A/B microbatches the logical EOS is the final
+            # unpadded position for each example. Exclude it from native
+            # attention even when other samples have a larger Display window.
+            lengths = display_keys.long().sum(dim=1) - 1
+            if not bool(
+                batch.display_ids.gather(1, lengths[:, None])
+                .eq(adapter.eos_token_id).all()
+            ):
+                raise ValueError("lfm-native requires logical EOS at each Display end")
+            display_keys = display_keys & ~batch.display_ids.eq(adapter.eos_token_id)
         keys = torch.cat((prompt_keys, display_keys), dim=1)
         token_ids = torch.cat(
             (batch.prompt_ids, adapter.backbone_display_ids(batch.display_ids)), dim=1
@@ -135,10 +148,7 @@ class IdentityPreservingPath(nn.Module):
         # CID keeps a logical terminal EOS, but the original LFM diffusion
         # model never sees this sentinel. Drop it before native inference so
         # the remaining MASK window exactly matches the pretrained protocol.
-        native_protocol = adapter.config.backbone_protocol == "lfm-native"
         if native_protocol:
-            if not bool(batch.display_ids[:, -1].eq(adapter.eos_token_id).all()):
-                raise ValueError("lfm-native Display must end with the logical EOS sentinel")
             token_ids = token_ids[:, :-1]
         native_keys = keys[:, :-1] if native_protocol else keys
         hidden, auxiliary = self._native_hidden(adapter, token_ids, native_keys, batch)

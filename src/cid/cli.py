@@ -3273,7 +3273,7 @@ def _train_stage_b(args: argparse.Namespace) -> None:
             if device_type == "npu":
                 model.set_device_value_validation(False)
                 model = model.to(device)
-            model.set_backbone_trainable(True)
+            model.set_backbone_trainable(not args.freeze_backbone)
             grouped_moe_layers = (
                 model.pack_trainable_moe_experts()
                 if device_type == "cuda"
@@ -4715,7 +4715,9 @@ def main() -> None:
     )
     train.add_argument("--max-display-tokens", type=int, default=1536)
     train.add_argument("--display-canvas-tokens", type=int, default=64)
-    train.add_argument("--backbone-protocol", choices=("cid", "cid-answer"), default="cid")
+    train.add_argument(
+        "--backbone-protocol", choices=("cid", "cid-answer", "lfm-native"), default="cid"
+    )
     train.add_argument("--seed", type=int, default=0)
     train.add_argument("--max-examples", type=int)
     train.add_argument("--max-validation-examples", type=int)
@@ -4879,7 +4881,13 @@ def main() -> None:
     )
     train_full.add_argument("--max-display-tokens", type=int, default=1536)
     train_full.add_argument("--display-canvas-tokens", type=int, default=64)
-    train_full.add_argument("--backbone-protocol", choices=("cid", "cid-answer"), default="cid")
+    train_full.add_argument(
+        "--backbone-protocol", choices=("cid", "cid-answer", "lfm-native"), default="cid"
+    )
+    train_full.add_argument(
+        "--freeze-backbone", action="store_true",
+        help="keep the original pretrained language backbone frozen during Stage B",
+    )
     train_full.add_argument("--seed", type=int, default=0)
     train_full.add_argument("--max-examples", type=int)
     train_full.add_argument("--max-validation-examples", type=int)
