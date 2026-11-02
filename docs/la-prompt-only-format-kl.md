@@ -64,12 +64,26 @@ separately. Optionally, generate additional native teacher drafts:
       --model /path/to/original-350m \
       --data prompt-only-train.jsonl \
       --output teacher-drafts.jsonl \
-      --max-examples 1000 --canvas 64
+      --max-examples 1600 --attempts 5000 \
+      --canvas-buckets 24,32,40,48,64,96,128,160
 
 Native teacher decoding and stopping happens OFFLINE. The resulting
 draft JSONL contains natural-language answer text but no markers for
 the student to learn. No native termination parser is introduced in
-CID Runtime.
+CID Runtime. **Do not use a fixed 64-token teacher canvas:** it previously
+caused 998/1,000 pseudo answer lengths to cluster at 50–59 tokens,
+so the student learned the canvas's artificial stopping position.
+
+For short instructions and multilingual probes, optionally generate a
+second teacher file using `examples/la-format-prompts-v2.jsonl`.
+Combine sources with a length-distribution gate:
+
+    python scripts/assemble_la_teacher_drafts.py \
+      --sources native-general.jsonl native-curated.jsonl \
+      --output native-teacher-balanced.jsonl --min-examples 1200
+
+The assembler rejects native marker leakage and severe stop-length
+concentration before the distillation job is allowed to start.
 
 ## Train and checkpoint
 

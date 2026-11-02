@@ -4,6 +4,7 @@ import argparse
 import hashlib
 import json
 import random
+from collections import Counter
 from pathlib import Path
 
 import torch
@@ -19,10 +20,19 @@ def main():
     p.add_argument("--max-examples", type=int, default=1000)
     p.add_argument("--attempts", type=int, default=6000)
     p.add_argument("--canvas", type=int, default=64)
+    p.add_argument("--canvas-buckets", default=None)
+    p.add_argument("--languages", default="en")
     p.add_argument("--seed", type=int, default=20261101)
     args = p.parse_args()
 
     random.seed(args.seed)
+    buckets = (
+        tuple(int(value) for value in args.canvas_buckets.split(","))
+        if args.canvas_buckets else (args.canvas,)
+    )
+    if not buckets or min(buckets) < 16 or max(buckets) > 192:
+        raise ValueError("teacher canvas buckets must be in [16, 192]")
+    languages = frozenset(s.strip() for s in args.languages.split(","))
     torch.set_num_threads(4)
     model, tok = load_la_backbone(args.model, dtype=torch.float32)
     model.to("cuda").eval()
@@ -32,6 +42,7 @@ def main():
     output = Path(args.output)
     output.parent.mkdir(parents=True, exist_ok=True)
     selected = failed = 0
+    lengths = Counter()
     mask_id = int(tok.mask_token_id)
     with (
         output.open("w", encoding="utf-8") as stream,
@@ -42,7 +53,7 @@ def main():
             if selected >= args.max_examples:
                 break
             question = row["prompt"]
-            if row.get("language") != "en":
+            if row.get("language") not in languages:
                 continue
             prompt = tok.apply_chat_template(
                 [{"role": "user", "content": question}],
@@ -53,8 +64,9 @@ def main():
             if prefix.shape[-1] > 240:
                 failed += 1
                 continue
-            canvas = torch.full((1, args.canvas), mask_id, dtype=torch.long, device="cuda")
-            for _ in range(args.canvas):
+            width = random.choice(buckets)
+            canvas = torch.full((1, width), mask_id, dtype=torch.long, device="cuda")
+            for _ in range(width):
                 remaining = torch.nonzero(canvas[0].eq(mask_id), as_tuple=False).flatten()
                 if not len(remaining):
                     break
@@ -74,7 +86,7 @@ def main():
                 continue
             text = raw.split("[/Answer]")[0].strip()
             n_tokens = len(tok.encode(text, add_special_tokens=False))
-            if not 8 <= n_tokens <= args.canvas - 4:
+            if not 8 <= n_tokens <= width - 4:
                 failed += 1
                 continue
             if any(tag in text for tag in ("[Question]", "[Answer]", "[/Question]")):
@@ -87,8 +99,9 @@ def main():
                         "prompt": question,
                         "answer": text,
                         "source": "native-350m-teacher",
-                        "language": "en",
+                        "language": row.get("language", "en"),
                         "answer_tokens": n_tokens,
+                        "canvas": width,
                         "prompt_sha256": digest,
                     },
                     ensure_ascii=False,
@@ -96,10 +109,16 @@ def main():
                 + "\n"
             )
             selected += 1
+            lengths[(n_tokens // 8) * 8] += 1
             if selected % 100 == 0:
                 stream.flush()
                 print("TEACHER_DISTILLED", selected, "rejected", failed, flush=True)
-    print("COMPLETE", json.dumps({"written": selected, "rejected": failed, "output": str(output)}))
+    print("COMPLETE", json.dumps({
+        "written": selected,
+        "rejected": failed,
+        "output": str(output),
+        "length_bins_8": sorted(lengths.items()),
+    }))
 
 
 if __name__ == "__main__":
