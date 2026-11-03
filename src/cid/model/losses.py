@@ -79,6 +79,8 @@ class CIDTargets:
     link_target_kind_targets: Tensor
     link_target_embeddings: Tensor
     link_mask: Tensor
+    display_answer_ids: Tensor | None = None
+    display_answer_position_mask: Tensor | None = None
 
 
 @dataclass(frozen=True, slots=True)
@@ -174,12 +176,22 @@ def cid_loss(
         positive_weight_cap=ALLOCATION_POSITIVE_WEIGHT_CAP,
         batch_mask=batch_mask,
     )
-    display = _masked_cross_entropy(
-        output.display_logits,
-        targets.display_ids,
-        display_mask,
-        batch_mask=batch_mask,
-    )
+    if targets.display_answer_ids is not None:
+        if targets.display_answer_position_mask is None:
+            raise ValueError("position-invariant Display requires an eligible position mask")
+        display = _position_invariant_display_loss(
+            output.display_logits,
+            targets.display_answer_ids,
+            targets.display_answer_position_mask,
+            batch_mask=batch_mask,
+        )
+    else:
+        display = _masked_cross_entropy(
+            output.display_logits,
+            targets.display_ids,
+            display_mask,
+            batch_mask=batch_mask,
+        )
     roles = _masked_binary_cross_entropy(
         output.role_logits,
         targets.role_targets,
@@ -372,6 +384,82 @@ def _with_batch_mask(mask: Tensor, batch_mask: Tensor) -> Tensor:
         raise ValueError("mask batch dimension does not match batch_mask")
     shape = (batch_mask.shape[0],) + (1,) * (mask.ndim - 1)
     return mask.bool() & batch_mask.reshape(shape)
+
+
+def _position_invariant_display_loss(
+    logits: Tensor,
+    answer_ids: Tensor,
+    position_mask: Tensor,
+    *,
+    batch_mask: Tensor,
+) -> Tensor:
+    """Supervise an ordered answer span anywhere in the actual Display canvas.
+
+    Every candidate alignment uses contiguous token positions. Only the
+    best-scoring alignment receives a gradient; unselected surrounding prose
+    and the private native EOS sentinel remain unsupervised.
+    """
+    if logits.ndim != 3 or answer_ids.ndim != 2:
+        raise ValueError("expected Display logits [B,L,V] and answer IDs [B,M]")
+    batch, length, vocab = logits.shape
+    if answer_ids.shape[0] != batch or position_mask.shape != (batch, length):
+        raise ValueError("position-invariant Display target shapes differ")
+    if batch_mask.shape != (batch,):
+        raise ValueError("position-invariant Display batch mask shape differs")
+    lengths = answer_ids.ne(-100).sum(dim=-1)
+    if bool(((answer_ids == -100).cumsum(dim=-1) > 0).logical_and(
+        answer_ids != -100
+    ).any()):
+        raise ValueError("position-invariant answer IDs must be right-padded")
+    if bool(((answer_ids < 0) & (answer_ids != -100)).any()) or bool(
+        (answer_ids >= vocab).any()
+    ):
+        raise ValueError("position-invariant answer IDs outside vocabulary")
+    eligible = position_mask.bool() & batch_mask[:, None].bool()
+    supervised = batch_mask.bool() & lengths.gt(0)
+    if not bool(supervised.any()):
+        return _differentiable_zero(logits)
+
+    # Compute the vocabulary normalization at eligible positions only. Avoid
+    # materializing a full [B,L,V] fp32 log-softmax in long-window batches.
+    active_logits = logits[eligible]
+    norm = logits.new_zeros((batch, length), dtype=torch.float32)
+    norm[eligible] = torch.logsumexp(active_logits.float(), dim=-1)
+    token_ids = answer_ids.clamp_min(0)
+    maximum = answer_ids.shape[1]
+    chosen = logits.gather(
+        2, token_ids[:, None, :].expand(batch, length, maximum)
+    ).float()
+    # A candidate start s aligns answer token j to Display position s+j.
+    offsets = torch.arange(length, device=logits.device)[:, None] + torch.arange(
+        maximum, device=logits.device
+    )[None, :]
+    positions = offsets.clamp_max(length - 1)
+    aligned_logits = chosen.gather(1, positions[None].expand(batch, -1, -1))
+    aligned_norm = norm.gather(1, positions.reshape(1, -1).expand(batch, -1)).reshape(
+        batch, length, maximum
+    )
+    loss_per_token = aligned_norm - aligned_logits
+    is_answer_token = answer_ids.ne(-100)
+    summed = (
+        loss_per_token * is_answer_token[:, None, :].to(loss_per_token.dtype)
+    ).sum(dim=-1) / lengths[:, None].clamp_min(1)
+    eligible_positions = eligible.gather(
+        1, positions.reshape(1, -1).expand(batch, -1)
+    ).reshape(batch, length, maximum)
+    valid_tokens = torch.arange(maximum, device=logits.device)[None] < lengths[:, None]
+    valid = (
+        (eligible_positions | ~valid_tokens[:, None, :]).all(dim=-1)
+        & (torch.arange(length, device=logits.device)[None, :] + lengths[:, None] <= length)
+        & supervised[:, None]
+    )
+    if bool((supervised & ~valid.any(dim=-1)).any()):
+        raise ValueError("answer does not fit in eligible Display canvas")
+    best = summed.masked_fill(~valid, float("inf")).min(dim=-1).values
+    return (
+        torch.where(supervised, best, torch.zeros_like(best)).sum()
+        / batch_mask.sum().clamp_min(1)
+    )
 
 
 def _masked_element_mean(

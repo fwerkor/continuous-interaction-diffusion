@@ -21,6 +21,17 @@ It suppresses the same special tokens as the original reference. The original
 lexical answer terminator is recognized internally and mapped to logical CID
 EOS, without changing the required on-wire CID output protocol.
 
+Stage A/B Display training uses an ordered, position-invariant answer-span
+objective for this native protocol. A complete answer reference may occupy any
+contiguous sequence of native output positions, without enforcing a prefix,
+terminating the response at the dataset answer length, or supplying target
+tokens as teacher-forcing input. Partially unknown references provide no
+Display language target while Thought, tool, and control targets remain active.
+For an answer span, the loss takes the lowest mean token CE across all legal
+starts before the private EOS sentinel. Existing non-native CID protocols retain
+their original position-aligned CE. This is a positive answer-fragment
+objective, not a guarantee of semantic consistency of the entire response.
+
 Limitations:
 - Exact native language parity applies only in a neutral Thought/tool state.
   TCT, tools, memory and control residuals still need separate Stage A/B

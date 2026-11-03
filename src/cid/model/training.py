@@ -337,6 +337,20 @@ def collate_training_steps(
         allocation_targets=_pad_slot_targets(steps, "allocation_targets"),
         allocation_mask=_pad_slot_targets(steps, "allocation_mask"),
         display_ids=display_labels,
+        display_answer_ids=(
+            _pad_2d(
+                tuple(step.targets.display_answer_ids for step in steps),
+                pad_value=-100,
+            )[0]
+            if steps[0].targets.display_answer_ids is not None else None
+        ),
+        display_answer_position_mask=(
+            _pad_2d(
+                tuple(step.targets.display_answer_position_mask for step in steps),
+                pad_value=False,
+            )[0]
+            if steps[0].targets.display_answer_position_mask is not None else None
+        ),
         role_targets=_pad_slot_targets(steps, "role_targets"),
         uncertainty=_pad_slot_targets(steps, "uncertainty", pad_value=1.0),
         noise_delta=_pad_slot_targets(steps, "noise_delta"),
@@ -4025,6 +4039,36 @@ class ILLaDATrajectoryTensorizer:
                 display_input_ids[:, :-1],
             )
             display_input_ids[:, -1] = self.eos_token_id
+        display_answer_ids = None
+        display_answer_position_mask = None
+        if self.adapter.config.backbone_protocol == "lfm-native":
+            # Target text supplies *what* must be said, never *where* it
+            # must appear. Teacher forcing starts from the same free native
+            # MASK canvas as inference; the target prefix is never injected.
+            if rollout_state is None:
+                display_input_ids.fill_(self.adapter.mask_token_id)
+                if source_text_ids is not None:
+                    # A genuinely different prior draft is a valid editing
+                    # input. Repeated identical teacher drafts would leak the
+                    # correct target and reward mere copying.
+                    source_count = int(source_text_ids.shape[1])
+                    display_input_ids[:, :source_count] = source_text_ids
+                    display_input_ids[:, :source_count][
+                        display_input_ids[:, :source_count] == self.eos_token_id
+                    ] = self.adapter.mask_token_id
+                display_input_ids[:, -1] = self.eos_token_id
+            display_labels.fill_(-100)
+            # Partial unknown drafts do not establish a full answer target.
+            # Their tool/thought supervision remains active until the
+            # evidence needed for a complete Display is available.
+            display_answer_ids = target_text_ids.clone()
+            if bool(display_answer_ids.eq(self.adapter.mask_token_id).any()):
+                display_answer_ids.fill_(-100)
+            display_answer_position_mask = torch.ones_like(
+                display_input_ids, dtype=torch.bool
+            )
+            display_answer_position_mask[:, -1] = False
+
         if target_display == DISPLAY_UNKNOWN_MARKER:
             # The trailing EOS in the transport encoding of a wholly unknown
             # answer is only a physical canvas sentinel. It does not certify
@@ -4145,6 +4189,8 @@ class ILLaDATrajectoryTensorizer:
             target_output_slots=target_output_slots,
             target_vectors=target_vectors,
             display_labels=display_labels,
+            display_answer_ids=display_answer_ids,
+            display_answer_position_mask=display_answer_position_mask,
             display_supervision_mask=display_supervision_mask,
             input_occupancy=occupancy,
             input_control=target_control,
@@ -4928,6 +4974,8 @@ class ILLaDATrajectoryTensorizer:
         target_output_slots: Mapping[str, int],
         target_vectors: Mapping[str, Tensor],
         display_labels: Tensor,
+        display_answer_ids: Tensor | None,
+        display_answer_position_mask: Tensor | None,
         display_supervision_mask: Tensor,
         input_occupancy: Tensor,
         input_control: _TrainingTargetControl,
@@ -5272,6 +5320,8 @@ class ILLaDATrajectoryTensorizer:
             allocation_targets=allocation_targets,
             allocation_mask=allocation_mask,
             display_ids=display_labels,
+            display_answer_ids=display_answer_ids,
+            display_answer_position_mask=display_answer_position_mask,
             role_targets=role_targets,
             uncertainty=uncertainty,
             noise_delta=noise_delta,
