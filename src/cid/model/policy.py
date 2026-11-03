@@ -311,8 +311,7 @@ class ILLaDANeuralPolicy:
                 display=self.scheduler.initial_display(len(context.display.token_ids)),
             )
         diffusion_step = context.diffusion_step
-        if self.native_decoder is None:
-            self.display_revision_controller.observe_context(context)
+        self.display_revision_controller.observe_context(context)
         batch = self.tensorizer(
             context,
             generator=self.generator,
@@ -335,8 +334,12 @@ class ILLaDANeuralPolicy:
                         diffusion_step,
                     )
             if self.native_decoder is not None:
-                display_ids = self.native_decoder.refine(
-                    batch.display_ids, output.display_logits
+                display_ids = self.display_revision_controller.refine_native_display(
+                    self.native_decoder,
+                    batch.display_ids,
+                    output.display_logits,
+                    revision_fraction=self.config.display_revision_fraction,
+                    revision_margin=self.config.display_revision_margin,
                 )
                 return self.materializer.materialize(
                     output,

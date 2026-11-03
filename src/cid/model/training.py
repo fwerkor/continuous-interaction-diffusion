@@ -57,6 +57,7 @@ from cid.model.diffusion import (
     denoising_noise_level,
     denoising_reveal_fraction,
 )
+from cid.model.display_revision import DisplayRevisionController
 from cid.model.encoding import (
     ILLaDATextEncoder,
     canonical_fact_text,
@@ -170,6 +171,7 @@ class CIDTrainingStep:
     input_runtime_cell_ids: tuple[str | None, ...] = ()
     input_next_cell_serial: int = 0
     input_retired_at: tuple[tuple[str, int], ...] = ()
+    display_revision_controller: DisplayRevisionController | None = None
 
 
 @dataclass(slots=True)
@@ -223,6 +225,7 @@ class CIDRolloutState:
     converged: bool = False
     quiescent: bool = False
     terminal: bool = False
+    display_revision_controller: DisplayRevisionController | None = None
 
 
 @dataclass(frozen=True, slots=True)
@@ -1714,10 +1717,20 @@ class CIDTrainer:
         previous_display_ids = input_batch.display_ids[
             batch_index : batch_index + 1, :display_length
         ]
+        revision_controller = None
         if self.tensorizer.adapter.config.backbone_protocol == "lfm-native":
-            display_ids = self.tensorizer.native_decoder.refine(
+            revision_controller = sample.display_revision_controller or DisplayRevisionController()
+            revision_controller.observe_evidence(
+                step=sample.target_step,
+                facts_revision=sample.promoted_fact_texts,
+                percepts=sample.replay_observation_steps,
+            )
+            display_ids = revision_controller.refine_native_display(
+                self.tensorizer.native_decoder,
                 previous_display_ids,
                 output.display_logits[batch_index : batch_index + 1, :display_length],
+                revision_fraction=self.config.rollout_display_revision_fraction,
+                revision_margin=self.config.rollout_display_revision_margin,
             )
         else:
             display_ids = self.tensorizer.scheduler.refine_display(
@@ -1979,6 +1992,7 @@ class CIDTrainer:
             slot_occupancy=occupancy.to(dtype=sample.batch.slot_occupancy.dtype).detach(),
             local_noise=local_noise.detach(),
             display_ids=display_ids.detach(),
+            display_revision_controller=revision_controller,
             runtime_cell_ids=tuple(runtime_cell_ids),
             next_cell_serial=next_cell_serial,
             display_noise_level=denoising_noise_level(
@@ -4166,6 +4180,9 @@ class ILLaDATrajectoryTensorizer:
             input_runtime_cell_ids=input_runtime_cell_ids,
             input_next_cell_serial=input_next_cell_serial,
             input_retired_at=input_retired_at,
+            display_revision_controller=(
+                None if rollout_state is None else rollout_state.display_revision_controller
+            ),
         )
 
     @staticmethod

@@ -2,6 +2,7 @@
 
 from __future__ import annotations
 
+import math
 import re
 from dataclasses import dataclass
 from typing import Any
@@ -58,6 +59,7 @@ class DisplayRevisionController:
         self._streak: Tensor | None = None
         self._evidence: object = None
         self._last_step: int | None = None
+        self._evidence_changed = False
         self._loop_attempts: dict[int, int] = {}
         self._loop_finalized: set[int] = set()
         self.loop_repairs = 0
@@ -65,18 +67,171 @@ class DisplayRevisionController:
         self.loop_detected = 0
 
     def observe_context(self, context: object) -> None:
-        """Drop prior trust on a new run or any new external source/fact/percept."""
-        facts = context.facts
-        evidence = (
-            facts.revision,
-            tuple(repr(item) for item in context.sources),
-            tuple(repr(item) for item in context.percepts),
+        """Update the revision epoch from the runtime's external evidence."""
+        self.observe_evidence(
+            step=int(context.step),
+            facts_revision=context.facts.revision,
+            sources=tuple(repr(item) for item in context.sources),
+            percepts=tuple(repr(item) for item in context.percepts),
         )
-        step = int(context.step)
-        if self._last_step is not None and (step <= self._last_step or evidence != self._evidence):
-            self.reset()
+
+    def observe_evidence(
+        self,
+        *,
+        step: int,
+        facts_revision: object,
+        sources: tuple[object, ...] = (),
+        percepts: tuple[object, ...] = (),
+    ) -> None:
+        """Share the same evidence invalidation rule with detached training rollout."""
+        evidence = (facts_revision, sources, percepts)
+        if self._last_step is not None:
+            changed = evidence != self._evidence
+            new_evidence = changed and step > self._last_step
+            if step <= self._last_step or changed:
+                self.reset()
+                self._evidence_changed = new_evidence
         self._evidence = evidence
         self._last_step = step
+
+    def refine_native_display(
+        self,
+        decoder: Any,
+        token_ids: Tensor,
+        logits: Tensor,
+        *,
+        revision_fraction: float,
+        revision_margin: float,
+    ) -> Tensor:
+        """Retain native confidence reveal while allowing gated edits to visible tokens.
+
+        Revising a token reopens a MASK; the next forward pass fills it using
+        the native model's single-token confidence rule. Existing EOS may be
+        reopened on new external evidence, without clearing the accepted prefix.
+        """
+        if not 0.0 <= revision_fraction <= 1.0 or revision_margin < 0.0:
+            raise ValueError("invalid native Display revision parameters")
+        if token_ids.ndim != 2 or logits.shape[:2] != token_ids.shape:
+            raise ValueError("native Display/logits geometry differs")
+        if not bool(token_ids[:, -1].eq(decoder.eos_id).all()):
+            raise ValueError("native Display requires its terminal EOS")
+        if (
+            self._trusted is None
+            or self._trusted.shape != token_ids.shape
+            or self._trusted.device != token_ids.device
+        ):
+            self._trusted = torch.full_like(token_ids, -1)
+            self._candidate = torch.full_like(token_ids, -1)
+            self._streak = torch.zeros_like(token_ids)
+        assert self._candidate is not None and self._streak is not None
+
+        result = token_ids.clone()
+        deferred_rows: set[int] = set()
+        with torch.no_grad():
+            for row_index in range(token_ids.shape[0]):
+                row = token_ids[row_index]
+                revised = result[row_index]
+                previous_eos = torch.nonzero(row[:-1] == decoder.eos_id, as_tuple=False).flatten()
+                if self._evidence_changed and revision_fraction and previous_eos.numel():
+                    stop = int(previous_eos[0])
+                    if stop >= 2 and bool(row[:stop].ne(decoder.mask_id).all()):
+                        # Native masked-LM logits can also propose a shifted
+                        # suffix: the CID splice preserves its stable tokens.
+                        scores = logits[row_index, :-1, :decoder.vocab_size].float().clone()
+                        if decoder.special_ids:
+                            scores[:, decoder.special_ids] = -torch.inf
+                        probabilities = scores.softmax(dim=-1)
+                        guesses = probabilities.argmax(dim=-1)
+                        confidence = probabilities.gather(-1, guesses[:, None]).squeeze(-1)
+                        current_prob = probabilities.gather(-1, row[:-1, None]).squeeze(-1)
+                        proposal = torch.cat((guesses, row[-1:]))
+                        gains = torch.cat((confidence - current_prob, confidence.new_zeros(1)))
+                        gains[:-1].masked_fill_(
+                            confidence < self.config.correction_probability, 0.0
+                        )
+                        scheduler = CIDDiffusionScheduler(decoder.mask_id, decoder.eos_id)
+                        edit = scheduler._structural_display_edit(
+                            row[:-1], proposal[:-1], gains[:-1], eos_position=stop,
+                            revision_fraction=revision_fraction,
+                            revision_margin=max(revision_margin, self.config.correction_gain),
+                        )
+                        if edit is not None:
+                            start, delete_count, inserted = edit
+                            active = row[:stop + 1].tolist()
+                            updated = [*active[:start], *inserted, *active[start + delete_count:]]
+                            revised[:-1] = decoder.mask_id
+                            revised[:len(updated)] = torch.tensor(
+                                updated, device=row.device, dtype=row.dtype
+                            )
+                            self._trusted[row_index].fill_(-1)
+                            self._candidate[row_index].fill_(-1)
+                            self._streak[row_index].zero_()
+                            deferred_rows.add(row_index)
+                            continue
+                    # The old answer may have converged while waiting for a tool.
+                    # Keep the prefix editable and reopen its completion boundary.
+                    stop = int(previous_eos[0])
+                    revised[stop:-1] = decoder.mask_id
+                    self._trusted[row_index, stop:] = -1
+                    self._candidate[row_index, stop:] = -1
+                    self._streak[row_index, stop:] = 0
+                    deferred_rows.add(row_index)
+
+                visible = torch.nonzero(
+                    (row[:-1] != decoder.mask_id) & (row[:-1] != decoder.eos_id),
+                    as_tuple=False,
+                ).flatten()
+                if not visible.numel() or revision_fraction == 0.0:
+                    continue
+                # Native filtering is identical to the confidence-reveal path.
+                scores = logits[row_index, visible, :decoder.vocab_size].float().clone()
+                if decoder.special_ids:
+                    scores[:, decoder.special_ids] = -torch.inf
+                probabilities = scores.softmax(dim=-1)
+                proposed_prob, guesses = probabilities.max(dim=-1)
+                current_prob = probabilities.gather(-1, row[visible, None]).squeeze(-1)
+                gains = proposed_prob - current_prob
+                changes = (
+                    (guesses != row[visible])
+                    & (proposed_prob >= self.config.correction_probability)
+                    & (gains >= max(revision_margin, self.config.correction_gain))
+                )
+                candidates = []
+                for index, pos_tensor in enumerate(visible):
+                    pos = int(pos_tensor)
+                    if not bool(changes[index]):
+                        self._candidate[row_index, pos] = -1
+                        self._streak[row_index, pos] = 0
+                        self._trusted[row_index, pos] = int(row[pos])
+                        continue
+                    guess = int(guesses[index])
+                    if int(self._candidate[row_index, pos]) == guess:
+                        self._streak[row_index, pos] += 1
+                    else:
+                        self._candidate[row_index, pos] = guess
+                        self._streak[row_index, pos] = 1
+                    required = 1 if self._evidence_changed else self.config.correction_steps
+                    if int(self._streak[row_index, pos]) >= required:
+                        candidates.append((float(gains[index]), pos))
+                budget = max(1, math.ceil(visible.numel() * revision_fraction))
+                for _, pos in sorted(candidates, reverse=True)[:budget]:
+                    revised[pos] = decoder.mask_id
+                    self._trusted[row_index, pos] = -1
+                    self._candidate[row_index, pos] = -1
+                    self._streak[row_index, pos] = 0
+                    deferred_rows.add(row_index)
+            self._evidence_changed = False
+            filled = decoder.refine(result, logits)
+            for row_index in deferred_rows:
+                # Do not immediately re-fill a token from logits computed for
+                # the *old* Display; the next forward must observe the edit.
+                filled[row_index] = result[row_index]
+            for row_index in range(filled.shape[0]):
+                changed = filled[row_index] != token_ids[row_index]
+                self._trusted[row_index, changed] = -1
+                self._candidate[row_index, changed] = -1
+                self._streak[row_index, changed] = 0
+        return filled
 
     def refine_display(
         self,

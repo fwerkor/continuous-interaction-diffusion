@@ -187,3 +187,129 @@ def test_native_policy_materializes_one_reveal_per_cid_step() -> None:
     assert update.display.token_ids[-1] == 7
     assert update.display.unresolved == context.display.unresolved - 1
     assert update.display.token_ids != context.display.token_ids
+
+
+def _revision_logits(display, *proposals):
+    logits = torch.full((1, display.shape[1], 64), -12.0)
+    for index, token in enumerate(proposals):
+        logits[0, index, token] = 12.0
+    return logits
+
+
+def _native_revision(controller, decoder, display, logits):
+    return controller.refine_native_display(
+        decoder, display, logits, revision_fraction=0.25, revision_margin=0.1,
+    )
+
+
+def test_native_visible_revision_requires_stable_confident_alternative() -> None:
+    from cid.model.display_revision import DisplayRevisionController
+
+    decoder = LFMNativeDisplayDecoder(NativeTokenizer(), mask_id=16, eos_id=7)
+    controller = DisplayRevisionController()
+    display = torch.tensor([[20, 21, 22, 7, 16, 7]])
+    alternative = _revision_logits(display, 20, 30, 22)
+    for step in range(7):
+        controller.observe_evidence(step=step, facts_revision=0)
+        next_display = _native_revision(controller, decoder, display, alternative)
+        assert torch.equal(next_display, display)
+    controller.observe_evidence(step=7, facts_revision=0)
+    reopened = _native_revision(controller, decoder, display, alternative)
+    assert reopened.tolist() == [[20, 16, 22, 7, 16, 7]]
+    assert display.tolist() == [[20, 21, 22, 7, 16, 7]]
+    controller.observe_evidence(step=8, facts_revision=0)
+    revised = _native_revision(controller, decoder, reopened, alternative)
+    assert revised.tolist() == [[20, 30, 22, 7, 16, 7]]
+
+
+def test_native_tool_evidence_reopens_finished_answer_and_corrects_prefix() -> None:
+    from cid.model.display_revision import DisplayRevisionController
+
+    decoder = LFMNativeDisplayDecoder(NativeTokenizer(), mask_id=16, eos_id=7)
+    controller = DisplayRevisionController()
+    display = torch.tensor([[20, 21, 7, 16, 16, 7]])
+    same = _revision_logits(display, 20, 21, 7)
+    controller.observe_evidence(step=0, facts_revision=0)
+    assert torch.equal(_native_revision(controller, decoder, display, same), display)
+    controller.observe_evidence(step=1, facts_revision=1, percepts=(("tool", 1),))
+    changed = _revision_logits(display, 20, 30, 22, 23)
+    reopened = _native_revision(controller, decoder, display, changed)
+    assert reopened.tolist() == [[20, 16, 16, 16, 16, 7]]
+    controller.observe_evidence(step=2, facts_revision=1, percepts=(("tool", 1),))
+    refined = _native_revision(controller, decoder, reopened, changed)
+    assert refined[0, 1] == 30
+    assert refined[0, -1] == 7
+
+
+def test_native_unchanged_evidence_does_not_reopen_completed_answer() -> None:
+    from cid.model.display_revision import DisplayRevisionController
+
+    decoder = LFMNativeDisplayDecoder(NativeTokenizer(), mask_id=16, eos_id=7)
+    controller = DisplayRevisionController()
+    display = torch.tensor([[20, 21, 7, 16, 16, 7]])
+    logits = _revision_logits(display, 20, 21, 7)
+    for step in range(4):
+        controller.observe_evidence(step=step, facts_revision=0)
+        assert torch.equal(_native_revision(controller, decoder, display, logits), display)
+
+
+@pytest.mark.parametrize(
+    ("old_tokens", "proposals", "expected"),
+    [
+        ([20, 21, 22, 23, 7, 16, 16, 7],
+         [20, 21, 30, 22, 23, 7],
+         [20, 21, 30, 22, 23, 7, 16, 7]),
+        ([20, 21, 30, 22, 23, 7, 16, 7],
+         [20, 21, 22, 23, 7],
+         [20, 21, 22, 23, 7, 16, 16, 7]),
+    ],
+)
+def test_native_tool_evidence_supports_gated_splice(old_tokens, proposals, expected) -> None:
+    from cid.model.display_revision import DisplayRevisionController
+
+    decoder = LFMNativeDisplayDecoder(NativeTokenizer(), mask_id=16, eos_id=7)
+    controller = DisplayRevisionController()
+    display = torch.tensor([old_tokens])
+    controller.observe_evidence(step=0, facts_revision=0)
+    controller.observe_evidence(step=1, facts_revision=1, percepts=("new-tool",))
+    revised = _native_revision(
+        controller, decoder, display, _revision_logits(display, *proposals)
+    )
+    assert revised.tolist() == [expected]
+
+
+def test_native_revision_can_be_disabled() -> None:
+    from cid.model.display_revision import DisplayRevisionController
+
+    decoder = LFMNativeDisplayDecoder(NativeTokenizer(), mask_id=16, eos_id=7)
+    controller = DisplayRevisionController()
+    display = torch.tensor([[20, 21, 7, 16, 16, 7]])
+    controller.observe_evidence(step=0, facts_revision=0)
+    controller.observe_evidence(step=1, facts_revision=1)
+    revised = controller.refine_native_display(
+        decoder, display, _revision_logits(display, 20, 30, 22),
+        revision_fraction=0, revision_margin=0.1,
+    )
+    assert revised.tolist() == display.tolist()
+
+
+def test_native_low_confidence_alternative_does_not_force_remask() -> None:
+    from cid.model.display_revision import DisplayRevisionController
+
+    decoder = LFMNativeDisplayDecoder(NativeTokenizer(), mask_id=16, eos_id=7)
+    controller = DisplayRevisionController()
+    display = torch.tensor([[20, 21, 7, 16, 16, 7]])
+    low_confidence = torch.zeros((1, 6, 64))
+    low_confidence[0, 1, 30] = 0.5
+    for step in range(12):
+        controller.observe_evidence(step=step, facts_revision=0)
+        assert torch.equal(
+            _native_revision(controller, decoder, display, low_confidence), display
+        )
+
+
+def test_native_can_fill_remasked_position_before_accepted_eos() -> None:
+    decoder = LFMNativeDisplayDecoder(NativeTokenizer(), mask_id=16, eos_id=7)
+    display = torch.tensor([[20, 16, 22, 7, 16, 7]])
+    filled = decoder.refine(display, _revision_logits(display, 20, 30, 22))
+    assert filled.tolist() == [[20, 30, 22, 7, 16, 7]]

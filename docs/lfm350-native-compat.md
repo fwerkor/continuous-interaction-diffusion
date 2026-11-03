@@ -11,8 +11,13 @@ excludes this sentinel from the native Backbone forward. For N native MASK
 tokens, allocate N+1 physical CID Display cells. The original native forward
 logits and position IDs for the N generated cells then match in neutral state.
 
-The specialized decoder uses one-token, highest-confidence reveal. It
-suppresses the same special tokens as the original reference. The original
+The specialized decoder keeps the original one-token, highest-confidence
+reveal for MASK cells, while the CID revision controller can reopen visible
+tokens after a persistent confidence gain. External evidence invalidates old
+confidence anchors and can reopen a completed answer; a shifted suffix can
+trigger a bounded insertion/deletion without discarding the stable text.
+Inference and detached training rollout both apply the same revision gates.
+It suppresses the same special tokens as the original reference. The original
 lexical answer terminator is recognized internally and mapped to logical CID
 EOS, without changing the required on-wire CID output protocol.
 
@@ -22,8 +27,10 @@ Limitations:
   training and rollout validation.
 - The lexical terminator must be filled and all earlier MASK cells resolved
   before the bridge finalizes. Intermediate partial markup may be visible.
-- Decoding uses one reveal per CID update; callers must budget at least N
-  steps for an N-token response. The normal eight-step CID budget is too small.
+- Ordinary native decoding reveals one new token per CID update, excluding
+  explicit CID revisions; callers must budget enough steps for complete
+  responses and recovery after late tool evidence. The normal eight-step CID
+  budget is too small for a long native response.
 - If native EOS is predicted while earlier MASKs are unresolved, the decoder
   chooses an alternative non-EOS token; this rare case can differ from native.
 - Compare quality against the same original native model, not against a

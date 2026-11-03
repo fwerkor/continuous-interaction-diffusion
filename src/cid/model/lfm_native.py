@@ -55,9 +55,11 @@ class LFMNativeDisplayDecoder:
         result = display.clone()
         for b in range(display.shape[0]):
             row = result[b]
-            if bool(row[:-1].eq(self.eos_id).any()):
-                continue
-            positions = torch.nonzero(row[:-1].eq(self.mask_id), as_tuple=False).flatten()
+            boundary = torch.nonzero(row[:-1].eq(self.eos_id), as_tuple=False).flatten()
+            active_stop = int(boundary[0]) if boundary.numel() else row.numel() - 1
+            # A reopened token before an accepted EOS remains editable. Only
+            # a fully resolved prefix is complete.
+            positions = torch.nonzero(row[:active_stop].eq(self.mask_id), as_tuple=False).flatten()
             if not positions.numel():
                 self._stop_at_native_marker(row)
                 continue
