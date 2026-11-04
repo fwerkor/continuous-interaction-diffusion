@@ -122,8 +122,8 @@ def test_native_repetition_penalty_works_on_nonmonotonic_visible_tokens() -> Non
     logits = torch.zeros((1, 6, 64))
     logits[0, 1, 20] = 6.0
     logits[0, 1, 21] = 5.85
-    logits[0, 3, 22] = 5.0
-    logits[0, 4, 23] = 5.0
+    logits[0, 3, 22] = 0.8
+    logits[0, 4, 23] = 0.8
     assert decoder.refine(display, logits)[0, 1] == 20
     out = decoder.refine(display, logits, repetition_score_multiplier=0.7)
     assert out[0, 1] == 21
