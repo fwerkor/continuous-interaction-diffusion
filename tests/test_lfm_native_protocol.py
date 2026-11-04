@@ -116,6 +116,22 @@ def test_native_decoder_reveals_exactly_one_token_and_uses_confidence() -> None:
     assert display.tolist() == [[16, 16, 16, 16, 7]]
 
 
+def test_native_repetition_penalty_works_on_nonmonotonic_visible_tokens() -> None:
+    decoder = LFMNativeDisplayDecoder(NativeTokenizer(), mask_id=16, eos_id=7)
+    display = torch.tensor([[20, 16, 20, 16, 16, 7]])
+    logits = torch.zeros((1, 6, 64))
+    logits[0, 1, 20] = 6.0
+    logits[0, 1, 21] = 5.85
+    logits[0, 3, 22] = 5.0
+    logits[0, 4, 23] = 5.0
+    assert decoder.refine(display, logits)[0, 1] == 20
+    out = decoder.refine(display, logits, repetition_score_multiplier=0.7)
+    assert out[0, 1] == 21
+    assert display[0, 1] == 16
+    with pytest.raises(ValueError, match="repetition_score_multiplier"):
+        decoder.refine(display, logits, repetition_score_multiplier=0.0)
+
+
 def test_native_terminator_is_private_and_idempotent() -> None:
     decoder = LFMNativeDisplayDecoder(NativeTokenizer(), mask_id=16, eos_id=7)
     display = torch.tensor([[20, 31, 32, 16, 16, 7]])

@@ -102,6 +102,7 @@ class DisplayRevisionController:
         *,
         revision_fraction: float,
         revision_margin: float,
+        repetition_score_multiplier: float = 1.0,
     ) -> Tensor:
         """Retain native confidence reveal while allowing gated edits to visible tokens.
 
@@ -221,7 +222,9 @@ class DisplayRevisionController:
                     self._streak[row_index, pos] = 0
                     deferred_rows.add(row_index)
             self._evidence_changed = False
-            filled = decoder.refine(result, logits)
+            filled = decoder.refine(
+                result, logits, repetition_score_multiplier=repetition_score_multiplier
+            )
             for row_index in deferred_rows:
                 # Do not immediately re-fill a token from logits computed for
                 # the *old* Display; the next forward must observe the edit.

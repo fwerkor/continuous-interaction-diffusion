@@ -4,6 +4,7 @@ import torch
 from torch import Tensor, nn
 
 from cid.model.allocation import prefix_allocation_mask
+from cid.model.language_preservation import native_language_kl
 from cid.model.ar import AR_CID_MODEL_TYPES, bidirectional_ar_hidden_states
 from cid.model.tensors import CIDTensorBatch, CIDTensorOutput, live_slot_occupancy
 
@@ -356,5 +357,14 @@ class IdentityPreservingPath(nn.Module):
             eos_preserve = (eos_rise.square() * eos_mask).sum() / eos_mask.sum().clamp_min(1)
             auxiliary = (auxiliary if auxiliary is not None else preserve.new_zeros(()))
             auxiliary = auxiliary + 0.5 * preserve + 0.05 * eos_preserve
+            # Preserve the frozen model's *whole-canvas* language distribution,
+            # while the answer can match anywhere and external facts can still
+            # correct its content. No answer position or termination offset is
+            # prescribed by this regularizer.
+            preserve_mask = display_keys & active_positions
+            if batch.sample_mask is not None:
+                preserve_mask = preserve_mask & batch.sample_mask[:, None].bool()
+            native_kl = native_language_kl(logits, base_logits, preserve_mask)
+            auxiliary = auxiliary + 0.08 * native_kl
         result.auxiliary_loss = auxiliary
         return result

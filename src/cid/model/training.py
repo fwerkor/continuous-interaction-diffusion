@@ -1745,6 +1745,7 @@ class CIDTrainer:
                 output.display_logits[batch_index : batch_index + 1, :display_length],
                 revision_fraction=self.config.rollout_display_revision_fraction,
                 revision_margin=self.config.rollout_display_revision_margin,
+                repetition_score_multiplier=self.config.rollout_display_repetition_score_multiplier,
             )
         else:
             display_ids = self.tensorizer.scheduler.refine_display(
@@ -2328,6 +2329,9 @@ class CIDTrainer:
                                     output.display_logits[
                                         row_index : row_index + 1, :display_length
                                     ],
+                                    repetition_score_multiplier=(
+                                        self.config.rollout_display_repetition_score_multiplier
+                                    ),
                                 )
                                 if self.tensorizer.native_decoder is not None
                                 else self.tensorizer.scheduler.refine_display(

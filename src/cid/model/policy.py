@@ -340,6 +340,7 @@ class ILLaDANeuralPolicy:
                     output.display_logits,
                     revision_fraction=self.config.display_revision_fraction,
                     revision_margin=self.config.display_revision_margin,
+                    repetition_score_multiplier=self.config.display_repetition_score_multiplier,
                 )
                 return self.materializer.materialize(
                     output,

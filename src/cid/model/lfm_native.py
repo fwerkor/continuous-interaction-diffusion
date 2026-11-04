@@ -45,7 +45,11 @@ class LFMNativeDisplayDecoder:
                 row[pos] = self.eos_id
                 break
 
-    def refine(self, display: Tensor, logits: Tensor) -> Tensor:
+    def refine(
+        self, display: Tensor, logits: Tensor, *, repetition_score_multiplier: float = 1.0
+    ) -> Tensor:
+        if not 0.0 < repetition_score_multiplier <= 1.0:
+            raise ValueError("repetition_score_multiplier must be in (0, 1]")
         if display.ndim != 2 or logits.ndim != 3:
             raise ValueError("expected Display [B,L] and logits [B,L,V]")
         if display.shape != logits.shape[:2] or logits.shape[-1] < self.vocab_size:
@@ -68,6 +72,17 @@ class LFMNativeDisplayDecoder:
             candidates = logits[b, positions, :self.vocab_size].float().clone()
             if self.special_ids:
                 candidates[:, self.special_ids] = -torch.inf
+            if repetition_score_multiplier < 1.0:
+                # Nonmonotonic reveal: only discourage overused token types,
+                # regardless of the order in which their positions were filled.
+                visible = row[:active_stop]
+                visible = visible[(visible != self.mask_id) & (visible != self.eos_id)]
+                if visible.numel():
+                    counts = torch.bincount(visible, minlength=self.vocab_size)
+                    repeated = (counts - 1).clamp_min(0).clamp_max(5)
+                    candidates += repeated.to(candidates.dtype)[None] * torch.log(
+                        candidates.new_tensor(repetition_score_multiplier)
+                    )
             probs = candidates.softmax(dim=-1)
             confidences, guesses = probs.max(dim=-1)
             best = int(confidences.argmax())
