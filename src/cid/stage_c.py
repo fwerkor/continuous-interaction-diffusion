@@ -540,7 +540,19 @@ def train_stage_c(args: Any) -> None:
     optimizer = torch.optim.AdamW(module.parameters(), lr=args.learning_rate)
     generator = torch.Generator(device=device)
     generator.manual_seed(args.seed)
-    examples = load_stage_c_examples(args.data, max_examples=args.max_examples)
+    language_only = bool(getattr(args, "language_sft", False))
+    if language_only:
+        from itertools import islice
+
+        from cid.language_sft import iter_language_sft
+        selected = iter_language_sft(args.data)
+        if args.max_examples is not None:
+            selected = islice(selected, args.max_examples)
+        examples = [StageCExample(row.prompt, row.answer) for row in selected]
+        if not examples:
+            raise ValueError("language_sft dataset contains no valid Display examples")
+    else:
+        examples = load_stage_c_examples(args.data, max_examples=args.max_examples)
     rng = random.Random(args.seed)
     completed = 0
     for epoch in range(args.epochs):
@@ -560,13 +572,23 @@ def train_stage_c(args: Any) -> None:
                     > adapter.max_position_embeddings
                 ):
                     continue
-                thought = frozen_thought_rollout(
-                    adapter,
-                    tensorizer,
-                    example.prompt,
-                    steps=args.thought_steps,
-                    forward_model=forward_model,
-                )
+                if language_only:
+                    # A language_sft record contains no TCT teacher state. Keeping
+                    # the runtime TCT empty also avoids generating synthetic
+                    # thought supervision. The entire CID model is frozen; only
+                    # the Display residual may receive gradients.
+                    from cid.state import CognitiveField
+                    thought = CognitiveField.empty(
+                        adapter.config.max_thought_slots, adapter.d_model
+                    )
+                else:
+                    thought = frozen_thought_rollout(
+                        adapter,
+                        tensorizer,
+                        example.prompt,
+                        steps=args.thought_steps,
+                        forward_model=forward_model,
+                    )
                 batch, labels = make_display_batch(
                     tensorizer,
                     thought,

@@ -177,10 +177,9 @@ def test_native_completion_requires_explicit_verified_response() -> None:
     from cid.model.training import ILLaDATrajectoryTensorizer
 
     target = make_trajectory()
-    with pytest.raises(ValueError, match="short CID answer fragments"):
-        ILLaDATrajectoryTensorizer._native_full_display_reference(
-            target, 0, target.target_display
-        )
+    assert ILLaDATrajectoryTensorizer._native_full_display_reference(
+        target, 0, target.target_display
+    ) is None
 
 
 def test_native_completion_rejects_unverified_answer_mismatch() -> None:

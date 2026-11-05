@@ -4,8 +4,8 @@ import torch
 from torch import Tensor, nn
 
 from cid.model.allocation import prefix_allocation_mask
-from cid.model.language_preservation import native_language_kl
 from cid.model.ar import AR_CID_MODEL_TYPES, bidirectional_ar_hidden_states
+from cid.model.language_preservation import native_language_kl
 from cid.model.tensors import CIDTensorBatch, CIDTensorOutput, live_slot_occupancy
 
 

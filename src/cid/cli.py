@@ -4310,6 +4310,10 @@ def main() -> None:
         "train-display", help="Stage C: frozen CID with Display-only low-rank diffusion SFT"
     )
     stage_c.add_argument("--data", required=True, help="prompt/answer or chat messages JSONL")
+    stage_c.add_argument(
+        "--language-sft", action="store_true",
+        help="v1.2 language_sft: validate Display-only schema; never supervise TCT or tools",
+    )
     stage_c.add_argument("--checkpoint", required=True, help="Stage B .pt or unified CID release")
     stage_c.add_argument("--checkpoint-kind", choices=("stage-b", "release"), default="release")
     stage_c.add_argument("--model", default="GSAI-ML/iLLaDA-8B-Base")

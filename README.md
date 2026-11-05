@@ -230,7 +230,7 @@ Convert a pool into teacher-ready CID tasks and causal evidence-exposure jobs wi
 cid prepare-public-distillation
 ```
 
-Released CID datasets are published on Hugging Face at `fwerkor/CID-Dataset`; the GitHub
+See docs/cid-dataset-v12.md for the new Display-only language_sft component.\n\nReleased CID datasets are published on Hugging Face at `fwerkor/CID-Dataset`; the GitHub
 repository intentionally does not track release data or release manifests. The local `data/` tree is
 a gitignored build/training workspace. **v12 through v17 are preserved as complete releases** so
 training artifacts do not skip a version.

@@ -5843,12 +5843,14 @@ class ILLaDATrajectoryTensorizer:
         value = step_references.get(str(step))
         if value is None and target_display == example.target_display:
             value = example.metadata.get("native_full_display")
+        if value is None:
+            # v1.1 factual references often contain only a value or entity.
+            # The language_sft component supplies independent full-reply
+            # supervision; an old CID fact must not be relabeled as a full
+            # natural-language sentence or block Stage A/B training.
+            return None
         if not isinstance(value, str) or not value.strip():
-            raise ValueError(
-                f"{example.example_id}: LFM-native complete Display requires a "
-                "verified metadata.native_full_display reference; short CID answer "
-                "fragments cannot supervise fluent language"
-            )
+            raise ValueError("provided native full Display reference must be a nonempty string")
         reviewer = example.metadata.get("native_full_display_reviewer")
         if (
             example.metadata.get("native_full_display_verified") is not True

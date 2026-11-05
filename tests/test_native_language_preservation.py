@@ -4,8 +4,8 @@ import pytest
 
 torch = pytest.importorskip("torch")
 
-from cid.model.language_preservation import native_language_kl
-from cid.model.losses import _position_invariant_display_loss
+from cid.model.language_preservation import native_language_kl  # noqa: E402
+from cid.model.losses import _position_invariant_display_loss  # noqa: E402
 
 
 def test_native_kl_preserves_any_display_position_and_backpropagates() -> None:

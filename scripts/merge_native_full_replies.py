@@ -15,7 +15,7 @@ def assemble(trajectories: Path, reviews: Path, output: Path) -> dict[str, objec
         raise ValueError("output must not overwrite the original CID dataset")
     annotations: dict[str, dict] = {}
     with reviews.open(encoding="utf-8") as handle:
-        for number, line in enumerate(handle, 1):
+        for line in handle:
             if not line.strip():
                 continue
             item = json.loads(line)
@@ -40,7 +40,7 @@ def assemble(trajectories: Path, reviews: Path, output: Path) -> dict[str, objec
         ) as target:
             path = Path(target.name)
             with trajectories.open(encoding="utf-8") as source:
-                for number, line in enumerate(source, 1):
+                for line in source:
                     if not line.strip():
                         continue
                     item = json.loads(line)
@@ -62,7 +62,9 @@ def assemble(trajectories: Path, reviews: Path, output: Path) -> dict[str, objec
                     errors = validate_row(item)
                     if errors:
                         raise ValueError(f"{identifier}: {'; '.join(errors)}")
-                    data = (json.dumps(item, ensure_ascii=False, separators=(",", ":")) + "\n").encode()
+                    data = (
+                        json.dumps(item, ensure_ascii=False, separators=(",", ":")) + "\n"
+                    ).encode()
                     target.write(data)
                     digest.update(data)
                     written += 1

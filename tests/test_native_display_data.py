@@ -1,6 +1,5 @@
 from __future__ import annotations
 
-import importlib.util
 import json
 import sys
 from pathlib import Path
@@ -9,8 +8,8 @@ import pytest
 
 ROOT = Path(__file__).resolve().parents[1]
 sys.path.insert(0, str(ROOT / "scripts"))
-from merge_native_full_replies import assemble
-from validate_native_display_data import validate_row
+from merge_native_full_replies import assemble  # noqa: E402
+from validate_native_display_data import validate_row  # noqa: E402
 
 
 def test_native_reply_data_validation_and_atomic_merge(tmp_path: Path) -> None:
