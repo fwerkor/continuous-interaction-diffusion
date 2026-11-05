@@ -21,16 +21,16 @@ It suppresses the same special tokens as the original reference. The original
 lexical answer terminator is recognized internally and mapped to logical CID
 EOS, without changing the required on-wire CID output protocol.
 
-Stage A/B Display training uses an ordered, position-invariant answer-span
-objective for this native protocol. A complete answer reference may occupy any
-contiguous sequence of native output positions, without enforcing a prefix,
-terminating the response at the dataset answer length, or supplying target
-tokens as teacher-forcing input. Partially unknown references provide no
-Display language target while Thought, tool, and control targets remain active.
-For an answer span, the loss takes the lowest mean token CE across all legal
-starts before the private EOS sentinel. Existing non-native CID protocols retain
-their original position-aligned CE. This is a positive answer-fragment
-objective, not a guarantee of semantic consistency of the entire response.
+For native Stage A/B supervision contract v3, a verified full response plus
+the lexical answer terminator is required. Full-response denoising is the
+primary language loss. The historical position-invariant answer-span loss
+contributes only as a small auxiliary factual constraint when its tokenization
+actually matches the verified full reply. Unknown drafts do not have language
+targets; Thought, tool and control supervision continues. No fixed placement
+of the short answer is prescribed independently of the full response.
+See docs/lfm350-native-display-supervision.md for the input data contract,
+independent review requirement, data preflight and training quality gates.
+Non-native protocols keep their existing Display losses.
 
 Limitations:
 - Exact native language parity applies only in a neutral Thought/tool state.

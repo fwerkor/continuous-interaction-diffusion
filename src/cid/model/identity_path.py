@@ -253,10 +253,12 @@ class IdentityPreservingPath(nn.Module):
         percept_evidence = torch.zeros(
             (batch_size, display_length), device=device, dtype=torch.bool,
         )
+        external_evidence = torch.zeros(batch_size, device=device, dtype=torch.bool)
         for kind in ("source", "fact", "percept"):
             value = getattr(batch, f"{kind}_memory").to(dtype=dtype)
             if value.shape[1]:
                 valid = self._keys(getattr(batch, f"{kind}_padding_mask"), value)
+                external_evidence |= valid.any(dim=1)
                 display_memories.append(value)
                 display_keys_list.append(valid)
                 if kind == "percept":
@@ -361,7 +363,9 @@ class IdentityPreservingPath(nn.Module):
             # while the answer can match anywhere and external facts can still
             # correct its content. No answer position or termination offset is
             # prescribed by this regularizer.
-            preserve_mask = display_keys & active_positions
+            # The unconditioned native teacher has not seen external evidence.
+            # Matching it after a tool observation penalizes correct answers.
+            preserve_mask = display_keys & active_positions & ~external_evidence[:, None]
             if batch.sample_mask is not None:
                 preserve_mask = preserve_mask & batch.sample_mask[:, None].bool()
             native_kl = native_language_kl(logits, base_logits, preserve_mask)

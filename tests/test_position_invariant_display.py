@@ -125,11 +125,23 @@ def test_native_tensorizer_keeps_answer_out_of_teacher_input_and_loss() -> None:
     tensorizer = ILLaDATrajectoryTensorizer(
         model, TrainTokenizer(), display_canvas_tokens=12
     )
-    example = make_trajectory()
+    example = replace(
+        make_trajectory(),
+        metadata={
+            "native_full_display": "37.",
+            "native_full_display_verified": True,
+            "native_full_display_reviewer": "unit-test",
+        },
+    )
     original = tensorizer.tensorize(example, source_step=-1, timestep=0.5)
     same_answer = tensorizer.tensorize(example, source_step=0, timestep=0.5)
     for sample in (original, same_answer):
-        assert sample.targets.display_ids.eq(-100).all()
+        full = tensorizer._encode_display_text(
+            "37.\n[/Answer]"
+        )
+        length = full.shape[1]
+        assert torch.equal(sample.targets.display_ids[:, :length], full)
+        assert sample.targets.display_ids[:, length:].eq(-100).all()
         assert sample.targets.display_answer_ids.shape == (1, 2)
         assert sample.batch.display_ids[:, :-1].eq(model.mask_token_id).all()
         assert sample.batch.display_ids[0, -1] == model.eos_token_id
@@ -138,6 +150,14 @@ def test_native_tensorizer_keeps_answer_out_of_teacher_input_and_loss() -> None:
         (original, same_answer), pad_token_id=1
     )
     assert combined.targets.display_answer_ids.shape == (2, 2)
+
+    from cid.model.losses import cid_loss
+
+    model.train()
+    result = cid_loss(model(original.batch), original.targets)
+    assert torch.isfinite(result.total)
+    assert result.display.item() > 0.0
+    result.display.backward()
 
     unknown = replace(
         example,
@@ -149,3 +169,62 @@ def test_native_tensorizer_keeps_answer_out_of_teacher_input_and_loss() -> None:
     pending = tensorizer.tensorize(unknown, source_step=0, timestep=0.5)
     assert pending.targets.display_answer_ids.eq(-100).all()
     assert pending.targets.display_ids.eq(-100).all()
+
+
+def test_native_completion_requires_explicit_verified_response() -> None:
+    from test_training import make_trajectory
+
+    from cid.model.training import ILLaDATrajectoryTensorizer
+
+    target = make_trajectory()
+    with pytest.raises(ValueError, match="short CID answer fragments"):
+        ILLaDATrajectoryTensorizer._native_full_display_reference(
+            target, 0, target.target_display
+        )
+
+
+def test_native_completion_rejects_unverified_answer_mismatch() -> None:
+    from dataclasses import replace
+
+    from test_training import make_trajectory
+
+    from cid.model.training import ILLaDATrajectoryTensorizer
+
+    target = make_trajectory()
+    bad = replace(
+        target,
+        metadata={
+            "native_full_display": "The documented latency is 300.",
+            "native_full_display_verified": True,
+            "native_full_display_reviewer": "unit-test",
+        },
+    )
+    with pytest.raises(ValueError, match="lacks reference answer"):
+        ILLaDATrajectoryTensorizer._native_full_display_reference(
+            bad, 0, target.target_display
+        )
+    verified = replace(
+        bad, metadata={
+            "native_full_display": "The documented latency is thirty-seven.",
+            "native_full_display_verified": True,
+            "native_full_display_reviewer": "unit-test",
+            "native_full_display_semantic_paraphrase": True,
+        },
+    )
+    assert ILLaDATrajectoryTensorizer._native_full_display_reference(
+        verified, 0, target.target_display
+    ) == "The documented latency is thirty-seven."
+
+
+def test_native_completion_supervises_full_reply_and_terminator() -> None:
+    from cid.model.losses import _masked_cross_entropy
+
+    targets = torch.tensor([[4, 5, 6, 7, 8, 9, -100]])
+    logits = torch.zeros((1, 7, 16), requires_grad=True)
+    batch_mask = torch.tensor([True])
+    loss = _masked_cross_entropy(
+        logits, targets, targets.ne(-100), batch_mask=batch_mask
+    )
+    loss.backward()
+    active_positions = logits.grad.abs().sum(dim=-1).flatten().gt(0)
+    assert active_positions.tolist() == [True] * 6 + [False]

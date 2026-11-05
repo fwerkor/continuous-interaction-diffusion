@@ -179,12 +179,27 @@ def cid_loss(
     if targets.display_answer_ids is not None:
         if targets.display_answer_position_mask is None:
             raise ValueError("position-invariant Display requires an eligible position mask")
-        display = _position_invariant_display_loss(
+        # A short, freely placed answer fragment is a *factual* auxiliary.
+        # It cannot be the primary language objective: a 1-token reference
+        # supervises only one position and leaves the rest of Display free to
+        # repeat or hallucinate indefinitely.
+        span_loss = _position_invariant_display_loss(
             output.display_logits,
             targets.display_answer_ids,
             targets.display_answer_position_mask,
             batch_mask=batch_mask,
         )
+        complete = display_mask.any(dim=-1)
+        missing = batch_mask & targets.display_answer_ids.ne(-100).any(dim=-1) & ~complete
+        if bool(missing.any()):
+            raise ValueError("native Display requires full-response denoising labels")
+        completion_loss = _masked_cross_entropy(
+            output.display_logits,
+            targets.display_ids,
+            display_mask,
+            batch_mask=batch_mask,
+        )
+        display = completion_loss + 0.1 * span_loss
     else:
         display = _masked_cross_entropy(
             output.display_logits,

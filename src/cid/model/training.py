@@ -97,7 +97,7 @@ def _adapter_config_matches(saved: dict[str, Any], config: Any) -> bool:
 
 CID_NEURAL_CONTRACT_VERSION = 6
 # Bump independently of neural geometry when teacher labels/loss semantics change.
-CID_SUPERVISION_CONTRACT_VERSION = 2
+CID_SUPERVISION_CONTRACT_VERSION = 3
 STAGE_B_SEMANTIC_SNAPSHOT_FILENAME = "semantic-embedding.pt"
 _PORTABLE_LENGTH_BAND_SIZE = 64
 
@@ -3860,6 +3860,14 @@ class ILLaDATrajectoryTensorizer:
         )
         target_display = self._display_text(example, supervision_step)
         target_text_ids = self._encode_display_text(target_display)
+        native_full_text = (
+            self._native_full_display_reference(example, supervision_step, target_display)
+            if self.adapter.config.backbone_protocol == "lfm-native" else None
+        )
+        native_full_ids = (
+            self._encode_display_text(native_full_text + "\n[/Answer]")
+            if native_full_text is not None else None
+        )
         realized_tokens = target_text_ids.shape[1]
         source_display = None
         source_text_ids = None
@@ -3868,8 +3876,20 @@ class ILLaDATrajectoryTensorizer:
         ):
             source_display = self._display_text(example, source_step)
             if source_display != target_display:
-                source_text_ids = self._encode_display_text(source_display)
+                if self.adapter.config.backbone_protocol == "lfm-native":
+                    source_full = self._native_full_display_reference(
+                        example, source_step, source_display
+                    )
+                    source_text_ids = self._encode_display_text(
+                        source_full if source_full is not None else source_display
+                    )
+                else:
+                    source_text_ids = self._encode_display_text(source_display)
         required_display_tokens = realized_tokens + 1
+        if native_full_ids is not None:
+            required_display_tokens = max(
+                required_display_tokens, int(native_full_ids.shape[1]) + 1
+            )
         if source_text_ids is not None:
             required_display_tokens = max(
                 required_display_tokens,
@@ -4061,13 +4081,38 @@ class ILLaDATrajectoryTensorizer:
                         display_input_ids[:, :source_count] == self.eos_token_id
                     ] = self.adapter.mask_token_id
                 display_input_ids[:, -1] = self.eos_token_id
+            # Runtime conditions the whole native canvas at one denoising
+            # level, including the latent tail beyond the short answer.
+            native_noise = (
+                float(rollout_display_noise_level)
+                if rollout_state is not None and rollout_display_noise_level is not None
+                else 1.0 if source_step == -1 else timestep
+            )
+            display_noise.fill_(native_noise)
             display_labels.fill_(-100)
+            if native_full_ids is not None:
+                full_length = int(native_full_ids.shape[1])
+                display_labels[:, :full_length] = native_full_ids
             # Partial unknown drafts do not establish a full answer target.
             # Their tool/thought supervision remains active until the
             # evidence needed for a complete Display is available.
             display_answer_ids = target_text_ids.clone()
             if bool(display_answer_ids.eq(self.adapter.mask_token_id).any()):
                 display_answer_ids.fill_(-100)
+            elif native_full_ids is not None:
+                # Standalone answer tokenization can differ inside a longer
+                # reply (e.g. a leading-space BPE token). Never optimize
+                # incompatible token spans against the same full reply.
+                width = int(display_answer_ids.shape[1])
+                matches = (
+                    native_full_ids[0].unfold(0, width, 1)
+                    .eq(display_answer_ids[0])
+                    .all(dim=-1)
+                    if width <= native_full_ids.shape[1]
+                    else torch.zeros(0, dtype=torch.bool, device=device)
+                )
+                if not bool(matches.any()):
+                    display_answer_ids.fill_(-100)
             display_answer_position_mask = torch.ones_like(
                 display_input_ids, dtype=torch.bool
             )
@@ -5778,6 +5823,56 @@ class ILLaDATrajectoryTensorizer:
                     )
                 return target.text
         return example.target_display
+
+    @staticmethod
+    def _native_full_display_reference(
+        example: TrajectoryExample, step: int, target_display: str
+    ) -> str | None:
+        """Retrieve independently verified complete language supervision.
+
+        Short CID targets specify answer facts, not their verbalization.
+        Inventing a response template here would silently teach a new language
+        distribution. LFM-native training therefore requires an explicit full
+        reference for every causally available, complete Display.
+        """
+        if DISPLAY_UNKNOWN_MARKER in target_display:
+            return None
+        step_references = example.metadata.get("native_full_display_by_step", {})
+        if not isinstance(step_references, dict):
+            raise ValueError("native_full_display_by_step must map steps to replies")
+        value = step_references.get(str(step))
+        if value is None and target_display == example.target_display:
+            value = example.metadata.get("native_full_display")
+        if not isinstance(value, str) or not value.strip():
+            raise ValueError(
+                f"{example.example_id}: LFM-native complete Display requires a "
+                "verified metadata.native_full_display reference; short CID answer "
+                "fragments cannot supervise fluent language"
+            )
+        reviewer = example.metadata.get("native_full_display_reviewer")
+        if (
+            example.metadata.get("native_full_display_verified") is not True
+            or not isinstance(reviewer, str)
+            or not reviewer.strip()
+        ):
+            raise ValueError(
+                f"{example.example_id}: native full reply requires independent "
+                "verification and a nonempty reviewer"
+            )
+        reply = value.strip()
+        if DISPLAY_UNKNOWN_MARKER in reply or "[/Answer]" in reply:
+            raise ValueError("native full reply cannot contain a MASK or internal answer delimiter")
+        # Literal inclusion is a cheap factual safeguard, while externally
+        # checked semantic paraphrases may explicitly opt in.
+        if (
+            target_display.strip().casefold() not in reply.casefold()
+            and not example.metadata.get("native_full_display_semantic_paraphrase", False)
+        ):
+            raise ValueError(
+                f"{example.example_id}: native full reply lacks reference answer "
+                "and has no explicit semantic verification"
+            )
+        return reply
 
     def _encode_display_text(self, text: str) -> Tensor:
         if DISPLAY_UNKNOWN_MARKER not in text:
