@@ -1919,6 +1919,7 @@ def _train_stage_a(args: argparse.Namespace) -> None:
     import torch
     import torch.distributed as dist
 
+    from cid.language_mix import mix_language_rollout_windows, mixed_dataset_identity
     from cid.model import (
         CIDTrainer,
         CIDTrainerConfig,
@@ -1966,6 +1967,13 @@ def _train_stage_a(args: argparse.Namespace) -> None:
         identity_initial_mask_tokens=args.identity_initial_mask_tokens,
     )
     dataset_manifest = inspect_dataset(args.data)
+    mix_data = getattr(args, "language_sft_data", None)
+    mix_fraction = float(getattr(args, "language_sft_token_fraction", 0.2))
+    mix_prompt_cap = int(getattr(args, "language_sft_max_prompt_tokens", 1024))
+    combined_dataset_sha256, _language_manifest = mixed_dataset_identity(
+        dataset_manifest.sha256, mix_data,
+        token_fraction=mix_fraction, max_prompt_tokens=mix_prompt_cap,
+    )
     validate_neural_training_contract(
         dataset_manifest,
         max_argument_slots=adapter_config.max_argument_slots,
@@ -2259,7 +2267,7 @@ def _train_stage_a(args: argparse.Namespace) -> None:
             if rank == 0:
                 trainer.save_checkpoint(
                     checkpoint,
-                    dataset_sha256=dataset_manifest.sha256,
+                    dataset_sha256=combined_dataset_sha256,
                     include_optimizer_state=not (
                         args.zero_redundancy_optimizer and distributed
                     ),
@@ -2272,7 +2280,7 @@ def _train_stage_a(args: argparse.Namespace) -> None:
         if args.resume:
             loaded_checkpoint_metadata = trainer.load_checkpoint(
                 args.resume,
-                expected_dataset_sha256=dataset_manifest.sha256,
+                expected_dataset_sha256=combined_dataset_sha256,
                 allow_partial_world_size_change=True,
             )
             if args.zero_redundancy_optimizer and distributed:
@@ -2338,6 +2346,15 @@ def _train_stage_a(args: argparse.Namespace) -> None:
         windows = balance_rollout_windows_by_semantic_task(
             trajectory_rollout_windows(examples, max_horizon=args.rollout_horizon)
         )
+        if mix_data:
+            windows, mixed_report = mix_language_rollout_windows(
+                windows, mix_data, tokenizer,
+                token_fraction=mix_fraction, max_prompt_tokens=mix_prompt_cap,
+                max_display_tokens=args.max_display_tokens, seed=args.seed,
+                backbone_protocol=args.backbone_protocol,
+            )
+            if rank == 0:
+                print("language_sft " + json.dumps(mixed_report, sort_keys=True), flush=True)
         if not windows:
             raise ValueError("training data contains no adjacent thought transitions")
         validation_windows = balance_rollout_windows_by_semantic_task(
@@ -2998,6 +3015,7 @@ def _train_stage_b(args: argparse.Namespace) -> None:
     import torch
     import torch.distributed as dist
 
+    from cid.language_mix import mix_language_rollout_windows, mixed_dataset_identity
     from cid.model import (
         CIDTrainer,
         CIDTrainerConfig,
@@ -3129,6 +3147,13 @@ def _train_stage_b(args: argparse.Namespace) -> None:
             identity_initial_mask_tokens=args.identity_initial_mask_tokens,
         )
         dataset_manifest = inspect_dataset(args.data)
+        mix_data = getattr(args, "language_sft_data", None)
+        mix_fraction = float(getattr(args, "language_sft_token_fraction", 0.2))
+        mix_prompt_cap = int(getattr(args, "language_sft_max_prompt_tokens", 1024))
+        combined_dataset_sha256, _language_manifest = mixed_dataset_identity(
+            dataset_manifest.sha256, mix_data,
+            token_fraction=mix_fraction, max_prompt_tokens=mix_prompt_cap,
+        )
         validate_neural_training_contract(
             dataset_manifest,
             max_argument_slots=adapter_config.max_argument_slots,
@@ -3149,6 +3174,16 @@ def _train_stage_b(args: argparse.Namespace) -> None:
         windows = balance_rollout_windows_by_semantic_task(
             trajectory_rollout_windows(examples, max_horizon=args.rollout_horizon)
         )
+        if mix_data:
+            tokenizer = load_cid_tokenizer(args.model)
+            windows, mixed_report = mix_language_rollout_windows(
+                windows, mix_data, tokenizer,
+                token_fraction=mix_fraction, max_prompt_tokens=mix_prompt_cap,
+                max_display_tokens=args.max_display_tokens, seed=args.seed,
+                backbone_protocol=args.backbone_protocol,
+            )
+            if rank == 0:
+                print("language_sft " + json.dumps(mixed_report, sort_keys=True), flush=True)
         if not windows:
             raise ValueError("training data contains no adjacent thought transitions")
         validation_windows = balance_rollout_windows_by_semantic_task(
@@ -3364,7 +3399,7 @@ def _train_stage_b(args: argparse.Namespace) -> None:
             if single_npu_stage_b:
                 trainer.load_checkpoint(
                     args.resume,
-                    expected_dataset_sha256=dataset_manifest.sha256,
+                    expected_dataset_sha256=combined_dataset_sha256,
                 )
             else:
                 loaded_checkpoint_metadata = load_stage_b_checkpoint(
@@ -3372,7 +3407,7 @@ def _train_stage_b(args: argparse.Namespace) -> None:
                     optimizer,
                     trainer,
                     args.resume,
-                    expected_dataset_sha256=dataset_manifest.sha256,
+                    expected_dataset_sha256=combined_dataset_sha256,
                 )
         else:
             trainer.reseed(args.seed + rank)
@@ -3585,7 +3620,7 @@ def _train_stage_b(args: argparse.Namespace) -> None:
                 if single_npu_stage_b:
                     trainer.save_checkpoint(
                         checkpoint,
-                        dataset_sha256=dataset_manifest.sha256,
+                        dataset_sha256=combined_dataset_sha256,
                     )
                 else:
                     consumed_by_bucket = stage_b_consumed_windows_by_bucket(
@@ -3600,7 +3635,7 @@ def _train_stage_b(args: argparse.Namespace) -> None:
                         optimizer,
                         trainer,
                         checkpoint,
-                        dataset_sha256=dataset_manifest.sha256,
+                        dataset_sha256=combined_dataset_sha256,
                         epoch_progress={
                             "epoch": current_epoch,
                             "base_consumed_by_bucket": current_base_consumed,
@@ -3660,7 +3695,7 @@ def _train_stage_b(args: argparse.Namespace) -> None:
             if single_npu_stage_b:
                 trainer.save_checkpoint(
                     checkpoint,
-                    dataset_sha256=dataset_manifest.sha256,
+                    dataset_sha256=combined_dataset_sha256,
                 )
             else:
                 save_stage_b_checkpoint(
@@ -3668,7 +3703,7 @@ def _train_stage_b(args: argparse.Namespace) -> None:
                     optimizer,
                     trainer,
                     checkpoint,
-                    dataset_sha256=dataset_manifest.sha256,
+                    dataset_sha256=combined_dataset_sha256,
                 )
             if rank == 0:
                 step_alias = output_dir / (
@@ -4492,6 +4527,18 @@ def main() -> None:
     )
     train.add_argument("--data", required=True)
     train.add_argument(
+        "--language-sft-data",
+        help="v1.2 Display-only language JSONL mixed into Stage A/B rollout windows",
+    )
+    train.add_argument(
+        "--language-sft-token-fraction", type=float, default=0.20,
+        help="fraction of estimated training tokens from language_sft (default: 0.20)",
+    )
+    train.add_argument(
+        "--language-sft-max-prompt-tokens", type=int, default=1024,
+        help="exclude overlong language_sft prompts before mixing",
+    )
+    train.add_argument(
         "--validation-data",
         help=(
             "optional held-out trajectory JSONL; when omitted, validation examples are "
@@ -4738,6 +4785,18 @@ def main() -> None:
         help="run Stage B full-parameter diffusion-backbone training with FSDP FULL_SHARD",
     )
     train_full.add_argument("--data", required=True)
+    train_full.add_argument(
+        "--language-sft-data",
+        help="v1.2 Display-only language JSONL mixed into Stage A/B rollout windows",
+    )
+    train_full.add_argument(
+        "--language-sft-token-fraction", type=float, default=0.20,
+        help="fraction of estimated training tokens from language_sft (default: 0.20)",
+    )
+    train_full.add_argument(
+        "--language-sft-max-prompt-tokens", type=int, default=1024,
+        help="exclude overlong language_sft prompts before mixing",
+    )
     train_full.add_argument(
         "--validation-data",
         help=(

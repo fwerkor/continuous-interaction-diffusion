@@ -1,7 +1,7 @@
 from __future__ import annotations
 
 from collections.abc import Callable
-from dataclasses import dataclass
+from dataclasses import dataclass, fields
 
 import torch
 from torch import Tensor
@@ -80,6 +80,7 @@ class CIDTargets:
     link_target_embeddings: Tensor
     link_mask: Tensor
     display_answer_ids: Tensor | None = None
+    display_only_mask: Tensor | None = None
     display_answer_position_mask: Tensor | None = None
 
 
@@ -129,6 +130,21 @@ def cid_loss(
     if batch_mask.shape != (output.thought_semantic.shape[0],):
         raise ValueError("CID loss batch_mask must have shape [batch]")
     batch_mask = batch_mask.bool()
+    if targets.display_only_mask is not None:
+        only = targets.display_only_mask.bool()
+        if only.shape != batch_mask.shape:
+            raise ValueError("display-only supervision mask must match batch")
+        if bool(only.any()):
+            if bool((~only & batch_mask).any()):
+                raise ValueError("CID and language_sft must be in separate microbatches")
+            display_mask = _with_batch_mask(targets.display_ids != -100, batch_mask)
+            display = _masked_cross_entropy(
+                output.display_logits, targets.display_ids, display_mask, batch_mask=batch_mask
+            )
+            zero = display * 0.0
+            components = {field.name: zero for field in fields(CIDLoss)}
+            components.update(total=w.display * display, display=display)
+            return CIDLoss(**components)
 
     thought_mask = _with_batch_mask(targets.thought_mask, batch_mask)
     allocation_mask = _with_batch_mask(targets.allocation_mask, batch_mask)

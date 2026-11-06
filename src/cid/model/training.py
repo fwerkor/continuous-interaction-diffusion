@@ -254,6 +254,7 @@ class CIDRolloutWindow:
     source_steps: tuple[int, ...]
     loss_weight: float = 1.0
     is_padding: bool = False
+    is_language_sft: bool = False
 
     def __post_init__(self) -> None:
         if not self.source_steps:
@@ -337,6 +338,15 @@ def collate_training_steps(
         allocation_targets=_pad_slot_targets(steps, "allocation_targets"),
         allocation_mask=_pad_slot_targets(steps, "allocation_mask"),
         display_ids=display_labels,
+        display_only_mask=torch.tensor(
+            [
+                bool(step.targets.display_only_mask.item())
+                if step.targets.display_only_mask is not None else False
+                for step in steps
+            ],
+            device=steps[0].batch.thought_semantic.device,
+            dtype=torch.bool,
+        ),
         display_answer_ids=(
             _pad_2d(
                 tuple(step.targets.display_answer_ids for step in steps),
@@ -1210,6 +1220,8 @@ class CIDTrainer:
         if len(loss_weights) != 1:
             raise ValueError("rollout micro-batch windows must have the same loss_weight")
         loss_weight = next(iter(loss_weights))
+        if len({window.is_language_sft for window in windows}) != 1:
+            raise ValueError("CID and language_sft require separate microbatches")
 
         rollout_states: list[CIDRolloutState | None] = [None] * len(windows)
         failed_rollout_rows = [False] * len(windows)
@@ -2429,9 +2441,9 @@ class CIDTrainer:
         if preserve_order:
             microbatches: list[tuple[CIDRolloutWindow, ...]] = []
             current: list[CIDRolloutWindow] = []
-            current_key: tuple[int, float] | None = None
+            current_key: tuple[int, float, bool] | None = None
             for window in windows:
-                key = (len(window.source_steps), window.loss_weight)
+                key = (len(window.source_steps), window.loss_weight, window.is_language_sft)
                 if current and (key != current_key or len(current) >= self.config.micro_batch_size):
                     microbatches.append(tuple(current))
                     current = []
@@ -2441,9 +2453,9 @@ class CIDTrainer:
                 microbatches.append(tuple(current))
             return microbatches
 
-        buckets: dict[tuple[int, float], list[CIDRolloutWindow]] = {}
+        buckets: dict[tuple[int, float, bool], list[CIDRolloutWindow]] = {}
         for window in windows:
-            key = (len(window.source_steps), window.loss_weight)
+            key = (len(window.source_steps), window.loss_weight, window.is_language_sft)
             buckets.setdefault(key, []).append(window)
         microbatches = []
         for key in sorted(buckets):
@@ -3709,6 +3721,14 @@ class ILLaDATrajectoryTensorizer:
         if rollout_denoising_steps <= 0:
             raise ValueError("rollout_denoising_steps must be positive")
         target_step = source_step + 1
+        language_only = bool(example.metadata.get("cid_language_sft", False))
+        if language_only and (
+            source_step != -1
+            or example.thought_targets
+            or example.events
+            or example.binding_targets
+        ):
+            raise ValueError("language_sft must have no Thought/TCT or tool trajectory")
         transition = self._teacher_runtime_transition(example, source_step)
         current = transition.current
 
@@ -3861,8 +3881,13 @@ class ILLaDATrajectoryTensorizer:
         target_display = self._display_text(example, supervision_step)
         target_text_ids = self._encode_display_text(target_display)
         native_full_text = (
-            self._native_full_display_reference(example, supervision_step, target_display)
-            if self.adapter.config.backbone_protocol == "lfm-native" else None
+            (
+                target_display
+                if language_only
+                else self._native_full_display_reference(example, supervision_step, target_display)
+            )
+            if self.adapter.config.backbone_protocol == "lfm-native"
+            else None
         )
         native_full_ids = (
             self._encode_display_text(native_full_text + "\n[/Answer]")
@@ -3919,7 +3944,7 @@ class ILLaDATrajectoryTensorizer:
         display_supervision_mask = torch.zeros_like(target_display_ids, dtype=torch.bool)
         display_supervision_mask[:, : realized_tokens + 1] = True
 
-        if rollout_state is None and source_step == -1:
+        if rollout_state is None and source_step == -1 and not language_only:
             # The virtual bootstrap transition must match inference exactly: an empty
             # TCT plus one unresolved Display token followed by EOS, with the rest of
             # the physical canvas kept as latent capacity.  Corrupting the teacher's
@@ -4257,6 +4282,10 @@ class ILLaDATrajectoryTensorizer:
             dtype=dtype,
             device=device,
         )
+        if language_only:
+            targets.display_only_mask = torch.ones(1, device=device, dtype=torch.bool)
+            targets.display_answer_ids = None
+            targets.display_answer_position_mask = None
         return CIDTrainingStep(
             example_id=example.example_id,
             source_step=source_step,
@@ -5044,7 +5073,7 @@ class ILLaDATrajectoryTensorizer:
         relation_order = tuple(LinkRelation)
         object_order = tuple(ObjectKind)
         freshness_order = tuple(FreshnessDemand)
-        final_step = max(target.step for target in example.thought_targets)
+        final_step = max((target.step for target in example.thought_targets), default=target_step)
         runtime_cell_slots = {
             cell_id: slot
             for slot, cell_id in enumerate(input_runtime_cell_ids)
@@ -5591,6 +5620,8 @@ class ILLaDATrajectoryTensorizer:
 
         capacity = self._trajectory_thought_capacity(example)
         steps = sorted({target.step for target in example.thought_targets})
+        if not steps and example.metadata.get("cid_language_sft"):
+            steps = [0]
         if not steps or steps[0] != 0 or steps != list(range(steps[-1] + 1)):
             raise ValueError("thought trajectory steps must be contiguous and start at zero")
 
@@ -6222,7 +6253,8 @@ def shard_transitions(
 
 
 def _stage_b_rollout_bucket_key(window: CIDRolloutWindow) -> str:
-    return f"{len(window.source_steps)}:{float(window.loss_weight).hex()}"
+    key = f"{len(window.source_steps)}:{float(window.loss_weight).hex()}"
+    return key + (":language_sft" if window.is_language_sft else "")
 
 
 def stage_b_consumed_windows_by_bucket(
@@ -6306,13 +6338,13 @@ def shard_rollout_windows(
     local_microbatches: list[tuple[CIDRolloutWindow, ...]] = []
     portable_bucket_microbatches: list[list[tuple[CIDRolloutWindow, ...]]] = []
     resume_repair_microbatches: list[tuple[CIDRolloutWindow, ...]] = []
-    buckets: dict[tuple[int, float], list[CIDRolloutWindow]] = {}
+    buckets: dict[tuple[int, float, bool], list[CIDRolloutWindow]] = {}
     for window in windows:
-        key = (len(window.source_steps), window.loss_weight)
+        key = (len(window.source_steps), window.loss_weight, window.is_language_sft)
         buckets.setdefault(key, []).append(window)
     indexed_keys = list(enumerate(sorted(buckets)))
     for bucket_index, key in indexed_keys:
-        length, loss_weight = key
+        length, loss_weight, _language_only = key
         bucket = buckets[key]
         if shuffle:
             random.Random(seed + epoch * 1009 + length * 100_003 + bucket_index).shuffle(bucket)
@@ -6622,9 +6654,9 @@ def stage_b_optimizer_steps_per_epoch(
     ) -> tuple[tuple[CIDRolloutWindow, ...], ...]:
         batches: list[tuple[CIDRolloutWindow, ...]] = []
         current: list[CIDRolloutWindow] = []
-        current_key: tuple[int, float] | None = None
+        current_key: tuple[int, float, bool] | None = None
         for window in local_windows:
-            key = (len(window.source_steps), window.loss_weight)
+            key = (len(window.source_steps), window.loss_weight, window.is_language_sft)
             if current and (key != current_key or len(current) >= micro_batch_size):
                 batches.append(tuple(current))
                 current = []

@@ -40,9 +40,43 @@ CID supports an isolated Display-only pass on a frozen checkpoint:
 This updates the Display output adapter only and leaves TCT, Thought, tools,
 convergence, and the backbone frozen. It does not supervise or train TCT.
 
-The recommended future Stage A/B mixing target is 80% original CID tokens
-and 20% language_sft tokens. This mixing is NOT automatically integrated
-into Stage A/B in the current code; train-display remains a separate pass.
+Stage A and B now support training the same CID adapter and backbone with
+an 80/20 language mixture. Both commands accept:
+
+    --language-sft-data path/to/language-sft-train.jsonl
+    --language-sft-token-fraction 0.20
+    --language-sft-max-prompt-tokens 1024
+
+For example, append these flags to an existing `cid train` or
+`cid train-full` command. Other CID v1.1 flags and rollout logic remain
+unchanged. The language-only examples create empty TCT inputs (no teacher
+cognitive state) and supervise only Display CE. They do not train
+Thought/TCT/tool/convergence losses; the normal CID windows continue to train
+all their objectives.
+
+The mixture uses the shared, deterministic v5 sharding and optimizer
+accumulation logic. Language and CID examples have distinct buckets and never
+share a physical micro-batch, so each rank runs the same loss path in each
+distributed step. Checkpoints include the CID manifest checksum, language data
+checksum, and mixture configuration in their combined dataset identity.
+The original CID-only checkpoint identity remains backward compatible.
+Changing the language data or its sampling fraction requires a new optimizer
+run, while resuming with the same contract replays the same windows.
+
+The current mixture target is **estimated tokens**: original CID rollout
+windows have compact prompt-plus-Display character-length indexes (estimated
+at four characters/token, multiplied by supervised rollout offsets);
+language_sft records are validated with the model tokenizer but budgeted using
+the same character conversion. The reported ratio is therefore a reproducible
+approximation, not an exact measured tokenizer-token fraction. This avoids
+re-tokenizing the full multi-gigabyte CID dataset on every FSDP rank.
+The Stage B learning-rate schedule includes the additional language windows.
+Use the held-out language_sft validation JSONL for separate fluency metrics;
+existing CID runtime validation remains separate and comparable to v1.1.
+
+For native LFM protocols, full language responses train the native Display
+reply sequence. The loss does not fabricate the short-answer auxiliary target
+used for ordinary CID v1.1 tool trajectories.
 
 For legacy CID v1.1 factual short answers, the native model falls back
 to factual answer-span supervision; it does not invent full language
