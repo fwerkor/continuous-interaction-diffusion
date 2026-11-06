@@ -86,7 +86,8 @@ def test_native_neutral_logits_match_original_without_extra_eos_mask() -> None:
             return_dict=True,
         ).last_hidden_state
         original_logits = adapter.output_embeddings(native_hidden[:, -3:])
-    torch.testing.assert_close(output.display_logits[:, :-1], original_logits, rtol=0, atol=0)
+    # CPU attention kernels may reorder reductions across supported PyTorch versions.
+    torch.testing.assert_close(output.display_logits[:, :-1], original_logits, rtol=1e-5, atol=5e-6)
     assert adapter.backbone.lfm2.last_inputs_embeds.shape[1] == original_ids.shape[1]
 
 
