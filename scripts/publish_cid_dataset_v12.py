@@ -43,37 +43,33 @@ def main() -> None:
 
     anonymous = HfApi(token=False)
     repo = anonymous.repo_info(args.repo_id, repo_type="dataset")
-    tree = {item.path: item for item in anonymous.list_repo_tree(
-        args.repo_id, repo_type="dataset", recursive=True,
-    )}
+    tree = {
+        item.path: item
+        for item in anonymous.list_repo_tree(
+            args.repo_id,
+            repo_type="dataset",
+            recursive=True,
+        )
+    }
     base_path = release["base"]["path"]
     base_entry = tree.get(base_path)
     base_lfs = getattr(base_entry, "lfs", None)
     if base_lfs is None or base_lfs.sha256 != release["base"]["sha256"]:
         raise ValueError("HF v1.1 base is missing or its LFS SHA256 has changed")
 
-    announcement = (
-        "\n\n## v1.2 — Display-only language SFT\n\n"
-        "CID-Dataset v1.2 preserves all 422,230 original CID trajectories. "
-        "It adds 48,000 instruction/response examples under "
-        "`components/language-sft/` (46,560 train; 1,440 validation) "
-        "covering conversation, knowledge, writing, summarization, coding, "
-        "mathematics, instruction following, and multilingual tasks.\n\n"
-        "Language examples supervise only Display and contain no TCT, "
-        "Thought or tool targets. Training supports an optional 80/20 "
-        "**estimated token** mixture via the CID `train` and `train-full` "
-        "`--language-sft-data` flags; see the CID code repository for "
-        "exact behavior and resume requirements.\n\n"
-        "The new component's schema, source revisions, upstream licenses, "
-        "counts and checksums are in "
-        "`components/language-sft/language-sft-v1.2.manifest.json`. "
-        "Consult the upstream source notices when reusing the data.\n"
-    )
-    remote_readme = Path(hf_hub_download(
-        repo_id=args.repo_id, filename="README.md",
-        repo_type="dataset", token=False,
-    )).read_text(encoding="utf-8")
-    if "## v1.2 — Display-only language SFT" in remote_readme:
+    release_notes = (root / "README.md").read_text(encoding="utf-8")
+    if not release_notes.startswith("# CID-Dataset v1.2"):
+        raise ValueError("expanded release README does not describe v1.2")
+    announcement = "\n\n" + release_notes.replace("# CID-Dataset v1.2", "## CID-Dataset v1.2", 1)
+    remote_readme = Path(
+        hf_hub_download(
+            repo_id=args.repo_id,
+            filename="README.md",
+            repo_type="dataset",
+            token=False,
+        )
+    ).read_text(encoding="utf-8")
+    if "## CID-Dataset v1.2" in remote_readme:
         raise ValueError("v1.2 announcement already present; verify remote release before retrying")
     expected_uploads = [*expected, additions["manifest"], "RELEASE-MANIFEST-v1.2.json"]
     collisions = [item for item in expected_uploads if item in tree]
@@ -92,10 +88,12 @@ def main() -> None:
         CommitOperationAdd(path_in_repo=relative, path_or_fileobj=str(root / relative))
         for relative in expected_uploads
     ]
-    operations.append(CommitOperationAdd(
-        path_in_repo="README.md",
-        path_or_fileobj=(remote_readme + announcement).encode("utf-8"),
-    ))
+    operations.append(
+        CommitOperationAdd(
+            path_in_repo="README.md",
+            path_or_fileobj=(remote_readme + announcement).encode("utf-8"),
+        )
+    )
     commit = api.create_commit(
         args.repo_id,
         repo_type="dataset",
@@ -106,7 +104,9 @@ def main() -> None:
     print(f"commit={commit.oid} url={commit.commit_url}")
     try:
         api.create_tag(
-            args.repo_id, tag="v1.2", revision=commit.oid,
+            args.repo_id,
+            tag="v1.2",
+            revision=commit.oid,
             repo_type="dataset",
         )
         print("tag=v1.2")

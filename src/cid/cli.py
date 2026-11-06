@@ -1919,7 +1919,7 @@ def _train_stage_a(args: argparse.Namespace) -> None:
     import torch
     import torch.distributed as dist
 
-    from cid.language_mix import mix_language_rollout_windows, mixed_dataset_identity
+    from cid.language_mix import mixed_dataset_identity, prepare_language_mix
     from cid.model import (
         CIDTrainer,
         CIDTrainerConfig,
@@ -1973,6 +1973,9 @@ def _train_stage_a(args: argparse.Namespace) -> None:
     combined_dataset_sha256, _language_manifest = mixed_dataset_identity(
         dataset_manifest.sha256, mix_data,
         token_fraction=mix_fraction, max_prompt_tokens=mix_prompt_cap,
+        max_display_tokens=args.max_display_tokens, model_identity=args.model,
+        sampling_seed=args.seed, rollout_horizon=args.rollout_horizon,
+        max_examples=args.max_examples,
     )
     validate_neural_training_contract(
         dataset_manifest,
@@ -2346,13 +2349,16 @@ def _train_stage_a(args: argparse.Namespace) -> None:
         windows = balance_rollout_windows_by_semantic_task(
             trajectory_rollout_windows(examples, max_horizon=args.rollout_horizon)
         )
+        language_plan = None
         if mix_data:
-            windows, mixed_report = mix_language_rollout_windows(
+            language_plan = prepare_language_mix(
                 windows, mix_data, tokenizer,
                 token_fraction=mix_fraction, max_prompt_tokens=mix_prompt_cap,
                 max_display_tokens=args.max_display_tokens, seed=args.seed,
                 backbone_protocol=args.backbone_protocol,
+                cid_data_path=args.data, cid_sha256=dataset_manifest.sha256,
             )
+            windows, mixed_report = language_plan.for_epoch(1)
             if rank == 0:
                 print("language_sft " + json.dumps(mixed_report, sort_keys=True), flush=True)
         if not windows:
@@ -2435,6 +2441,13 @@ def _train_stage_a(args: argparse.Namespace) -> None:
             trainer.state.optimizer_steps // args.checkpoint_every_steps + 1
         ) * args.checkpoint_every_steps
         for epoch in range(first_epoch, args.epochs + 1):
+            if language_plan is not None:
+                windows, mixed_report = language_plan.for_epoch(epoch)
+                if rank == 0:
+                    print(
+                        "language_sft " + json.dumps(mixed_report, sort_keys=True),
+                        flush=True,
+                    )
             epoch_base_consumed: dict[str, int] = {}
             if epoch == first_epoch and args.resume:
                 if resume_epoch_progress is not None:
@@ -2580,6 +2593,7 @@ def _train_stage_a(args: argparse.Namespace) -> None:
                 current_total_windows: int = total_local_windows,
                 current_epoch_shard=epoch_shard,
                 current_base_consumed=epoch_base_consumed,
+                current_epoch_windows=windows,
             ) -> None:
                 nonlocal next_checkpoint_step
                 interval_transitions = progress.transitions
@@ -2628,7 +2642,7 @@ def _train_stage_a(args: argparse.Namespace) -> None:
                     # its peers advance to different collectives and NCCL sequences diverge.
                     checkpoint = output_dir / "stage-a-latest.pt"
                     consumed_by_bucket = stage_b_consumed_windows_by_bucket(
-                        windows,
+                        current_epoch_windows,
                         current_epoch_shard,
                         local_windows_seen=progress.rollout_windows_seen_in_epoch,
                         world_size=world_size,
@@ -3015,7 +3029,7 @@ def _train_stage_b(args: argparse.Namespace) -> None:
     import torch
     import torch.distributed as dist
 
-    from cid.language_mix import mix_language_rollout_windows, mixed_dataset_identity
+    from cid.language_mix import mixed_dataset_identity, prepare_language_mix
     from cid.model import (
         CIDTrainer,
         CIDTrainerConfig,
@@ -3153,6 +3167,9 @@ def _train_stage_b(args: argparse.Namespace) -> None:
         combined_dataset_sha256, _language_manifest = mixed_dataset_identity(
             dataset_manifest.sha256, mix_data,
             token_fraction=mix_fraction, max_prompt_tokens=mix_prompt_cap,
+            max_display_tokens=args.max_display_tokens, model_identity=args.model,
+            sampling_seed=args.seed, rollout_horizon=args.rollout_horizon,
+            max_examples=args.max_examples,
         )
         validate_neural_training_contract(
             dataset_manifest,
@@ -3174,14 +3191,17 @@ def _train_stage_b(args: argparse.Namespace) -> None:
         windows = balance_rollout_windows_by_semantic_task(
             trajectory_rollout_windows(examples, max_horizon=args.rollout_horizon)
         )
+        language_plan = None
         if mix_data:
             tokenizer = load_cid_tokenizer(args.model)
-            windows, mixed_report = mix_language_rollout_windows(
+            language_plan = prepare_language_mix(
                 windows, mix_data, tokenizer,
                 token_fraction=mix_fraction, max_prompt_tokens=mix_prompt_cap,
                 max_display_tokens=args.max_display_tokens, seed=args.seed,
                 backbone_protocol=args.backbone_protocol,
+                cid_data_path=args.data, cid_sha256=dataset_manifest.sha256,
             )
+            windows, mixed_report = language_plan.for_epoch(1)
             if rank == 0:
                 print("language_sft " + json.dumps(mixed_report, sort_keys=True), flush=True)
         if not windows:
@@ -3240,7 +3260,11 @@ def _train_stage_b(args: argparse.Namespace) -> None:
             1,
             sum(
                 stage_b_optimizer_steps_per_epoch(
-                    windows,
+                    (
+                        language_plan.for_epoch(epoch)[0]
+                        if language_plan is not None
+                        else windows
+                    ),
                     world_size=world_size,
                     micro_batch_size=args.micro_batch_size,
                     gradient_accumulation_steps=gradient_accumulation_steps,
@@ -3495,6 +3519,13 @@ def _train_stage_b(args: argparse.Namespace) -> None:
 
         first_epoch = trainer.state.epochs_completed + 1
         for epoch in range(first_epoch, args.epochs + 1):
+            if language_plan is not None:
+                windows, mixed_report = language_plan.for_epoch(epoch)
+                if rank == 0:
+                    print(
+                        "language_sft " + json.dumps(mixed_report, sort_keys=True),
+                        flush=True,
+                    )
             epoch_base_consumed: dict[str, int] = {}
             if epoch == first_epoch and resume_epoch_progress is not None:
                 if int(resume_epoch_progress.get("epoch", epoch)) != epoch:
@@ -3552,6 +3583,7 @@ def _train_stage_b(args: argparse.Namespace) -> None:
                 current_total_windows: int = total_local_windows,
                 current_epoch_shard=epoch_shard,
                 current_base_consumed=epoch_base_consumed,
+                current_epoch_windows=windows,
             ) -> None:
                 nonlocal next_checkpoint_step, last_periodic_checkpoint
                 group_lrs = {
@@ -3624,7 +3656,7 @@ def _train_stage_b(args: argparse.Namespace) -> None:
                     )
                 else:
                     consumed_by_bucket = stage_b_consumed_windows_by_bucket(
-                        windows,
+                        current_epoch_windows,
                         current_epoch_shard,
                         local_windows_seen=progress.rollout_windows_seen_in_epoch,
                         world_size=world_size,

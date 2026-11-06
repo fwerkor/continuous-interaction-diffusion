@@ -1,86 +1,100 @@
 # CID-Dataset v1.2 — Language SFT
 
-The language_sft component extends CID-Dataset v1.1 without rewriting the
-original 422,230 CID training trajectories or altering tool and TCT semantics.
+CID-Dataset v1.2 preserves the 422,230 original v1.1 tool and TCT trajectories
+byte-for-byte and introduces a separately versioned `language_sft` split to
+restore natural-language fluency during Stage A/B optimization.
 
-## Corpus
+## Corpus and splits
 
-48,000 sampled instruction/response pairs across conversation (20%),
-knowledge (20%), writing (15%), summarization (10%), coding (10%),
-mathematics (10%), instruction following (10%), and multilingual (5%).
-Train: 46,560. Validation: 1,440. Samples are source-aware and deduplicated.
+The release targets approximately 300,000 unique instruction-response examples.
+The release manifest records exact train/validation counts, SHA256, source
+revisions, category distribution, and rejected examples. The categories cover
+conversation, knowledge, writing, summarization, coding, mathematics,
+instruction following, and multilingual interactions. Category ceilings
+prevent one domain from overwhelming the corpus while allowing the actual
+distribution to follow the supply of eligible licensed data.
 
-Upstream sources, pinned revisions, counts, licenses and data SHA256 hashes
-are listed in components/language-sft/language-sft-v1.2.manifest.json.
-Sources: Tülu 3 SFT mixture (dataset-level ODC-BY, observe upstream notices),
-UltraChat 200k (MIT), OASST1 (Apache-2.0), GSM8K (MIT).
+Sources include the pinned Tülu 3 SFT mixture (dataset-level ODC-BY; review
+upstream notices), UltraChat 200k (MIT), and previously accepted v1.2
+OASST1 (Apache-2.0) and GSM8K (MIT) examples. An additional
+Apache-2.0 Aya Dataset supplement supplies multilingual coverage. Answers containing internal
+Thought, TCT, or runtime transport markers are rejected.
 
-Each example explicitly enables Display supervision and disables
-Thought, TCT, and tools. No TCT labels, tool calls, or event traces are
-invented for language-only data. Schema validation rejects them.
+All records use `cid-language-sft-v1` and supervise **Display only**.
+There are no Thought/TCT labels, tool calls, or fabricated cognitive traces.
+The expanded corpus deduplicates by normalized prompt, including across
+training/validation. Validation examples take precedence when a previous
+v1.2 training prompt collides with a held-out prompt.
 
-## Building
+## Building the expanded release
 
-Use scripts/prepare_language_sft_v12.py to sample source data, then
-scripts/finalize_language_sft_v12.py to add natural-language mathematical
-solutions and construct independent validation split.
+```sh
+python scripts/expand_language_sft_v12.py \
+  --existing /path/to/CID-Dataset-v1.2/components/language-sft \
+  --output-dir /path/to/CID-Dataset-v1.2-expanded/components/language-sft \
+  --target-total 300000 --seed 20261106
 
-Python dependency requirements: datasets, pyarrow, huggingface_hub.
+python scripts/complete_cid_dataset_v12_release.py \
+  --parent-dir /path/to/CID-Dataset-v1.2 \
+  --expanded-dir /path/to/CID-Dataset-v1.2-expanded
+```
 
-## Training
+Building requires the `datasets`, `pyarrow`, and `huggingface_hub`
+packages. Release metadata specifies source revisions for reproducibility.
 
-CID supports an isolated Display-only pass on a frozen checkpoint:
+## Stage A/B mixture
 
-    cid train-display --language-sft \
-      --data path/to/language-sft-train.jsonl \
-      --checkpoint path/to/cid-release \
-      --checkpoint-kind release \
-      --output-dir path/to/display-adapter
+Add the same flags to a normal `cid train` or `cid train-full` command:
 
-This updates the Display output adapter only and leaves TCT, Thought, tools,
-convergence, and the backbone frozen. It does not supervise or train TCT.
+```sh
+--language-sft-data /path/to/language-sft-train.jsonl \
+--language-sft-token-fraction 0.20 \
+--language-sft-max-prompt-tokens 1024
+```
 
-Stage A and B now support training the same CID adapter and backbone with
-an 80/20 language mixture. Both commands accept:
+Each model uses its own tokenizer. The primary 80/20 ratio counts the exact
+tokenized Prompt plus target Display (including the protocol's delimiter
+tokens), summed over CID supervised transitions. For CID indexed trajectories,
+the token accounting is cached by dataset/checkpoint identity, tokenizer
+vocabulary, protocol, and window selection under
+`~/.cache/cid/language-mix`. All distributed ranks reuse the same cache.
 
-    --language-sft-data path/to/language-sft-train.jsonl
-    --language-sft-token-fraction 0.20
-    --language-sft-max-prompt-tokens 1024
+The reported ratio is exact for these reference token sequences. The
+stochastic number of tokens masked and used by an individual diffusion
+optimizer step can differ. For this reason the trainer also reports the
+Display-reference token fraction separately.
 
-For example, append these flags to an existing `cid train` or
-`cid train-full` command. Other CID v1.1 flags and rollout logic remain
-unchanged. The language-only examples create empty TCT inputs (no teacher
-cognitive state) and supervise only Display CE. They do not train
-Thought/TCT/tool/convergence losses; the normal CID windows continue to train
-all their objectives.
+A deterministic per-epoch sampler draws language examples from the eligible
+corpus without replacement until the requested token budget is reached.
+Epoch-specific seeds broaden coverage while preserving reproducible
+checkpoint replay. At most two passes through the corpus are allowed; if the
+dataset cannot supply the requested budget, training fails with a
+descriptive error instead of silently repeating the same small set many times.
 
-The mixture uses the shared, deterministic v5 sharding and optimizer
-accumulation logic. Language and CID examples have distinct buckets and never
-share a physical micro-batch, so each rank runs the same loss path in each
-distributed step. Checkpoints include the CID manifest checksum, language data
-checksum, and mixture configuration in their combined dataset identity.
-The original CID-only checkpoint identity remains backward compatible.
-Changing the language data or its sampling fraction requires a new optimizer
-run, while resuming with the same contract replays the same windows.
+CID windows retain their original semantic-task importance weights. The
+language-only windows get a common scalar weight calibrated so they receive
+20% of the **nominal objective weight mass**. This stabilizes the relative
+contribution when language responses are much longer than CID answers.
+Nominal weight mass does not guarantee 20% of actual gradient magnitude.
 
-The current mixture target is **estimated tokens**: original CID rollout
-windows have compact prompt-plus-Display character-length indexes (estimated
-at four characters/token, multiplied by supervised rollout offsets);
-language_sft records are validated with the model tokenizer but budgeted using
-the same character conversion. The reported ratio is therefore a reproducible
-approximation, not an exact measured tokenizer-token fraction. This avoids
-re-tokenizing the full multi-gigabyte CID dataset on every FSDP rank.
-The Stage B learning-rate schedule includes the additional language windows.
-Use the held-out language_sft validation JSONL for separate fluency metrics;
-existing CID runtime validation remains separate and comparable to v1.1.
+Training uses the existing DDP/FSDP gradient accumulation and independent
+mode buckets. Language loss is Display cross-entropy only; CID trajectories
+continue to train all original losses. The Stage B learning-rate scheduler
+accounts for each epoch's separately sampled language windows.
 
-For native LFM protocols, full language responses train the native Display
-reply sequence. The loss does not fabricate the short-answer auxiliary target
-used for ordinary CID v1.1 tool trajectories.
+The mixed checkpoint fingerprint includes dataset SHA256, sampling version,
+model, seed, rollout horizon, example cap, Prompt limit, Display limit, and
+mixture ratio. A changed corpus or sampler configuration cannot silently
+resume a previous mixed optimizer state.
 
-For legacy CID v1.1 factual short answers, the native model falls back
-to factual answer-span supervision; it does not invent full language
-targets or refuse to train without metadata.native_full_display.
+The optional `cid train-display --language-sft` remains a separate
+Display-only adaptation on a frozen checkpoint. It is not required for
+Stage A/B mixing.
 
-No model-quality improvements are claimed without independent end-to-end
-tool correctness, Display fluency, and repetition benchmarks.
+## Evaluation
+
+Evaluate on the held-out language_sft validation set for fluency, instruction
+following, long-form responses, and repeated output. Independently measure
+CID tool correctness, TCT behavior, and runtime latency against v1.1.
+A 20% token budget alone does not establish improved model quality; model
+weights require independent training and evaluation.

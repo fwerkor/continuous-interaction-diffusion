@@ -6,7 +6,10 @@ import pytest
 
 torch = pytest.importorskip("torch")
 from cid.model.diffusion import CIDDiffusionScheduler  # noqa: E402
-from cid.model.display_revision import DisplayRevisionConfig, DisplayRevisionController  # noqa: E402
+from cid.model.display_revision import (  # noqa: E402
+    DisplayRevisionConfig,
+    DisplayRevisionController,
+)
 
 MASK, EOS, VOCAB = 62, 63, 64
 
