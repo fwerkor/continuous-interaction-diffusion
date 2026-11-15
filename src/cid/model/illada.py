@@ -38,7 +38,8 @@ def _chunked_illada_mlp_forward(module: nn.Module, x: torch.Tensor) -> torch.Ten
         output = module.down_proj(module.act_fn(module.gate_proj(chunk)) * module.up_proj(chunk))
         return dropout(output) if dropout is not None else output
 
-    if x.ndim != 3 or x.shape[1] <= chunk_size:
+    min_tokens = int(getattr(module, "_cid_mlp_chunk_min_tokens", 0))
+    if x.ndim != 3 or x.shape[1] <= max(chunk_size, min_tokens):
         return run_chunk(x)
     outputs = []
     for start in range(0, x.shape[1], chunk_size):
@@ -53,7 +54,8 @@ def _chunked_lfm2_mlp_forward(module: nn.Module, x: torch.Tensor) -> torch.Tenso
     def run_chunk(chunk: torch.Tensor) -> torch.Tensor:
         return module.w2(torch.nn.functional.silu(module.w1(chunk)) * module.w3(chunk))
 
-    if x.ndim != 3 or x.shape[1] <= chunk_size:
+    min_tokens = int(getattr(module, "_cid_mlp_chunk_min_tokens", 0))
+    if x.ndim != 3 or x.shape[1] <= max(chunk_size, min_tokens):
         return run_chunk(x)
     outputs = []
     for start in range(0, x.shape[1], chunk_size):
@@ -476,7 +478,12 @@ def _chunked_frozen_llada_moe_forward(
     backend = module._cid_moe_backend
     implementation = implementations[backend]
     chunk_size = int(getattr(module, "_cid_moe_chunk_size", 0))
-    if hidden_states.ndim != 3 or chunk_size <= 0 or hidden_states.shape[1] <= chunk_size:
+    min_tokens = int(getattr(module, "_cid_mlp_chunk_min_tokens", 0))
+    if (
+        hidden_states.ndim != 3
+        or chunk_size <= 0
+        or hidden_states.shape[1] <= max(chunk_size, min_tokens)
+    ):
         return implementation(module, hidden_states)
     return torch.cat(
         [
@@ -1032,12 +1039,14 @@ class ILLaDACIDAdapter(nn.Module):
         for attention in self._llada_moe_attention_modules:
             attention._cid_query_chunk_size = int(chunk_size)
 
-    def set_mlp_chunk_size(self, chunk_size: int | None) -> None:
+    def set_mlp_chunk_size(self, chunk_size: int | None, *, min_tokens: int = 0) -> None:
         """Chunk token-wise iLLaDA MLP evaluation without changing its function."""
         if chunk_size is None:
             return
         if chunk_size <= 0:
             raise ValueError("MLP chunk size must be positive")
+        if min_tokens < 0:
+            raise ValueError("MLP chunk minimum sequence length cannot be negative")
         if self.is_llada_moe:
             decoder = self.hidden_backbone()
             layers = getattr(decoder, "layers", None)
@@ -1047,6 +1056,7 @@ class ILLaDACIDAdapter(nn.Module):
                 moe = getattr(layer, "mlp", None)
                 if moe is not None and hasattr(moe, "experts"):
                     moe._cid_moe_chunk_size = int(chunk_size)
+                    moe._cid_mlp_chunk_min_tokens = int(min_tokens)
             return
         if self.backbone_family == "lfm2":
             decoder = self.hidden_backbone()
@@ -1058,6 +1068,7 @@ class ILLaDACIDAdapter(nn.Module):
                 if mlp is None or any(not hasattr(mlp, name) for name in ("w1", "w2", "w3")):
                     raise RuntimeError("LFM2 decoder layer does not expose the expected MLP")
                 mlp._cid_mlp_chunk_size = int(chunk_size)
+                mlp._cid_mlp_chunk_min_tokens = int(min_tokens)
                 mlp.forward = MethodType(_chunked_lfm2_mlp_forward, mlp)
             return
         decoder = self.hidden_backbone()
@@ -1077,6 +1088,7 @@ class ILLaDACIDAdapter(nn.Module):
             if mlp is None or any(not hasattr(mlp, name) for name in required):
                 raise RuntimeError("iLLaDA decoder layer does not expose the expected MLP")
             mlp._cid_mlp_chunk_size = int(chunk_size)
+            mlp._cid_mlp_chunk_min_tokens = int(min_tokens)
             mlp.forward = MethodType(_chunked_illada_mlp_forward, mlp)
 
     def set_norm_chunk_size(self, chunk_size: int | None) -> None:

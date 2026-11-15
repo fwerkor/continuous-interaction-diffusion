@@ -754,6 +754,8 @@ class CIDTrainer:
         stage_a_activation_offload_threshold_tokens: int = 512,
         stage_a_activation_offload_budget_bytes: int | None = None,
         stage_a_activation_offload_prefetch_depth: int = 2,
+        stage_a_small_tensor_offload_threshold_tokens: int = 0,
+        stage_a_small_tensor_offload_min_bytes: int = 64 * 1024,
         stage_a_async_activation_offload: bool = False,
         stage_a_async_gradient_reduction: bool = False,
         flatten_teacher_forcing_horizon: bool = False,
@@ -793,6 +795,16 @@ class CIDTrainer:
         )
         self.stage_a_activation_offload_prefetch_depth = int(
             stage_a_activation_offload_prefetch_depth
+        )
+        if stage_a_small_tensor_offload_threshold_tokens < 0:
+            raise ValueError("small-tensor offload threshold must be non-negative")
+        if stage_a_small_tensor_offload_min_bytes <= 0:
+            raise ValueError("small-tensor offload minimum bytes must be positive")
+        self.stage_a_small_tensor_offload_threshold_tokens = int(
+            stage_a_small_tensor_offload_threshold_tokens
+        )
+        self.stage_a_small_tensor_offload_min_bytes = int(
+            stage_a_small_tensor_offload_min_bytes
         )
         self.stage_a_async_activation_offload = bool(stage_a_async_activation_offload)
         self.stage_a_async_gradient_reduction = bool(stage_a_async_gradient_reduction)
@@ -848,6 +860,9 @@ class CIDTrainer:
         self._pending_gradient_example_ids: list[str] = []
         self._npu_cache_release_min_free_bytes = int(
             float(os.environ.get("CID_NPU_CACHE_RELEASE_MIN_FREE_GIB", "0")) * 1024**3
+        )
+        self._cuda_cache_release_min_free_bytes = int(
+            float(os.environ.get("CID_CUDA_CACHE_RELEASE_MIN_FREE_GIB", "0")) * 1024**3
         )
         if (
             getattr(self.forward_model, "_cid_stage_a_ddp", False)
@@ -995,6 +1010,21 @@ class CIDTrainer:
                 ),
                 flush=True,
             )
+
+    def _maybe_release_cuda_cache(self) -> None:
+        """Reclaim *unused* CUDA allocator blocks only when free VRAM is critically low."""
+        if self._cuda_cache_release_min_free_bytes <= 0:
+            return
+        device = self.tensorizer.text_encoder.device
+        if device.type != "cuda":
+            return
+        free, _ = torch.cuda.mem_get_info(device)
+        if free >= self._cuda_cache_release_min_free_bytes:
+            return
+        reserved = torch.cuda.memory_reserved(device)
+        allocated = torch.cuda.memory_allocated(device)
+        if reserved - allocated >= 256 * 1024**2:
+            torch.cuda.empty_cache()
 
     def _distributed_global_batch_size(self, local_rows: int) -> int:
         if local_rows < 0:
@@ -1393,6 +1423,7 @@ class CIDTrainer:
         # Reclaim before collation to leave room for both the batch and the
         # backbone's temporary NPU convolution workspaces.
         self._maybe_release_npu_cache()
+        self._maybe_release_cuda_cache()
         training_batch = collate_training_steps(
             samples,
             pad_token_id=int(self.pad_token_id),
@@ -1475,6 +1506,12 @@ class CIDTrainer:
                 for parameter in self.forward_model.parameters()
                 if parameter.device.type == accelerator_type
             }
+            min_saved_tensor_bytes = (
+                self.stage_a_small_tensor_offload_min_bytes
+                if self.stage_a_small_tensor_offload_threshold_tokens > 0
+                and sequence_tokens >= self.stage_a_small_tensor_offload_threshold_tokens
+                else 1024**2
+            )
             offload_budget_bytes = (
                 self.stage_a_activation_offload_budget_bytes
                 if self.stage_a_activation_offload_budget_bytes is not None
@@ -1493,7 +1530,7 @@ class CIDTrainer:
                     self._stage_a_activation_offloader = engine.AsyncPinnedActivationOffloader(
                         training_batch.batch.thought_semantic.device,
                         max_bytes=offload_budget_bytes,
-                        min_tensor_bytes=1024**2,
+                        min_tensor_bytes=min_saved_tensor_bytes,
                         prefetch_depth=self.stage_a_activation_offload_prefetch_depth,
                         requires_grad_only=True,
                     )
@@ -1502,6 +1539,7 @@ class CIDTrainer:
                 and self._stage_a_activation_offloader is not None
             ):
                 self._stage_a_activation_offloader.max_bytes = offload_budget_bytes
+                self._stage_a_activation_offloader.min_tensor_bytes = min_saved_tensor_bytes
                 if self._stage_a_activation_prefetch_controller is None:
                     engine = native_engine(capability="LayerActivationPrefetchController")
                     decoder = self.adapter.hidden_backbone()
@@ -1527,7 +1565,7 @@ class CIDTrainer:
                     if tensor.untyped_storage().data_ptr() in parameter_storages:
                         return tensor
                     tensor_bytes = tensor.numel() * tensor.element_size()
-                    if tensor_bytes < 1024**2:
+                    if tensor_bytes < min_saved_tensor_bytes:
                         return tensor
                     if offloaded_bytes + tensor_bytes > offload_budget_bytes:
                         return tensor
@@ -1622,9 +1660,20 @@ class CIDTrainer:
                     reducer.finish()
                     reducer_finished = True
                     self._stage_a_manual_sync_required = False
-        except BaseException:
+        except BaseException as exc:
             if reducer_started and not reducer_finished:
                 reducer.abort()
+            if (
+                stage_a_ddp
+                and accelerator_type == "cuda"
+                and isinstance(exc, torch.OutOfMemoryError)
+                and os.environ.get("CID_STAGE_A_FAIL_FAST_ON_CUDA_OOM") == "1"
+            ):
+                # torchrun terminates its peers on nonzero rank exit, instead of
+                # leaving them inside an unmatched collective until the watchdog.
+                rank = torch.distributed.get_rank()
+                print(f"CID_STAGE_A_FATAL_OOM rank={rank}: {exc}", flush=True)
+                os._exit(75)
             raise
         finally:
             self._stage_a_backward_cpu_stash_active = False

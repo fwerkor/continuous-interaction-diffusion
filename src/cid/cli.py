@@ -2127,7 +2127,11 @@ def _train_stage_a(args: argparse.Namespace) -> None:
         if args.mlp_chunk_size is not None:
             if args.mlp_chunk_size <= 0:
                 raise ValueError("--mlp-chunk-size must be positive")
-            adapter.set_mlp_chunk_size(args.mlp_chunk_size)
+            adapter.set_mlp_chunk_size(
+                args.mlp_chunk_size, min_tokens=args.mlp_chunk_min_tokens
+            )
+        elif args.mlp_chunk_min_tokens:
+            raise ValueError("--mlp-chunk-min-tokens requires --mlp-chunk-size")
         if args.norm_chunk_size is not None:
             if args.norm_chunk_size <= 0:
                 raise ValueError("--norm-chunk-size must be positive")
@@ -2231,6 +2235,12 @@ def _train_stage_a(args: argparse.Namespace) -> None:
             ),
             stage_a_activation_offload_prefetch_depth=(
                 args.stage_a_activation_offload_prefetch_depth
+            ),
+            stage_a_small_tensor_offload_threshold_tokens=(
+                args.stage_a_small_tensor_offload_threshold_tokens
+            ),
+            stage_a_small_tensor_offload_min_bytes=(
+                args.stage_a_small_tensor_offload_kib * 1024
             ),
             stage_a_async_activation_offload=args.stage_a_async_activation_offload,
             stage_a_async_gradient_reduction=args.stage_a_async_gradient_reduction,
@@ -4674,6 +4684,18 @@ def main() -> None:
         help="number of reverse-order saved activations prefetched during backward",
     )
     train.add_argument(
+        "--stage-a-small-tensor-offload-threshold-tokens",
+        type=int,
+        default=0,
+        help="on long inputs, also offload tensors below the usual 1 MiB saved-tensor threshold",
+    )
+    train.add_argument(
+        "--stage-a-small-tensor-offload-kib",
+        type=int,
+        default=64,
+        help="minimum tensor size in KiB for extra offload of long sequences",
+    )
+    train.add_argument(
         "--stage-a-async-activation-offload",
         action=argparse.BooleanOptionalAction,
         default=False,
@@ -4726,6 +4748,12 @@ def main() -> None:
         "--mlp-chunk-size",
         type=int,
         help="token chunk size for exact frozen-backbone MLP evaluation",
+    )
+    train.add_argument(
+        "--mlp-chunk-min-tokens",
+        type=int,
+        default=0,
+        help="use full-sequence MLP for inputs at or below this length; chunk only longer inputs",
     )
     train.add_argument(
         "--norm-chunk-size",

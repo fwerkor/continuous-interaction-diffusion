@@ -729,6 +729,30 @@ transition counts, scenario/distillation tags, source names, maximum trajectory 
 TCT capacity. This gives every training run a deterministic dataset identity independent of
 mutable filenames.
 
+### Stage A CUDA memory-safe execution
+
+For memory-constrained CUDA DDP training, use a length-sensitive MLP profile:
+
+- The --mlp-chunk-size=128 and --mlp-chunk-min-tokens=1536 options keep
+  shorter sequences in one MLP call and chunk only longer inputs.
+- A --stage-a-activation-offload-threshold-tokens=768 option avoids host
+  copies on common short inputs, while
+  --stage-a-activation-offload-budget-gib=32 allows more host storage.
+- The --stage-a-small-tensor-offload-threshold-tokens=1536 and
+  --stage-a-small-tensor-offload-kib=64 options move smaller saved
+  activations to host memory only for long sequences.
+- A --cpu-gradient-stash-threshold-tokens=1536 option keeps accumulated
+  gradients on GPU for short examples.
+- CID_CUDA_CACHE_RELEASE_MIN_FREE_GIB=0.75 optionally reclaims *unused*
+  allocator memory when available device memory is low.
+- CID_STAGE_A_FAIL_FAST_ON_CUDA_OOM=1 terminates a failed DDP rank
+  promptly on OOM, allowing torchrun to stop peers instead of waiting
+  for the NCCL watchdog. The runner must still resume a valid checkpoint.
+
+These execution settings leave the loss and checkpoint geometry
+unchanged. The pinned asynchronous Stage A activation offload option
+requires end-to-end gradient validation before production use.
+
 ## Stage 2 — joint T/Y refinement
 
 Unfreeze selected backbone blocks and optimize coupled thought/display denoising. The main training
