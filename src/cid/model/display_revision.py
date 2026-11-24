@@ -103,6 +103,7 @@ class DisplayRevisionController:
         revision_fraction: float,
         revision_margin: float,
         repetition_score_multiplier: float = 1.0,
+        max_reveals_per_step: int = 2,
     ) -> Tensor:
         """Retain native confidence reveal while allowing gated edits to visible tokens.
 
@@ -223,7 +224,10 @@ class DisplayRevisionController:
                     deferred_rows.add(row_index)
             self._evidence_changed = False
             filled = decoder.refine(
-                result, logits, repetition_score_multiplier=repetition_score_multiplier
+                result,
+                logits,
+                repetition_score_multiplier=repetition_score_multiplier,
+                max_reveals_per_step=max_reveals_per_step,
             )
             for row_index in deferred_rows:
                 # Do not immediately re-fill a token from logits computed for

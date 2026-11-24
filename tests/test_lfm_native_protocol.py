@@ -103,7 +103,8 @@ def test_native_thought_control_remains_available() -> None:
     assert active.need_logits.shape == inactive.need_logits.shape
 
 
-def test_native_decoder_reveals_exactly_one_token_and_uses_confidence() -> None:
+def test_native_decoder_reference_mode_reveals_exactly_one_token() -> None:
+    """Explicit K=1 retains the LiquidAI reference one-token reveal contract."""
     decoder = LFMNativeDisplayDecoder(NativeTokenizer(), mask_id=16, eos_id=7)
     display = torch.tensor([[16, 16, 16, 16, 7]])
     logits = torch.zeros((1, 5, 64))
@@ -112,9 +113,30 @@ def test_native_decoder_reveals_exactly_one_token_and_uses_confidence() -> None:
     logits[0, 2, 22] = 8
     logits[0, 3, 23] = 7
     logits[:, :, 16] = 30
-    out = decoder.refine(display, logits)
+    out = decoder.refine(display, logits, max_reveals_per_step=1)
     assert out.tolist() == [[16, 21, 16, 16, 7]]
     assert display.tolist() == [[16, 16, 16, 16, 7]]
+
+
+def test_native_decoder_default_reveals_top_confidence_budget() -> None:
+    """The default budget reveals several positions, highest confidence first."""
+    decoder = LFMNativeDisplayDecoder(NativeTokenizer(), mask_id=16, eos_id=7)
+    display = torch.tensor([[16, 16, 16, 16, 7]])
+    logits = torch.zeros((1, 5, 64))
+    logits[0, 0, 20] = 6
+    logits[0, 1, 21] = 12
+    logits[0, 2, 22] = 8
+    logits[0, 3, 23] = 7
+    logits[:, :, 16] = 30
+    # Default budget is 2: positions 1 (12) and 2 (8) are the top two.
+    out = decoder.refine(display, logits)
+    assert out.tolist() == [[16, 21, 22, 16, 7]]
+    # A budget wider than the MASK count is clamped, never overruns.
+    wide = decoder.refine(display, logits, max_reveals_per_step=99)
+    assert wide[0, :4].tolist() == [20, 21, 22, 23]
+    assert wide[0, -1].item() == 7
+    with pytest.raises(ValueError, match="max_reveals_per_step"):
+        decoder.refine(display, logits, max_reveals_per_step=0)
 
 
 def test_native_repetition_penalty_works_on_nonmonotonic_visible_tokens() -> None:
@@ -160,7 +182,7 @@ def test_native_rejects_nonterminal_eos_and_wrong_shapes() -> None:
         decoder.refine(torch.tensor([[16, 7]]), torch.zeros(1, 3, 64))
 
 
-def test_native_policy_materializes_one_reveal_per_cid_step() -> None:
+def test_native_policy_materializes_reveal_budget_per_cid_step() -> None:
     from cid.contracts import ModelContext
     from cid.model.materialize import CIDMaterializer, CIDMaterializerConfig
     from cid.model.policy import (
@@ -202,7 +224,8 @@ def test_native_policy_materializes_one_reveal_per_cid_step() -> None:
     update = policy.step(context)
     assert update.display.eos_token_id == 7
     assert update.display.token_ids[-1] == 7
-    assert update.display.unresolved == context.display.unresolved - 1
+    # The default native reveal budget resolves more than one cell per forward.
+    assert update.display.unresolved <= context.display.unresolved - 2
     assert update.display.token_ids != context.display.token_ids
 
 
