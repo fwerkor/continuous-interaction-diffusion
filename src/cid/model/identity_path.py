@@ -325,12 +325,15 @@ class IdentityPreservingPath(nn.Module):
             source_memory=batch.source_memory.to(dtype=dtype),
             source_padding_mask=batch.source_padding_mask,
         )
-        # A newly allocated Thought cell must survive at least one subsequent
-        # CID step before the runtime is permitted to converge. Otherwise the
-        # model may claim to "think" while finishing without any iteration.
-        result.convergence_logits = result.convergence_logits.masked_fill(
-            newly_allocated.any(dim=1), -20.0
-        )
+        # Runtime must take at least one more step after creating a Thought
+        # cell. Do not clamp the *training* convergence logit: a teacher
+        # transition may legitimately allocate a cell at its final step.
+        # Forcing -20 there made the positive BCE target unlearnable and
+        # severed the gradient to the convergence head.
+        if not self.training:
+            result.convergence_logits = result.convergence_logits.masked_fill(
+                newly_allocated.any(dim=1), -20.0
+            )
         if self.training:
             # The frozen native language path is an anchor, not merely an
             # initialization. Penalize excessive changes in hidden space and

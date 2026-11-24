@@ -363,3 +363,33 @@ def test_display_preservation_loss_is_trainable_and_neutral_when_inactive() -> N
     active.auxiliary_loss.backward()
     assert adapter.identity_path.display_gate.grad is not None
     assert torch.isfinite(adapter.identity_path.display_gate.grad).all()
+
+
+def test_training_convergence_on_new_thought_keeps_supervised_gradient() -> None:
+    # The teacher can both allocate a Thought and complete a trajectory.
+    # Training must learn that target; only live runtime requires an extra
+    # post-allocation step. A hard -20 training logit made this BCE impossible.
+    adapter = new_adapter().train()
+    batch = make_batch()
+    batch.slot_occupancy.zero_()
+    with torch.no_grad():
+        adapter.output_heads.allocation_head.weight.zero_()
+        adapter.output_heads.allocation_head.bias.fill_(10.0)
+        adapter.output_heads.convergence_head.weight.zero_()
+        adapter.output_heads.convergence_head.bias.zero_()
+    output = adapter(batch)
+    assert output.convergence_logits[0].item() > -19.0
+    loss = torch.nn.functional.binary_cross_entropy_with_logits(
+        output.convergence_logits,
+        torch.ones_like(output.convergence_logits),
+    )
+    loss.backward()
+    gradient = adapter.output_heads.convergence_head.bias.grad
+    assert gradient is not None
+    assert torch.isfinite(gradient).all()
+    assert gradient.abs().sum() > 0
+
+    adapter.eval()
+    with torch.no_grad():
+        runtime = adapter(batch)
+    assert runtime.convergence_logits[0].item() < -19.0
