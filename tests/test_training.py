@@ -1015,7 +1015,7 @@ def test_trajectory_tensorizer_rejects_display_that_exceeds_fixed_canvas() -> No
         tensorizer.tensorize(example, source_step=0, timestep=1.0)
 
 
-def test_trajectory_tensorizer_expands_display_to_coarse_bucket() -> None:
+def test_trajectory_tensorizer_expands_display_to_granular_bucket() -> None:
     adapter = ILLaDACIDAdapter(
         TinyBackbone(),
         ILLaDACIDConfig(
@@ -1034,10 +1034,31 @@ def test_trajectory_tensorizer_expands_display_to_coarse_bucket() -> None:
 
     sample = tensorizer.tensorize(example, source_step=0, timestep=1.0)
 
-    # 10 target tokens + EOS are rounded to a 16-token training bucket.
-    assert sample.batch.display_ids.shape[1] == 16
+    # 10 target tokens + EOS are rounded up to the next multiple of the base
+    # canvas (4) rather than doubled to 16. Doubling overshoots on long-form
+    # language rows and costs quadratic attention for unused cells.
+    assert sample.batch.display_ids.shape[1] == 12
     assert sample.targets.display_ids[0, 10] == tensorizer.eos_token_id
     assert (sample.targets.display_ids[0, 11:] == -100).all()
+
+
+def test_display_canvas_growth_is_tight_but_never_truncates() -> None:
+    """The canvas must always fit the target and never exceed the configured cap."""
+    adapter = ILLaDACIDAdapter(
+        TinyBackbone(),
+        ILLaDACIDConfig(
+            max_thought_slots=4,
+            max_display_tokens=32,
+            display_canvas_tokens=4,
+        ),
+        freeze_backbone=True,
+    )
+    tensorizer = ILLaDATrajectoryTensorizer(adapter, TinyTokenizer())
+    for length in range(1, 25):
+        canvas = tensorizer._display_canvas_size(length + 1, rollout_state=None)
+        assert canvas >= length + 1
+        assert canvas % 4 == 0 or canvas == 32
+        assert canvas <= 32
 
 
 def test_rollout_display_bucket_can_grow_but_never_shrinks() -> None:

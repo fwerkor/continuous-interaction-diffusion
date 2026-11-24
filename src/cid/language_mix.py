@@ -310,6 +310,89 @@ class LanguageMixPlan:
         return self.cid_windows + language_windows, report
 
 
+def _language_eligibility(
+    language_sft_path: str | Path,
+    tokenizer: Any,
+    *,
+    protocol: str,
+    max_prompt_tokens: int,
+    max_display_tokens: int,
+    cache_dir: str | Path | None,
+) -> dict[str, tuple[int, int]]:
+    """Tokenize each language example once and memoize the geometry filter.
+
+    The eligibility decision for a row depends only on the row text, the
+    tokenizer, the protocol, and the two token caps, yet tokenizing a large
+    corpus costs minutes on every process start. The result is cached by that
+    identity so restarts and resumes skip the scan entirely. Returns
+    ``example_id -> (input_and_display_tokens, display_tokens)`` for rows that
+    fit the Stage A/B geometry; rows absent from the mapping are the skipped
+    ones.
+    """
+    manifest = validate_language_sft(language_sft_path)
+    key = _sha256_json(
+        {
+            "version": MIX_VERSION,
+            "language_sft_sha256": manifest["sha256"],
+            "tokenizer": tokenizer_identity(tokenizer),
+            "protocol": protocol,
+            "max_prompt_tokens": int(max_prompt_tokens),
+            "max_display_tokens": int(max_display_tokens),
+        }
+    )
+    directory = Path(
+        cache_dir
+        or os.environ.get("CID_LANGUAGE_MIX_CACHE_DIR", Path.home() / ".cache/cid/language-mix")
+    )
+    directory.mkdir(parents=True, exist_ok=True)
+    cache = directory / f"cid-language-eligibility-{key}.json"
+    lock = directory / f"cid-language-eligibility-{key}.lock"
+    with lock.open("a+b") as handle:
+        fcntl.flock(handle, fcntl.LOCK_EX)
+        if cache.is_file():
+            try:
+                record = json.loads(cache.read_text(encoding="utf-8"))
+            except (OSError, json.JSONDecodeError):
+                record = None
+            if record is not None and record.get("key") == key:
+                return {
+                    str(name): (int(budget[0]), int(budget[1]))
+                    for name, budget in record["eligible"].items()
+                }
+        eligible: dict[str, tuple[int, int]] = {}
+        for record in iter_language_sft(language_sft_path):
+            prompt_tokens = _prompt_tokens(tokenizer, record.prompt, protocol)
+            answer_tokens = _token_count(
+                tokenizer,
+                record.answer + ("\n[/Answer]" if protocol == "lfm-native" else ""),
+            )
+            trailing = 0 if protocol == "lfm-native" else 1
+            if (
+                prompt_tokens > max_prompt_tokens
+                or answer_tokens < 1
+                or answer_tokens + trailing >= max_display_tokens
+            ):
+                continue
+            eligible[record.example_id] = (
+                prompt_tokens + answer_tokens + trailing,
+                answer_tokens + trailing,
+            )
+        tmp = cache.with_suffix(".tmp")
+        tmp.write_text(
+            json.dumps(
+                {
+                    "key": key,
+                    "examples": manifest["examples"],
+                    "eligible": {k: list(v) for k, v in sorted(eligible.items())},
+                },
+                sort_keys=True,
+            ),
+            encoding="utf-8",
+        )
+        tmp.replace(cache)
+        return eligible
+
+
 def prepare_language_mix(
     cid_windows: tuple[CIDRolloutWindow, ...],
     language_sft_path: str | Path,
@@ -341,23 +424,20 @@ def prepare_language_mix(
     )
     candidates = []
     skipped = 0
+    eligibility = _language_eligibility(
+        language_sft_path,
+        tokenizer,
+        protocol=backbone_protocol,
+        max_prompt_tokens=max_prompt_tokens,
+        max_display_tokens=max_display_tokens,
+        cache_dir=cache_dir,
+    )
     for record in iter_language_sft(language_sft_path):
-        prompt_tokens = _prompt_tokens(tokenizer, record.prompt, backbone_protocol)
-        answer_tokens = _token_count(
-            tokenizer,
-            record.answer + ("\n[/Answer]" if backbone_protocol == "lfm-native" else ""),
-        )
-        trailing = 0 if backbone_protocol == "lfm-native" else 1
-        if (
-            prompt_tokens > max_prompt_tokens
-            or answer_tokens < 1
-            or answer_tokens + trailing >= max_display_tokens
-        ):
+        budget = eligibility.get(record.example_id)
+        if budget is None:
             skipped += 1
             continue
-        candidates.append(
-            _Candidate(record, prompt_tokens + answer_tokens + trailing, answer_tokens + trailing)
-        )
+        candidates.append(_Candidate(record, budget[0], budget[1]))
     if not candidates:
         raise ValueError("no eligible language_sft records fit Stage A/B geometry")
     cid_mass = sum(

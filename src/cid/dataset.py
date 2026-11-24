@@ -2,6 +2,7 @@ from __future__ import annotations
 
 import hashlib
 import json
+import os
 from collections import Counter
 from dataclasses import dataclass
 from pathlib import Path
@@ -68,8 +69,89 @@ class DatasetManifest:
         }
 
 
+def _manifest_cache_dir() -> Path | None:
+    """Content-identity cache directory for full-dataset scans.
+
+    A full ``inspect_dataset`` pass hashes and JSON-parses the entire corpus
+    (minutes on multi-GB trajectory files) yet its result only depends on the
+    file's bytes. Restarting or resuming a run therefore repeated identical
+    work. The cache is keyed by (resolved path, size, mtime, inode) and stores
+    the manifest, so a hit is only possible when the file is literally
+    unchanged. Set ``CID_DATASET_CACHE_DIR=""`` to disable.
+    """
+    configured = os.environ.get("CID_DATASET_CACHE_DIR")
+    if configured is not None and not configured.strip():
+        return None
+    return Path(configured or (Path.home() / ".cache/cid/dataset-manifest"))
+
+
+def _file_identity(source: Path) -> dict[str, Any] | None:
+    try:
+        stat = source.stat()
+    except OSError:
+        return None
+    return {
+        "path": str(source.resolve()),
+        "size": int(stat.st_size),
+        "mtime_ns": int(stat.st_mtime_ns),
+        "inode": int(stat.st_ino),
+    }
+
+
 def inspect_dataset(path: str | Path) -> DatasetManifest:
     source = Path(path)
+    cache_dir = _manifest_cache_dir()
+    identity = _file_identity(source) if cache_dir is not None else None
+    if cache_dir is None or identity is None:
+        return _inspect_dataset_uncached(source)
+    import fcntl
+
+    key = hashlib.sha256(
+        json.dumps(identity, sort_keys=True).encode("utf-8")
+    ).hexdigest()
+    cache_dir.mkdir(parents=True, exist_ok=True)
+    cache = cache_dir / f"manifest-{key}.json"
+    lock = cache_dir / f"manifest-{key}.lock"
+    with lock.open("a+b") as handle:
+        fcntl.flock(handle, fcntl.LOCK_EX)
+        if cache.is_file():
+            try:
+                record = json.loads(cache.read_text(encoding="utf-8"))
+            except (OSError, json.JSONDecodeError):
+                record = None
+            if record is not None and record.get("identity") == identity:
+                payload = record.get("manifest")
+                if isinstance(payload, dict):
+                    return _manifest_from_dict(payload)
+        manifest = _inspect_dataset_uncached(source)
+        tmp = cache.with_suffix(".tmp")
+        tmp.write_text(
+            json.dumps(
+                {"identity": identity, "manifest": manifest.to_dict()},
+                sort_keys=True,
+            ),
+            encoding="utf-8",
+        )
+        tmp.replace(cache)
+        return manifest
+
+
+def _manifest_from_dict(payload: dict[str, Any]) -> DatasetManifest:
+    """Rebuild a manifest with the exact field types ``inspect_dataset`` returns.
+
+    JSON round-trips tuples into lists and leaves numeric keys as strings, so the
+    container fields are normalized here. Without this, a cached manifest would
+    not compare equal to a freshly scanned one.
+    """
+    normalized = dict(payload)
+    normalized["tag_counts"] = {
+        str(key): int(value) for key, value in (payload.get("tag_counts") or {}).items()
+    }
+    normalized["sources"] = tuple(payload.get("sources") or ())
+    return DatasetManifest(**normalized)
+
+
+def _inspect_dataset_uncached(source: Path) -> DatasetManifest:
     digest = hashlib.sha256()
     byte_count = 0
     example_count = 0
