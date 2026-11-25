@@ -5682,3 +5682,61 @@ def test_training_checkpoint_refuses_legacy_need_display_supervision_but_inferen
             require_current_supervision=True,
         )
     trainer.load_checkpoint(saved)
+
+
+def test_streamed_indexed_rollouts_match_eager_parameter_updates(tmp_path, monkeypatch) -> None:
+    """Deferred JSONL reads preserve exact optimizer updates and cap live examples."""
+    base = make_rollout_trajectory()
+    examples = (
+        replace(base, example_id="stream-0"),
+        replace(base, example_id="stream-1"),
+        replace(base, example_id="stream-2"),
+    )
+    path = tmp_path / "train.jsonl"
+    dump_jsonl(examples, path)
+    indexed_examples = index_training_jsonl(path)
+    eager_windows = trajectory_rollout_windows(examples, max_horizon=2)
+    indexed_windows = trajectory_rollout_windows(indexed_examples, max_horizon=2)
+
+    config = CIDTrainerConfig(
+        learning_rate=1e-3, seed=19, micro_batch_size=2,
+        gradient_accumulation_steps=1, rollout_horizon=2,
+        teacher_forcing_epochs=1, timestep_min=0.3, timestep_max=0.3,
+    )
+    eager_adapter = make_adapter(seed=213)
+    eager = CIDTrainer(
+        eager_adapter,
+        ILLaDATrajectoryTensorizer(eager_adapter, TinyTokenizer()),
+        config,
+    )
+    expected = eager.train_rollout_windows(eager_windows, epochs=1, shuffle=False)
+
+    streamed_adapter = make_adapter(seed=213)
+    streamed = CIDTrainer(
+        streamed_adapter,
+        ILLaDATrajectoryTensorizer(streamed_adapter, TinyTokenizer()),
+        config,
+    )
+    # Require each read to contain at most one logical microbatch. The former
+    # CLI implementation loaded the full epoch (hundreds of GiB per rank).
+    original = cid_training.materialize_indexed_rollout_windows
+    sizes = []
+
+    def bounded_materialize(input_path, batch):
+        sizes.append(len(batch))
+        assert len(batch) <= config.micro_batch_size
+        return original(input_path, batch)
+
+    monkeypatch.setattr(cid_training, "materialize_indexed_rollout_windows", bounded_materialize)
+    actual = streamed.train_rollout_windows(
+        indexed_windows,
+        epochs=1, shuffle=False, indexed_data_path=path,
+    )
+    assert sizes and len(sizes) >= 2
+    assert actual.transitions == expected.transitions
+    assert actual.optimizer_steps == expected.optimizer_steps
+    assert actual.mean_loss == pytest.approx(expected.mean_loss, abs=1e-5)
+    assert streamed.state == eager.state
+    for name, weight in eager_adapter.named_parameters():
+        other = dict(streamed_adapter.named_parameters())[name]
+        torch.testing.assert_close(weight, other, atol=1e-5, rtol=1e-5)

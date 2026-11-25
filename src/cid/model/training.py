@@ -2113,6 +2113,7 @@ class CIDTrainer:
         physical_micro_batch_size: int | None = None,
         progress_every_optimizer_steps: int | None = None,
         progress_callback: Callable[[CIDTrainProgress], None] | None = None,
+        indexed_data_path: str | Path | None = None,
     ) -> CIDTrainReport:
         if epochs <= 0:
             raise ValueError("epochs must be positive")
@@ -2180,6 +2181,15 @@ class CIDTrainer:
                 windows, shuffle=shuffle, preserve_order=preserve_order
             )
             for microbatch_index, microbatch in enumerate(microbatches):
+                # Keep the shuffled rollout schedule as compact JSONL offsets.
+                # Materializing a complete 9GB trajectory dataset once per DDP
+                # rank inflated the 4-rank host working set beyond 390 GiB.
+                # The data consumed by each optimizer microbatch is identical,
+                # but only those examples remain live during its update.
+                if indexed_data_path is not None:
+                    microbatch = materialize_indexed_rollout_windows(
+                        indexed_data_path, microbatch
+                    )
                 (
                     loss_sum,
                     raw_loss_sum,

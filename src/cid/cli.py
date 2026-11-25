@@ -2592,7 +2592,8 @@ def _train_stage_a(args: argparse.Namespace) -> None:
                         f"windows_seen={resumed_windows}/{total_local_windows}",
                         flush=True,
                     )
-            local_windows = materialize_indexed_rollout_windows(args.data, local_windows)
+            # Preserve deterministic indexed rollout order; materialize only
+            # the current microbatch to prevent multi-rank host-memory OOM.
             rollout_probability = trainer.rollout_probability()
 
             def report_progress(
@@ -2683,6 +2684,7 @@ def _train_stage_a(args: argparse.Namespace) -> None:
                 physical_micro_batch_size=args.physical_micro_batch_size,
                 progress_every_optimizer_steps=args.log_every_steps,
                 progress_callback=report_progress,
+                indexed_data_path=args.data,
             )
 
             transition_count = report.transitions
@@ -3582,7 +3584,8 @@ def _train_stage_b(args: argparse.Namespace) -> None:
                     f"new_world_size={world_size} optimizer_steps={trainer.state.optimizer_steps}",
                     flush=True,
                 )
-            local_windows = materialize_indexed_rollout_windows(args.data, local_windows)
+            # Preserve deterministic indexed rollout order; materialize only
+            # the current microbatch to prevent multi-rank host-memory OOM.
             rollout_probability = trainer.rollout_probability()
 
             def report_progress(
@@ -3714,6 +3717,7 @@ def _train_stage_b(args: argparse.Namespace) -> None:
                 preserve_order=True,
                 progress_every_optimizer_steps=args.log_every_steps,
                 progress_callback=report_progress,
+                indexed_data_path=args.data,
             )
             aggregate = torch.tensor(
                 [
