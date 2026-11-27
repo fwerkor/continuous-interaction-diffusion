@@ -3848,6 +3848,22 @@ class ILLaDATrajectoryTensorizer:
                 )
             input_retired_at = rollout_state.retired_at
 
+        if language_only and self.adapter.config.backbone_protocol == "lfm-native":
+            # Preserve fluent expression *with an occupied Thought*, as runtime
+            # usually has one. A neutral SFT sample would instead use the
+            # frozen backbone exactly and give zero gradient to the Display
+            # correction branch. This input-only reasoning context carries
+            # no answer text and has no TCT/Thought supervision.
+            thought_semantic[0, 0] = self.text_encoder.encode_one(
+                "Plan: answer the user accurately and in fluent natural language.",
+                detach=True,
+            ).to(device=device, dtype=dtype)
+            occupancy[0, 0, 0] = 1.0
+            state_noise[0, 0, 0] = 0.0
+            uncertainty[0, 0, 0] = 0.0
+            lifecycle_features[0, 0, lifecycle_order.index(CellLifecycle.STABLE)] = 1.0
+            role_features[0, 0, role_order.index(CognitiveRole.PLAN)] = 1.0
+
         if self.scheduler.display_initialization == "preallocated" and rollout_state is None:
             # Quantize teacher corruption to the noise levels actually visited
             # by Runtime's discrete iterative reveal schedule.

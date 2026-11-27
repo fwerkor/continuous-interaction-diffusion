@@ -202,6 +202,10 @@ def test_language_tensorizer_and_gradient_are_display_only():
     step = tensorizer.tensorize(example, -1, timestep=0.65)
     assert step.targets.display_only_mask.tolist() == [True]
     assert step.targets.display_ids.ne(-100).any()
+    if adapter.config.backbone_protocol == "lfm-native":
+        assert step.batch.slot_occupancy[0, 0, 0].item() == 1
+        assert step.batch.thought_semantic[0, 0].abs().sum().item() > 0
+        assert not step.targets.thought_mask.any()
     batch = collate_training_steps((step,), pad_token_id=tokenizer.pad_token_id)
     output = adapter(batch.batch)
     losses = cid_loss(output, batch.targets)

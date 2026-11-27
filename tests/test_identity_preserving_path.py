@@ -393,3 +393,90 @@ def test_training_convergence_on_new_thought_keeps_supervised_gradient() -> None
     with torch.no_grad():
         runtime = adapter(batch)
     assert runtime.convergence_logits[0].item() < -19.0
+
+def test_native_neutral_display_loss_has_no_spurious_allocation_gradient() -> None:
+    adapter = LFMCIDAdapter(
+        TinyLFMBackbone(),
+        ILLaDACIDConfig(
+            max_thought_slots=8,
+            max_display_tokens=16,
+            interaction_architecture="identity-preserving",
+            backbone_protocol="lfm-native",
+            semantic_head_version=2,
+        ),
+        freeze_backbone=True,
+    ).train()
+    batch = make_batch()
+    batch.slot_occupancy.zero_()
+    batch.thought_semantic.zero_()
+    batch.display_ids[:, -1] = adapter.eos_token_id
+    result = adapter(batch)
+    native_logits = result.display_logits.detach().clone()
+    # Explicit zero dependency lets us backpropagate to a trainable anchor;
+    # no allocation/Display correction parameter should get a gradient.
+    loss = result.display_logits.float().square().mean() + 0.0 * adapter.identity_path.display_gate.sum()
+    loss.backward()
+    assert adapter.output_heads.allocation_head.weight.grad is None
+    assert adapter.output_heads.allocation_head.bias.grad is None
+    native_grad = adapter.identity_path.display_attention.out_proj.weight.grad
+    assert native_grad is None or native_grad.float().abs().sum() == 0
+
+    with torch.no_grad():
+        adapter.output_heads.allocation_head.bias.fill_(100.0)
+        changed = adapter(batch)
+    torch.testing.assert_close(changed.display_logits, native_logits, rtol=0, atol=0)
+
+
+def test_native_language_sft_trains_display_without_thought_targets() -> None:
+    from cid.data import TrajectoryExample
+    from cid.model.encoding import ILLaDATextEncoder
+    from cid.model.losses import cid_loss
+    from cid.model.training import ILLaDATrajectoryTensorizer
+    from test_stage_ab_language_mix import ToyTokenizer
+
+    class NativeToyTokenizer(ToyTokenizer):
+        all_special_ids = (0, 7, 16)
+        eos_token_id = 7
+        chat_template = "unit-test"
+
+        def __len__(self) -> int:
+            return 64
+
+        def apply_chat_template(self, messages, *, tokenize=False, add_generation_prompt=True):
+            return "User: " + messages[0]["content"] + "\nAssistant: "
+
+    adapter = LFMCIDAdapter(
+        TinyLFMBackbone(),
+        ILLaDACIDConfig(
+            max_thought_slots=8,
+            max_display_tokens=32,
+            display_canvas_tokens=16,
+            interaction_architecture="identity-preserving",
+            backbone_protocol="lfm-native",
+            semantic_head_version=2,
+        ),
+        freeze_backbone=True,
+    ).train()
+    tokenizer = NativeToyTokenizer()
+    tensorizer = ILLaDATrajectoryTensorizer(
+        adapter, tokenizer, text_encoder=ILLaDATextEncoder(adapter, tokenizer)
+    )
+    example = TrajectoryExample(
+        example_id="language_sft:native",
+        prompt="Hello",
+        target_display="Hi there",
+        metadata={"cid_language_sft": True},
+    )
+    step = tensorizer.tensorize(example, -1, timestep=0.5)
+    assert step.targets.display_only_mask.tolist() == [True]
+    assert step.batch.slot_occupancy[0, 0, 0].item() == 1
+    assert step.batch.thought_semantic[0, 0].abs().sum().item() > 0
+    assert not step.targets.thought_mask.any()
+    output = adapter(step.batch)
+    loss = cid_loss(output, step.targets)
+    loss.total.backward()
+    grad = adapter.identity_path.display_attention.out_proj.weight.grad
+    assert grad is not None and grad.float().abs().sum() > 0
+    assert adapter.output_heads.allocation_head.weight.grad is None
+    assert adapter.output_heads.allocation_head.bias.grad is None
+    assert loss.thought.item() == 0.0

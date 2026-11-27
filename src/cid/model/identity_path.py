@@ -302,9 +302,11 @@ class IdentityPreservingPath(nn.Module):
         )
         active_positions = base_evidence[:, None] | percept_evidence
         gate = active_positions.to(dtype=dtype).unsqueeze(-1)
-        if self.training:
-            # Straight-through gate lets language loss teach the controller
-            # when to initiate reasoning while preserving exact hard routing.
+        if self.training and adapter.config.backbone_protocol != "lfm-native":
+            # Legacy CID format permits differentiable same-step allocation.
+            # Native CID only uses a newly allocated Thought on the next
+            # iteration; letting a neutral language-only Display loss backprop
+            # through allocation here gives a gradient with no forward effect.
             soft_reason = torch.sigmoid(first.allocation_logits.float()).amax(dim=1)
             gate = gate + (
                 soft_reason - soft_reason.detach()
