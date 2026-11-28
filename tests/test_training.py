@@ -5740,3 +5740,37 @@ def test_streamed_indexed_rollouts_match_eager_parameter_updates(tmp_path, monke
     for name, weight in eager_adapter.named_parameters():
         other = dict(streamed_adapter.named_parameters())[name]
         torch.testing.assert_close(weight, other, atol=1e-5, rtol=1e-5)
+
+def test_streaming_replay_cache_cannot_alias_recycled_object_address(monkeypatch) -> None:
+    tensorizer = ILLaDATrajectoryTensorizer(make_adapter(), TinyTokenizer())
+    short = make_trajectory()
+    long = replace(make_rollout_trajectory(), example_id=short.example_id)
+
+    # Simulate CPython reusing an address after a streamed example is released.
+    # Even example_id may repeat, so identity must be tied to a live object.
+    monkeypatch.setattr(cid_training, "id", lambda _: 42, raising=False)
+    short_replay, _ = tensorizer._teacher_runtime_replay(short)
+    assert 1 not in short_replay
+    assert tensorizer._teacher_runtime_replay(short)[0] is short_replay
+    transition = tensorizer._teacher_runtime_transition(long, 1)
+    assert all(target.step == 2 for target in transition.target)
+    assert tensorizer._teacher_runtime_replay_cache[0] is long
+    assert tensorizer._teacher_runtime_replay(short)[0] is not short_replay
+
+
+def test_streaming_argument_catalog_cannot_alias_recycled_object_address(monkeypatch) -> None:
+    tensorizer = ILLaDATrajectoryTensorizer(make_adapter(), TinyTokenizer())
+    first = make_trajectory()
+    second = replace(
+        first,
+        binding_targets=(
+            replace(first.binding_targets[0], arguments={"key": "timeout", "scope": "staging"}),
+        ),
+    )
+    monkeypatch.setattr(cid_training, "id", lambda _: 42, raising=False)
+    first_catalog = tensorizer._runtime_argument_catalog(first)
+    assert tensorizer._runtime_argument_catalog(first) is first_catalog
+    second_catalog = tensorizer._runtime_argument_catalog(second)
+    assert second_catalog is not first_catalog
+    assert {candidate.value for candidate in second_catalog.arguments} == {"timeout", "staging"}
+    assert tensorizer._runtime_argument_catalog_cache[0] is second

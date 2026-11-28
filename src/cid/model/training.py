@@ -3759,10 +3759,10 @@ class ILLaDATrajectoryTensorizer:
             ) if adapter.config.backbone_protocol == "lfm-native" else None
         )
         self._runtime_argument_catalog_cache: (
-            tuple[int, ClosedWorldMaterializationCatalog] | None
+            tuple[TrajectoryExample, ClosedWorldMaterializationCatalog] | None
         ) = None
         self._teacher_runtime_replay_cache: (
-            tuple[int, dict[int, _TeacherRuntimeTransition], dict[str, str]] | None
+            tuple[TrajectoryExample, dict[int, _TeacherRuntimeTransition], dict[str, str]] | None
         ) = None
 
     def tensorize(
@@ -4738,9 +4738,8 @@ class ILLaDATrajectoryTensorizer:
     def _runtime_argument_catalog(
         self, example: TrajectoryExample
     ) -> ClosedWorldMaterializationCatalog:
-        cache_key = id(example)
         cached = self._runtime_argument_catalog_cache
-        if cached is not None and cached[0] == cache_key:
+        if cached is not None and cached[0] is example:
             return cached[1]
         arguments: list[ArgumentCandidate] = []
         seen: set[tuple[str, str, str]] = set()
@@ -4760,10 +4759,11 @@ class ILLaDATrajectoryTensorizer:
                     )
                 )
         catalog = ClosedWorldMaterializationCatalog(arguments=tuple(arguments))
-        # Production Stage A/B use micro-batch 1, so a one-entry cache eliminates repeated
-        # semantic encoding across every transition of a long rollout without retaining
-        # catalogs for the full 400k-example dataset.
-        self._runtime_argument_catalog_cache = (cache_key, catalog)
+        # Keep exactly one strong reference per cache. Streaming JSONL materialization
+        # releases trajectory objects between microbatches, so an integer id alone
+        # could identify an unrelated new object after CPython reuses its address.
+        # Object identity retains the cache benefit without unbounded dataset retention.
+        self._runtime_argument_catalog_cache = (example, catalog)
         return catalog
 
     @staticmethod
@@ -5688,9 +5688,10 @@ class ILLaDATrajectoryTensorizer:
     def _teacher_runtime_replay(
         self, example: TrajectoryExample
     ) -> tuple[dict[int, _TeacherRuntimeTransition], dict[str, str]]:
-        cache_key = id(example)
+        # The current example must stay alive while its replay is cached.
+        # An integer id is unsafe with streaming microbatch materialization.
         cached = self._teacher_runtime_replay_cache
-        if cached is not None and cached[0] == cache_key:
+        if cached is not None and cached[0] is example:
             return cached[1], cached[2]
 
         capacity = self._trajectory_thought_capacity(example)
@@ -5823,7 +5824,7 @@ class ILLaDATrajectoryTensorizer:
                 runtime_ids_by_teacher=dict(runtime_ids),
             )
 
-        self._teacher_runtime_replay_cache = (cache_key, transitions, runtime_ids)
+        self._teacher_runtime_replay_cache = (example, transitions, runtime_ids)
         return transitions, runtime_ids
 
     @staticmethod
