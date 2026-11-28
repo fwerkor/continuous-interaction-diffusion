@@ -1,8 +1,8 @@
 from __future__ import annotations
 
+import math
 from collections.abc import Callable
 from dataclasses import dataclass, fields
-import math
 
 import torch
 from torch import Tensor
@@ -206,29 +206,14 @@ def cid_loss(
             targets.display_answer_position_mask,
             batch_mask=batch_mask,
         )
-        complete = display_mask.any(dim=-1)
-        missing = batch_mask & targets.display_answer_ids.ne(-100).any(dim=-1) & ~complete
         completion_loss = _masked_cross_entropy(
             output.display_logits,
             targets.display_ids,
             display_mask,
             batch_mask=batch_mask,
         )
-        # Full replies train sequence-wide CE. Legacy short CID references
-        # supervise factual spans only; they must not impersonate whole
-        # sentences or make the v1.1 tool curriculum fail preflight.
-        if bool(missing.any()):
-            missing_span = _position_invariant_display_loss(
-                output.display_logits,
-                targets.display_answer_ids,
-                targets.display_answer_position_mask,
-                batch_mask=missing,
-            )
-            valid_rows = batch_mask.sum().clamp_min(1)
-            legacy_weight = missing.sum() / valid_rows
-            display = completion_loss + 0.1 * span_loss + 0.9 * legacy_weight * missing_span
-        else:
-            display = completion_loss + 0.1 * span_loss
+        # Legacy answer-only references are an auxiliary factual objective.
+        display = completion_loss + 0.1 * span_loss
     else:
         display = _masked_cross_entropy(
             output.display_logits,

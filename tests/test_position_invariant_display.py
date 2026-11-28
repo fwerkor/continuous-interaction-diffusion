@@ -134,18 +134,27 @@ def test_native_tensorizer_keeps_answer_out_of_teacher_input_and_loss() -> None:
         },
     )
     original = tensorizer.tensorize(example, source_step=-1, timestep=0.5)
-    same_answer = tensorizer.tensorize(example, source_step=0, timestep=0.5)
+    same_answer = tensorizer.tensorize(
+        example, source_step=0, timestep=0.5, generator=torch.Generator().manual_seed(123)
+    )
     for sample in (original, same_answer):
         full = tensorizer._encode_display_text(
             "37.\n[/Answer]"
         )
         length = full.shape[1]
-        assert torch.equal(sample.targets.display_ids[:, :length], full)
+        masked = sample.batch.display_ids[:, :length].eq(model.mask_token_id)
+        labels = sample.targets.display_ids[:, :length]
+        assert masked.any()
+        assert torch.equal(labels[masked], full[masked])
+        assert labels[~masked].eq(-100).all()
+        assert torch.equal(sample.batch.display_ids[:, :length][~masked], full[~masked])
         assert sample.targets.display_ids[:, length:].eq(-100).all()
-        assert sample.targets.display_answer_ids.shape == (1, 2)
-        assert sample.batch.display_ids[:, :-1].eq(model.mask_token_id).all()
+        assert sample.targets.display_answer_ids.eq(-100).all()
+        assert sample.batch.display_ids[:, length:-1].eq(model.mask_token_id).all()
         assert sample.batch.display_ids[0, -1] == model.eos_token_id
         assert not sample.targets.display_answer_position_mask[0, -1]
+    assert original.batch.display_ids[:, :-1].eq(model.mask_token_id).all()
+    assert same_answer.batch.display_ids[:, :-1].ne(model.mask_token_id).any()
     combined = collate_training_steps(
         (original, same_answer), pad_token_id=1
     )

@@ -1,6 +1,7 @@
 from __future__ import annotations
 
 import gc
+import hashlib
 import json
 import math
 import os
@@ -80,6 +81,7 @@ from cid.model.materialize import (
     RevisionAction,
 )
 from cid.model.native_engine import cuda_engine, native_engine
+from cid.model.native_reference import corrupt_native_reference
 from cid.model.tensors import CIDTensorBatch, CIDTensorOutput, build_percept_routing_masks
 from cid.reclamation import retired_reclamation_candidates
 from cid.runtime.bindings import canonical_work_key
@@ -3854,8 +3856,16 @@ class ILLaDATrajectoryTensorizer:
             # frozen backbone exactly and give zero gradient to the Display
             # correction branch. This input-only reasoning context carries
             # no answer text and has no TCT/Thought supervision.
+            plans = (
+                "Plan: identify what the user is asking and respond clearly.",
+                "Plan: follow the requested format and explain relevant details.",
+                "Plan: use the information in the question and avoid unsupported claims.",
+                "Plan: produce a coherent, useful response to the current request.",
+            )
+            plan_index = int(hashlib.sha256(example.example_id.encode()).hexdigest()[:8], 16)
+            plan = plans[plan_index % len(plans)]
             thought_semantic[0, 0] = self.text_encoder.encode_one(
-                "Plan: answer the user accurately and in fluent natural language.",
+                plan + "\nRequest: " + example.prompt[:256],
                 detach=True,
             ).to(device=device, dtype=dtype)
             occupancy[0, 0, 0] = 1.0
@@ -4166,9 +4176,9 @@ class ILLaDATrajectoryTensorizer:
         display_answer_ids = None
         display_answer_position_mask = None
         if self.adapter.config.backbone_protocol == "lfm-native":
-            # Target text supplies *what* must be said, never *where* it
-            # must appear. Teacher forcing starts from the same free native
-            # MASK canvas as inference; the target prefix is never injected.
+            # Native inference and bootstraps start from a free MASK canvas.
+            # Only verified complete references may supply partially visible
+            # text for denoising augmentation; genuine prior drafts stay editable.
             if rollout_state is None:
                 display_input_ids.fill_(self.adapter.mask_token_id)
                 if source_text_ids is not None:
@@ -4192,7 +4202,40 @@ class ILLaDATrajectoryTensorizer:
             display_labels.fill_(-100)
             if native_full_ids is not None:
                 full_length = int(native_full_ids.shape[1])
-                display_labels[:, :full_length] = native_full_ids
+                # Preserve actual prior drafts and closed-loop predictions.
+                # For ordinary teacher states sample genuine masked references.
+                prior_visible = source_text_ids is not None and bool(
+                    source_text_ids.ne(self.adapter.mask_token_id).any()
+                )
+                if (
+                    rollout_state is None
+                    and (language_only or source_step >= 0)
+                    and not prior_visible
+                ):
+                    alternative = None
+                    pair_replies = example.metadata.get("native_counterfactual_by_step", {})
+                    if not isinstance(pair_replies, dict):
+                        raise ValueError("native_counterfactual_by_step must be a mapping")
+                    paired_text = pair_replies.get(str(supervision_step))
+                    if paired_text is not None:
+                        if (
+                            not isinstance(paired_text, str)
+                            or not paired_text.strip()
+                            or DISPLAY_UNKNOWN_MARKER in paired_text
+                            or "[/Answer]" in paired_text
+                        ):
+                            raise ValueError("invalid native counterfactual reference")
+                        alternative = self._encode_display_text(paired_text + "\n[/Answer]")
+                    display_input_ids, display_labels, native_noise = corrupt_native_reference(
+                        native_full_ids, display_input_ids,
+                        mask_id=self.adapter.mask_token_id, eos_id=self.eos_token_id,
+                        timestep=timestep, generator=generator, alternative=alternative,
+                        denoising_steps=rollout_denoising_steps,
+                    )
+                    display_noise.fill_(native_noise)
+                else:
+                    display_labels[:, :full_length] = native_full_ids
+                    display_labels[display_input_ids.eq(display_labels)] = -100
             # Partial unknown drafts do not establish a full answer target.
             # Their tool/thought supervision remains active until the
             # evidence needed for a complete Display is available.
@@ -4200,19 +4243,9 @@ class ILLaDATrajectoryTensorizer:
             if bool(display_answer_ids.eq(self.adapter.mask_token_id).any()):
                 display_answer_ids.fill_(-100)
             elif native_full_ids is not None:
-                # Standalone answer tokenization can differ inside a longer
-                # reply (e.g. a leading-space BPE token). Never optimize
-                # incompatible token spans against the same full reply.
-                width = int(display_answer_ids.shape[1])
-                matches = (
-                    native_full_ids[0].unfold(0, width, 1)
-                    .eq(display_answer_ids[0])
-                    .all(dim=-1)
-                    if width <= native_full_ids.shape[1]
-                    else torch.zeros(0, dtype=torch.bool, device=device)
-                )
-                if not bool(matches.any()):
-                    display_answer_ids.fill_(-100)
+                # Full replies already supervise their facts and termination.
+                # Avoid duplicate unconstrained factual span supervision.
+                display_answer_ids.fill_(-100)
             display_answer_position_mask = torch.ones_like(
                 display_input_ids, dtype=torch.bool
             )
@@ -5971,6 +6004,24 @@ class ILLaDATrajectoryTensorizer:
             return None
         if not isinstance(value, str) or not value.strip():
             raise ValueError("provided native full Display reference must be a nonempty string")
+        if example.metadata.get("native_full_display_contract") == "source-complete-v1":
+            if (
+                str(step) not in step_references
+                or example.metadata.get("native_full_display_origin") not in {
+                    "original_complete_response", "explicit_output_contract",
+                }
+                or any(event.arrival_step > step for event in example.events)
+            ):
+                raise ValueError(
+                    "source-complete reference requires an explicit causally available step"
+                )
+            if value.strip() != target_display.strip():
+                raise ValueError(
+                    "source-complete reference must preserve the original answer verbatim"
+                )
+            if DISPLAY_UNKNOWN_MARKER in value or "[/Answer]" in value:
+                raise ValueError("source-complete reference contains a transport marker")
+            return value.strip()
         reviewer = example.metadata.get("native_full_display_reviewer")
         if (
             example.metadata.get("native_full_display_verified") is not True
