@@ -1155,6 +1155,34 @@ def _summarize_benchmark_task_metrics(examples, results) -> dict[str, object]:
     }
 
 
+def _fail_distributed_rank(dist, error: BaseException) -> None:
+    """Report local failures before any potentially collective process-group teardown.
+
+    A peer can already be inside an all-reduce. NCCL shutdown is not safe in
+    that situation: it hides the original exception until the collective
+    times out. torchrun owns the rank processes and terminates peers after
+    a nonzero exit, so bypass Python/CUDA shutdown on a failed multi-rank
+    worker, after preserving the real traceback in the elastic error file.
+    Single-process callers retain normal exception handling and cleanup.
+    """
+    if not dist.is_initialized() or dist.get_world_size() <= 1:
+        return
+    import sys
+    import traceback
+
+    print(f"CID_DISTRIBUTED_RANK_FAILURE rank={dist.get_rank()}", file=sys.stderr, flush=True)
+    traceback.print_exception(type(error), error, error.__traceback__, file=sys.stderr)
+    sys.stderr.flush()
+    sys.stdout.flush()
+    try:
+        from torch.distributed.elastic.multiprocessing.errors import get_error_handler
+        get_error_handler().record_exception(error)
+    except Exception:
+        traceback.print_exc(file=sys.stderr)
+        sys.stderr.flush()
+    os._exit(1)
+
+
 def _benchmark(args: argparse.Namespace) -> None:
     import torch
     import torch.distributed as dist
@@ -1611,6 +1639,10 @@ def _benchmark(args: argparse.Namespace) -> None:
                 f"tool_wait={summary.tool_wait_ratio:.4f} "
                 f"hidden={summary.latency_hidden_ratio:.4f} output={output}"
             )
+    except BaseException as error:
+        if distributed:
+            _fail_distributed_rank(dist, error)
+        raise
     finally:
         if distributed and dist.is_initialized():
             dist.destroy_process_group()
@@ -2881,6 +2913,10 @@ def _train_stage_a(args: argparse.Namespace) -> None:
                     f"rollout_probability={rollout_probability:.3f} checkpoint={checkpoint}",
                     flush=True,
                 )
+    except BaseException as error:
+        if distributed:
+            _fail_distributed_rank(dist, error)
+        raise
     finally:
         if distributed and dist.is_initialized():
             dist.destroy_process_group()
@@ -3840,6 +3876,9 @@ def _train_stage_b(args: argparse.Namespace) -> None:
                     f"rollout_probability={rollout_probability:.3f} checkpoint={checkpoint}",
                     flush=True,
                 )
+    except BaseException as error:
+        _fail_distributed_rank(dist, error)
+        raise
     finally:
         if dist.is_initialized():
             dist.destroy_process_group()
