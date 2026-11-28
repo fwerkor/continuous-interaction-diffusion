@@ -196,3 +196,20 @@ def test_batched_grounding_alignment_matches_fallback(
             torch.testing.assert_close(actual, expected, rtol=0, atol=0)
         for actual, expected in zip(actual_link, expected_link, strict=True):
             torch.testing.assert_close(actual, expected, rtol=0, atol=0)
+
+@pytest.mark.parametrize("bad", [float("nan"), float("inf"), -float("inf")])
+def test_nonfinite_grounding_assignment_raises_instead_of_looping(bad):
+    with pytest.raises(FloatingPointError, match="non-finite"):
+        losses._linear_assignment_matrix([[bad, bad], [bad, bad]])
+
+
+@pytest.mark.parametrize("bad", [float("nan"), float("inf"), -float("inf")])
+def test_native_assignment_rejects_only_nonfinite_active_costs(bad):
+    engine = _ReferenceAssignmentEngine()
+    counts = torch.tensor([1, 0])
+    costs = torch.tensor([[[0., 1.], [bad, bad]], [[bad, bad], [bad, bad]]])
+    actual = losses._checked_native_assignment(engine, costs, counts)
+    assert actual.tolist() == [[0, -1], [-1, -1]]
+    costs[0, 0, 0] = bad
+    with pytest.raises(FloatingPointError, match="non-finite active"):
+        losses._checked_native_assignment(engine, costs, counts)

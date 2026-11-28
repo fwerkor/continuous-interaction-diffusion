@@ -2,6 +2,7 @@ from __future__ import annotations
 
 from collections.abc import Callable
 from dataclasses import dataclass, fields
+import math
 
 import torch
 from torch import Tensor
@@ -997,6 +998,23 @@ def _batched_classification_cost(logits: Tensor, target: Tensor) -> Tensor:
     return -expanded.gather(dim=-1, index=index).squeeze(-1)
 
 
+def _checked_native_assignment(engine: object, costs: Tensor, counts: Tensor) -> Tensor:
+    """Validate only the active rows before entering a native Hungarian solver.
+
+    Older cid-engine releases do not terminate if an augmenting path has no
+    finite edge. Do not launch that kernel with non-finite active costs; padded
+    rows are irrelevant. Keep finite costs and assignment/tie semantics intact.
+    """
+    active = torch.arange(costs.shape[1], device=costs.device)[None, :] < counts[:, None]
+    invalid = active & ~torch.isfinite(costs).all(dim=-1)
+    if bool(invalid.any()):
+        bad = invalid.nonzero(as_tuple=False).detach().cpu().tolist()
+        raise FloatingPointError(
+            f"non-finite active grounding assignment cost (matrix,row): {bad[:16]}"
+        )
+    return engine.batched_linear_assignment(costs, counts)
+
+
 def _native_assignment_indices(
     engine: object,
     packed_slots: Tensor,
@@ -1009,7 +1027,7 @@ def _native_assignment_indices(
 
     flat_cost = cost.detach().float().reshape(-1, slot_count, slot_count).contiguous()
     flat_counts = row_counts.reshape(-1).long()
-    assignments = engine.batched_linear_assignment(flat_cost, flat_counts)
+    assignments = _checked_native_assignment(engine, flat_cost, flat_counts)
 
     offsets = torch.arange(
         slot_count,
@@ -1093,7 +1111,7 @@ def _grounding_assignment_indices(
     count_tensor = torch.tensor(row_counts, dtype=torch.long, device=device)
     engine = cuda_engine(cost_batch, capability="batched_linear_assignment")
     if engine is not None:
-        assignments = engine.batched_linear_assignment(cost_batch, count_tensor)
+        assignments = _checked_native_assignment(engine, cost_batch, count_tensor)
     else:
         host_costs = cost_batch.cpu().tolist()
         host_assignments = [
@@ -1162,6 +1180,10 @@ def _linear_assignment_matrix(matrix: list[list[float]]) -> tuple[int, ...]:
         return ()
     if rows > columns:
         raise ValueError("grounding target count exceeds prediction slot capacity")
+    if any(len(row) != columns for row in matrix):
+        raise ValueError("grounding assignment matrix must be rectangular")
+    if any(not math.isfinite(cost) for row in matrix for cost in row):
+        raise FloatingPointError("non-finite active grounding assignment cost")
 
     u = [0.0] * (rows + 1)
     v = [0.0] * (columns + 1)
@@ -1187,6 +1209,8 @@ def _linear_assignment_matrix(matrix: list[list[float]]) -> tuple[int, ...]:
                 if minimum[column] < delta:
                     delta = minimum[column]
                     column1 = column
+            if column1 == 0 or not math.isfinite(delta):
+                raise FloatingPointError("no finite augmenting path in grounding assignment")
             for column in range(columns + 1):
                 if used[column]:
                     u[p[column]] += delta
